@@ -562,6 +562,31 @@ pending notice. Each io_uring count is in or below its estimate before the run (
 `UringWide` 22,058,438 against 15 to 40 million, and `UringOps3` 19,962,870 against 30 to 70
 million).
 
+### Budget check on a 16-vCPU host (2026-11-09)
+
+The budget rule of [FP Design Models] (selected on 2026-11-09) limits each profile to one hour on
+one host of the standing approval, an EC2 4xlarge with 16 vCPUs. The record above ran on 32
+vCPUs, so the two largest profiles ran again on a 16-vCPU host, each alone on the host, at the
+same digest.
+
+- Command: `cargo xtask model operation-ownership/OperationOwnership.UringWide.cfg`, then the same
+  command for `OperationOwnership.UringOps3.cfg`, from the repository root, at commit
+  `3f28290`. The xtask printed
+  `sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa (53 files)`.
+- Checkers: as in the record above, with 16 workers and a 14,028 MB heap.
+- Host: EC2 m8g.4xlarge (16 vCPUs, 64 GiB, AWS Graviton4), us-east-1a, image
+  `ami-06b1a03fa3561aefb`, kernel 7.0.0-1016-aws, instance `i-0cc104d10ea31d875`, on demand.
+  Before these two runs, the host ran two rsauthnz searches, one at a time; nothing ran beside
+  either profile.
+
+| Profile | Result (checker exit) | Distinct states | Depth | Duration (s) |
+| --- | --- | --- | --- | --- |
+| `UringWide` | Pass (0) | 22,058,438 | 30 | 2125.3 |
+| `UringOps3` | Pass (0) | 19,962,870 | 30 | 1954.8 |
+
+Both fit the rule, and the state counts are those of the record above. Each other profile took at
+most 760 s on 32 vCPUs, under half the limit, so a run on 16 vCPUs also fits.
+
 ### Local runs of the rule of 2026-11-08
 
 Local runs on 2026-11-08, after the rule of 2026-11-08. The Mac ran only the known-bad and

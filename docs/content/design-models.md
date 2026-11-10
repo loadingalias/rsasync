@@ -66,8 +66,8 @@ minute each. These profiles take more time (measured on 32 vCPUs, 64 GiB, 2026-1
 
 | Profile | Distinct states | Time |
 | --- | --- | --- |
-| `OperationOwnership.UringWide.cfg`, `IocpWide.cfg` | 22.1 and 7.8 million | 31 and 11 minutes |
-| `OperationOwnership.UringOps3.cfg`, `IocpOps3.cfg` | 20.0 and 9.4 million | 30 and 13 minutes |
+| `OperationOwnership.UringWide.cfg`, `IocpWide.cfg` | 22.1 and 7.8 million | 31 and 11 minutes (`UringWide`: 35 minutes on 16 vCPUs) |
+| `OperationOwnership.UringOps3.cfg`, `IocpOps3.cfg` | 20.0 and 9.4 million | 30 and 13 minutes (`UringOps3`: 33 minutes on 16 vCPUs) |
 
 Each profile must finish within one hour on a 16-vCPU host. Before you run a new large profile in
 full, run it for 10 minutes, and estimate its full size from the growth of the distinct states and
