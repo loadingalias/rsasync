@@ -7,5 +7,7 @@
 //! use rsasync::{buffer, capacity, time};
 //! ```
 
+// By name, not `*`: a module of this crate with one of these names is then a
+// compile error, not a module that hides the shared one.
 #[doc(inline)]
 pub use rstypes::{buffer, capacity, time};

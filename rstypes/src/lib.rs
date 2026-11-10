@@ -12,6 +12,9 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+// rsasync re-exports these modules by name. Write each doc example in them
+// through `rsasync::`, the path that users write, after the hidden line
+// `# extern crate rstypes as rsasync;`, so it builds without the runtime.
 pub mod buffer;
 pub mod capacity;
 pub mod time;
