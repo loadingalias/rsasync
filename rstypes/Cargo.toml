@@ -1,0 +1,18 @@
+[package]
+name = "rstypes"
+# Its own version: it changes only when a shared type changes, so different
+# runtime and networking releases can use the same types.
+version = "0.1.0-alpha.1"
+description = "The types that rsasync shares with networking and applications: owned buffers, capacity, and time. It has no scheduler and no driver."
+repository = "https://github.com/loadingalias/rsasync"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# Without `std`, the crate needs only `core` and `alloc`.
+std = []
+
+[lints]
+workspace = true
