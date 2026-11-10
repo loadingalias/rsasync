@@ -2,3 +2,6 @@
 channel = "nightly-2026-11-02"
 profile = "minimal"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
+# A target with no `std`. `cargo xtask fix` and `check` lint each crate that
+# builds without `std` on it, so each use of `std` outside its feature fails.
+targets = ["wasm32v1-none"]

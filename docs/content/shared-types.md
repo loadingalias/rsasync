@@ -31,9 +31,13 @@ the same type, so a value goes from a library to the runtime with no conversion.
 ## Build without `std`
 
 `rstypes` has a `std` feature, which is on by default. Without it, the crate needs only `core` and
-`alloc`. `rsasync` needs `std`, and it turns on this feature. To build `rstypes` without `std`, run
-this command from the repository root:
+`alloc`. `rsasync` needs `std`, and it turns on this feature.
+
+`cargo xtask check` and `cargo xtask fix`, with no arguments, lint `rstypes` without `std` for
+`wasm32v1-none`. That target has no `std`, so each use of `std` outside the `std` feature fails the
+check. `rust-toolchain.toml` names the target. To run only this build, from the repository root:
 
 ```sh
-cargo build --locked -p rstypes --no-default-features
+rustup target add wasm32v1-none   # when rustup did not install it with the toolchain
+cargo build --locked -p rstypes --no-default-features --target wasm32v1-none
 ```

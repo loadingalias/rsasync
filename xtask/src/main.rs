@@ -34,7 +34,9 @@ Commands
   model [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
 
-With no Cargo arguments, fix and check select the whole workspace.
+With no Cargo arguments, fix and check select the whole workspace, and they
+also lint each crate that builds without `std` on wasm32v1-none, a target
+with no `std`.
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -49,6 +51,13 @@ The checkers are the pinned JRE, TLC, and Apalache under ~/.local/opt, one
 version of each (docs/content/design-models.md), and their output goes to
 target/model/.
 ";
+
+/// A target with no `std`, which rust-toolchain.toml names. A build for it
+/// fails at each use of `std`, also at a use that is outside its `cfg`.
+const NO_STD_TARGET: &str = "wasm32v1-none";
+
+/// The packages whose library builds without `std`.
+const NO_STD_PACKAGES: &[&str] = &["rstypes"];
 
 /// The keywords of a TLC configuration file.
 const TLC_KEYWORDS: &[&str] = &[
@@ -190,7 +199,31 @@ impl Repo {
             "clippy",
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
                 .args(&scope),
-        )
+        )?;
+        self.clippy_no_std(args)
+    }
+
+    /// Lints the library of each package in `NO_STD_PACKAGES` with no default
+    /// feature, on `NO_STD_TARGET`. Cargo arguments select their own scope, so
+    /// this step runs only when there are none, and it says when it does not run.
+    fn clippy_no_std(&self, args: &[String]) -> Result<(), Failure> {
+        if !args.is_empty() {
+            eprintln!("── clippy without std\n   not run: Cargo arguments select the scope; run with no arguments");
+            return Ok(());
+        }
+        let mut command = self.cargo(&[
+            "clippy",
+            "--locked",
+            "--quiet",
+            "--lib",
+            "--no-default-features",
+            "--target",
+            NO_STD_TARGET,
+        ]);
+        for package in NO_STD_PACKAGES {
+            command.args(["--package", package]);
+        }
+        step("clippy without std", &mut command)
     }
 
     /// Checks formatting, lints, and rustdoc. It changes no file.
@@ -202,6 +235,7 @@ impl Repo {
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
                 .args(&scope),
         )?;
+        self.clippy_no_std(args)?;
         step(
             "rustdoc",
             self.cargo(&["doc", "--locked", "--no-deps", "--quiet"]).args(&scope),
