@@ -1,7 +1,9 @@
 [toolchain]
 channel = "nightly-2026-11-02"
 profile = "minimal"
-components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"]
+# Miri runs the tests of the unsafe buffer code (`rstypes`) and finds undefined
+# behavior in them, for example a read of uninitialized bytes.
+components = ["clippy", "rustfmt", "rust-analyzer", "rust-src", "miri"]
 # wasm32v1-none is a target with no `std`. `cargo xtask fix` and `check` lint
 # each crate that builds without `std` on it, so each use of `std` outside its
 # feature fails. The two musl targets run the tests on musl, the second Linux
