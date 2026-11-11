@@ -38,7 +38,8 @@ Commands
 
 With no Cargo arguments, fix and check select the whole workspace, and they
 also lint each crate that builds without `std` on wasm32v1-none, a target
-with no `std`.
+with no `std`. test runs the tests of the whole workspace unless its
+arguments select packages with -p, --package, or --workspace.
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -239,16 +240,18 @@ impl Repo {
         )
     }
 
-    /// Runs the tests with Nextest. With no arguments, it runs every test in
-    /// the workspace, then the doctests, which Nextest does not run.
+    /// Runs the tests with Nextest, in the whole workspace unless the
+    /// arguments select packages. With no arguments, it then runs the
+    /// doctests, which Nextest does not run.
     fn test(&self, args: &[String]) -> Result<(), Failure> {
-        if !args.is_empty() {
-            return step("nextest", self.cargo(&["nextest", "run", "--locked"]).args(args));
+        let mut nextest = self.cargo(&["nextest", "run", "--locked"]);
+        if !selects_packages(args) {
+            nextest.arg("--workspace");
         }
-        step(
-            "nextest",
-            &mut self.cargo(&["nextest", "run", "--locked", "--workspace"]),
-        )?;
+        step("nextest", nextest.args(args))?;
+        if !args.is_empty() {
+            return Ok(());
+        }
         step(
             "doctest",
             &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--quiet"]),
@@ -875,6 +878,14 @@ fn scope(args: &[String]) -> Vec<&str> {
     }
 }
 
+/// Whether the Nextest arguments select packages. With no selection, Cargo
+/// takes only the root package. With `--workspace`, Cargo ignores `-p`, and a
+/// second `--workspace` is an error.
+fn selects_packages(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--workspace" || arg.starts_with("--package") || arg.starts_with("-p"))
+}
+
 /// Runs `command` as the step `name`. A failure keeps the exit code of the command.
 fn step(name: &str, command: &mut Command) -> Result<(), Failure> {
     eprintln!("── {name}");
@@ -914,14 +925,14 @@ impl Failure {
 
 #[cfg(test)]
 mod tests {
-    //! The verdicts from checker output, and profile discovery. Each checker
-    //! input is lines that the pinned checkers printed (TLC 1.8.0 rev 3ec1cc4,
-    //! Apalache 0.62.4).
+    //! The verdicts from checker output, profile discovery, and the package
+    //! selection of the tests. Each checker input is lines that the pinned
+    //! checkers printed (TLC 1.8.0 rev 3ec1cc4, Apalache 0.62.4).
 
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{Report, profiles};
+    use super::{Report, profiles, selects_packages};
 
     fn report(apalache: bool, lines: &[&str]) -> Report {
         let mut report = Report::default();
@@ -1040,5 +1051,29 @@ mod tests {
         let result = profiles(&models, None);
         fs::remove_dir_all(&models).expect("remove the scratch model");
         assert!(matches!(result, Err(failure) if failure.message.contains("m/Missing.cfg")));
+    }
+
+    /// A target or a filter keeps the whole workspace: without
+    /// `--workspace`, the musl step of CI and a named test run only the tests
+    /// of the root package. Each package flag keeps its own selection.
+    #[test]
+    fn only_package_flags_narrow_the_tests() {
+        let selects = |args: &[&str]| selects_packages(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+        for args in [
+            &["--target", "x86_64-unknown-linux-musl"][..],
+            &["-E", "test(tlc_complete_search_holds)"],
+            &["--exclude", "xtask"],
+        ] {
+            assert!(!selects(args), "{args:?}");
+        }
+        for args in [
+            &["-p", "rstypes"][..],
+            &["-prstypes"],
+            &["--package", "rstypes"],
+            &["--package=rstypes"],
+            &["--workspace"],
+        ] {
+            assert!(selects(args), "{args:?}");
+        }
     }
 }
