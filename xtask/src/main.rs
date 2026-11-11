@@ -11,6 +11,8 @@
     reason = "xtask is a command-line tool, and standard error is its report channel"
 )]
 
+mod evidence;
+
 use core::iter;
 
 use rscrypto::Sha256;
@@ -20,7 +22,7 @@ use std::{
     fs,
     io::{self, BufRead as _, Write as _},
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{Command, ExitCode},
     time::Instant,
 };
 
@@ -80,11 +82,6 @@ const TLC_KEYWORDS: &[&str] = &[
     "SYMMETRY",
     "VIEW",
 ];
-
-/// Environment variables that pass options to a checker's JVM without notice,
-/// such as `-Dtlc2.TLC.stopAfter`, which stops a search and still exits with 0.
-/// Each checker run removes them. `JVM_ARGS` is the one that `apalache-mc` reads.
-const JVM_SCRUBBED: &[&str] = &["JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "JVM_ARGS", "_JAVA_OPTIONS"];
 
 /// The name that a deadlock report gets. It is not a TLA+ identifier, so no
 /// property can have it.
@@ -263,7 +260,17 @@ impl Repo {
     /// selection is not a pass. Each profile is checked before the first run,
     /// and the runs hold the host lock together.
     fn model(&self, args: &[String]) -> Result<(), Failure> {
-        let models = self.root.join("models");
+        let live_models = self.root.join("models");
+        let _lock = host_lock()?;
+        let models = evidence::directory(&self.root.join("target/model/inputs"))?;
+        for dir in sorted_entries(&live_models)? {
+            let Some(name) = dir.file_name().and_then(OsStr::to_str) else {
+                continue;
+            };
+            if dir.is_dir() && (args.is_empty() || args.iter().any(|arg| arg.split('/').next() == Some(name))) {
+                evidence::freeze(&dir, &models.join(name))?;
+            }
+        }
         let selections: Vec<Option<&str>> = if args.is_empty() {
             vec![None]
         } else {
@@ -286,16 +293,26 @@ impl Repo {
         }
         let profiles = selected;
         let checkers = Checkers::find()?;
-        let _lock = host_lock()?;
         eprintln!("checkers: {}", checkers.versions);
         let mut dirs: Vec<&Path> = profiles.iter().map(|profile| profile.dir.as_path()).collect();
         dirs.sort();
         dirs.dedup();
-        for dir in dirs {
+        for dir in &dirs {
             eprintln!("files of {}: {}", dir.display(), digest(dir)?);
         }
         for profile in &profiles {
             checkers.run(profile, &self.root.join("target/model").join(&profile.name))?;
+        }
+        for dir in dirs {
+            let name = dir
+                .file_name()
+                .ok_or_else(|| Failure::new("model has no directory name".to_owned()))?;
+            if digest(dir)? != digest(&live_models.join(name))? {
+                return Err(Failure::new(
+                    "model files changed after the inputs were retained; results apply to the retained revision"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -311,6 +328,16 @@ enum Kind {
     /// A reachability witness (`_reach`): a violation of its one property,
     /// which is the negation of its target.
     Reach,
+}
+
+fn profile_kind(stem: &str) -> Kind {
+    if stem.ends_with("_bad") {
+        Kind::Bad
+    } else if stem.ends_with("_reach") {
+        Kind::Reach
+    } else {
+        Kind::Holds
+    }
 }
 
 /// A checker run: a model module and the file that configures the run.
@@ -344,6 +371,7 @@ fn profiles(models: &Path, selection: Option<&str>) -> Result<Vec<Profile>, Fail
         if !dir.is_dir() || model.is_some_and(|model| model != model_name) {
             continue;
         }
+        evidence::matrix(&dir)?;
         for path in sorted_entries(&dir)? {
             let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
                 continue;
@@ -367,13 +395,7 @@ fn profiles(models: &Path, selection: Option<&str>) -> Result<Vec<Profile>, Fail
             if !dir.join(&module).is_file() {
                 return Err(Failure::new(format!("{name}: the model has no module {module}")));
             }
-            let kind = if stem.ends_with("_bad") {
-                Kind::Bad
-            } else if stem.ends_with("_reach") {
-                Kind::Reach
-            } else {
-                Kind::Holds
-            };
+            let kind = profile_kind(stem);
             let expected = if kind == Kind::Holds {
                 None
             } else {
@@ -578,15 +600,19 @@ fn host_lock() -> Result<fs::File, Failure> {
 /// line for each file with the SHA-256 of its bytes and its name. An evidence
 /// record names this digest, not each file.
 fn digest(dir: &Path) -> Result<String, Failure> {
-    let names: Vec<String> = sorted_entries(dir)?
-        .iter()
-        .filter(|path| {
-            path.extension()
-                .and_then(OsStr::to_str)
-                .is_some_and(|extension| matches!(extension, "tla" | "cfg" | "apalache"))
-        })
-        .filter_map(|path| path.file_name().and_then(OsStr::to_str).map(str::to_owned))
-        .collect();
+    let mut names = std::collections::BTreeSet::new();
+    for path in sorted_entries(dir)? {
+        let extension = path.extension().and_then(OsStr::to_str);
+        if extension.is_some_and(|extension| matches!(extension, "tla" | "cfg" | "apalache" | "matrix"))
+            && let Some(name) = path.file_name().and_then(OsStr::to_str)
+        {
+            names.insert(name.to_owned());
+        }
+        if extension == Some("apalache") {
+            let text = fs::read_to_string(&path).map_err(|error| Failure::new(error.to_string()))?;
+            names.extend(evidence::auxiliaries(&text)?);
+        }
+    }
     let mut list = String::new();
     for name in &names {
         let path = dir.join(name);
@@ -645,6 +671,16 @@ impl Checkers {
         let (jre, jre_version) = installed(&opt, "temurin-jre")?;
         let (tla2tools, tla2tools_version) = installed(&opt, "tla2tools")?;
         let (apalache, apalache_version) = installed(&opt, "apalache")?;
+        let identities = format!(
+            "jre-sha256={}\ntlc-sha256={}\napalache-sha256={}\nrunner-sha256={}",
+            evidence::tool_identity(&jre)?,
+            evidence::tool_identity(&tla2tools)?,
+            evidence::tool_identity(&apalache)?,
+            hex(&Sha256::digest(
+                &fs::read(env::current_exe().map_err(|error| Failure::new(error.to_string()))?)
+                    .map_err(|error| Failure::new(error.to_string()))?
+            ))
+        );
         // A macOS JRE keeps its home in a bundle; a Linux JRE is the home.
         let bundle = jre.join("Contents/Home");
         let java_home = if bundle.is_dir() { bundle } else { jre };
@@ -652,36 +688,49 @@ impl Checkers {
             java_bin: java_home.join("bin"),
             tla2tools: tla2tools.join("tla2tools.jar"),
             apalache: apalache.join("bin/apalache-mc"),
-            versions: format!("temurin-jre {jre_version}, tla2tools {tla2tools_version}, apalache {apalache_version}"),
+            versions: format!(
+                "temurin-jre {jre_version}, tla2tools {tla2tools_version}, apalache {apalache_version}\n{identities}"
+            ),
         })
     }
 
-    /// Runs `profile` with its output in `out`, which starts empty. The checker
-    /// output also goes to `out/checker.log`. TLC runs with no search limit,
+    /// Runs `profile` in a new child of `out`, with its inputs and both logs.
+    /// Existing run directories stay unchanged. TLC runs with no search limit,
     /// so a pass is a completed search. A `_bad` or `_reach` profile passes
     /// only when the output reports a violation of its one property.
     fn run(&self, profile: &Profile, out: &Path) -> Result<(), Failure> {
+        let out = evidence::directory(out)?;
         let output_error = |error: io::Error| Failure::new(format!("{}: {error}", out.display()));
-        match fs::remove_dir_all(out) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(output_error(error)),
-            _ => fs::create_dir_all(out).map_err(output_error)?,
-        }
+        let source_digest = digest(&profile.dir)?;
+        let closure = evidence::snapshot(&out, profile)?;
+        let source = out.join("source");
+        let file_name = profile
+            .file
+            .file_name()
+            .ok_or_else(|| Failure::new("profile has no file name".to_owned()))?;
+        let retained_profile = source.join(file_name);
         let mut command = if profile.apalache {
-            let text = fs::read_to_string(&profile.file)
-                .map_err(|error| Failure::new(format!("{}: {error}", profile.file.display())))?;
+            let text = fs::read_to_string(&retained_profile)
+                .map_err(|error| Failure::new(format!("{}: {error}", retained_profile.display())))?;
             // apalache-mc runs the first `java` on the path.
-            let path = env::var_os("PATH").unwrap_or_default();
-            let path = env::join_paths(iter::once(self.java_bin.clone()).chain(env::split_paths(&path)))
-                .map_err(|error| Failure::new(format!("PATH: {error}")))?;
+            let path = env::join_paths(
+                iter::once(self.java_bin.clone()).chain(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from)),
+            )
+            .map_err(|error| Failure::new(format!("PATH: {error}")))?;
+            let settings = out.join("apalache.json");
+            fs::write(&settings, "{}\n").map_err(output_error)?;
             let mut command = Command::new(&self.apalache);
             command
+                .env_clear()
                 .args(text.lines().map(str::trim).filter(|line| !line.is_empty()))
                 .arg(format!("--out-dir={}", out.display()))
+                .arg(format!("--config-file={}", settings.display()))
                 .env("PATH", path);
             command
         } else {
             let mut command = Command::new(self.java_bin.join("java"));
             command
+                .env_clear()
                 .args(["-XX:+UseParallelGC", "-cp"])
                 .arg(&self.tla2tools)
                 .args([
@@ -697,61 +746,65 @@ impl Checkers {
                 .args(["-dumpTrace", "json"])
                 .arg(out.join("trace.json"))
                 .arg("-config")
-                .arg(&profile.file);
+                .arg(&retained_profile);
             command
         };
-        command.arg(&profile.module).current_dir(&profile.dir);
-        for name in JVM_SCRUBBED {
-            command.env_remove(name);
-        }
+        command.arg(&profile.module).current_dir(&source);
 
         let checker = if profile.apalache { "apalache" } else { "tlc" };
         eprintln!("── {checker} {}", profile.name);
         let started = Instant::now();
         let start_error = |error: io::Error| Failure::new(format!("{}: cannot start {checker}: {error}", profile.name));
-        let mut child = command.stdout(Stdio::piped()).spawn().map_err(start_error)?;
-        let log_path = out.join("checker.log");
-        let log_error = |error: io::Error| Failure::new(format!("{}: {error}", log_path.display()));
-        let mut log = fs::File::create(&log_path).map_err(log_error)?;
-        let mut report = Report::default();
-        let mut copy = || -> io::Result<()> {
-            if let Some(stdout) = child.stdout.take() {
-                for line in io::BufReader::new(stdout).lines() {
-                    let line = line?;
-                    eprintln!("{line}");
-                    writeln!(log, "{line}")?;
-                    report.read(&line, profile.apalache, profile.expected.as_deref());
-                }
-            }
-            Ok(())
-        };
-        if let Err(error) = copy() {
-            // A checker that runs on unattended after this run releases the
-            // host lock would share the host with the next run, so stop it.
-            child.kill().map_err(start_error)?;
-            child.wait().map_err(start_error)?;
-            return Err(log_error(error));
-        }
-        let status = child.wait().map_err(start_error)?;
+        let mut manifest = evidence::start(&out, profile, &command, &self.versions, &closure)?;
+        eprintln!("   evidence: {}", out.display());
+        let stdout = fs::File::create(out.join("checker.log")).map_err(output_error)?;
+        let stderr = fs::File::create(out.join("stderr.log")).map_err(output_error)?;
+        let status = command.stdout(stdout).stderr(stderr).status().map_err(start_error)?;
         let seconds = started.elapsed().as_secs_f64();
+        writeln!(manifest, "state=finished\nstatus={status}\nseconds={seconds:.6}").map_err(output_error)?;
+        manifest.sync_all().map_err(output_error)?;
+        if digest(&profile.dir)? != source_digest {
+            writeln!(manifest, "verdict=fail\nreason=model files changed during the check").map_err(output_error)?;
+            manifest.sync_all().map_err(output_error)?;
+            return Err(Failure::new(
+                "model files changed during the check; evidence is invalid".to_owned(),
+            ));
+        }
+        let mut report = Report::default();
+        for name in ["checker.log", "stderr.log"] {
+            let log = fs::File::open(out.join(name)).map_err(output_error)?;
+            for line in io::BufReader::new(log).lines() {
+                report.read(
+                    &line.map_err(output_error)?,
+                    profile.apalache,
+                    profile.expected.as_deref(),
+                );
+            }
+        }
         let Some(expected) = profile.expected.as_deref() else {
             return match report.holds(profile.apalache, status.code()) {
                 Ok(()) => {
+                    writeln!(manifest, "verdict=pass").map_err(output_error)?;
+                    manifest.sync_all().map_err(output_error)?;
                     eprintln!("   ok in {seconds:.2}s ({status})");
                     Ok(())
                 }
-                Err(reason) => Err(Failure {
-                    message: format!(
-                        "{}: {reason} ({status}); the output is in {}",
-                        profile.name,
-                        out.display()
-                    ),
-                    code: status
-                        .code()
-                        .and_then(|code| u8::try_from(code).ok())
-                        .filter(|code| *code != 0)
-                        .unwrap_or(1),
-                }),
+                Err(reason) => {
+                    writeln!(manifest, "verdict=fail\nreason={reason}").map_err(output_error)?;
+                    manifest.sync_all().map_err(output_error)?;
+                    Err(Failure {
+                        message: format!(
+                            "{}: {reason} ({status}); the output is in {}",
+                            profile.name,
+                            out.display()
+                        ),
+                        code: status
+                            .code()
+                            .and_then(|code| u8::try_from(code).ok())
+                            .filter(|code| *code != 0)
+                            .unwrap_or(1),
+                    })
+                }
             };
         };
         let violated = &report.violated;
@@ -764,6 +817,8 @@ impl Checkers {
             } else {
                 "as the known-bad variant requires"
             };
+            writeln!(manifest, "verdict=pass\nviolated={expected}").map_err(output_error)?;
+            manifest.sync_all().map_err(output_error)?;
             eprintln!("   `{expected}` is violated: {shows}, in {seconds:.2}s ({status})");
             return Ok(());
         }
@@ -772,6 +827,8 @@ impl Checkers {
         } else {
             format!("a violation of `{}`", violated.join("`, `"))
         };
+        writeln!(manifest, "verdict=fail\nreason=expected {expected}; found {found}").map_err(output_error)?;
+        manifest.sync_all().map_err(output_error)?;
         Err(Failure::new(format!(
             "{}: it must violate `{expected}`, and the checker reports {found} ({status}); the output is in {}",
             profile.name,

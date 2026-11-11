@@ -7,14 +7,11 @@ Completion I/O and Buffers (the terminal-event table and the cancel rule), Futur
 (generations), and Startup, Shutdown, and Failures. The Design Models section of
 `docs/specs/family-policy.md` sets the acceptance.
 
-**Status (2026-11-08): complete.** The rule of 2026-11-08 changed the module: a zero-copy send
-frees its direction at its send result ([Decisions of 2026-11-08](#decisions-of-2026-11-08)).
-Every profile passed with its required verdict on the evidence host at the current digest
-`sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa` (53 files), in one
-command ([Evidence record](#evidence-record)). The evidence-host record of the rule of 2026-11-07
-stays below as the record of that design. The design as first written had one defect, a close that
-waits for a zero-copy notice; [Decisions of 2026-11-07](#decisions-of-2026-11-07) gives it, the
-selected design, and each rejected option.
+**Status (2026-11-11): all 55 profiles pass at the current inputs.** The model checks
+conservation of the received prefix, both missing and duplicate progress reports, and every
+detached notice. The 12 positive searches complete; all 16 fault variants and 27 witnesses
+produce their required violations. See [Evidence record](#evidence-record). The design decisions
+of 2026-11-07 and 2026-11-08 stay below; this change strengthens their checks.
 
 ## The promise and a concrete failure
 
@@ -44,8 +41,10 @@ cargo xtask model operation-ownership                                    # every
 cargo xtask model operation-ownership/OperationOwnership.Uring.cfg       # one profile
 ```
 
-The output of a profile goes to `target/model/operation-ownership/<file>/`: the checker output in
-`checker.log` and, on a violation, the trace in `trace.json`. The xtask prints one digest over the
+The output of a profile goes to `target/model/operation-ownership/<file>/<run>/`: the checker output in
+`checker.log`, diagnostics in `stderr.log`, and, on a violation, the trace in `trace.json`.
+`run.txt` records the command, tool identities, source hashes, status, and verdict. The checker
+reads the exact inputs in `source/`; later runs preserve this directory. The xtask prints one digest over the
 checked files of the model; the evidence record names it. [Check the design
 models](../../docs/content/design-models.md) tells how to install the checkers and what a
 failure means.
@@ -77,11 +76,11 @@ Each profile is a TLC configuration of `OperationOwnership.tla`. The xtask passe
 | Requests | `rq` holds the request entries `<<c, g>>`. A cancel from the consumer or from close travels to the home of operation `g`, and the home takes it in a later step |
 | Backings | `bk[c][g]`: the buffer and charge of operation `g`. `own`, `held` (received bytes that the stream keeps), `zc` (the driver keeps it for the zero-copy notice of send `g`), `out` (released), or `dbl` (released twice) |
 | Stream bytes | `Bytes = 3` from the peer. `rbuf` is the buffer of the receive, `held` the bytes that the stream keeps, and `got` the bytes that the caller received |
-| Send progress | `tp`: `part` (partial or failed) or `full`. `wd` is the write direction, and `rep[g]` counts the progress reports of send `g` |
+| Send progress | `tp`: `part` (partial or failed) or `full`. `wd` is the write direction, `required` records which send results require a report, and `rep[g]` counts the reports of send `g` |
 | Pending notices | `pn`: the sends whose result had `IORING_CQE_F_MORE` and whose notice has not arrived. `nh[g]`: the home of the notice of send `g`, selected when the task ends, as for a slot. The submissions bound the set, as each send's charge bounds it in the design |
 | Connections | `Conns = 1` connection waits on the listener. `ar` is in the accept, `hc` is held by the listener, and `uc` is with the caller |
 | Waker | `wake`: the waker of the latest poll of the receive future. `woke[c]`: the latest waker of the future in slot `c` is woken |
-| Detached debt | `dt`: close returned and left the stream's pending notices, with their buffers, charges, and the descriptor, to the driver. `pg`: a reset ended the kernel's hold of the stream's queued bytes, so every pending notice comes from the kernel |
+| Detached debt | `debt` holds the exact generations that close left to the driver, with their buffers, charges, and the descriptor. `dt` means that this set is not empty. `pg`: a reset ended the kernel's hold of the stream's queued bytes, so every pending notice comes from the kernel |
 
 ## Physical assumptions
 
@@ -241,8 +240,15 @@ direction needs an argument:
 - `DetachedReleased` and `LatestWakerWoken`: `Q` includes `~P`, so `[]<>(~P \/ Q)` is `[]<>Q`,
   and `[]<>Q` gives `P ~> Q` with no side condition.
 
-A full abandoned send reports nothing (selected on 2026-11-07): `ReportOnce` checks the reports
-that are owed, and a next send that succeeds is the report of a full transfer.
+`InOrderOnce` checks both the order of returned bytes and conservation of the received prefix:
+before close returns, `got \o held \o rbuf` is exactly the prefix delivered by the kernel. A check
+of `got` alone cannot detect an unread suffix that the driver drops.
+
+`required` is independent of `rep`: the send result records the obligation, and error reporting
+or close discharges it. `ReportOnce` rejects an extra report and a missing required report when
+the write direction has failed or close has returned. A full abandoned send reports nothing
+unless close cancelled it. `ReleaseOnce` also checks `debt = pn` after close; a Boolean flag cannot
+show that close omitted one of several notices.
 
 ## Bounds, faults, and fairness
 
@@ -283,6 +289,9 @@ bounds of reduction 11.
 | `SubmitFirst_bad` | A receive submits before it returns held data | `InOrderOnce` |
 | `NoGeneration_bad` | The home does not check the generation of a request | `NoStaleEffect` |
 | `ReportTwice_bad` | Close reports send progress that a send error already reported | `ReportOnce` |
+| `DropRxTail_bad` | An abandoned receive drops its unread suffix | `InOrderOnce` |
+| `OmitReport_bad` | Error reporting or close omits required send progress | `ReportOnce` |
+| `OmitDebt_bad` | Close omits one of two pending notices from detached debt | `ReleaseOnce` |
 | `CloseNoCancel_bad` | Close does not cancel, and the peer refuses to read | `CloseReturns` |
 | `CloseNoCancelJoin_bad` | The same rule change | `ShutdownJoins` |
 | `StaleWaker_bad` | The home wakes the waker of the first poll | `LatestWakerWoken` |
@@ -308,9 +317,9 @@ The counterexamples, as actions and observations:
 - `ZcEarlyRelease_bad` (`ReleaseOnce`): `BeginTx`; `Shutdown`; `EndTask`; `Complete("tx")` (a
   result with `IORING_CQE_F_MORE`, and the variant releases the backing). The notice is still
   pending while the backing is released.
-- The other variants keep the traces of the first run (2026-11-06): for example `DropRelease_bad`
-  is `BeginRx`, `Drop("rx")`, and the drop releases the receive buffer while the receive is in
-  flight. Each trace is in `target/model/operation-ownership/<profile>/trace.json`.
+- For example, `DropRelease_bad` is `BeginRx`, `Drop("rx")`, and the drop releases the receive
+  buffer while the receive is in flight. Each current trace is retained in
+  `target/model/operation-ownership/<profile>/<run>/trace.json`.
 
 ## Reachability
 
@@ -468,278 +477,59 @@ resets of 2026-11-07, and a reset purges every pending notice of the connection.
 
 ## Evidence record
 
-### Evidence host record of the rule of 2026-11-08
+All 55 profiles pass for
+`sha256:9519fd9c04854f42cb016adb867e3671e135a2ab8bb6333b3073855b31ca6beb` (56 files).
+SANY parsed the module before TLC. The checks use Temurin JRE 21.0.13+9,
+TLC 1.8.0+d8fb231de4e4, and `cargo xtask model operation-ownership/<profile>`.
+Each retained profile closure matches the current module and configuration.
 
-One complete run of every profile on the evidence host on 2026-11-08, from 19:05:09 to 20:41:49
-UTC. It is the main record of the current files: one command, one digest, and the original checker
-exit status of each profile. It includes the main, wide, and raise-by-one profiles (rule 4 of
-[FP Design Models]) on both backends.
+The 12 positive searches finish with no violation, an empty queue, and exit 0. The main
+io_uring run used this shared Mac; its duration is indicative. The other positive runs used
+one quiet EC2 c8g.4xlarge: 16 vCPUs, 32 GiB, Ubuntu 26.04, aarch64, kernel 7.0.0-1016-aws.
+Every profile finished within the one-hour limit.
 
-- Command: `cargo xtask model operation-ownership/OperationOwnership.Uring.cfg
-  operation-ownership`, from the repository root, with a limit of `timeout 28000`. The first
-  selection puts the main profile first; the command runs each of the 52 profiles once. Exit
-  status 0.
-- Source: the files of this directory, not yet committed, on top of commit
-  `3ad84f8813b29badc0e0ff725075aea52d40062f`. The xtask printed
-  `sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa (53 files)`, the
-  digest of the files as they are now.
-- Checkers: temurin-jre 21.0.13+9 (Linux aarch64, SHA-256 checked against Adoptium), tla2tools
-  1.8.0+d8fb231de4e4 (TLC2 Version 2026.11.06.222357, rev d8fb231; the pinned jar, SHA-256
-  `e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f` checked), with `-workers auto
-  -lncheck final` (32 workers, 14,028 MB heap).
-- Host: EC2 c8g.8xlarge (32 vCPUs, 64 GiB), us-east-1c, image `ami-06b1a03fa3561aefb` (Ubuntu
-  26.04 arm64, 20261104.1), kernel 7.0.0-1016-aws, instance `i-02cd2238d360c7437`. No other checker
-  ran during the run; one short build of the rsauthnz xtask ran at about 19:59. The instance is
-  terminated.
-- Replay: the same command writes each profile's output to
-  `target/model/operation-ownership/<profile>/` (`checker.log`, and `trace.json` for a
-  violation). The host's own logs are not kept; this record holds their figures.
-- Exit: the checker's own exit status, as the xtask printed it: 0 for a complete search with no
-  violation, 12 for an invariant violation, 13 for an action or temporal property violation. TLC
-  stops a known-bad or reachability search at the first violation that a worker finds, so those
-  state counts change with the number of workers; the verdicts do not.
+| Profile | Distinct states | Seconds | Host |
+| --- | --- | --- | --- |
+| `OperationOwnership.Iocp.cfg` | 648,946 | 53.93 | EC2 |
+| `OperationOwnership.IocpBytes4.cfg` | 873,266 | 71.73 | EC2 |
+| `OperationOwnership.IocpConns2.cfg` | 861,278 | 74.04 | EC2 |
+| `OperationOwnership.IocpOps3.cfg` | 9,357,002 | 904.79 | EC2 |
+| `OperationOwnership.IocpWide.cfg` | 7,752,242 | 746.93 | EC2 |
+| `OperationOwnership.IocpWorkers3.cfg` | 1,100,658 | 94.53 | EC2 |
+| `OperationOwnership.Uring.cfg` | 970,534 | 352.85 | Mac |
+| `OperationOwnership.UringBytes4.cfg` | 1,282,956 | 110.42 | EC2 |
+| `OperationOwnership.UringConns2.cfg` | 1,852,358 | 152.81 | EC2 |
+| `OperationOwnership.UringOps3.cfg` | 19,962,870 | 2033.76 | EC2 |
+| `OperationOwnership.UringWide.cfg` | 22,058,438 | 2168.35 | EC2 |
+| `OperationOwnership.UringWorkers3.cfg` | 2,198,912 | 190.24 | EC2 |
 
-| Profile | Bounds | Result (checker exit) | Distinct states | Depth | Duration (s) |
-| --- | --- | --- | --- | --- | --- |
-| `Uring` | Declared | Pass (0) | 970,534 | 23 | 73.3 |
-| `Iocp` | Declared | Pass (0) | 648,946 | 21 | 45.8 |
-| `UringWide` | Two submissions on each direction | Pass (0) | 22,058,438 | 30 | 1851.4 |
-| `IocpWide` | Two submissions on each direction | Pass (0) | 7,752,242 | 28 | 636.6 |
-| `UringWorkers3` | Three workers (raise) | Pass (0) | 2,198,912 | 24 | 170.7 |
-| `IocpWorkers3` | Three workers (raise) | Pass (0) | 1,100,658 | 22 | 85.5 |
-| `UringBytes4` | Four bytes (raise) | Pass (0) | 1,282,956 | 23 | 103.2 |
-| `IocpBytes4` | Four bytes (raise) | Pass (0) | 873,266 | 21 | 62.6 |
-| `UringConns2` | Two connections (raise) | Pass (0) | 1,852,358 | 25 | 149.5 |
-| `IocpConns2` | Two connections (raise) | Pass (0) | 861,278 | 23 | 62.2 |
-| `UringOps3` | Three submissions on each resource (raise) | Pass (0) | 19,962,870 | 30 | 1772.0 |
-| `IocpOps3` | Three submissions on each resource (raise) | Pass (0) | 9,357,002 | 28 | 759.8 |
-| `CloseNoCancelJoin_bad` | Small (reduction 11) | `ShutdownJoins` violated (13) | 8,938 | 17 | 1.0 |
-| `CloseNoCancel_bad` | Small (reduction 11) | `CloseReturns` violated (13) | 8,938 | 17 | 1.0 |
-| `DropRelease_bad` | Declared | `ReleaseOnce` violated (12) | 805 | 10 | 0.6 |
-| `ExitLive_bad` | Declared | `NoImpossibleWait` violated (12) | 778 | 10 | 0.6 |
-| `NoDrainLimit_bad` | Small (reduction 11) | `DetachedReleased` violated (13) | 8,794 | 17 | 1.1 |
-| `NoGeneration_bad` | Declared | `NoStaleEffect` violated (12) | 3,907 | 10 | 0.7 |
-| `NoGraceReset_bad` | Small (reduction 11) | `ShutdownJoins` violated (13) | 8,794 | 17 | 1.1 |
-| `ReportTwice_bad` | Declared | `ReportOnce` violated (12) | 16,145 | 12 | 0.9 |
-| `StaleWaker_bad` | Small (reduction 11) | `LatestWakerWoken` violated (13) | 8,794 | 17 | 1.0 |
-| `SubmitFirst_bad` | Declared | `InOrderOnce` violated (12) | 10,695 | 12 | 0.9 |
-| `Win32_bad` | Declared | `ReleaseOnce` violated (12) | 781 | 8 | 0.6 |
-| `ZcEarlyRelease_bad` | Declared | `ReleaseOnce` violated (12) | 600 | 10 | 0.6 |
-| `ZcWait_bad` | Small (reduction 11) | `CloseReturns` violated (13) | 7,332 | 15 | 0.9 |
-| `CancelFound_reach` | Declared | Reached (12) | 512 | 10 | 0.6 |
-| `CancelNotFound_reach` | Declared | Reached (13) | 906 | 10 | 0.6 |
-| `CancelRacesCompletion_reach` | Declared | Reached (13) | 300 | 7 | 0.6 |
-| `CancelRacesDrop_reach` | Declared | Reached (13) | 1,183 | 10 | 0.6 |
-| `CancelledData_reach` | Declared | Reached (13) | 2,970 | 12 | 0.6 |
-| `CloseLive_reach` | Declared | Reached (12) | 1,229 | 11 | 0.6 |
-| `CloseReport_reach` | Declared | Reached (13) | 933 | 10 | 0.6 |
-| `DetachTwo_reach` | Declared | Reached (13) | 41,710 | 12 | 0.9 |
-| `DetachedAck_reach` | Declared | Reached (13) | 1,006 | 10 | 0.6 |
-| `DetachedClose_reach` | Declared | Reached (12) | 940 | 10 | 0.6 |
-| `DetachedReset_reach` | Declared | Reached (13) | 1,857 | 10 | 0.6 |
-| `HeldBytes_reach` | Declared | Reached (13) | 2,361 | 11 | 0.6 |
-| `HeldConn_reach` | Declared | Reached (13) | 2,560 | 11 | 0.6 |
-| `IocpError_reach` | Declared | Reached (13) | 733 | 10 | 0.5 |
-| `IocpOtherPacket_reach` | Declared | Reached (13) | 668 | 9 | 0.6 |
-| `IocpPending_reach` | Declared | Reached (13) | 904 | 9 | 0.6 |
-| `IocpSkip_reach` | Declared | Reached (13) | 1,099 | 10 | 0.6 |
-| `MultishotFinal_reach` | Declared | Reached (13) | 995 | 10 | 0.6 |
-| `NewWaker_reach` | Declared | Reached (12) | 2,112 | 11 | 0.6 |
-| `SendError_reach` | Declared | Reached (13) | 4,070 | 11 | 0.7 |
-| `ShutdownCross_reach` | Declared | Reached (12) | 1,391 | 10 | 0.7 |
-| `StaleRequest_reach` | Declared | Reached (12) | 2,335 | 11 | 0.7 |
-| `TwoPending_reach` | Declared | Reached (12) | 6,171 | 10 | 0.7 |
-| `UringSingle_reach` | Declared | Reached (13) | 429 | 10 | 0.6 |
-| `ZcNoNotice_reach` | Declared | Reached (13) | 542 | 10 | 0.6 |
-| `ZcNotice_reach` | Declared | Reached (13) | 611 | 10 | 0.6 |
-| `ZcResult_reach` | Declared | Reached (13) | 745 | 10 | 0.6 |
+All 16 known-bad variants violate their named property, and all 27 witnesses reach their
+named target. Their combined checker time is 100.74 seconds on this shared Mac; this is
+functional evidence, not a qualified performance measurement. The three new fault checks are:
 
-What the raises show: each argued bound raised by one passed on both backends, and each raise
-added states to its declared profile, so each raise exercised its bound. Reading 2 (`UringWide`,
-`IocpWide`) also passed. Each IOCP count is equal to the record of 2026-11-07, as the rule of
-2026-11-08 predicts: it changes only branches that need a result with `IORING_CQE_F_MORE` or a
-pending notice. Each io_uring count is in or below its estimate before the run (for example,
-`UringWide` 22,058,438 against 15 to 40 million, and `UringOps3` 19,962,870 against 30 to 70
-million).
+| Profile | Required violation | Seconds |
+| --- | --- | --- |
+| `DropRxTail_bad` | `InOrderOnce` | 1.20 |
+| `OmitReport_bad` | `ReportOnce` | 1.21 |
+| `OmitDebt_bad` | `ReleaseOnce` | 3.33 |
 
-### Budget check on a 16-vCPU host (2026-11-09)
+The original logs, traces, manifests, and source copies are retained under
+`target/model/operation-ownership/<profile>/<run>/`. The current-input index is
+`target/model/operation-ownership-evidence-status.tsv`. The `OmitDebt_bad` run
+`1794375904485908000-57608` also exercises the retained-input runner: it reads `source/`,
+and the earlier run remains present.
 
-The budget rule of [FP Design Models] (selected on 2026-11-09) limits each profile to one hour on
-one host of the standing approval, an EC2 4xlarge with 16 vCPUs. The record above ran on 32
-vCPUs, so the two largest profiles ran again on a 16-vCPU host, each alone on the host, at the
-same digest.
+The EC2 run is `20261111T073937Z-48704`. Its collected archive is
+`target/model/remote-r000/node-1-artifacts.tar.gz`, with SHA-256
+`a8d1d1d2cc847da9c143656372ddc7c7e4b4d961793ab8e27e5049d68d87ef8d`.
+Collection and teardown both exit 0. `dev-machine status rsasync aws-linux-arm64-ubuntu2604`
+reports no AWS instance or EBS volume. The archive excludes TLC state caches; it keeps the
+inputs, commands, results, and replay artifacts.
 
-- Command: `cargo xtask model operation-ownership/OperationOwnership.UringWide.cfg`, then the same
-  command for `OperationOwnership.UringOps3.cfg`, from the repository root, at commit
-  `3f28290`. The xtask printed
-  `sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa (53 files)`.
-- Checkers: as in the record above, with 16 workers and a 14,028 MB heap.
-- Host: EC2 m8g.4xlarge (16 vCPUs, 64 GiB, AWS Graviton4), us-east-1a, image
-  `ami-06b1a03fa3561aefb`, kernel 7.0.0-1016-aws, instance `i-0cc104d10ea31d875`, on demand.
-  Before these two runs, the host ran two rsauthnz searches, one at a time; nothing ran beside
-  either profile.
-
-| Profile | Result (checker exit) | Distinct states | Depth | Duration (s) |
-| --- | --- | --- | --- | --- |
-| `UringWide` | Pass (0) | 22,058,438 | 30 | 2125.3 |
-| `UringOps3` | Pass (0) | 19,962,870 | 30 | 1954.8 |
-
-Both fit the rule, and the state counts are those of the record above. Each other profile took at
-most 760 s on 32 vCPUs, under half the limit, so a run on 16 vCPUs also fits.
-
-### Local runs of the rule of 2026-11-08
-
-Local runs on 2026-11-08, after the rule of 2026-11-08. The Mac ran only the known-bad and
-reachability profiles; the large profiles are for the evidence host.
-
-- Command: `cargo xtask model operation-ownership`, from the repository root, with the 12
-  evidence-host profiles set aside in a scratch directory for that command and put back after it,
-  so the 40 small profiles ran under one host lock. Exit status 0.
-- Source: the files of this directory, not yet committed, on top of commit
-  `3ad84f8813b29badc0e0ff725075aea52d40062f`. The xtask printed
-  `sha256:547ac1439f4f0c0272d1ce0792a011acbaafebf778d0bdfc694cd2f70b58f70c (41 files)`:
-  `OperationOwnership.tla` and the 40 profiles below. The same method over all 53 checked files
-  gives `sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa`, which the
-  evidence-host run prints.
-- Checkers: temurin-jre 21.0.13+9, tla2tools 1.8.0+d8fb231de4e4 (TLC with `-workers auto
-  -lncheck final`), apalache 0.62.4 (not used).
-- SANY parsed `OperationOwnership.tla` with no error before the first TLC run.
-- Host: macOS 26.6.2 (25G83), arm64, 10 cores, 16 GB, shared with other sessions, so the
-  durations are indicative only.
-- Replay: `target/model/operation-ownership/<profile>/trace.json`, and the checker output in
-  `checker.log` beside it.
-- "TLC exit" is the code that TLC gives for that report (12 for an invariant, 13 for an action or
-  temporal property); the xtask prints the checker's code only for a failure. Durations are in
-  seconds.
-
-| Profile | Backend | Bounds | Result | Distinct states | Depth | Duration |
-| --- | --- | --- | --- | --- | --- | --- |
-| `CancelFound_reach` | io_uring | Declared | `UnreachedCancelFound` violated (TLC exit 12, xtask exit 0) | 197 | 7 | 0.70 |
-| `CancelNotFound_reach` | io_uring | Declared | `UnreachedCancelNotFound` violated (TLC exit 13, xtask exit 0) | 429 | 7 | 0.69 |
-| `CancelRacesCompletion_reach` | io_uring | Declared | `UnreachedCancelRacesCompletion` violated (TLC exit 13, xtask exit 0) | 150 | 7 | 0.68 |
-| `CancelRacesDrop_reach` | io_uring | Declared | `UnreachedCancelRacesDrop` violated (TLC exit 13, xtask exit 0) | 432 | 7 | 0.68 |
-| `CancelledData_reach` | io_uring | Declared | `UnreachedCancelledData` violated (TLC exit 13, xtask exit 0) | 794 | 7 | 0.77 |
-| `CloseLive_reach` | io_uring | Declared | `UnreachedCloseLive` violated (TLC exit 12, xtask exit 0) | 253 | 8 | 0.69 |
-| `CloseNoCancelJoin_bad` | io_uring | Bytes 1, MaxOps 1 | `ShutdownJoins` violated (TLC exit 13, xtask exit 0) | 8,938 | 17 | 2.75 |
-| `CloseNoCancel_bad` | io_uring | Bytes 1, MaxOps 1 | `CloseReturns` violated (TLC exit 13, xtask exit 0) | 8,938 | 17 | 2.22 |
-| `CloseReport_reach` | io_uring | Declared | `UnreachedCloseReport` violated (TLC exit 13, xtask exit 0) | 293 | 7 | 0.76 |
-| `DetachTwo_reach` | io_uring | Declared | `UnreachedDetachTwo` violated (TLC exit 13, xtask exit 0) | 23,292 | 10 | 1.51 |
-| `DetachedAck_reach` | io_uring | Declared | `UnreachedDetachedAck` violated (TLC exit 13, xtask exit 0) | 639 | 7 | 0.72 |
-| `DetachedClose_reach` | io_uring | Declared | `UnreachedDetachedClose` violated (TLC exit 12, xtask exit 0) | 670 | 7 | 0.75 |
-| `DetachedReset_reach` | io_uring | Declared | `UnreachedDetachedReset` violated (TLC exit 13, xtask exit 0) | 6,829 | 8 | 1.21 |
-| `DropRelease_bad` | io_uring | Declared | `ReleaseOnce` violated (TLC exit 12, xtask exit 0) | 175 | 7 | 0.73 |
-| `ExitLive_bad` | io_uring | Declared | `NoImpossibleWait` violated (TLC exit 12, xtask exit 0) | 246 | 7 | 0.71 |
-| `HeldBytes_reach` | io_uring | Declared | `UnreachedHeldBytes` violated (TLC exit 13, xtask exit 0) | 742 | 7 | 0.76 |
-| `HeldConn_reach` | io_uring | Declared | `UnreachedHeldConn` violated (TLC exit 13, xtask exit 0) | 1,567 | 7 | 0.82 |
-| `IocpError_reach` | IOCP | Declared | `UnreachedIocpError` violated (TLC exit 13, xtask exit 0) | 213 | 7 | 0.70 |
-| `IocpOtherPacket_reach` | IOCP | Declared | `UnreachedIocpOtherPacket` violated (TLC exit 13, xtask exit 0) | 325 | 7 | 0.66 |
-| `IocpPending_reach` | IOCP | Declared | `UnreachedIocpPending` violated (TLC exit 13, xtask exit 0) | 344 | 7 | 0.63 |
-| `IocpSkip_reach` | IOCP | Declared | `UnreachedIocpSkip` violated (TLC exit 13, xtask exit 0) | 281 | 6 | 0.64 |
-| `MultishotFinal_reach` | io_uring | Declared | `UnreachedMultishotFinal` violated (TLC exit 13, xtask exit 0) | 563 | 5 | 0.71 |
-| `NewWaker_reach` | io_uring | Declared | `UnreachedNewWaker` violated (TLC exit 12, xtask exit 0) | 590 | 7 | 0.72 |
-| `NoDrainLimit_bad` | io_uring | Bytes 1, MaxOps 1 | `DetachedReleased` violated (TLC exit 13, xtask exit 0) | 8,794 | 17 | 2.02 |
-| `NoGeneration_bad` | io_uring | Declared | `NoStaleEffect` violated (TLC exit 12, xtask exit 0) | 3,044 | 10 | 0.78 |
-| `NoGraceReset_bad` | io_uring | Bytes 1, MaxOps 1 | `ShutdownJoins` violated (TLC exit 13, xtask exit 0) | 8,794 | 17 | 1.67 |
-| `ReportTwice_bad` | io_uring | Declared | `ReportOnce` violated (TLC exit 12, xtask exit 0) | 9,230 | 10 | 1.15 |
-| `SendError_reach` | io_uring | Declared | `UnreachedSendError` violated (TLC exit 13, xtask exit 0) | 1,396 | 7 | 0.78 |
-| `ShutdownCross_reach` | io_uring | Declared | `UnreachedShutdownCross` violated (TLC exit 12, xtask exit 0) | 519 | 7 | 0.69 |
-| `StaleRequest_reach` | io_uring | Declared | `UnreachedStaleRequest` violated (TLC exit 12, xtask exit 0) | 1,295 | 7 | 0.78 |
-| `StaleWaker_bad` | io_uring | Bytes 1, MaxOps 1 | `LatestWakerWoken` violated (TLC exit 13, xtask exit 0) | 8,794 | 17 | 1.82 |
-| `SubmitFirst_bad` | io_uring | Declared | `InOrderOnce` violated (TLC exit 12, xtask exit 0) | 5,951 | 8 | 1.08 |
-| `TwoPending_reach` | io_uring | Declared | `UnreachedTwoPending` violated (TLC exit 12, xtask exit 0) | 2,414 | 9 | 0.84 |
-| `UringSingle_reach` | io_uring | Declared | `UnreachedUringSingle` violated (TLC exit 13, xtask exit 0) | 119 | 7 | 0.81 |
-| `Win32_bad` | IOCP | Declared | `ReleaseOnce` violated (TLC exit 12, xtask exit 0) | 432 | 7 | 0.78 |
-| `ZcEarlyRelease_bad` | io_uring | Declared | `ReleaseOnce` violated (TLC exit 12, xtask exit 0) | 204 | 7 | 0.69 |
-| `ZcNoNotice_reach` | io_uring | Declared | `UnreachedZcNoNotice` violated (TLC exit 13, xtask exit 0) | 127 | 6 | 0.65 |
-| `ZcNotice_reach` | io_uring | Declared | `UnreachedZcNotice` violated (TLC exit 13, xtask exit 0) | 296 | 7 | 0.74 |
-| `ZcResult_reach` | io_uring | Declared | `UnreachedZcResult` violated (TLC exit 13, xtask exit 0) | 228 | 7 | 0.68 |
-| `ZcWait_bad` | io_uring | Bytes 1, MaxOps 1 | `CloseReturns` violated (TLC exit 13, xtask exit 0) | 7,332 | 15 | 2.03 |
-
-### Evidence host record of the rule of 2026-11-07
-
-This record checked the module before the rule of 2026-11-08. The module has changed since then,
-so these rows no longer hold for it. They stay as the record of that design.
-
-One complete run of every profile on the evidence host on 2026-11-08, from 07:47:35 to 08:45:57
-UTC. It is the main record of this model: one command, one digest, a host with no other
-workload, and the original checker exit status of each profile. It includes the main, wide, and
-raise-by-one profiles (rule 4 of [FP Design Models]) on both backends; the IOCP raise-by-one
-profiles were added for this run.
-
-- Command: `cargo xtask model operation-ownership`, from the repository root. Exit status 0.
-- Source: the files of this directory, not yet committed. The xtask printed
-  `45494d286e492a35c7095a9a0fd86221d82150df (49 files)`, the digest of the files as they are now.
-  That digest is a Git object ID. From 2026-11-08 the xtask prints a SHA-256 digest from rscrypto
-  instead, and the same 49 files give
-  `sha256:a535f5931a50bcc19bb6dd867c6b963b92b06c9837649467e35309ad5d460f5a`; `shasum -a 256`
-  over the same list gives the same value.
-- Checkers: temurin-jre 21.0.13+9 (Linux aarch64, SHA-256 checked against Adoptium), tla2tools
-  1.8.0+3ec1cc4f8c24 (TLC2 Version 2026.11.06.005304, rev 3ec1cc4; the pinned jar, SHA-256
-  checked), with `-workers auto -lncheck final`.
-- Host: EC2 m8g.4xlarge (16 vCPUs, 64 GiB), us-east-1a, image `ami-06b1a03fa3561aefb` (Ubuntu
-  26.04 arm64, 20261104.1), kernel 7.0.0-1016-aws, instance `i-0b429594a0faf07f8`. The instance
-  is terminated.
-- Replay: the same command writes each profile's output to
-  `target/model/operation-ownership/<profile>/` (`checker.log`, and `trace.json` for a
-  violation). The host's own logs are not kept; this record holds their figures.
-- Exit: the checker's own exit status, as the xtask printed it: 0 for a complete search with no
-  violation, 12 for an invariant violation, 13 for an action or temporal property violation.
-
-| Profile | Bounds | Result (checker exit) | Distinct states | Depth | Duration (s) |
-| --- | --- | --- | --- | --- | --- |
-| `Uring` | Declared | Pass (0) | 581,276 | 22 | 44.9 |
-| `Iocp` | Declared | Pass (0) | 648,946 | 21 | 50.2 |
-| `UringWide` | Two submissions on each direction | Pass (0) | 6,661,700 | 29 | 596.7 |
-| `IocpWide` | Two submissions on each direction | Pass (0) | 7,752,242 | 28 | 717.4 |
-| `UringWorkers3` | Three workers (raise) | Pass (0) | 1,071,492 | 23 | 92.8 |
-| `IocpWorkers3` | Three workers (raise) | Pass (0) | 1,100,658 | 22 | 96.3 |
-| `UringBytes4` | Four bytes (raise) | Pass (0) | 782,174 | 22 | 62.9 |
-| `IocpBytes4` | Four bytes (raise) | Pass (0) | 873,266 | 21 | 70.6 |
-| `UringConns2` | Two connections (raise) | Pass (0) | 1,109,632 | 24 | 88.0 |
-| `IocpConns2` | Two connections (raise) | Pass (0) | 861,278 | 23 | 72.4 |
-| `UringOps3` | Three submissions on each resource (raise) | Pass (0) | 8,135,220 | 29 | 717.8 |
-| `IocpOps3` | Three submissions on each resource (raise) | Pass (0) | 9,357,002 | 28 | 868.2 |
-| `DropRelease_bad` | Declared | `ReleaseOnce` violated (12) | 538 | 9 | 0.6 |
-| `Win32_bad` | Declared | `ReleaseOnce` violated (12) | 459 | 7 | 0.6 |
-| `ExitLive_bad` | Declared | `NoImpossibleWait` violated (12) | 478 | 7 | 0.6 |
-| `SubmitFirst_bad` | Declared | `InOrderOnce` violated (12) | 7,512 | 9 | 0.7 |
-| `NoGeneration_bad` | Declared | `NoStaleEffect` violated (12) | 3,904 | 10 | 0.6 |
-| `ReportTwice_bad` | Declared | `ReportOnce` violated (12) | 10,521 | 10 | 0.7 |
-| `CloseNoCancel_bad` | Small (reduction 11) | `CloseReturns` violated (13) | 7,014 | 16 | 1.0 |
-| `CloseNoCancelJoin_bad` | Small (reduction 11) | `ShutdownJoins` violated (13) | 7,014 | 16 | 1.0 |
-| `StaleWaker_bad` | Small (reduction 11) | `LatestWakerWoken` violated (13) | 6,332 | 16 | 1.0 |
-| `ZcWait_bad` | Small (reduction 11) | `CloseReturns` violated (13) | 5,544 | 15 | 0.9 |
-| `NoDrainLimit_bad` | Small (reduction 11) | `DetachedReleased` violated (13) | 6,332 | 16 | 1.0 |
-| `NoGraceReset_bad` | Small (reduction 11) | `ShutdownJoins` violated (13) | 6,332 | 16 | 1.0 |
-| `CancelFound_reach` | Declared | Reached (12) | 258 | 7 | 0.5 |
-| `CancelNotFound_reach` | Declared | Reached (13) | 1,247 | 8 | 0.6 |
-| `CancelRacesCompletion_reach` | Declared | Reached (13) | 160 | 7 | 0.6 |
-| `CancelRacesDrop_reach` | Declared | Reached (13) | 924 | 9 | 0.6 |
-| `CancelledData_reach` | Declared | Reached (13) | 2,099 | 9 | 0.6 |
-| `CloseLive_reach` | Declared | Reached (12) | 924 | 10 | 0.6 |
-| `CloseReport_reach` | Declared | Reached (13) | 820 | 7 | 0.5 |
-| `DetachedAck_reach` | Declared | Reached (13) | 966 | 9 | 0.6 |
-| `DetachedClose_reach` | Declared | Reached (12) | 714 | 9 | 0.6 |
-| `DetachedReset_reach` | Declared | Reached (13) | 6,627 | 8 | 0.7 |
-| `HeldBytes_reach` | Declared | Reached (13) | 1,747 | 9 | 0.6 |
-| `HeldConn_reach` | Declared | Reached (13) | 1,948 | 10 | 0.6 |
-| `IocpError_reach` | Declared | Reached (13) | 679 | 9 | 0.5 |
-| `IocpOtherPacket_reach` | Declared | Reached (13) | 532 | 7 | 0.6 |
-| `IocpPending_reach` | Declared | Reached (13) | 641 | 7 | 0.6 |
-| `IocpSkip_reach` | Declared | Reached (13) | 780 | 8 | 0.5 |
-| `MultishotFinal_reach` | Declared | Reached (13) | 1,469 | 8 | 0.6 |
-| `NewWaker_reach` | Declared | Reached (12) | 1,207 | 10 | 0.6 |
-| `SendError_reach` | Declared | Reached (13) | 1,918 | 9 | 0.6 |
-| `ShutdownCross_reach` | Declared | Reached (12) | 954 | 8 | 0.6 |
-| `StaleRequest_reach` | Declared | Reached (12) | 1,923 | 10 | 0.6 |
-| `UringSingle_reach` | Declared | Reached (13) | 213 | 7 | 0.6 |
-| `ZcNoNotice_reach` | Declared | Reached (13) | 407 | 9 | 0.6 |
-| `ZcNotice_reach` | Declared | Reached (13) | 471 | 8 | 0.6 |
-
-What the raises show: each argued bound raised by one passed on both backends, and each raise
-added states (the state counts above are all larger than those of the declared profiles), so each
-raise exercised its bound. Reading 2 (`UringWide`, `IocpWide`) also passed, so the reading of the
-task's bound is not hiding a failure that the larger reading has. At that digest every profile was
-complete; the rule of 2026-11-08 reopened the large profiles.
+The gate recorded at Git revision `4b5e8c1` checked digest
+`sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa` (53 files).
+That is a historical baseline. The current main and largest io_uring searches have the same
+state counts: the added obligation state does not multiply the reachable states. Durations
+from different hosts are not a speed comparison.
 
 [FP Design Models]: ../../docs/specs/family-policy.md#design-models

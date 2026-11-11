@@ -9,8 +9,8 @@ the design, not the Rust code. Change the model when you change one of these rul
 
 ## Install the checkers
 
-The model command uses the Rust toolchain that `rust-toolchain.toml` pins and three checkers. Put
-one version of each checker under `~/.local/opt/<name>/<version>/`:
+The model command uses the Rust toolchain that `rust-toolchain.toml` pins and three tools. Put
+one version of each tool under `~/.local/opt/<name>/<version>/`:
 
 | Name | Version of the recorded evidence | Source | Path that the command uses |
 | --- | --- | --- | --- |
@@ -41,7 +41,7 @@ another run waits for it.
 The command prints the digest of the model files, then one result for each profile:
 
 ```text
-files of .../models/operation-ownership: sha256:<digest> (<count> files)
+files of .../target/model/inputs/<run>/operation-ownership: sha256:<digest> (<count> files)
 ── tlc operation-ownership/OperationOwnership.ZcWait_bad.cfg
    `CloseReturns` is violated: as the known-bad variant requires, in 0.93s (exit status: 13)
 ```
@@ -49,30 +49,62 @@ files of .../models/operation-ownership: sha256:<digest> (<count> files)
 - A main profile passes with `ok` and exit status 0: a complete search with no violation. The
   command reads the checker's own summary: TLC must report 0 states left on the queue, and
   Apalache the outcome `NoError` with no timed-out query. A search that stopped early fails as
-  inconclusive, also when the checker exits with 0. The command removes the JVM option variables
-  (`JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`, `JVM_ARGS`) from each checker run.
+  inconclusive, also when the checker exits with 0. Each checker runs with a cleared environment.
+  Apalache uses an explicit empty JSON configuration and the pinned JRE on its path, so inherited
+  options and user-wide settings cannot change the check.
 - A `_bad` profile is a known-bad variant. It passes only when the checker reports a violation
   of its one property.
 - A `_reach` profile is a reachability witness. It passes only when the checker reaches its
   target.
 
 The command exits 0 when every selected profile passes. The output of each profile goes to
-`target/model/operation-ownership/<profile>/`: `checker.log`, and `trace.json` for a violation.
+`target/model/operation-ownership/<profile>/<run>/`. Each run keeps `checker.log`,
+`stderr.log`, and `trace.json` for a violation. It also keeps the exact profile and imported local
+modules in `source/`, which is the directory that the checker reads. `run.txt` records the command,
+source hashes, installed checker hashes, runner identity, original exit status, and verdict.
+The command first retains the selected model directories under `target/model/inputs/<run>/`,
+then validates and runs profiles from that revision. A new run never replaces an earlier one.
+A record with no final verdict is incomplete.
+
+Use a profile's source-closure hash to identify its exact inputs. Reuse a result only when those
+inputs, the checker, and its assumptions still apply. The whole-directory digest also includes
+`induction.matrix` when a model has one. Before any check, that file requires the whole
+initialization, induction-step, and safety profiles for each declared domain. The step checks
+`Next` and `IndInv` directly through Apalache, so adding a transition or invariant clause also adds
+it to that obligation. A fault or witness cannot supply a proof. An induction profile can pair
+`--discard-disabled=false` with `--no-deadlock=true` to omit enabledness prechecks. This does not
+remove a transition or invariant check. The model must state its separate argument for enabledness
+and for the complete, nonempty domain of its invariant initializer.
+
+A Step profile can use `--tuning-options=search.invariantFilter=1->.*` when its initializer
+already includes `IndInv`. This checks every invariant clause at the successor state and omits
+the redundant initial-state check. The matrix rejects narrower filters, transition filters,
+and filters on Init or Safety.
+
+Apalache profiles can name a TLC configuration with `--config` and solver settings with
+`--tuning-options-file`. Each input must be a file in the model directory, named without a directory
+prefix. The command retains it with the profile. The runner owns `--config-file`; use the two model
+input options for explicit settings.
 
 ## Large profiles
 
-The whole model takes about 1 hour 40 minutes on a 32-core host. The main profiles take about one
-minute each. These profiles take more time (measured on 32 vCPUs, 64 GiB, 2026-11-08):
+The current gate has 55 profiles. Its 43 fault and witness checks take about 101 seconds of
+checker time on the shared development Mac. The complete searches take longer. The largest
+profiles have these results on a quiet EC2 c8g.4xlarge (16 vCPUs, 32 GiB, 2026-11-11):
 
 | Profile | Distinct states | Time |
 | --- | --- | --- |
-| `OperationOwnership.UringWide.cfg`, `IocpWide.cfg` | 22.1 and 7.8 million | 31 and 11 minutes (`UringWide`: 35 minutes on 16 vCPUs) |
-| `OperationOwnership.UringOps3.cfg`, `IocpOps3.cfg` | 20.0 and 9.4 million | 30 and 13 minutes (`UringOps3`: 33 minutes on 16 vCPUs) |
+| `OperationOwnership.UringWide.cfg` | 22,058,438 | 36.1 minutes |
+| `OperationOwnership.UringOps3.cfg` | 19,962,870 | 33.9 minutes |
+| `OperationOwnership.IocpWide.cfg` | 7,752,242 | 12.4 minutes |
+| `OperationOwnership.IocpOps3.cfg` | 9,357,002 | 15.1 minutes |
 
+The [model evidence record](../../models/operation-ownership/README.md#evidence-record)
+gives every positive profile, its host, and its retained evidence.
 Each profile must finish within one hour on a 16-vCPU host, so that a run of every profile after a
 change stays short. Before you run a new large profile in full, run it for 10 minutes, and estimate
-its full size from the growth of the distinct states and the queue. A profile that does not finish
-in that time gives no result, and a larger host does not change the limit. Make the model smaller
+its full size from the growth of the distinct states and the queue. An interrupted sample gives no result. The full profile must finish within one hour;
+a larger host does not change that limit. Make the model smaller
 only in a way that keeps the result sound: symmetry over identical processes, a bound that the
 model proves, or an inductive proof. Each such change needs a known-bad variant that still fails
 under it. A smaller bound must still reach each failure that the model names, and it needs a
@@ -87,8 +119,9 @@ you record evidence.
   Compare each step with the design's transitions. If the model follows the design, the trace is
   a counterexample to a design rule: the design changes first, and then the model. If the model
   does not follow the design, correct the model.
-- A `_bad` profile reports "no violation". The variant no longer breaks its property, so the
-  property or the module changed. Find which one changed before you change the profile.
+- A `_bad` profile reports "no violation". It has not supplied the required failure. Check
+  whether the bounds reach the fault, the faulty transition runs, and the property detects
+  the violating result before you change the profile.
 - A profile reports a violation of a property other than its own. The variant fails for another
   reason, so it shows nothing about its own property.
 

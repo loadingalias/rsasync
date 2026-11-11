@@ -36,7 +36,8 @@ ASSUME Backend \in {"uring", "iocp"}
 ASSUME Submissions \in {"resource", "direction"}
 ASSUME Bug \in {"none", "dropRelease", "win32", "exitLive", "submitFirst",
                 "closeNoCancel", "noGeneration", "reportTwice", "staleWaker",
-                "zcWait", "noDrainLimit", "noGraceReset", "zcEarlyRelease"}
+                "zcWait", "noDrainLimit", "noGraceReset", "zcEarlyRelease",
+                "dropRxTail", "omitReport", "omitDebt"}
 
 Ch == {"rx", "tx", "ac"}            \* One operation slot for each direction.
 Res == {"s", "l"}                   \* The stream and the listener.
@@ -74,11 +75,13 @@ VARIABLES
   tp,     \* The progress of the send in slot "tx": "none", "part", or "full".
   wd,     \* The write direction: "ok", "owe" (failed, a report is owed), "failed".
   rep,    \* rep[g]: the progress reports of abandoned send g.
+  required, \* The sends whose abandoned terminal result requires a report.
   kc,     \* The connections that the kernel has not yet accepted.
   ar,     \* The connections that the accept in slot "ac" accepted.
   hc,     \* The connections that the listener holds for the next accept.
   uc,     \* The connections that the caller received.
-  dt,     \* Detached debt: close returned and left the stream's pending
+  debt,   \* The notices that close transferred to the driver as detached debt.
+          \* Close returned and left the stream's pending
           \* notices, with their buffers, charges, and the descriptor, to
           \* the driver.
   pg,     \* A reset ended the kernel's hold of the stream's queued bytes.
@@ -91,9 +94,10 @@ lifeVars == <<life, wk, alive, cl>>
 futVars == <<fut, wake, woke>>
 opVars == <<gen, st, home, k, cx, rq, bk>>
 rxVars == <<rxk, rbuf, held, got>>
-txVars == <<tp, wd, rep>>
+txVars == <<tp, wd, rep, required>>
 acVars == <<kc, ar, hc, uc>>
-zcVars == <<dt, pg, pn, nh>>
+zcVars == <<debt, pg, pn, nh>>
+dt == debt # {}
 vars == <<lifeVars, futVars, opVars, rxVars, txVars, acVars, zcVars>>
 
 TypeOK ==
@@ -118,8 +122,9 @@ TypeOK ==
   /\ tp \in {"none", "part", "full"}
   /\ wd \in {"ok", "owe", "failed"}
   /\ rep \in [Gens -> 0..2]
+  /\ required \subseteq Gens
   /\ {kc, ar, hc, uc} \subseteq 0..Conns
-  /\ dt \in BOOLEAN
+  /\ debt \subseteq Gens
   /\ pg \in BOOLEAN
   /\ pn \subseteq Gens
   /\ nh \in [Gens -> Workers \cup {NoHome}]
@@ -176,7 +181,7 @@ RxTakes(n) ==
   /\ rbuf' = [i \in 1..n |-> rxk + i - 1]
   /\ rxk' = rxk + n
   /\ UNCHANGED <<held, got, txVars, acVars>>
-TxTakes(t) == tp' = t /\ UNCHANGED <<rxVars, wd, rep, acVars>>
+TxTakes(t) == tp' = t /\ UNCHANGED <<rxVars, wd, rep, acVars, required>>
 AcTakes(m) == kc' = kc - m /\ ar' = ar + m /\ UNCHANGED <<rxVars, txVars, hc, uc>>
 NoData == UNCHANGED <<rxVars, txVars, acVars>>
 
@@ -215,13 +220,15 @@ EndSlot(c) ==
 EndRx(b, att) ==
   IF att THEN rbuf' = b /\ UNCHANGED <<held, bk>>
   ELSE /\ rbuf' = <<>>
-       /\ held' = held \o b
+       /\ held' = IF Bug = "dropRxTail" THEN held ELSE held \o b
        /\ bk' = [bk EXCEPT !["rx"][gen["rx"]] = IF b = <<>> THEN Rel(@) ELSE Hold(@)]
 \* A zero-copy result (zc) ends the send, and its backing stays with the
 \* driver ("zc") until its notice. The claim and the abandoned rule release
 \* only a backing that the send still owns. The "zcEarlyRelease" variant
 \* releases the backing at the send result.
 EndTx(t, att, zc) ==
+  /\ required' = IF ~att /\ (t = "part" \/ cx["tx"])
+                    THEN required \cup {gen["tx"]} ELSE required
   /\ IF att THEN tp' = t /\ UNCHANGED wd
      ELSE /\ tp' = "none"
           /\ wd' = IF t = "part" \/ cx["tx"] THEN "owe" ELSE wd
@@ -319,9 +326,9 @@ BeginTx ==
   /\ CanBegin("tx")
   /\ \/ /\ wd = "owe"
         /\ wd' = "failed"
-        /\ rep' = [rep EXCEPT ![gen["tx"]] = @ + 1]
+        /\ rep' = [rep EXCEPT ![gen["tx"]] = IF Bug = "omitReport" THEN @ ELSE @ + 1]
         /\ Returns("tx")
-        /\ UNCHANGED <<lifeVars, opVars, rxVars, tp, acVars, zcVars>>
+        /\ UNCHANGED <<lifeVars, opVars, rxVars, tp, acVars, zcVars, required>>
      \/ /\ wd = "ok"
         /\ CanSubmit("tx")
         /\ Submit("tx")
@@ -370,7 +377,7 @@ Claim(c) ==
             /\ UNCHANGED <<rxk, held, txVars, acVars>>
        [] c = "tx" ->
             /\ tp' = "none"
-            /\ UNCHANGED <<rxVars, wd, rep, acVars>>
+            /\ UNCHANGED <<rxVars, wd, rep, acVars, required>>
        [] c = "ac" ->
             /\ uc' = uc + ar
             /\ ar' = 0
@@ -444,7 +451,7 @@ CompleteTx ==
   /\ st["tx"] = "live" /\ Driven("tx") /\ k["tx"] # "none"
   /\ k' = [k EXCEPT !["tx"] = "none"]
   /\ EndSlot("tx")
-  /\ UNCHANGED <<lifeVars, fut, wake, gen, rq, rxVars, rep, acVars, dt, pg>>
+  /\ UNCHANGED <<lifeVars, fut, wake, gen, rq, rxVars, rep, acVars, debt, pg>>
   /\ IF k["tx"] = "tail"
        THEN EndTx(tp, fut["tx"] = "att", FALSE) /\ UNCHANGED <<pn, nh>>
        ELSE \E t \in {"part", "full"}, zc \in BOOLEAN :
@@ -523,18 +530,19 @@ CloseDone(r) ==
   /\ Bug = "zcWait" /\ r = "s" => pn = {}
   /\ cl' = [cl EXCEPT ![r] = "closed"]
   /\ UNCHANGED <<life, wk, alive, futVars, gen, st, home, k, cx, rq, rxk,
-                 rbuf, got, tp, kc, ar, uc, pg, pn, nh>>
+                 rbuf, got, tp, kc, ar, uc, pg, pn, nh, required>>
   /\ IF r = "s"
        THEN /\ held' = <<>>
             /\ bk' = [bk EXCEPT !["rx"] = ReleaseHeld(@)]
-            /\ dt' = (pn # {})
+            /\ debt' = IF Bug = "omitDebt" /\ (\E g, h \in pn : g # h)
+                         THEN pn \ {CHOOSE g \in pn : TRUE} ELSE pn
             /\ IF wd = "owe" \/ (Bug = "reportTwice" /\ wd = "failed")
-                 THEN /\ rep' = [rep EXCEPT ![gen["tx"]] = @ + 1]
+                 THEN /\ rep' = [rep EXCEPT ![gen["tx"]] = IF Bug = "omitReport" THEN @ ELSE @ + 1]
                       /\ wd' = "failed"
                  ELSE UNCHANGED <<rep, wd>>
             /\ UNCHANGED hc
        ELSE /\ hc' = 0
-            /\ UNCHANGED <<held, bk, rep, wd, dt>>
+            /\ UNCHANGED <<held, bk, rep, wd, debt>>
 
 \* A reset ends the kernel's hold of the stream's queued bytes: connect
 \* with AF_UNSPEC purges the send queue, so every pending notice of the
@@ -547,7 +555,7 @@ Reset ==
   /\ dt
   /\ ~pg
   /\ pg' = TRUE
-  /\ UNCHANGED <<lifeVars, futVars, opVars, rxVars, txVars, acVars, dt, pn, nh>>
+  /\ UNCHANGED <<lifeVars, futVars, opVars, rxVars, txVars, acVars, debt, pn, nh>>
 
 \* The zero-copy notice of send g releases its backing and charge, once.
 \* Before a reset, the peer's acknowledgement gives it; after a reset, the
@@ -559,7 +567,7 @@ Notice(g) ==
   /\ pn' = pn \ {g}
   /\ nh' = [nh EXCEPT ![g] = NoHome]
   /\ bk' = [bk EXCEPT !["tx"][g] = IF @ = "zc" THEN "out" ELSE "dbl"]
-  /\ dt' = (dt /\ pn' # {})
+  /\ debt' = debt \ {g}
   /\ UNCHANGED <<lifeVars, futVars, gen, st, home, k, cx, rq, rxVars, txVars,
                  acVars, pg>>
 
@@ -598,7 +606,7 @@ EndTask ==
   /\ Ask({c \in {"rx", "ac"} : fut[c] = "att" /\ st[c] = "live"}
          \cup CloseCancels({c \in Ch : cl[ResOf(c)] = "open"
                                        /\ st[c] = "live"}))
-  /\ UNCHANGED <<life, wk, gen, st, k, bk, rxVars, txVars, acVars, dt, pg, pn>>
+  /\ UNCHANGED <<life, wk, gen, st, k, bk, rxVars, txVars, acVars, debt, pg, pn>>
 
 \* A worker exits after its task ends, and only when no operation that it
 \* homes is live or holds its slot, and no pending notice has it as its
@@ -646,11 +654,12 @@ Init ==
   /\ tp = "none"
   /\ wd = "ok"
   /\ rep = [g \in Gens |-> 0]
+  /\ required = {}
   /\ kc = Conns
   /\ ar = 0
   /\ hc = 0
   /\ uc = 0
-  /\ dt = FALSE
+  /\ debt = {}
   /\ pg = FALSE
   /\ pn = {}
   /\ nh = [g \in Gens |-> NoHome]
@@ -710,6 +719,7 @@ ReleaseOnce ==
   \* A send's backing stays with the driver exactly while its notice is
   \* pending.
   /\ \A g \in Gens : (g \in pn) = (bk["tx"][g] = "zc")
+  /\ cl["s"] = "closed" => debt = pn
   /\ cl["l"] # "closed" => kc + ar + hc + uc = Conns
   /\ Done => /\ \A c \in Ch, g \in Gens : bk[c][g] \in {"none", "out"}
              /\ pn = {}
@@ -722,7 +732,11 @@ NoImpossibleWait ==
   /\ \A g \in pn : NDriven(g)
 
 \* The caller receives each byte once and in order.
-InOrderOnce == \A i \in 1..Len(got) : got[i] = i
+InOrderOnce ==
+  /\ \A i \in 1..Len(got) : got[i] = i
+  \* Close may discard unread bytes. Before close, every received byte has an owner.
+  /\ cl["s"] # "closed" =>
+       got \o held \o rbuf = [i \in 1..(rxk - 1) |-> i]
 
 \* A stale identity never changes a reused slot: only a request for the
 \* operation now in the slot can cancel it.
@@ -730,7 +744,9 @@ NoStaleEffect == \A c \in Ch : k[c] = "cxl" => cx[c]
 
 \* An abandoned send's progress is reported exactly once.
 ReportOnce ==
-  /\ \A g \in Gens : rep[g] <= 1
+  /\ \A g \in Gens : rep[g] <= IF g \in required THEN 1 ELSE 0
+  /\ wd = "failed" \/ cl["s"] = "closed" =>
+       \A g \in required : rep[g] = 1
   /\ Done => wd # "owe"
 
 (* Progress properties. Each one is a []<> form, which TLC checks with no *)

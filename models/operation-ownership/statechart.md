@@ -30,8 +30,8 @@ stateDiagram-v2
 
 A send result with `IORING_CQE_F_MORE` ends the send and frees its slot, and its backing joins
 the stream's pending notices (`pn`, `bk = "zc"`). Each pending notice has this life, apart from the
-slot. `Detached` is a pending notice after close returned (`dt`), and `Purged` is the same state
-after a reset (`dt` and `pg`).
+slot. `Detached` is a pending notice whose generation is in `debt` after close returned.
+`Purged` is the same state after a reset (`pg`). `dt` means that `debt` is not empty.
 
 ```mermaid
 stateDiagram-v2
@@ -81,7 +81,7 @@ stateDiagram-v2
 - The request entries (`rq`), the cancel flag (`cx`), and the generation check are not shown. A
   stale request removes itself and changes nothing.
 - The data is not shown: the received bytes (`rbuf`, `held`, `got`), the send progress (`tp`,
-  `wd`, `rep`), the connections (`kc`, `ar`, `hc`, `uc`), each backing (`bk`), and the home of
+  `wd`, `required`, `rep`), the connections (`kc`, `ar`, `hc`, `uc`), each backing (`bk`), and the home of
   each pending notice (`nh`).
 - The futures (`fut`) and the waker (`wake`, `woke`) are not shown. `Repoll` changes only the
   waker.
