@@ -66,6 +66,11 @@ The command first retains the selected model directories under `target/model/inp
 then validates and runs profiles from that revision. A new run never replaces an earlier one.
 A record with no final verdict is incomplete.
 
+TLC uses `-XX:+ExitOnOutOfMemoryError`: Java stops on heap exhaustion. This prevents the
+pinned checker's [liveness index](https://github.com/tlaplus/tlaplus/blob/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
+from continuing after a failed allocation leaves its index arrays inconsistent. Such a run fails;
+it gives no verification result.
+
 Use a profile's source-closure hash to identify its exact inputs. Reuse a result only when those
 inputs, the checker, and its assumptions still apply. The whole-directory digest also includes
 `induction.matrix` when a model has one. Before any check, that file requires the whole

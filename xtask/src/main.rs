@@ -731,7 +731,7 @@ impl Checkers {
             let mut command = Command::new(self.java_bin.join("java"));
             command
                 .env_clear()
-                .args(["-XX:+UseParallelGC", "-cp"])
+                .args(["-XX:+UseParallelGC", "-XX:+ExitOnOutOfMemoryError", "-cp"])
                 .arg(&self.tla2tools)
                 .args([
                     "tlc2.TLC",
