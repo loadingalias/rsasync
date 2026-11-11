@@ -36,10 +36,10 @@ Commands
   model [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
 
-With no Cargo arguments, fix and check select the whole workspace, and they
-also lint each crate that builds without `std` on wasm32v1-none, a target
-with no `std`. test runs the tests of the whole workspace unless its
-arguments select packages with -p, --package, or --workspace.
+fix, check, and test select the whole workspace unless their arguments select
+packages with -p or --package. With the whole workspace, fix and check also
+lint each crate that builds without `std` on wasm32v1-none, a target with no
+`std`.
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -198,15 +198,16 @@ impl Repo {
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
                 .args(&scope),
         )?;
-        self.clippy_no_std(args)
+        self.clippy_no_std(&scope)
     }
 
     /// Lints the library of each package in `NO_STD_PACKAGES` with no default
-    /// feature, on `NO_STD_TARGET`. Cargo arguments select their own scope, so
-    /// this step runs only when there are none, and it says when it does not run.
-    fn clippy_no_std(&self, args: &[String]) -> Result<(), Failure> {
-        if !args.is_empty() {
-            eprintln!("── clippy without std\n   not run: Cargo arguments select the scope; run with no arguments");
+    /// feature, on `NO_STD_TARGET`. It runs only when `scope` is the whole
+    /// workspace, and it says when it does not run. It takes no argument of
+    /// the caller: a feature or target argument applies to the other steps.
+    fn clippy_no_std(&self, scope: &[&str]) -> Result<(), Failure> {
+        if !scope.contains(&"--workspace") {
+            eprintln!("── clippy without std\n   not run: the arguments select packages; run with no -p or --package");
             return Ok(());
         }
         let mut command = self.cargo(&[
@@ -233,7 +234,7 @@ impl Repo {
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
                 .args(&scope),
         )?;
-        self.clippy_no_std(args)?;
+        self.clippy_no_std(&scope)?;
         step(
             "rustdoc",
             self.cargo(&["doc", "--locked", "--no-deps", "--quiet"]).args(&scope),
@@ -244,11 +245,7 @@ impl Repo {
     /// arguments select packages. With no arguments, it then runs the
     /// doctests, which Nextest does not run.
     fn test(&self, args: &[String]) -> Result<(), Failure> {
-        let mut nextest = self.cargo(&["nextest", "run", "--locked"]);
-        if !selects_packages(args) {
-            nextest.arg("--workspace");
-        }
-        step("nextest", nextest.args(args))?;
+        step("nextest", self.cargo(&["nextest", "run", "--locked"]).args(scope(args)))?;
         if !args.is_empty() {
             return Ok(());
         }
@@ -869,21 +866,19 @@ fn scrubbed(name: &OsStr) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// The Cargo arguments of the caller, or the whole workspace when there are none.
+/// The Cargo or Nextest arguments of the caller, after `--workspace` unless
+/// they select packages. With no selection, Cargo takes only the root package.
+/// With `--workspace`, Cargo ignores `-p`, and a second `--workspace` is an
+/// error.
 fn scope(args: &[String]) -> Vec<&str> {
-    if args.is_empty() {
-        vec!["--workspace"]
-    } else {
-        args.iter().map(String::as_str).collect()
-    }
-}
-
-/// Whether the Nextest arguments select packages. With no selection, Cargo
-/// takes only the root package. With `--workspace`, Cargo ignores `-p`, and a
-/// second `--workspace` is an error.
-fn selects_packages(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--workspace" || arg.starts_with("--package") || arg.starts_with("-p"))
+    let selects = args
+        .iter()
+        .any(|arg| arg == "--workspace" || arg.starts_with("--package") || arg.starts_with("-p"));
+    (!selects)
+        .then_some("--workspace")
+        .into_iter()
+        .chain(args.iter().map(String::as_str))
+        .collect()
 }
 
 /// Runs `command` as the step `name`. A failure keeps the exit code of the command.
@@ -926,13 +921,13 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     //! The verdicts from checker output, profile discovery, and the package
-    //! selection of the tests. Each checker input is lines that the pinned
-    //! checkers printed (TLC 1.8.0 rev 3ec1cc4, Apalache 0.62.4).
+    //! selection of the Cargo commands. Each checker input is lines that the
+    //! pinned checkers printed (TLC 1.8.0 rev 3ec1cc4, Apalache 0.62.4).
 
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{Report, profiles, selects_packages};
+    use super::{Report, profiles, scope};
 
     fn report(apalache: bool, lines: &[&str]) -> Report {
         let mut report = Report::default();
@@ -1053,18 +1048,21 @@ mod tests {
         assert!(matches!(result, Err(failure) if failure.message.contains("m/Missing.cfg")));
     }
 
-    /// A target or a filter keeps the whole workspace: without
-    /// `--workspace`, the musl step of CI and a named test run only the tests
-    /// of the root package. Each package flag keeps its own selection.
+    /// A feature, target, or filter argument keeps the whole workspace:
+    /// without `--workspace`, `cargo xtask check --all-features`, the musl
+    /// step of CI, and a named test cover only the root package, and the lint
+    /// without `std` does not run. Each package flag keeps its own selection.
     #[test]
-    fn only_package_flags_narrow_the_tests() {
-        let selects = |args: &[&str]| selects_packages(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+    fn only_package_flags_narrow_the_scope() {
+        let joined = |args: &[&str]| scope(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).join(" ");
         for args in [
-            &["--target", "x86_64-unknown-linux-musl"][..],
+            &[][..],
+            &["--all-features"],
+            &["--target", "x86_64-unknown-linux-musl"],
             &["-E", "test(tlc_complete_search_holds)"],
             &["--exclude", "xtask"],
         ] {
-            assert!(!selects(args), "{args:?}");
+            assert_eq!(joined(args), [&["--workspace"][..], args].concat().join(" "));
         }
         for args in [
             &["-p", "rstypes"][..],
@@ -1073,7 +1071,7 @@ mod tests {
             &["--package=rstypes"],
             &["--workspace"],
         ] {
-            assert!(selects(args), "{args:?}");
+            assert_eq!(joined(args), args.join(" "));
         }
     }
 }
