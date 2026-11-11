@@ -8,7 +8,7 @@ rsasync shares three groups of types with networking libraries and with applicat
 | `rsasync::capacity` | Capacity permits, and the caller-owned budget that contains them |
 | `rsasync::time` | Clock domains, instants and deadlines, and physical-time readings |
 
-rsasync is in development and has no release. These modules have no items yet.
+rsasync is in development and has no release. The `capacity` module has no items yet.
 
 ## Use the types through `rsasync`
 
@@ -20,6 +20,70 @@ The modules come from the `rstypes` crate, and `rsasync` re-exports them. Do not
 your dependencies, and do not name it in your code. A library that uses these types in its public
 API re-exports them, so you use them through that library or through `rsasync`. Each path gives
 the same type, so a value goes from a library to the runtime with no conversion.
+
+## Time
+
+`rsasync::time` holds time values. It has no clock, and rsasync does not have a clock source yet.
+You can make each value directly, for example in a test.
+
+- A `ClockDomain` identifies one monotonic clock. It has a `u32` identifier and a `Suspend` value:
+  `Advances` when the clock counts the time while the system is suspended, and `Pauses` when it
+  stops. Two domains are equal only when their identifiers and their `Suspend` values are equal.
+  Each clock source gives its domain an identifier that no other domain uses.
+- An `Instant` is a `u64` count of nanoseconds since the origin of its domain.
+- A `Deadline` is an absolute instant. It keeps its domain and its instant, so a late poll does
+  not move it. Make it from a duration budget one time, at the start of the work. A deadline has
+  no operation that gives a new duration budget.
+- A `Reading` is physical time: an estimate, an uncertainty bound or "unknown", and its source.
+  The estimate is a `Duration` since the Unix epoch, 1970-01-01 00:00:00 UTC, with no leap
+  seconds. A bound of `None` is unknown. The source is `ReadingSource::SystemClock` or
+  `ReadingSource::Caller`, when the caller supplied the bound.
+
+Instants have no `<` operator, because instants of two domains have no order. Use `compare`. A
+reading is separate from the clock domains, so a correction of the civil clock never moves a
+deadline. A reading gives no distributed order, database visibility, or authorization.
+
+```rust
+use core::time::Duration;
+use rsasync::time::{ClockDomain, Deadline, Instant, Reading, ReadingSource, Suspend, TimeError};
+
+fn main() -> Result<(), TimeError> {
+    let domain = ClockDomain::new(1, Suspend::Pauses);
+    let start = Instant::new(domain, 1_000_000);
+    let deadline = Deadline::at(start.checked_add(Duration::from_millis(5))?);
+
+    // A late poll reads a later instant. The deadline does not move.
+    assert!(!deadline.is_reached(Instant::new(domain, 5_999_999))?);
+    assert!(deadline.is_reached(Instant::new(domain, 90_000_000))?);
+
+    // An instant of a different domain does not compare.
+    let other = Instant::new(ClockDomain::new(2, Suspend::Advances), 1_000_000);
+    assert_eq!(start.compare(other), Err(TimeError::DomainMismatch));
+
+    // A check that needs a bound refuses an unknown bound.
+    let estimate = Duration::from_secs(1_800_000_000);
+    let reading = Reading::new(estimate, Some(Duration::from_millis(20)), ReadingSource::Caller);
+    assert!(reading.latest()? < Duration::from_secs(1_800_000_060));
+    let unknown = Reading::new(estimate, None, ReadingSource::SystemClock);
+    assert_eq!(unknown.latest(), Err(TimeError::UnknownBound));
+    Ok(())
+}
+```
+
+| Operation | Result | Refusal |
+| --- | --- | --- |
+| `Instant::compare(other)` | The `Ordering` of the two instants | `DomainMismatch` |
+| `Instant::checked_add(duration)` and `checked_sub(duration)` | The instant on the same domain | `Overflow` before the origin or after `u64::MAX` nanoseconds |
+| `Instant::duration_since(earlier)` | The `Duration` from `earlier` | `DomainMismatch`, and `Overflow` when `earlier` is later |
+| `Deadline::is_reached(now)` | `true` when `now` is at or after the deadline | `DomainMismatch` |
+| `Reading::earliest()` and `latest()` | The estimate minus or plus the bound | `UnknownBound`, and `Overflow` before the Unix epoch or past `Duration::MAX` |
+
+Each refusal is a `TimeError`:
+
+- `DomainMismatch`: the values come from two clocks. Use instants of one domain.
+- `Overflow`: the result is out of range for its type.
+- `UnknownBound`: the reading has no bound. Refuse the check, or get a reading with a bound, for
+  example a bound that the caller supplies.
 
 ## Why the types are in a separate crate
 
