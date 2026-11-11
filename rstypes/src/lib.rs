@@ -17,4 +17,5 @@ extern crate std;
 // `# extern crate rstypes as rsasync;`, so it builds without the runtime.
 pub mod buffer;
 pub mod capacity;
+mod sync;
 pub mod time;

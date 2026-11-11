@@ -6,6 +6,16 @@
 //! ```
 //! use rsasync::{buffer, capacity, time};
 //! ```
+//!
+//! Without the `std` feature, which is on by default, the crate needs only `core` and `alloc`.
+
+#![no_std]
+
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+mod sync;
 
 // By name, not `*`: a module of this crate with one of these names is then a
 // compile error, not a module that hides the shared one.

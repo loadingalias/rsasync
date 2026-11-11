@@ -14,5 +14,10 @@ default = ["std"]
 # Without `std`, the crate needs only `core` and `alloc`.
 std = []
 
+# The exploration tests (`cargo xtask explore`) use loom. A build without
+# `--cfg loom` compiles none of it.
+[target.'cfg(loom)'.dev-dependencies]
+loom.workspace = true
+
 [lints]
 workspace = true

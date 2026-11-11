@@ -39,13 +39,14 @@
 //! ```
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::slice::SliceIndex;
-use core::sync::atomic::{AtomicPtr, Ordering};
+
+use crate::sync::Arc;
+use crate::sync::atomic::{AtomicPtr, Ordering};
 
 /// Bytes whose address stays the same when the value that owns them moves.
 ///
@@ -529,8 +530,10 @@ pub struct Lease {
 enum Owner {
     /// A backing, which the last lease or view releases.
     Backing(Arc<Backing>),
-    /// An owner from [`Lease::from_owner`], which the last lease or view drops.
-    Foreign(Arc<dyn ForeignBytes>),
+    /// An owner from [`Lease::from_owner`], which the last lease or view drops. Its count is a
+    /// standard `Arc` in each form, because the loom `Arc` cannot hold a trait object. The count
+    /// only drops the owner.
+    Foreign(alloc::sync::Arc<dyn ForeignBytes>),
     /// A static region, which nothing releases.
     Static(&'static [u8]),
 }
@@ -613,7 +616,7 @@ impl Lease {
     where
         T: AsRef<[u8]> + Send + Sync + 'static,
     {
-        let foreign = Arc::new(Foreign {
+        let foreign = alloc::sync::Arc::new(Foreign {
             ptr: AtomicPtr::new(ptr::null_mut()),
             allocation_size,
             owner,

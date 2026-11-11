@@ -33,13 +33,19 @@ Commands
   fix [Cargo args]     Apply Clippy fixes, format, then fail on the lints that remain (local only)
   check [Cargo args]   Check formatting, lints, and rustdoc, and change no file (the CI gate)
   test [Nextest args]  Run the tests; with no arguments, also run the doctests
+  explore [Nextest args]
+                       Run the exploration tests with the loom form of each sync module
   model [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
 
-fix, check, and test select the whole workspace unless their arguments select
-packages with -p or --package. With the whole workspace, fix and check also
-lint each crate that builds without `std` on wasm32v1-none, a target with no
-`std`.
+fix, check, test, and explore select the whole workspace unless their
+arguments select packages with -p or --package. With the whole workspace, fix
+and check also lint each crate that builds without `std` on wasm32v1-none, a
+target with no `std`.
+
+An exploration test is a unit test in a module named `explore`. The explore
+command builds the unit tests with `--cfg loom`, in target/loom/, and runs only
+the exploration tests.
 
 A model is a directory in models/. The first part of a profile's file name
 names its module: <M>.cfg and <M>.<name>.cfg are TLC profiles of <M>.tla, and
@@ -60,7 +66,7 @@ target/model/.
 const NO_STD_TARGET: &str = "wasm32v1-none";
 
 /// The packages whose library builds without `std`.
-const NO_STD_PACKAGES: &[&str] = &["rstypes"];
+const NO_STD_PACKAGES: &[&str] = &["rstypes", "rsasync"];
 
 /// The keywords of a TLC configuration file.
 const TLC_KEYWORDS: &[&str] = &[
@@ -119,6 +125,7 @@ fn main() -> ExitCode {
         "fix" => Repo::open().and_then(|repo| repo.fix(rest)),
         "check" => Repo::open().and_then(|repo| repo.check(rest)),
         "test" => Repo::open().and_then(|repo| repo.test(rest)),
+        "explore" => Repo::open().and_then(|repo| repo.explore(rest)),
         "model" => Repo::open().and_then(|repo| repo.model(rest)),
         other => Err(Failure::new(format!("unknown command `{other}`\n\n{USAGE}"))),
     };
@@ -252,6 +259,30 @@ impl Repo {
         step(
             "doctest",
             &mut self.cargo(&["test", "--locked", "--doc", "--workspace", "--quiet"]),
+        )
+    }
+
+    /// Runs the exploration tests. `--cfg loom` gives each `sync` module its
+    /// loom form, which works only inside a loom model, so the other unit
+    /// tests do not run. The release build with debug assertions makes each
+    /// model fast and keeps its assertions. Its own target directory keeps the
+    /// builds of the other commands valid.
+    fn explore(&self, args: &[String]) -> Result<(), Failure> {
+        step(
+            "nextest with loom",
+            self.cargo(&[
+                "nextest",
+                "run",
+                "--locked",
+                "--release",
+                "--lib",
+                "--target-dir",
+                "target/loom",
+                "--filterset",
+                "test(/(^|::)explore::/)",
+            ])
+            .args(scope(args))
+            .env("RUSTFLAGS", "--cfg loom -C debug-assertions"),
         )
     }
 
