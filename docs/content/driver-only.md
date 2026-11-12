@@ -21,9 +21,9 @@ it.
 | `Driver::new(Config)` | Starts the driver and allocates its bounded memory one time. It gives `Error::Refused` if the kernel or its policy refuses io_uring, for example in a container with the default seccomp profile |
 | `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and gives up to `Config::completions_per_turn` completions to their futures |
 | `Turn::more()` | Work remains. Turn again before you wait |
-| The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread |
-| `Driver::wait()` | Blocks until the wake descriptor is readable |
-| `Driver::wake_handle()` | A `WakeHandle` that any thread can use to make the wake descriptor readable |
+| `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. The kernel runs its deferred work during the wait |
+| The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread. Some kernels signal deferred work only one time; see [Drive it from another reactor](#drive-it-from-another-reactor) |
+| `Driver::wake_handle()` | A `WakeHandle` that any thread can use to make the wake descriptor readable and to end a wait |
 | `Driver::teardown()` | Cancels each running operation, drives until each terminal event, closes each resource, and reports the cancelled operations |
 
 ## Drive it from your own loop
@@ -53,6 +53,15 @@ Register the wake descriptor (`driver.as_fd()`) for readability with the reactor
 example epoll, kqueue, or the reactor of another runtime. When it reports the descriptor readable,
 turn the driver, and turn it again while `Turn::more()` gives `true`. The turn clears the
 descriptor, so the reactor reports it again only for new work.
+
+Some kernels signal the wake descriptor for deferred work of the kernel only one time in the life
+of the driver. In Linux, the defect is in a kernel that has the io_uring change `cd305ee3633a`
+("defer eventfd signaling when queued from a wakeup handler") and not `04fe9aeb4f3c` ("reset
+deferred signal state"). The driver tests saw it on Ubuntu 26.04 with `7.0.0-1016-aws`. On such a
+kernel, a reactor that waits only for the descriptor can miss an operation that waited for
+readiness, for example a receive that waited for its data, and the operation does not complete.
+`Driver::wait` does not depend on that signal, so use your own loop with `Driver::wait` on such a
+kernel.
 
 ## Accept, receive, and send on TCP
 

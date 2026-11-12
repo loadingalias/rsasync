@@ -75,6 +75,7 @@ pub(super) const IOU_PBUF_RING_INC: u16 = 2;
 pub(super) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
 pub(super) const IORING_OP_NOP: u8 = 0;
+pub(super) const IORING_OP_POLL_ADD: u8 = 6;
 pub(super) const IORING_OP_ACCEPT: u8 = 13;
 pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
 pub(super) const IORING_OP_READ: u8 = 22;
@@ -99,6 +100,8 @@ pub(super) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 pub(super) const IORING_CQE_F_MORE: u32 = 1 << 1;
 pub(super) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
 
+/// `POLLIN` (`include/uapi/asm-generic/poll.h`): the descriptor is readable.
+pub(super) const POLLIN: u32 = 0x1;
 /// `MSG_NOSIGNAL` (`include/linux/socket.h`): a send to a closed peer gives `EPIPE` and raises no
 /// `SIGPIPE`.
 pub(super) const MSG_NOSIGNAL: u32 = 0x4000;

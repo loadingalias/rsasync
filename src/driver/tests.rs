@@ -249,7 +249,8 @@ fn a_turn_stops_at_its_bound_and_reports_the_remaining_work() {
 }
 
 /// With the task-run flag set and no entry to submit, a turn enters the kernel, which runs the
-/// deferred work, and the pending read completes.
+/// deferred work, and the pending read completes. The write wakes the poll of the read, which
+/// queues the deferred work and sets the flag before the write returns.
 #[test]
 fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     let (log, budget) = (Log::default(), budget());
@@ -258,11 +259,21 @@ fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     let future = read(&mut driver, reader, held(&log, &budget));
     driver.turn().unwrap();
     writer.write_all(b"x").unwrap();
-    driver.wait().unwrap();
     assert!(driver.ring.task_run_pending());
     assert_eq!(driver.ring.unsubmitted(), 0);
     assert_eq!(driver.turn().unwrap().completed(), 1);
     assert!(matches!(block_on(future), Ok((1, _))));
+}
+
+/// A wake from another thread ends a wait of the home that has no completion to wait for, also
+/// when the wake comes before the wait.
+#[test]
+fn a_wake_from_another_thread_ends_a_wait() {
+    let mut driver = driver(Config::new());
+    let wake = driver.wake_handle();
+    let waker = thread::spawn(move || wake.wake());
+    driver.wait().unwrap();
+    waker.join().unwrap();
 }
 
 /// Teardown cancels a read that gets no data, returns after the completion of the read, closes

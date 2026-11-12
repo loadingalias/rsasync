@@ -10,9 +10,11 @@
 //!   other threads, such as the cancel of a dropped future, submits, enters the kernel when there
 //!   is work for it, and gives each ready completion to its future, up to
 //!   [`Config::completions_per_turn`]. [`Turn::more`] says that work remains.
-//! - The wake descriptor, [`AsFd`] of the driver, becomes readable when work comes: a completion,
-//!   deferred work of the kernel, or a request from another thread. A host's reactor can wait for
-//!   it, or [`Driver::wait`] blocks until it.
+//! - [`Driver::wait`] blocks in the kernel until work comes: a completion, or a request or wake
+//!   from another thread. The kernel runs its deferred work during the wait.
+//! - The wake descriptor, [`AsFd`] of the driver, becomes readable when work comes, so a host's
+//!   reactor can wait for it. Some kernels signal it for deferred work only one time, as the
+//!   documentation of its `AsFd` implementation says.
 //! - [`Driver::teardown`] cancels each running operation, drives until each terminal event, and
 //!   closes each resource. Its [`Teardown`] reports the cancelled operations.
 //!
@@ -59,7 +61,7 @@ use rsnetwork_udp::SockAddrStorage;
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool};
 use crate::capacity::Permit;
 use crate::sync::Arc;
-use crate::table::{MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
+use crate::table::{CONTROL, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Ring, SetupError, Sqe};
 
 pub use tcp::{TcpListener, TcpStream};
@@ -381,6 +383,9 @@ impl Resources {
 /// The buffer group of the provided ring.
 const GROUP: u16 = 0;
 
+/// The user data of the poll of the interrupt descriptor that a wait keeps in the ring.
+const WAKE: u64 = CONTROL;
+
 /// The provided buffers: the slots of a pool, which the kernel selects for a receive. Each one is
 /// in the kernel ring, or in a lease of a consumer, or back in the pool.
 #[derive(Debug)]
@@ -458,21 +463,29 @@ impl Selected {
 struct Shared {
     entries: Box<[Entry<Held>]>,
     requests: Requests,
-    /// The wake descriptor: an `eventfd` that the kernel also signals at each completion.
+    /// The wake descriptor: an `eventfd` that the kernel also signals at each completion and for
+    /// its deferred work.
     wake: File,
+    /// An `eventfd` that only the other threads signal. A wait polls it in the ring. A signal of
+    /// the kernel would also complete that poll, so the wait does not poll `wake`.
+    interrupt: File,
 }
 
 impl Shared {
     fn wake(&self) {
-        // A full counter is a pending wake already, and nothing else can fail here.
-        drop((&self.wake).write(&1_u64.to_ne_bytes()));
+        for fd in [&self.wake, &self.interrupt] {
+            // A full counter is a pending wake already, and nothing else can fail here.
+            drop((&*fd).write(&1_u64.to_ne_bytes()));
+        }
     }
 
-    /// Clears the wake descriptor.
+    /// Clears the wake descriptors.
     fn clear(&self) {
         let mut count = [0; 8];
-        // A descriptor with no wake gives `WouldBlock`, which is the clear state.
-        drop((&self.wake).read(&mut count));
+        for fd in [&self.wake, &self.interrupt] {
+            // A descriptor with no wake gives `WouldBlock`, which is the clear state.
+            drop((&*fd).read(&mut count));
+        }
     }
 }
 
@@ -492,6 +505,9 @@ pub struct Driver {
     resources: Resources,
     selected: Option<Selected>,
     completions_per_turn: u32,
+    /// The ring polls the interrupt descriptor, so that a request or wake from another thread
+    /// ends a wait.
+    waking: bool,
 }
 
 impl fmt::Debug for Driver {
@@ -526,13 +542,14 @@ impl Driver {
             SetupError::Failed(error) if error.kind() == io::ErrorKind::InvalidInput => Error::Config,
             SetupError::Failed(error) => Error::System(error),
         })?;
-        let wake = eventfd().map_err(Error::System)?;
+        let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
         ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
         let table = Table::new(config.operations);
         let shared = Arc::new(Shared {
             entries: (0..config.operations).map(|_| Entry::new()).collect(),
             requests: table.requests(),
             wake: File::from(wake),
+            interrupt: File::from(interrupt),
         });
         Ok(Self {
             ring,
@@ -541,6 +558,7 @@ impl Driver {
             resources: Resources((0..config.resources).map(|_| Owned::default()).collect()),
             selected: None,
             completions_per_turn: config.completions_per_turn,
+            waking: false,
         })
     }
 
@@ -602,27 +620,29 @@ impl Driver {
         Ok(Turn { completed, more })
     }
 
-    /// Blocks until the wake descriptor is readable: a completion, work of the kernel, or a
-    /// request or wake from another thread came.
+    /// Blocks in the kernel until a completion is ready, or a request or wake from another thread
+    /// came. The kernel runs its deferred work during the wait, so the wait does not depend on a
+    /// signal of the wake descriptor for that work.
     ///
     /// # Errors
     ///
-    /// A failure of `poll` other than an interrupt.
-    #[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
-    pub fn wait(&self) -> io::Result<()> {
-        let mut fd = sys::PollFd {
-            fd: self.shared.wake.as_raw_fd(),
-            events: sys::POLLIN,
-            revents: 0,
-        };
+    /// A failure of the kernel entry other than an interrupt or a full completion queue, which
+    /// leave work for the next turn.
+    #[expect(unsafe_code, reason = "a poll names no memory")]
+    pub fn wait(&mut self) -> io::Result<()> {
+        // Another thread writes the interrupt descriptor for a request or a wake. The poll of the
+        // descriptor in the ring then completes, which ends the wait.
+        if !self.waking {
+            let poll = Sqe::poll_readable(self.shared.interrupt.as_raw_fd()).with_user_data(WAKE);
+            // SAFETY: a poll names no memory.
+            unsafe { push_now(&mut self.ring, &poll) }?;
+            self.waking = true;
+        }
         loop {
-            // SAFETY: `fd` is one valid `pollfd` during the call.
-            if unsafe { sys::poll(&raw mut fd, 1, -1) } >= 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            match self.ring.submit(1) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if !retryable(&error) => return Err(error),
+                _ => return Ok(()),
             }
         }
     }
@@ -739,7 +759,7 @@ impl Driver {
     fn harvest(&mut self, limit: u32) -> u32 {
         let mut completed = 0;
         let (shared, table) = (&self.shared, &mut self.table);
-        let (resources, selected) = (&mut self.resources, &mut self.selected);
+        let (resources, selected, waking) = (&mut self.resources, &mut self.selected, &mut self.waking);
         for cqe in self.ring.completions().take(limit as usize) {
             completed += 1;
             let target =
@@ -747,6 +767,11 @@ impl Driver {
             let (abandoned, (id, slot)) = match (table.complete(cqe.user_data, cqe.event()), target) {
                 (Outcome::Ready, Some(target)) => (false, target),
                 (Outcome::Abandoned(_), Some(target)) => (true, target),
+                // The poll of the interrupt descriptor ended: the next wait polls it again.
+                (Outcome::Control(WAKE), _) => {
+                    *waking = false;
+                    continue;
+                }
                 // No driver operation is multishot or a zero-copy send yet; the other outcomes
                 // change nothing.
                 _ => continue,
@@ -812,7 +837,15 @@ fn finish(held: &mut Held, cqe: &Cqe, abandoned: bool, resources: &mut Resources
 }
 
 impl AsFd for Driver {
-    /// The wake descriptor.
+    /// The wake descriptor. It becomes readable when a completion is ready, when the kernel has
+    /// deferred work for the driver, and when another thread posts a request or a wake. Turn the
+    /// driver when it is readable.
+    ///
+    /// Some kernels signal the descriptor for deferred work only one time in the life of the
+    /// driver: a Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c`. The
+    /// driver tests saw it on Ubuntu 26.04 with `7.0.0-1016-aws`. A reactor that waits only for
+    /// this descriptor can then miss an operation that waited for readiness, such as a receive
+    /// that waited for its data. [`Driver::wait`] does not depend on the signal.
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.shared.wake.as_fd()
     }
@@ -841,14 +874,24 @@ impl Drop for Driver {
 /// Pushes a cancel of `id` by its own user data, and submits once when the queue is full.
 #[expect(unsafe_code, reason = "a cancel names no memory")]
 fn push_cancel(ring: &mut Ring, id: OpId) -> io::Result<()> {
-    let cancel = Sqe::cancel(id.user_data(), id.cancel_user_data());
     // SAFETY: a cancel names no memory.
-    if unsafe { ring.push(&cancel) }.is_ok() {
+    unsafe { push_now(ring, &Sqe::cancel(id.user_data(), id.cancel_user_data())) }
+}
+
+/// Pushes `entry`, and submits once when the queue is full.
+///
+/// # Safety
+///
+/// `entry` names no memory, as a cancel or a poll does.
+#[expect(unsafe_code, reason = "the caller gives an entry that names no memory")]
+unsafe fn push_now(ring: &mut Ring, entry: &Sqe) -> io::Result<()> {
+    // SAFETY: the entry names no memory.
+    if unsafe { ring.push(entry) }.is_ok() {
         return Ok(());
     }
     ring.submit(0)?;
     // SAFETY: as above.
-    unsafe { ring.push(&cancel) }.map_err(|_| io::ErrorKind::WouldBlock.into())
+    unsafe { ring.push(entry) }.map_err(|_| io::ErrorKind::WouldBlock.into())
 }
 
 /// A failure of the kernel entry that leaves the work for the next turn: an interrupt, or a full

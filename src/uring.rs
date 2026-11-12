@@ -154,6 +154,17 @@ impl Sqe {
         }
     }
 
+    /// A one-shot poll of `fd` for readability (`IORING_OP_POLL_ADD`). It completes at once when
+    /// `fd` is readable already. The entry names no memory.
+    pub(crate) fn poll_readable(fd: RawFd) -> Self {
+        Self {
+            opcode: sys::IORING_OP_POLL_ADD,
+            fd,
+            rw_flags: sys::POLLIN,
+            ..Self::default()
+        }
+    }
+
     /// A cancel of the request whose user data is `target` (`IORING_OP_ASYNC_CANCEL`). It cancels
     /// one request. Its own completion has the user data `user_data`.
     pub(crate) fn cancel(target: u64, user_data: u64) -> Self {
