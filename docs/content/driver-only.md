@@ -50,7 +50,7 @@ turn gives them. So a turn always returns soon, and your loop can do other work 
 ## Drive it from another reactor
 
 Register the wake descriptor (`driver.as_fd()`) for readability with the reactor of your host, for
-example epoll, kqueue, or the reactor of another runtime. When it reports the descriptor readable,
+example epoll or the reactor of another runtime. When it reports the descriptor readable,
 turn the driver, and turn it again while `Turn::more()` gives `true`. The turn clears the
 descriptor, so the reactor reports it again only for new work.
 
