@@ -4,7 +4,7 @@ rsasync shares three groups of types with networking libraries and with applicat
 
 | Module | Contents |
 | --- | --- |
-| `rsasync::buffer` | Owned buffers, and the leases and pool buffers that share their backing |
+| `rsasync::buffer` | Owned buffers, and the leases and pool buffers that share their backing. See [Buffer ownership](buffer-ownership.md) |
 | `rsasync::capacity` | Capacity permits, and the caller-owned budget that contains them |
 | `rsasync::time` | Clock domains, instants and deadlines, and physical-time readings |
 

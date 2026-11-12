@@ -167,3 +167,22 @@ fn the_release_hook_runs_once_on_the_thread_of_the_last_drop() {
     assert_eq!(releases.count.load(Ordering::Relaxed), 1);
     assert_eq!(*releases.thread.lock().unwrap(), Some(dropper));
 }
+
+#[test]
+fn truncate_shortens_the_initialized_bytes_and_never_lengthens_them() {
+    let releases = Arc::default();
+    let mut loan = WriteLoan::new(page(&releases));
+    backend_fill(&mut loan, b"first");
+    let mut backing = loan.into_inner();
+
+    // A longer length would expose capacity that is not initialized.
+    backing.truncate(backing.capacity());
+    assert_eq!(backing.bytes(), b"first");
+
+    // After `truncate(0)`, a second receive fills the full capacity again.
+    backing.truncate(0);
+    let mut loan = WriteLoan::new(backing);
+    assert_eq!(loan.capacity(), 1000);
+    backend_fill(&mut loan, b"second");
+    assert_eq!(loan.into_inner().bytes(), b"second");
+}

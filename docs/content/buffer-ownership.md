@@ -63,7 +63,8 @@ backend filled. Only those bytes become readable:
 - A receive that fails adds no bytes. The buffer keeps only its earlier initialized bytes.
 - The bytes that were initialized before the receive stay the same.
 
-To receive into the full capacity again, first clear the buffer, for example with `Vec::clear`.
+To receive into the full capacity again, first call `BufferMut::truncate(0)` (for a `Vec<u8>`,
+`Vec::clear` does the same).
 
 In this example, `WriteLoan::fill_from` does the work of the backend. It copies bytes into the
 loan. A driver uses it to give data that it holds already.

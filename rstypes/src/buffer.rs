@@ -102,7 +102,7 @@ pub unsafe trait Buffer: 'static {
 /// A [`Buffer`] with writable capacity after its initialized bytes.
 ///
 /// A receive fills the capacity after the initialized bytes through a [`WriteLoan`]. To receive
-/// into the full capacity again, first clear the buffer, for example with `Vec::clear`.
+/// into the full capacity again, first call [`truncate(0)`](Self::truncate).
 ///
 /// # Safety
 ///
@@ -132,6 +132,19 @@ pub unsafe trait BufferMut: Buffer {
     ///
     /// `len` is at most [`capacity`](Self::capacity), and the first `len` bytes are initialized.
     unsafe fn set_initialized(&mut self, len: usize);
+
+    /// Shortens the initialized bytes to their first `len` bytes. A `len` that is not shorter
+    /// changes nothing.
+    ///
+    /// After `truncate(0)`, a receive can fill the full capacity again.
+    #[expect(unsafe_code, reason = "a prefix of the initialized bytes is initialized")]
+    fn truncate(&mut self, len: usize) {
+        if len < self.initialized() {
+            // SAFETY: `len` is less than the initialized length, which is at most the capacity, and
+            // the first `len` bytes are a prefix of the initialized bytes.
+            unsafe { self.set_initialized(len) };
+        }
+    }
 }
 
 #[expect(unsafe_code, reason = "a Vec keeps its heap block at one address while it moves")]
