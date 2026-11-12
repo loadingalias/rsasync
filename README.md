@@ -21,19 +21,19 @@ rsasync is built to give you:
   says which backend ran. The driver also runs with no scheduler, inside your own event loop.
 - **Pure Rust.** No C, no binding crates, no hidden Tokio.
 
-**The bar.** Each release measures against Tokio, Monoio, Glommio, and Compio. A headline cell must
-win by at least 10% in throughput per core or 25% in tail latency, and no other cell may lose. The
-mixed-mode cell runs both modes in one build against Tokio alone and against Monoio or Compio
-composed with Tokio. Every loss is published, and no "fastest" claim ships without this evidence.
+**The bar.** A release that claims speed measures against Tokio, Monoio, Glommio, and Compio. A
+headline cell must win by at least 10% in throughput per core or 25% in tail latency, and no other
+cell may lose. The mixed-mode cell runs both modes in one build against Tokio alone and against
+Monoio or Compio composed with Tokio. Every loss is published, and no "fastest" claim ships without this evidence.
 
 **In this alpha.** These parts have run evidence:
 
 - The shared types: `rsasync::buffer`, `rsasync::capacity`, and `rsasync::time`. Their tests run on
   macOS and Linux, and on WebAssembly (`wasm32-wasip1`) without `std`, the portable subset.
 - The driver-only io_uring surface, `rsasync::driver`, on Linux 6.1 (Debian 12) and Linux 7.0
-  (Ubuntu 26.04), on x86_64 and aarch64, with glibc: bounded turns, a wake descriptor for the event
-  loop of a host, terminal teardown, and TCP accept, receive (into an owned buffer or into a buffer
-  that the kernel selects), and send.
+  (Ubuntu 26.04), on x86_64 and aarch64, with glibc and musl: bounded turns, a wake descriptor for
+  the event loop of a host, terminal teardown, and TCP accept, receive (into an owned buffer or into
+  a buffer that the kernel selects), and send.
 
 There is no scheduler yet, and the driver has no other backend and no other platform yet. Each
 alpha can change the API.
