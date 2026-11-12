@@ -1,21 +1,22 @@
 use alloc::task::Wake;
+use core::alloc::Layout;
 use core::ffi::c_int;
 use core::future::Future;
 use core::mem::{self, ManuallyDrop};
-use core::num::NonZeroU64;
+use core::num::{NonZeroU32, NonZeroU64};
 use core::pin::{Pin, pin};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::fs::File;
-use std::io::{ErrorKind, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, Thread};
 use std::vec::Vec;
 
 use super::{Completion, Config, Driver, Held, Reason, Refused};
-use crate::buffer::{Backing, BufferMut, Release};
+use crate::buffer::{Backing, Buffer as _, BufferMut, Lease, Pool, Release};
 use crate::capacity::Budget;
 use crate::completion::Gone;
 use crate::uring::Sqe;
@@ -111,7 +112,7 @@ fn read(driver: &mut Driver, fd: OwnedFd, mut held: Held) -> Completion {
     let entry = Sqe::read(fd, buffer.as_mut_ptr(), len);
     // SAFETY: the buffer of `held` keeps its address while `held` moves, and the pipe is a resource
     // of the driver.
-    unsafe { driver.submit(held, entry, true) }.expect("the test driver has room")
+    unsafe { driver.submit(held, Some(resource), |held| held, |_| entry, true) }.expect("the test driver has room")
 }
 
 /// Turns the driver until a turn gives a completion to its operation.
@@ -160,6 +161,7 @@ fn held(log: &Log, budget: &Budget) -> Held {
     Held {
         buffer: Some(recorded(log, 16)),
         charge: Some(budget.reserve(10).expect("the test budget has room")),
+        ..Held::default()
     }
 }
 
@@ -234,7 +236,7 @@ fn a_turn_stops_at_its_bound_and_reports_the_remaining_work() {
     let mut driver = driver(Config::new().completions_per_turn(2));
     let futures: Vec<Completion> = (0..3)
         // SAFETY: a no-op names no memory.
-        .map(|_| unsafe { driver.submit(Held::default(), Sqe::nop(), false) }.unwrap())
+        .map(|_| unsafe { driver.submit((), None, |()| Held::default(), |_| Sqe::nop(), false) }.unwrap())
         .collect();
     let turns = [driver.turn().unwrap(), driver.turn().unwrap()];
     assert_eq!(
@@ -303,12 +305,12 @@ fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new().operations(1));
     // SAFETY: a no-op names no memory.
-    let running = unsafe { driver.submit(Held::default(), Sqe::nop(), false) }.unwrap();
+    let running = unsafe { driver.submit((), None, |()| Held::default(), |_| Sqe::nop(), false) }.unwrap();
     // SAFETY: as above.
     let Err(Refused {
         reason: Reason::Operations,
-        held,
-    }) = (unsafe { driver.submit(held(&log, &budget), Sqe::nop(), false) })
+        value: held,
+    }) = (unsafe { driver.submit(held(&log, &budget), None, |held| held, |_| Sqe::nop(), false) })
     else {
         panic!("a full driver refuses");
     };
@@ -318,4 +320,140 @@ fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     assert_eq!(taken(&log), ["released"]);
     assert_eq!(budget.available(), 100);
     drop(running);
+}
+
+/// Polls `future` on the home thread while the driver turns, until it gives its output.
+fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(output) = Pin::new(&mut future).poll(&mut cx) {
+            return output;
+        }
+        let turn = driver.turn().expect("a turn of the test driver works");
+        if !turn.more()
+            && let Poll::Pending = Pin::new(&mut future).poll(&mut cx)
+        {
+            driver.wait().expect("the wait of the test driver works");
+        } else if let Poll::Ready(output) = Pin::new(&mut future).poll(&mut cx) {
+            return output;
+        }
+    }
+}
+
+/// A connection receives a request into an owned buffer after its earlier bytes, and sends a
+/// response from a lease. Each buffer comes back with its exact extent and at its own address: the
+/// kernel wrote and read it in place, with no staging buffer.
+#[test]
+fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses() {
+    let mut driver = driver(Config::new());
+    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.local_addr();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        (stream.local_addr().unwrap(), response)
+    });
+    let accept = driver.accept(&listener).unwrap();
+    let (stream, peer) = drive(&mut driver, accept).unwrap().unwrap();
+
+    let mut request = Vec::with_capacity(64);
+    request.extend_from_slice(b"seen:");
+    let request = Backing::from(request);
+    let request_address = request.as_ptr();
+    let receive = driver.recv(&stream, request).unwrap();
+    let (received, request) = drive(&mut driver, receive).unwrap();
+    assert_eq!(received.unwrap(), 18);
+    assert_eq!(request.as_ptr(), request_address);
+    assert_eq!(request.bytes(), b"seen:GET / HTTP/1.1\r\n\r\n");
+
+    let response = Lease::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
+    let response_address = response.as_ptr();
+    let send = driver.send(&stream, response).unwrap();
+    let (sent, response) = drive(&mut driver, send).unwrap();
+    assert_eq!(sent.unwrap(), 19);
+    assert_eq!(response.as_ptr(), response_address);
+    driver.close(stream).unwrap();
+    let (client_address, bytes) = client.join().unwrap();
+    assert_eq!(peer, client_address);
+    assert_eq!(bytes, b"HTTP/1.1 200 OK\r\n\r\n");
+}
+
+/// A request in a buffer that the kernel selected is read in place, at the address of the one
+/// slot of the pool. When the last view of that buffer drops on another thread, the buffer comes
+/// back to the kernel ring through the home, so the next selecting receive gets it again.
+#[test]
+fn a_selected_buffer_is_read_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere() {
+    let budget = budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut pool = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
+    let slot = pool.acquire().unwrap().as_ptr();
+    let mut driver = driver(Config::new());
+    driver.provide(pool).unwrap();
+    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.local_addr();
+    let (next, wait) = std::sync::mpsc::channel::<()>();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(b"first").unwrap();
+        wait.recv().unwrap();
+        stream.write_all(b"second").unwrap();
+    });
+    let accept = driver.accept(&listener).unwrap();
+    let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+
+    let receive = driver.recv_selected(&stream).unwrap();
+    let first = drive(&mut driver, receive).unwrap().unwrap();
+    assert_eq!((first.bytes(), first.as_ptr()), (&b"first"[..], slot));
+    let view = first.view(1..).unwrap();
+    drop(first);
+    thread::spawn(move || assert_eq!(view.bytes(), b"irst")).join().unwrap();
+
+    next.send(()).unwrap();
+    let receive = driver.recv_selected(&stream).unwrap();
+    let second = drive(&mut driver, receive).unwrap().unwrap();
+    assert_eq!((second.bytes(), second.as_ptr()), (&b"second"[..], slot));
+    client.join().unwrap();
+}
+
+/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`).
+const ENOBUFS: i32 = 105;
+
+/// A selecting receive that finds no free buffer ends with `ENOBUFS`, which its future gives: the
+/// driver does not retry it. The data stays in the socket, and a receive after the buffer comes
+/// back gets it.
+#[test]
+fn a_selecting_receive_with_no_free_buffer_gives_enobufs() {
+    let budget = budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut driver = driver(Config::new());
+    driver
+        .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
+        .unwrap();
+    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.local_addr();
+    let (next, wait) = std::sync::mpsc::channel::<()>();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(b"first").unwrap();
+        wait.recv().unwrap();
+        stream.write_all(b"second").unwrap();
+        wait.recv().unwrap();
+    });
+    let accept = driver.accept(&listener).unwrap();
+    let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+    let receive = driver.recv_selected(&stream).unwrap();
+    let held = drive(&mut driver, receive).unwrap().unwrap();
+
+    next.send(()).unwrap();
+    let receive = driver.recv_selected(&stream).unwrap();
+    let refused = drive(&mut driver, receive).unwrap().unwrap_err();
+    assert_eq!(refused.raw_os_error(), Some(ENOBUFS));
+
+    drop(held);
+    let receive = driver.recv_selected(&stream).unwrap();
+    assert_eq!(drive(&mut driver, receive).unwrap().unwrap().bytes(), b"second");
+    next.send(()).unwrap();
+    client.join().unwrap();
 }

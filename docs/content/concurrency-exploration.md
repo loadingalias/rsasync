@@ -40,8 +40,9 @@ The search finds two exceptions:
 - The `alloc::sync::Arc` of a trait object in `rstypes/src/buffer.rs`, which holds the owner of
   `Lease::from_owner`. The loom `Arc` cannot hold a trait object. That count only drops the owner,
   and the exploration of `rstypes` sees no algorithm in it.
-- The `core::sync::atomic` import in `src/uring.rs`. The kernel also reads and writes the head,
-  tail, and flag words of an io_uring ring, so they are hardware atomics in each form. The tests
+- The `core::sync::atomic` imports in `src/uring.rs` and `src/uring/buffers.rs`. The kernel also
+  reads and writes the head, tail, and flag words of an io_uring ring and the tail of a provided
+  buffer ring, so they are hardware atomics in each form. The tests
   of the ring run on a Linux kernel, not in loom.
 
 ## Write an exploration test

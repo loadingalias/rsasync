@@ -16,6 +16,10 @@
 //! - [`Driver::teardown`] cancels each running operation, drives until each terminal event, and
 //!   closes each resource. Its [`Teardown`] reports the cancelled operations.
 //!
+//! TCP runs on the driver: [`Driver::bind`], [`Driver::accept`], [`Driver::recv`] into an owned
+//! buffer, [`Driver::recv_selected`] into a buffer of [`Driver::provide`], [`Driver::send`] from a
+//! lease, and [`Driver::close`]. The kernel reads and writes each buffer in place.
+//!
 //! The io_uring driver needs no helper thread: [`Driver::helper_threads`] gives 0.
 //!
 //! ```no_run
@@ -33,30 +37,32 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#![cfg_attr(
-    any(not(test), loom),
-    expect(
-        dead_code,
-        reason = "the tests submit operations now; the TCP operations are the first other users"
-    )
-)]
-
 mod completion;
 mod sys;
+mod tcp;
 #[cfg(all(test, not(loom)))]
 mod tests;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::fmt;
+use core::future::Future;
+use core::mem::ManuallyDrop;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
-use crate::buffer::Backing;
+use rsnetwork_udp::SockAddrStorage;
+
+use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool};
 use crate::capacity::Permit;
 use crate::sync::Arc;
 use crate::table::{MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
-use crate::uring::{Ring, SetupError, Sqe};
+use crate::uring::{BufferRing, Cqe, Ring, SetupError, Sqe};
+
+pub use tcp::{TcpListener, TcpStream};
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
@@ -200,23 +206,125 @@ impl WakeHandle {
 #[derive(Debug, Default)]
 pub(crate) struct Held {
     pub(crate) buffer: Option<Backing>,
+    pub(crate) lease: Option<Lease>,
+    #[cfg_attr(
+        any(not(test), loom),
+        expect(dead_code, reason = "no operation takes a charge yet; the tests do")
+    )]
     pub(crate) charge: Option<Permit>,
+    /// The descriptor that the operation uses. It stays open while the operation runs.
+    pub(crate) resource: Option<Resource>,
+    /// What the home does with the result at the terminal event.
+    pub(crate) finish: Finish,
+    /// The peer address that an accept writes, and its length.
+    pub(crate) peer: SockAddrStorage,
+    pub(crate) peer_len: u32,
+    /// The stream that an accept gave.
+    pub(crate) accepted: Option<Resource>,
 }
 
-/// A refused submission: its reason, and the resources, which the caller keeps.
-#[derive(Debug)]
-pub(crate) struct Refused {
-    pub(crate) reason: Reason,
-    pub(crate) held: Held,
+/// What the home does with the result of an operation at its terminal event.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finish {
+    #[default]
+    Nothing,
+    /// The result counts the bytes that the kernel wrote after the initialized bytes of `buffer`.
+    Received,
+    /// The kernel selected a buffer of the provided ring, which becomes `lease`.
+    Selected,
+    /// The result is a new descriptor, which becomes `accepted`.
+    Accepted,
 }
 
-/// Why a submission was refused.
+/// Why the driver refused an operation. The caller keeps what it gave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reason {
+#[non_exhaustive]
+pub enum Reason {
     /// Each operation slot is in use.
     Operations,
     /// The submission queue is full, also after one submit.
     Queue,
+    /// The descriptor is not one that this driver owns, for example after its close.
+    Resource,
+    /// An operation still runs on the descriptor.
+    Busy,
+    /// The driver has no provided buffers ([`Driver::provide`]).
+    Buffers,
+}
+
+/// A refused operation: the reason, and the value that the caller gave, which it keeps.
+#[derive(Debug)]
+pub struct Refused<T> {
+    reason: Reason,
+    value: T,
+}
+
+impl<T> Refused<T> {
+    /// Why the driver refused.
+    #[must_use]
+    pub fn reason(&self) -> Reason {
+        self.reason
+    }
+
+    /// The value that the caller gave.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+}
+
+impl<T> fmt::Display for Refused<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the driver refused the operation: {:?}", self.reason)
+    }
+}
+
+impl<T: fmt::Debug> core::error::Error for Refused<T> {}
+
+/// The driver ended before the operation gave its result to its future: teardown released the
+/// result, or the driver dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ended;
+
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the driver ended before the operation gave its result")
+    }
+}
+
+impl core::error::Error for Ended {}
+
+/// The future of one operation. It can move to another thread while the driver stays driven, and
+/// it wakes the waker of its latest poll. A drop ends the interest, not the operation: the driver
+/// keeps the buffer until the kernel releases it.
+pub struct Operation<T> {
+    completion: Completion,
+    output: fn(i32, Held) -> Option<T>,
+}
+
+impl<T> Operation<T> {
+    fn new(completion: Completion, output: fn(i32, Held) -> Option<T>) -> Self {
+        Self { completion, output }
+    }
+}
+
+impl<T> Future for Operation<T> {
+    type Output = Result<T, Ended>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let output = self.output;
+        Pin::new(&mut self.completion)
+            .poll(cx)
+            .map(|taken| taken.ok().and_then(|(result, held)| output(result, held)).ok_or(Ended))
+    }
+}
+
+impl<T> fmt::Debug for Operation<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Operation")
+            .field("completion", &self.completion)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A descriptor that the driver owns.
@@ -224,6 +332,126 @@ pub(crate) enum Reason {
 pub(crate) struct Resource {
     index: u32,
     generation: u32,
+}
+
+/// One descriptor slot of the driver.
+#[derive(Debug, Default)]
+struct Owned {
+    generation: u32,
+    fd: Option<OwnedFd>,
+    /// The operations that run on the descriptor.
+    running: u32,
+}
+
+/// The descriptors that the driver owns, in a slice that it allocates once.
+#[derive(Debug)]
+struct Resources(Box<[Owned]>);
+
+impl Resources {
+    /// Takes `fd`. Refuses with `fd` when each slot is in use.
+    fn adopt(&mut self, fd: OwnedFd) -> Result<Resource, OwnedFd> {
+        let Some((index, slot)) = (0..).zip(self.0.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
+            return Err(fd);
+        };
+        slot.fd = Some(fd);
+        Ok(Resource {
+            index,
+            generation: slot.generation,
+        })
+    }
+
+    fn get(&mut self, resource: Resource) -> Option<&mut Owned> {
+        self.0
+            .get_mut(resource.index as usize)
+            .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())
+    }
+
+    /// Closes `resource` when no operation runs on it.
+    fn close(&mut self, resource: Resource) -> Result<(), Reason> {
+        let slot = self.get(resource).ok_or(Reason::Resource)?;
+        if slot.running > 0 {
+            return Err(Reason::Busy);
+        }
+        slot.fd = None;
+        slot.generation = slot.generation.wrapping_add(1);
+        Ok(())
+    }
+}
+
+/// The buffer group of the provided ring.
+const GROUP: u16 = 0;
+
+/// The provided buffers: the slots of a pool, which the kernel selects for a receive. Each one is
+/// in the kernel ring, or in a lease of a consumer, or back in the pool.
+#[derive(Debug)]
+struct Selected {
+    pool: Pool,
+    ring: BufferRing,
+    /// The buffer of each buffer identifier that the kernel ring holds.
+    buffers: Box<[Option<Backing>]>,
+    /// The identifiers with no buffer, which a refill fills from the pool.
+    free: Vec<u16>,
+    /// The capacity of each slot.
+    len: u32,
+}
+
+impl Selected {
+    /// Takes each slot of `pool`, up to 32768, and gives each to a new provided ring of `ring`.
+    fn new(ring: &Ring, mut pool: Pool) -> io::Result<Self> {
+        let mut buffers = Vec::new();
+        while buffers.len() < 1 << 15 {
+            match pool.acquire() {
+                Ok(backing) => buffers.push(Some(backing)),
+                Err(_) => break,
+            }
+        }
+        let count = u16::try_from(buffers.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let len = buffers
+            .first()
+            .and_then(|buffer| buffer.as_ref())
+            .and_then(|buffer| u32::try_from(buffer.capacity()).ok())
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        let mut selected = Self {
+            ring: BufferRing::register(ring, count.next_power_of_two(), GROUP)?,
+            pool,
+            buffers: buffers.into_boxed_slice(),
+            free: Vec::with_capacity(usize::from(count)),
+            len,
+        };
+        for (bid, buffer) in (0..).zip(selected.buffers.iter_mut()) {
+            if let Some(buffer) = buffer {
+                selected.ring.add(bid, buffer.as_mut_ptr(), len);
+            }
+        }
+        selected.ring.publish();
+        Ok(selected)
+    }
+
+    /// Takes the buffer that the kernel selected as `bid`.
+    fn take(&mut self, bid: u16) -> Option<Backing> {
+        let buffer = self.buffers.get_mut(usize::from(bid))?.take()?;
+        self.free.push(bid);
+        Some(buffer)
+    }
+
+    /// Gives each slot that came back to the pool to the kernel ring again.
+    fn refill(&mut self) {
+        let mut added = false;
+        while let Some(&bid) = self.free.last() {
+            let Ok(mut buffer) = self.pool.acquire() else {
+                break;
+            };
+            self.free.pop();
+            self.ring.add(bid, buffer.as_mut_ptr(), self.len);
+            if let Some(slot) = self.buffers.get_mut(usize::from(bid)) {
+                *slot = Some(buffer);
+            }
+            added = true;
+        }
+        if added {
+            self.ring.publish();
+        }
+    }
 }
 
 /// The state that the futures and the wake handles share with the home.
@@ -261,7 +489,8 @@ pub struct Driver {
     ring: Ring,
     table: Table<()>,
     shared: Arc<Shared>,
-    resources: Box<[(u32, Option<OwnedFd>)]>,
+    resources: Resources,
+    selected: Option<Selected>,
     completions_per_turn: u32,
 }
 
@@ -269,7 +498,8 @@ impl fmt::Debug for Driver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Driver")
             .field("ring", &self.ring)
-            .field("resources", &self.resources.len())
+            .field("resources", &self.resources.0.len())
+            .field("selected", &self.selected)
             .field("completions_per_turn", &self.completions_per_turn)
             .finish_non_exhaustive()
     }
@@ -308,7 +538,8 @@ impl Driver {
             ring,
             table,
             shared,
-            resources: (0..config.resources).map(|_| (0, None)).collect(),
+            resources: Resources((0..config.resources).map(|_| Owned::default()).collect()),
+            selected: None,
             completions_per_turn: config.completions_per_turn,
         })
     }
@@ -325,6 +556,22 @@ impl Driver {
         WakeHandle(Arc::clone(&self.shared))
     }
 
+    /// Gives the slots of `pool` to the kernel as the buffers of [`Driver::recv_selected`]: a
+    /// receive then takes a buffer only when its data comes. A selected buffer comes back to the
+    /// kernel when its last lease or view drops, on any thread, at the next turn.
+    ///
+    /// # Errors
+    ///
+    /// `AlreadyExists` when the driver has its buffers, `InvalidInput` for a pool with no free slot
+    /// or a slot above `u32::MAX` bytes, and an error of the registration.
+    pub fn provide(&mut self, pool: Pool) -> io::Result<()> {
+        if self.selected.is_some() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        self.selected = Some(Selected::new(&self.ring, pool)?);
+        Ok(())
+    }
+
     /// One bounded turn. It never blocks.
     ///
     /// # Errors
@@ -333,6 +580,9 @@ impl Driver {
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
         self.take_requests();
+        if let Some(selected) = &mut self.selected {
+            selected.refill();
+        }
         let mut more = false;
         if self.ring.unsubmitted() > 0 || self.ring.needs_enter() {
             match self.ring.submit(0) {
@@ -378,7 +628,7 @@ impl Driver {
     }
 
     /// Cancels each running operation, drives until each terminal event, and closes each
-    /// resource. Each future that has not taken its result then gives its end of the driver.
+    /// resource. Each future that has not taken its result then gives [`Ended`].
     ///
     /// # Errors
     ///
@@ -404,41 +654,41 @@ impl Driver {
 
     /// Takes `fd`, so that teardown closes it. Refuses with `fd` when each resource slot is in use.
     pub(crate) fn adopt(&mut self, fd: OwnedFd) -> Result<Resource, OwnedFd> {
-        let Some((index, (generation, slot))) = (0..)
-            .zip(self.resources.iter_mut())
-            .find(|(_, (_, slot))| slot.is_none())
-        else {
-            return Err(fd);
-        };
-        *slot = Some(fd);
-        Ok(Resource {
-            index,
-            generation: *generation,
-        })
+        self.resources.adopt(fd)
     }
 
     /// The descriptor of `resource`, while the driver owns it.
-    pub(crate) fn fd(&self, resource: Resource) -> Option<RawFd> {
-        match self.resources.get(resource.index as usize)? {
-            (generation, Some(fd)) if *generation == resource.generation => Some(fd.as_raw_fd()),
-            _ => None,
-        }
+    pub(crate) fn fd(&mut self, resource: Resource) -> Option<RawFd> {
+        Some(self.resources.get(resource)?.fd.as_ref()?.as_raw_fd())
     }
 
-    /// Submits `entry` for an operation with the resources `held`, and gives its future. A drop of
-    /// the future asks for a cancel when `cancel_on_drop` holds.
+    /// Submits an operation on `resource` with the resources that `held` makes from `value`, and
+    /// gives its future. `entry` makes the submission from the resources in their final place. A
+    /// drop of the future asks for a cancel when `cancel_on_drop` holds. A refusal gives back
+    /// `value`.
     ///
     /// # Safety
     ///
-    /// The memory that `entry` names belongs to `held`, and each descriptor that it names is a
-    /// resource of this driver. The memory keeps its address while `held` moves.
+    /// The memory that the entry names belongs to the resources, and each descriptor that it names
+    /// is `resource`. The memory keeps its address while the resources move.
     #[expect(unsafe_code, reason = "the kernel uses the memory that the entry names")]
-    pub(crate) unsafe fn submit(
+    pub(crate) unsafe fn submit<P>(
         &mut self,
-        held: Held,
-        entry: Sqe,
+        value: P,
+        resource: Option<Resource>,
+        held: impl FnOnce(P) -> Held,
+        entry: impl FnOnce(&mut Held) -> Sqe,
         cancel_on_drop: bool,
-    ) -> Result<Completion, Refused> {
+    ) -> Result<Completion, Refused<P>> {
+        let refuse = |reason, value| Err(Refused { reason, value });
+        if let Some(resource) = resource
+            && self.resources.get(resource).is_none()
+        {
+            return refuse(Reason::Resource, value);
+        }
+        if !self.ring.has_room() && (self.ring.submit(0).is_err() || !self.ring.has_room()) {
+            return refuse(Reason::Queue, value);
+        }
         let id = match self.table.begin((), Shape::Single) {
             Ok(id) => id,
             Err(_) => {
@@ -446,36 +696,24 @@ impl Driver {
                 self.take_requests();
                 match self.table.begin((), Shape::Single) {
                     Ok(id) => id,
-                    Err(_) => {
-                        return Err(Refused {
-                            reason: Reason::Operations,
-                            held,
-                        });
-                    }
+                    Err(_) => return refuse(Reason::Operations, value),
                 }
             }
         };
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
-            return Err(Refused {
-                reason: Reason::Operations,
-                held,
-            });
-        };
-        slot.start(id, held);
-        let entry = entry.with_user_data(id.user_data());
-        // SAFETY: the entry of the slot keeps `held` until the terminal event of `id`, and the
-        // driver owns each descriptor until teardown, which ends each operation first.
-        let pushed = unsafe { self.ring.push(&entry) }.is_ok()
-            || (self.ring.submit(0).is_ok()
-                // SAFETY: as above.
-                && unsafe { self.ring.push(&entry) }.is_ok());
-        if !pushed {
             self.table.withdraw(id);
-            return Err(Refused {
-                reason: Reason::Queue,
-                held: slot.take_back().unwrap_or_default(),
-            });
+            return refuse(Reason::Operations, value);
+        };
+        let mut held = held(value);
+        held.resource = resource;
+        let entry = slot.start(id, held, entry).with_user_data(id.user_data());
+        if let Some(owned) = resource.and_then(|resource| self.resources.get(resource)) {
+            owned.running += 1;
         }
+        // SAFETY: the entry of the slot keeps the resources until the terminal event of `id`, and
+        // the driver keeps the descriptor open while the operation runs. The queue has room.
+        let pushed = unsafe { self.ring.push(&entry) }.is_ok();
+        debug_assert!(pushed, "the queue has room for the entry");
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
     }
 
@@ -500,21 +738,76 @@ impl Driver {
     /// Gives up to `limit` ready completions to their operations. Gives their number.
     fn harvest(&mut self, limit: u32) -> u32 {
         let mut completed = 0;
-        let shared = &self.shared;
-        let table = &mut self.table;
+        let (shared, table) = (&self.shared, &mut self.table);
+        let (resources, selected) = (&mut self.resources, &mut self.selected);
         for cqe in self.ring.completions().take(limit as usize) {
             completed += 1;
-            let entry =
+            let target =
                 OpId::from_user_data(cqe.user_data).and_then(|id| Some((id, shared.entries.get(id.index() as usize)?)));
-            match (table.complete(cqe.user_data, cqe.event()), entry) {
-                (Outcome::Ready, Some((id, slot))) => slot.publish(id, cqe.res),
-                (Outcome::Abandoned(_), Some((id, slot))) => slot.reclaim(id),
+            let (abandoned, (id, slot)) = match (table.complete(cqe.user_data, cqe.event()), target) {
+                (Outcome::Ready, Some(target)) => (false, target),
+                (Outcome::Abandoned(_), Some(target)) => (true, target),
                 // No driver operation is multishot or a zero-copy send yet; the other outcomes
                 // change nothing.
-                _ => {}
+                _ => continue,
+            };
+            slot.update(id, |held| {
+                if let Some(held) = held {
+                    finish(held, &cqe, abandoned, resources, selected.as_mut());
+                }
+            });
+            if abandoned {
+                slot.reclaim(id);
+            } else {
+                slot.publish(id, cqe.res);
             }
         }
         completed
+    }
+}
+
+/// The home finishes the operation of `held` at its terminal event `cqe`, before its consumer
+/// takes the result, or before the home drops the resources of an abandoned operation.
+#[expect(unsafe_code, reason = "the kernel initialized the bytes that the result counts")]
+fn finish(held: &mut Held, cqe: &Cqe, abandoned: bool, resources: &mut Resources, selected: Option<&mut Selected>) {
+    if let Some(owned) = held.resource.and_then(|resource| resources.get(resource)) {
+        owned.running = owned.running.saturating_sub(1);
+    }
+    let count = usize::try_from(cqe.res);
+    match held.finish {
+        Finish::Nothing => {}
+        Finish::Received => {
+            if let (Ok(count), Some(buffer)) = (count, held.buffer.as_mut()) {
+                let len = buffer.initialized() + count;
+                // SAFETY: the receive named the capacity after the initialized bytes, and the
+                // kernel wrote `count` bytes there.
+                unsafe { buffer.set_initialized(len) };
+            }
+        }
+        Finish::Selected => {
+            if let Some(mut buffer) = cqe
+                .buffer()
+                .zip(selected)
+                .and_then(|(bid, selected)| selected.take(bid))
+            {
+                // SAFETY: the kernel wrote the bytes that the result counts at the start of the
+                // buffer that it selected.
+                unsafe { buffer.set_initialized(count.unwrap_or(0)) };
+                let lease = Lease::from(buffer);
+                if !abandoned {
+                    held.lease = Some(lease);
+                }
+            }
+        }
+        Finish::Accepted => {
+            if cqe.res >= 0 {
+                // SAFETY: the kernel gave a new descriptor that nothing else owns.
+                let fd = unsafe { OwnedFd::from_raw_fd(cqe.res) };
+                if !abandoned {
+                    held.accepted = resources.adopt(fd).ok();
+                }
+            }
+        }
     }
 }
 
@@ -526,12 +819,21 @@ impl AsFd for Driver {
 }
 
 impl Drop for Driver {
-    /// Ends each future: it gives the end of the driver. The resources of a running operation
-    /// leak, because the kernel can still use them; [`Driver::teardown`] ends the operations
-    /// first.
+    /// Ends each future: it gives [`Ended`]. The resources of a running operation leak, because the
+    /// kernel can still use them, and so do the provided buffers then; [`Driver::teardown`] ends
+    /// the operations first.
     fn drop(&mut self) {
+        let busy = self.table.busy();
         for entry in &self.shared.entries {
             entry.close();
+        }
+        if let Some(selected) = self.selected.take() {
+            if busy {
+                let _leaked = ManuallyDrop::new(selected);
+            } else {
+                // A failure leaves the ring registered, and then its memory leaks.
+                drop(selected.ring.unregister(&self.ring));
+            }
         }
     }
 }

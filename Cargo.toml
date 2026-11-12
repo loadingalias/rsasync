@@ -10,11 +10,15 @@ publish.workspace = true
 [features]
 default = ["std"]
 # Without `std`, the crate needs only `core` and `alloc`.
-std = ["rstypes/std"]
+std = ["rstypes/std", "dep:rsnetwork-udp"]
 
 [dependencies]
 # The shared types. Users reach them through this crate and never name it.
 rstypes = { path = "rstypes", version = "=0.1.0-alpha.1", default-features = false }
+
+# The socket-address declarations that the networking family shares, for the driver.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsnetwork-udp = { path = "rsnetwork-udp", version = "=0.1.0-alpha.1", optional = true }
 
 # The exploration tests (`cargo xtask explore`) use loom. A build without
 # `--cfg loom` compiles none of it.
@@ -26,7 +30,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = [".", "rstypes", "xtask"]
+members = [".", "rsnetwork-udp", "rstypes", "xtask"]
 
 # No `rust-version`: development requires the nightly pinned in
 # rust-toolchain.toml, which a release number cannot express.

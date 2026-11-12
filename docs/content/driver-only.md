@@ -1,10 +1,9 @@
 # Drive the I/O driver yourself
 
 An rsasync I/O driver can run with no scheduler: your code owns it and drives it. This page tells
-how to start a driver, drive it from your own loop or from the reactor of another host, and end it.
-The type is `rsasync::driver::Driver`. rsasync is in development and has no release. The driver
-has its full drive and teardown contract, but no public I/O operation yet: the operations, such
-as TCP, come in later changes and use this contract.
+how to start a driver, drive it from your own loop or from the reactor of another host, use TCP on
+it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development and has no
+release. The driver has TCP accept, receive, and send; the other operations come in later changes.
 
 The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It needs no helper
 thread: `Driver::helper_threads` gives 0.
@@ -54,6 +53,95 @@ Register the wake descriptor (`driver.as_fd()`) for readability with the reactor
 example epoll, kqueue, or the reactor of another runtime. When it reports the descriptor readable,
 turn the driver, and turn it again while `Turn::more()` gives `true`. The turn clears the
 descriptor, so the reactor reports it again only for new work.
+
+## Accept, receive, and send on TCP
+
+The driver owns each socket that it makes. `Driver::bind` binds a nonblocking socket and listens on
+it. `Driver::accept` gives the future of a connection: a `TcpStream` and the address of its peer.
+Each operation gives an `Operation` future. You poll it, and you turn the driver until it is ready.
+This helper does both:
+
+```rust
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
+
+use rsasync::driver::Driver;
+
+/// Polls `future` while the driver turns, until it gives its output.
+fn run<F: Future>(driver: &mut Driver, future: F) -> std::io::Result<F::Output> {
+    let mut future = pin!(future);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return Ok(output);
+        }
+        if !driver.turn()?.more() {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return Ok(output);
+            }
+            driver.wait()?;
+        }
+    }
+}
+```
+
+A receive takes an owned buffer by value, and the kernel writes into its capacity after its
+initialized bytes. The future gives the buffer back with the received bytes initialized, also
+after a failure. A send takes a lease, and the kernel reads its bytes. The future gives the lease
+back. Neither operation copies the bytes:
+
+```rust
+use rsasync::buffer::{Backing, Buffer as _, Lease};
+use rsasync::driver::{Config, Driver};
+
+let mut driver = Driver::new(Config::new())?;
+let listener = driver.bind("127.0.0.1:8080".parse()?)?;
+let accept = driver.accept(&listener)?;
+let (stream, peer) = run(&mut driver, accept)???;
+
+let receive = driver.recv(&stream, Backing::from(Vec::with_capacity(4096)))?;
+let (received, request) = run(&mut driver, receive)??;
+let count = received?;
+assert_eq!(request.bytes().len(), count);
+
+let send = driver.send(&stream, Lease::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()))?;
+let (sent, _response) = run(&mut driver, send)??;
+sent?;
+driver.close(stream)?;
+```
+
+The outer `Result` of each future is `Err(Ended)` only if the driver ended before the operation
+gave its result. A refused operation, for example when each operation slot is in use, gives its
+`Reason` and the buffer or lease back.
+
+### Receive with no buffer while you wait
+
+`Driver::provide` gives the slots of an `rsasync::buffer::Pool` to the kernel. Then
+`Driver::recv_selected` waits with no buffer, and the kernel takes a free slot only when the data
+comes. The future gives a `Lease` of the received bytes in that slot. When the last lease or view of
+the slot drops, on any thread, the slot goes back to the pool, and the next turn gives it to the
+kernel again:
+
+```rust
+use core::alloc::Layout;
+use core::num::{NonZeroU32, NonZeroU64};
+
+use rsasync::buffer::Pool;
+use rsasync::capacity::Budget;
+
+// The pool charges its memory to a budget: 64 slots of 4096 bytes.
+let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+let slot = Layout::from_size_align(4096, 4096)?;
+driver.provide(Pool::new(&budget, NonZeroU32::new(64).unwrap(), slot)?)?;
+let receive = driver.recv_selected(&stream)?;
+let request = run(&mut driver, receive)???;
+```
+
+If no slot is free when data comes, the receive ends with `ENOBUFS`.
+
+`Driver::close` closes a stream, and `Driver::close_listener` closes a listener. Each one refuses
+while an operation runs on the socket; its future must end first.
 
 ## Limits that you set
 

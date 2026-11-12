@@ -66,19 +66,24 @@ impl<T> Entry<T> {
         }
     }
 
-    /// The home starts the operation `id` of this slot with its resources.
-    pub(crate) fn start(&self, id: OpId, held: T) {
-        self.put(Some(held));
+    /// The home starts the operation `id` of this slot with its resources, and gives `f` the
+    /// resources in their place, for example to name their memory in a submission.
+    #[expect(unsafe_code, reason = "the home owns the cell of a slot that has no consumer")]
+    pub(crate) fn start<R>(&self, id: OpId, held: T, f: impl FnOnce(&mut T) -> R) -> R {
+        // SAFETY: the table gave the slot to a new operation: the consumer of its last operation
+        // took its resources or ended, and no consumer of `id` exists yet.
+        let output = self.held.with_mut(|cell| f(unsafe { &mut *cell }.insert(held)));
         // Release: a consumer that sees `READY` later also sees these resources.
         self.state.store(word(id, RUNNING), Ordering::Release);
+        output
     }
 
-    /// The home takes back the resources of an operation that it did not submit, so that no
-    /// consumer exists.
-    pub(crate) fn take_back(&self) -> Option<T> {
-        let held = self.take();
-        self.state.store(EMPTY, Ordering::Relaxed);
-        held
+    /// The home changes the resources of `id` while the operation runs: it alone owns them then.
+    #[expect(unsafe_code, reason = "the home owns the cell while the operation runs")]
+    pub(crate) fn update(&self, id: OpId, f: impl FnOnce(&mut Option<T>)) {
+        debug_assert_eq!(self.state.load(Ordering::Relaxed), word(id, RUNNING));
+        // SAFETY: the phase is `RUNNING`, so only the home uses the cell, and only on its thread.
+        self.held.with_mut(|cell| f(unsafe { &mut *cell }));
     }
 
     /// The home publishes the result of the terminal event of `id`, then wakes the consumer.
@@ -144,14 +149,6 @@ impl<T> Entry<T> {
             return Some(self.take().map(|held| (result, held)).ok_or(Gone));
         }
         (state != word(id, RUNNING)).then_some(Err(Gone))
-    }
-
-    /// Writes the cell.
-    #[expect(unsafe_code, reason = "the caller owns the cell by its phase")]
-    fn put(&self, held: Option<T>) {
-        // SAFETY: the home owns the cell of a slot that the table gave to a new operation: the
-        // consumer of the last operation of the slot took its resources or ended.
-        self.held.with_mut(|cell| unsafe { *cell = held });
     }
 
     /// Takes the resources out of the cell.

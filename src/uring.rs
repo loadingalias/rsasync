@@ -10,19 +10,21 @@
 //! The kernel reads and writes the head, tail, and flag words of the mapping while the ring exists.
 //! These words are hardware atomics in every build, because the other party is the kernel.
 
+mod buffers;
 mod sys;
 #[cfg(all(test, not(loom)))]
 mod table_tests;
 #[cfg(test)]
 mod tests;
 
-use core::ffi::{c_long, c_void};
+use core::ffi::{c_int, c_long, c_void};
 use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
+pub(crate) use buffers::BufferRing;
 pub(crate) use sys::{Cqe, Sqe};
 
 use crate::table::Event;
@@ -102,6 +104,56 @@ impl Sqe {
         Self { user_data, ..self }
     }
 
+    /// An accept on the listener `fd` (`IORING_OP_ACCEPT`). The kernel writes the peer address
+    /// into `address` and its length into `len`, and the new descriptor is nonblocking and closes
+    /// at an exec.
+    pub(crate) fn accept(fd: RawFd, address: *mut u8, len: *mut u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_ACCEPT,
+            fd,
+            addr: address.addr() as u64,
+            off: len.addr() as u64,
+            rw_flags: sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC,
+            ..Self::default()
+        }
+    }
+
+    /// A receive of up to `len` bytes from the socket `fd` into `buffer` (`IORING_OP_RECV`).
+    pub(crate) fn recv(fd: RawFd, buffer: *mut u8, len: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_RECV,
+            fd,
+            addr: buffer.addr() as u64,
+            len,
+            ..Self::default()
+        }
+    }
+
+    /// A receive from the socket `fd` into a buffer that the kernel selects from the provided
+    /// buffer ring of `group` when data comes (`IOSQE_BUFFER_SELECT`).
+    pub(crate) fn recv_selected(fd: RawFd, group: u16) -> Self {
+        Self {
+            opcode: sys::IORING_OP_RECV,
+            flags: sys::IOSQE_BUFFER_SELECT,
+            fd,
+            buf_index: group,
+            ..Self::default()
+        }
+    }
+
+    /// A send of `len` bytes from `buffer` on the socket `fd` (`IORING_OP_SEND`). A closed peer
+    /// gives `EPIPE` and no `SIGPIPE`.
+    pub(crate) fn send(fd: RawFd, buffer: *const u8, len: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_SEND,
+            fd,
+            addr: buffer.addr() as u64,
+            len,
+            rw_flags: sys::MSG_NOSIGNAL,
+            ..Self::default()
+        }
+    }
+
     /// A cancel of the request whose user data is `target` (`IORING_OP_ASYNC_CANCEL`). It cancels
     /// one request. Its own completion has the user data `user_data`.
     pub(crate) fn cancel(target: u64, user_data: u64) -> Self {
@@ -138,11 +190,18 @@ struct Mapping {
 }
 
 impl Mapping {
-    #[expect(
-        unsafe_code,
-        reason = "a new mapping of the ring changes no memory that Rust code uses"
-    )]
+    /// A shared mapping of the ring descriptor `fd`.
     fn new(fd: &OwnedFd, len: usize, offset: i64) -> io::Result<Self> {
+        Self::map(len, sys::MAP_SHARED | sys::MAP_POPULATE, fd.as_raw_fd(), offset)
+    }
+
+    /// New zero memory of `len` bytes that starts at a page boundary.
+    fn anonymous(len: usize) -> io::Result<Self> {
+        Self::map(len, sys::MAP_PRIVATE | sys::MAP_ANONYMOUS, -1, 0)
+    }
+
+    #[expect(unsafe_code, reason = "a new mapping changes no memory that Rust code uses")]
+    fn map(len: usize, flags: c_int, fd: RawFd, offset: i64) -> io::Result<Self> {
         // SAFETY: with no requested address, the kernel puts the mapping in unused address space,
         // so the call changes no memory that Rust code uses.
         let base = unsafe {
@@ -150,8 +209,8 @@ impl Mapping {
                 ptr::null_mut(),
                 len,
                 sys::PROT_READ | sys::PROT_WRITE,
-                sys::MAP_SHARED | sys::MAP_POPULATE,
-                fd.as_raw_fd(),
+                flags,
+                fd,
                 offset,
             )
         };
@@ -309,6 +368,13 @@ impl Ring {
         self.word(self.sq_flags).load(Ordering::Relaxed) & (sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW) != 0
     }
 
+    /// Whether the submission queue has a free entry for a push.
+    pub(crate) fn has_room(&self) -> bool {
+        self.sq_pushed
+            .wrapping_sub(self.word(self.sq_head).load(Ordering::Acquire))
+            < self.sq_entries
+    }
+
     /// The pushed entries that the kernel has not taken.
     pub(crate) fn unsubmitted(&self) -> u32 {
         self.sq_pushed
@@ -463,6 +529,12 @@ impl Iterator for Completions<'_> {
 }
 
 impl Cqe {
+    /// The buffer that the kernel selected from a provided buffer ring for this completion
+    /// (`IORING_CQE_F_BUFFER`).
+    pub(crate) fn buffer(&self) -> Option<u16> {
+        (self.flags & sys::IORING_CQE_F_BUFFER != 0).then_some((self.flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16)
+    }
+
     /// The completion in the terms of the operation table.
     pub(crate) fn event(&self) -> Event {
         Event {

@@ -39,6 +39,8 @@ pub(super) const ENOSYS: i32 = 38;
 pub(super) const PROT_READ: c_int = 0x1;
 pub(super) const PROT_WRITE: c_int = 0x2;
 pub(super) const MAP_SHARED: c_int = 0x01;
+pub(super) const MAP_PRIVATE: c_int = 0x02;
+pub(super) const MAP_ANONYMOUS: c_int = 0x20;
 pub(super) const MAP_POPULATE: c_int = 0x00_8000;
 
 pub(super) const IORING_SETUP_CQSIZE: u32 = 1 << 3;
@@ -73,8 +75,11 @@ pub(super) const IOU_PBUF_RING_INC: u16 = 2;
 pub(super) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
 pub(super) const IORING_OP_NOP: u8 = 0;
+pub(super) const IORING_OP_ACCEPT: u8 = 13;
 pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
 pub(super) const IORING_OP_READ: u8 = 22;
+pub(super) const IORING_OP_SEND: u8 = 26;
+pub(super) const IORING_OP_RECV: u8 = 27;
 pub(super) const IORING_OP_MSG_RING: u8 = 40;
 /// Linux 6.7.
 pub(super) const IORING_OP_WAITID: u8 = 50;
@@ -87,8 +92,19 @@ pub(super) const IORING_OP_LISTEN: u8 = 57;
 /// Linux 6.15.
 pub(super) const IORING_OP_RECV_ZC: u8 = 58;
 
+pub(super) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+
+pub(super) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+pub(super) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 pub(super) const IORING_CQE_F_MORE: u32 = 1 << 1;
 pub(super) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
+
+/// `MSG_NOSIGNAL` (`include/linux/socket.h`): a send to a closed peer gives `EPIPE` and raises no
+/// `SIGPIPE`.
+pub(super) const MSG_NOSIGNAL: u32 = 0x4000;
+/// `SOCK_NONBLOCK` and `SOCK_CLOEXEC` (`include/linux/net.h`): `O_NONBLOCK` and `O_CLOEXEC`.
+pub(super) const SOCK_NONBLOCK: u32 = 0o4_000;
+pub(super) const SOCK_CLOEXEC: u32 = 0o2_000_000;
 
 /// The command of `IORING_OP_MSG_RING` that posts `len` and `off` as a completion of the target.
 pub(super) const IORING_MSG_DATA: u64 = 0;
@@ -207,6 +223,14 @@ impl Probe {
         }; PROBE_OPS as usize],
     };
 }
+
+/// `struct io_uring_buf`: one buffer of a provided buffer ring, 16 bytes. Its last field, `resv`,
+/// overlays the tail of the ring in the first entry, so the driver never writes it.
+pub(super) const BUF_SIZE: usize = 16;
+pub(super) const BUF_LEN: usize = 8;
+pub(super) const BUF_BID: usize = 12;
+/// The byte offset of the tail in `struct io_uring_buf_ring`.
+pub(super) const BUF_RING_TAIL: usize = 14;
 
 /// `struct io_uring_buf_reg`. Linux 6.4 renamed `pad` to `flags`.
 #[repr(C)]

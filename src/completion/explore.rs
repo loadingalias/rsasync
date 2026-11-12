@@ -44,7 +44,7 @@ fn a_consumer_on_another_thread_takes_the_published_result() {
     model(|| {
         let id = operation();
         let entry = Arc::new(Entry::new());
-        entry.start(id, 7_u8);
+        entry.start(id, 7_u8, |_| ());
         let consumer = {
             let entry = Arc::clone(&entry);
             thread::spawn(move || take(&entry, id))
@@ -61,7 +61,7 @@ fn a_driver_that_ends_wakes_its_consumer_and_one_of_the_two_takes_the_resources(
     model(|| {
         let id = operation();
         let entry = Arc::new(Entry::new());
-        entry.start(id, 7_u8);
+        entry.start(id, 7_u8, |_| ());
         let consumer = {
             let entry = Arc::clone(&entry);
             thread::spawn(move || take(&entry, id))

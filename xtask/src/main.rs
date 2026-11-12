@@ -67,7 +67,7 @@ target/model/.
 const NO_STD_TARGET: &str = "wasm32v1-none";
 
 /// The packages whose library builds without `std`.
-const NO_STD_PACKAGES: &[&str] = &["rstypes", "rsasync"];
+const NO_STD_PACKAGES: &[&str] = &["rstypes", "rsasync", "rsnetwork-udp"];
 
 /// The keywords of a TLC configuration file.
 const TLC_KEYWORDS: &[&str] = &[
