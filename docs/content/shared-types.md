@@ -108,3 +108,7 @@ the tests without the feature, so a test that uses `std` with no gate fails it.
 rustup target add wasm32v1-none   # when rustup did not install it with the toolchain
 cargo build --locked -p rstypes --no-default-features --target wasm32v1-none
 ```
+
+The build of `rstypes` without `std` also compiles for `wasm32-unknown-unknown`, and its tests run on
+`wasm32-wasip1` in Wasmtime. [WebAssembly](platform-support.md#webassembly) gives the commands and
+the limits.
