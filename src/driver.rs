@@ -626,8 +626,8 @@ impl Driver {
     ///
     /// # Errors
     ///
-    /// A failure of the kernel entry other than an interrupt or a full completion queue, which
-    /// leave work for the next turn.
+    /// A failure of the kernel entry other than an interrupt or a full queue, which leave work for
+    /// the next turn.
     #[expect(unsafe_code, reason = "a poll names no memory")]
     pub fn wait(&mut self) -> io::Result<()> {
         // Another thread writes the interrupt descriptor for a request or a wake. The poll of the
@@ -635,8 +635,12 @@ impl Driver {
         if !self.waking {
             let poll = Sqe::poll_readable(self.shared.interrupt.as_raw_fd()).with_user_data(WAKE);
             // SAFETY: a poll names no memory.
-            unsafe { push_now(&mut self.ring, &poll) }?;
-            self.waking = true;
+            match unsafe { push_now(&mut self.ring, &poll) } {
+                Ok(()) => self.waking = true,
+                // A full queue leaves work for the next turn.
+                Err(error) if retryable(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            }
         }
         loop {
             match self.ring.submit(1) {
