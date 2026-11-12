@@ -17,7 +17,13 @@ extern crate std;
 
 mod sync;
 
-#[cfg(all(target_os = "linux", feature = "std"))]
+// The io_uring declarations are checked against the kernel headers of these two architectures
+// only. Another architecture has different constants, so it gets no ring.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "std"
+))]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the tests use the ring now; the driver is its first other user")
