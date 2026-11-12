@@ -41,7 +41,10 @@
 //!
 //! The condition itself needs no ordering of its own for this argument: the changes of `state`
 //! carry it. A publisher must change the condition before it calls [`Waiter::wake`], and a waiter
-//! must recheck the condition after [`Waiter::register`].
+//! must recheck the condition after [`Waiter::register`]. A condition that also publishes data,
+//! such as a result in a cell, needs its own `Release` store and `Acquire` load:
+//! [`Waiter::poll_wait`] and [`Waiter::wait`] check the condition one time before any change of
+//! `state`, so that check has no order from `state`.
 //!
 //! The module has no documentation for users: it is private, and each channel, permit wait, and
 //! one-shot documents its own waits.
