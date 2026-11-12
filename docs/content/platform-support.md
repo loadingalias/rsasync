@@ -36,9 +36,9 @@ owned buffer and into a buffer that the kernel selects; and send from a lease. T
 owned buffer and the send from a lease keep the addresses of their buffers and allocate nothing
 for each operation. Only the driver and `rsnetwork-udp` make system calls: the io_uring ring and
 its waits in the kernel, its two event descriptors, the bind and listen of a TCP socket through
-`std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs on musl, and that these
-calls work through the system calls of musl. It does not show that a runtime with a scheduler
-works on musl: the library has no scheduler yet. From the Linux driver stage on, each stage exit
+`std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
+on musl, and that these calls work through the system calls of musl. It does not show that a
+runtime with a scheduler works on musl: the library has no scheduler yet. From the Linux driver stage on, each stage exit
 also runs the tests on x86_64 and aarch64 Linux hosts with both C libraries. This page then names
 each operation that has that evidence.
 
