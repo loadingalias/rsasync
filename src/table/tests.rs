@@ -1,10 +1,7 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::alloc::{GlobalAlloc, Layout};
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::num::NonZeroU64;
-use std::alloc::System;
-use std::thread;
 
 use super::{Ended, Event, Full, Outcome, Request, Shape, Table, Taken};
 use crate::capacity::{Budget, Permit};
@@ -107,8 +104,8 @@ fn taken(table: &mut Table<Recorded>) -> Vec<Taken<Recorded>> {
     taken
 }
 
-/// A consumer on another thread ends its interest while the operation runs: the buffer and the
-/// charge stay until the terminal completion.
+/// The consumer ends its interest while the operation runs: the buffer and the charge stay until
+/// the terminal completion. A post from another thread does the same (`posting_a_request_never_allocates`).
 #[test]
 fn interest_that_ends_first_releases_the_buffer_and_charge_at_the_terminal_completion() {
     let (log, budget) = (Log::default(), budget());
@@ -116,10 +113,7 @@ fn interest_that_ends_first_releases_the_buffer_and_charge_at_the_terminal_compl
     let id = table
         .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
         .unwrap();
-    let requests = table.requests();
-    thread::spawn(move || requests.post(id, Request::EndInterest))
-        .join()
-        .unwrap();
+    table.requests().post(id, Request::EndInterest);
     assert!(taken(&mut table).is_empty());
     assert_eq!(budget.available(), 100 - CHARGE);
 
@@ -301,61 +295,74 @@ fn a_dropped_table_leaks_the_resources_that_the_kernel_can_still_use() {
     assert_eq!(budget.available(), 100 - 2 * CHARGE);
 }
 
-/// The allocations of the current thread.
-struct Counting;
+/// The allocation test needs threads and the system allocator.
+#[cfg(feature = "std")]
+mod allocations {
+    use alloc::vec::Vec;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::Cell;
+    use std::alloc::System;
+    use std::thread;
 
-std::thread_local! {
-    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
-}
+    use super::{Log, Recorded, apply, budget, done, taken};
+    use crate::table::{Request, Shape, Table, Taken};
 
-#[expect(
-    unsafe_code,
-    reason = "the test allocator counts each allocation and forwards it to the system allocator"
-)]
-// SAFETY: each method forwards its arguments to the system allocator, which meets the contract.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.set(ALLOCATIONS.get() + 1);
-        // SAFETY: the caller meets the contract of `alloc`.
-        unsafe { System.alloc(layout) }
+    /// The allocations of the current thread.
+    struct Counting;
+
+    std::thread_local! {
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: the caller meets the contract of `dealloc`.
-        unsafe { System.dealloc(ptr, layout) }
+    #[expect(
+        unsafe_code,
+        reason = "the test allocator counts each allocation and forwards it to the system allocator"
+    )]
+    // SAFETY: each method forwards its arguments to the system allocator, which meets the contract.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
+            // SAFETY: the caller meets the contract of `alloc`.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: the caller meets the contract of `dealloc`.
+            unsafe { System.dealloc(ptr, layout) }
+        }
     }
-}
 
-#[global_allocator]
-static COUNTING: Counting = Counting;
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
 
-/// A post from another thread allocates nothing, and the home gets both requests.
-#[test]
-fn posting_a_request_never_allocates() {
-    let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(2);
-    let _other = table
-        .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
+    /// A post from another thread allocates nothing, and the home gets both requests.
+    #[test]
+    fn posting_a_request_never_allocates() {
+        let (log, budget) = (Log::default(), budget());
+        let mut table = Table::new(2);
+        let _other = table
+            .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
+            .unwrap();
+        let id = table
+            .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
+            .unwrap();
+        let requests = table.requests();
+        let (counted, allocations) = thread::spawn(move || {
+            // The counter sees an allocation of this thread.
+            let before = ALLOCATIONS.get();
+            drop(Vec::<u8>::with_capacity(1));
+            let counted = ALLOCATIONS.get() - before;
+            let before = ALLOCATIONS.get();
+            requests.post(id, Request::Cancel);
+            requests.post(id, Request::EndInterest);
+            (counted, ALLOCATIONS.get() - before)
+        })
+        .join()
         .unwrap();
-    let id = table
-        .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
-        .unwrap();
-    let requests = table.requests();
-    let (counted, allocations) = thread::spawn(move || {
-        // The counter sees an allocation of this thread.
-        let before = ALLOCATIONS.get();
-        drop(Vec::<u8>::with_capacity(1));
-        let counted = ALLOCATIONS.get() - before;
-        let before = ALLOCATIONS.get();
-        requests.post(id, Request::Cancel);
-        requests.post(id, Request::EndInterest);
-        (counted, ALLOCATIONS.get() - before)
-    })
-    .join()
-    .unwrap();
-    assert_eq!((counted, allocations), (1, 0));
-    assert!(matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id));
-    assert!(table.claim(id).is_none(), "the end of interest applied");
-    apply(table.complete(id.user_data(), done(0)), &log);
-    assert_eq!(log.take(), ["abandoned", "released"]);
+        assert_eq!((counted, allocations), (1, 0));
+        assert!(matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id));
+        assert!(table.claim(id).is_none(), "the end of interest applied");
+        apply(table.complete(id.user_data(), done(0)), &log);
+        assert_eq!(log.take(), ["abandoned", "released"]);
+    }
 }
