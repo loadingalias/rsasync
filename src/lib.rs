@@ -17,6 +17,13 @@ extern crate std;
 
 mod sync;
 
+#[cfg(all(target_os = "linux", feature = "std"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the tests use the ring now; the driver is its first other user")
+)]
+mod uring;
+
 // By name, not `*`: a module of this crate with one of these names is then a
 // compile error, not a module that hides the shared one.
 #[doc(inline)]

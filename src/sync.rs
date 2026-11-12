@@ -1,5 +1,7 @@
 //! The memory-model substitution point. Each atomic, reference count, shared cell, and thread park
-//! of this crate comes from this module, so one algorithm runs in each form:
+//! of this crate comes from this module, so one algorithm runs in each form. The one exception is
+//! the words of an io_uring ring that the kernel also reads and writes: they are hardware atomics
+//! in each form.
 //!
 //! - Native: the `core` atomics, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, and, with the
 //!   `std` feature, `std::thread` for parking.

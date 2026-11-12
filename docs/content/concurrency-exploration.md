@@ -34,10 +34,14 @@ The search also finds each import with braces, such as `use core::{...}`, becaus
 can name `sync` on a later line. It also finds the test modules that are not in a `tests.rs`
 file, and the doc examples. Examine each line that it finds.
 
-The search finds one exception: the `alloc::sync::Arc` of a trait object in
-`rstypes/src/buffer.rs`, which holds the owner of `Lease::from_owner`. The loom `Arc` cannot hold
-a trait object. That count only drops the owner, and the exploration of `rstypes` sees no
-algorithm in it.
+The search finds two exceptions:
+
+- The `alloc::sync::Arc` of a trait object in `rstypes/src/buffer.rs`, which holds the owner of
+  `Lease::from_owner`. The loom `Arc` cannot hold a trait object. That count only drops the owner,
+  and the exploration of `rstypes` sees no algorithm in it.
+- The `core::sync::atomic` import in `src/uring.rs`. The kernel also reads and writes the head,
+  tail, and flag words of an io_uring ring, so they are hardware atomics in each form. The tests
+  of the ring run on a Linux kernel, not in loom.
 
 ## Write an exploration test
 
