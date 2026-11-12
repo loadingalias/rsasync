@@ -1,6 +1,13 @@
 use core::mem::{offset_of, size_of};
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
+mod control;
+#[cfg(feature = "std")]
+pub(crate) mod io;
+pub mod sys;
+
+pub use control::{Control, Ecn, Metadata, Transmit};
+
 /// The address family of IPv4 (`AF_INET`).
 pub const AF_INET: u16 = 2;
 /// The address family of IPv6 (`AF_INET6`).
@@ -56,6 +63,33 @@ impl SockAddrStorage {
     /// The size of the storage, as the kernel takes it in a `socklen_t`.
     pub const LEN: u32 = 128;
 
+    /// Storage that holds `address`, and the length of that address, as a call takes them.
+    #[must_use]
+    pub fn new(address: SocketAddr) -> (Self, u32) {
+        let mut storage = Self::EMPTY;
+        match address {
+            SocketAddr::V4(address) => {
+                storage.write(SockAddrIn {
+                    sin_family: AF_INET,
+                    sin_port: address.port().to_be(),
+                    sin_addr: address.ip().octets(),
+                    sin_zero: [0; 8],
+                });
+                (storage, 16)
+            }
+            SocketAddr::V6(address) => {
+                storage.write(SockAddrIn6 {
+                    sin6_family: AF_INET6,
+                    sin6_port: address.port().to_be(),
+                    sin6_flowinfo: address.flowinfo().to_be(),
+                    sin6_addr: address.ip().octets(),
+                    sin6_scope_id: address.scope_id(),
+                });
+                (storage, 28)
+            }
+        }
+    }
+
     /// The address that the kernel wrote, with the length that it gave. `None` for another
     /// family, or for a length that is too short for its family.
     #[must_use]
@@ -80,6 +114,14 @@ impl SockAddrStorage {
             }
             _ => None,
         }
+    }
+
+    /// Writes `address` at the start of the storage.
+    #[expect(unsafe_code, reason = "the storage holds the bytes of each socket address")]
+    fn write<A: Address>(&mut self, address: A) {
+        // SAFETY: `A` is a socket address, which is smaller than the storage and needs no more
+        // alignment.
+        unsafe { core::ptr::from_mut(self).cast::<A>().write(address) };
     }
 
     /// The bytes of the storage as the address type `A`.

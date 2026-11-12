@@ -1,10 +1,20 @@
 [package]
 name = "rsnetwork-udp"
 version = "0.1.0-alpha.2"
-description = "The system declarations of socket addresses, datagram calls, and control messages that the networking family and its runtimes share."
+description = "Datagram I/O on any socket that the caller owns, with segmentation offload, ECN, packet information, and truncation, and the system declarations that the networking family and its runtimes share."
 repository = "https://github.com/loadingalias/rsasync"
 edition.workspace = true
 license.workspace = true
+
+[features]
+default = ["std"]
+# The datagram calls on a socket. Without `std`, the crate has only its
+# declarations and its control-message encoding, which need only `core`.
+std = []
+
+# The tests of datagram I/O through a socket that Tokio owns.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio = { version = "1.54.1", default-features = false, features = ["net", "rt"] }
 
 [lints]
 workspace = true
