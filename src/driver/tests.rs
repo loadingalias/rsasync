@@ -1,6 +1,6 @@
 use alloc::task::Wake;
 use core::alloc::Layout;
-use core::ffi::c_int;
+use core::ffi::{c_int, c_short, c_ulong};
 use core::future::Future;
 use core::mem::{self, ManuallyDrop};
 use core::num::{NonZeroU32, NonZeroU64};
@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::fs::File;
 use std::io::{ErrorKind, Read as _, Write as _};
-use std::os::fd::{FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, Thread};
 use std::vec::Vec;
@@ -21,10 +21,41 @@ use crate::capacity::Budget;
 use crate::completion::Gone;
 use crate::uring::Sqe;
 
-#[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
+#[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
 unsafe extern "C" {
     /// `int pipe2(int pipefd[2], int flags)`.
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+    /// `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`, with `nfds_t` an
+    /// `unsigned long`.
+    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
+}
+
+/// `struct pollfd` (`poll.h` of glibc and musl), and `POLLIN`
+/// (`include/uapi/asm-generic/poll.h`).
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: c_short,
+    revents: c_short,
+}
+const POLLIN: c_short = 0x1;
+
+const _: () = {
+    assert!(size_of::<PollFd>() == 8);
+    assert!(core::mem::offset_of!(PollFd, events) == 4);
+};
+
+/// Blocks until the wake descriptor of `driver` is readable, as the reactor of a host waits for
+/// it.
+#[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
+fn wait_readable(driver: &Driver) {
+    let mut fd = PollFd {
+        fd: driver.as_fd().as_raw_fd(),
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `fd` is one valid `pollfd` during the call.
+    assert_eq!(unsafe { poll(&raw mut fd, 1, -1) }, 1);
 }
 
 /// `O_NONBLOCK` and `O_CLOEXEC` (`include/uapi/asm-generic/fcntl.h`).
@@ -249,8 +280,8 @@ fn a_turn_stops_at_its_bound_and_reports_the_remaining_work() {
 }
 
 /// With the task-run flag set and no entry to submit, a turn enters the kernel, which runs the
-/// deferred work, and the pending read completes. The write wakes the poll of the read, which
-/// queues the deferred work and sets the flag before the write returns.
+/// deferred work, and the pending read completes. The test waits for the wake descriptor, as a
+/// host reactor does, because `Driver::wait` runs the deferred work itself.
 #[test]
 fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     let (log, budget) = (Log::default(), budget());
@@ -259,6 +290,7 @@ fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     let future = read(&mut driver, reader, held(&log, &budget));
     driver.turn().unwrap();
     writer.write_all(b"x").unwrap();
+    wait_readable(&driver);
     assert!(driver.ring.task_run_pending());
     assert_eq!(driver.ring.unsubmitted(), 0);
     assert_eq!(driver.turn().unwrap().completed(), 1);
@@ -274,6 +306,30 @@ fn a_wake_from_another_thread_ends_a_wait() {
     let waker = thread::spawn(move || wake.wake());
     driver.wait().unwrap();
     waker.join().unwrap();
+}
+
+/// A completion during a wait adds no other completion. The poll that a wait keeps in the ring
+/// watches a descriptor that only the other threads signal, not the wake descriptor, which the
+/// kernel signals at each completion.
+#[test]
+fn a_completion_during_a_wait_adds_no_other_completion() {
+    let (log, budget) = (Log::default(), budget());
+    let mut driver = driver(Config::new());
+    let (reader, mut writer) = pipe();
+    let future = read(&mut driver, reader, held(&log, &budget));
+    driver.turn().unwrap();
+    writer.write_all(b"x").unwrap();
+    driver.wait().unwrap();
+    let mut completed = 0;
+    loop {
+        let turn = driver.turn().unwrap();
+        completed += turn.completed();
+        if !turn.more() {
+            break;
+        }
+    }
+    assert_eq!(completed, 1);
+    assert!(matches!(block_on(future), Ok((1, _))));
 }
 
 /// Teardown cancels a read that gets no data, returns after the completion of the read, closes

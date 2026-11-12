@@ -630,8 +630,10 @@ impl Driver {
     /// the next turn.
     #[expect(unsafe_code, reason = "a poll names no memory")]
     pub fn wait(&mut self) -> io::Result<()> {
-        // Another thread writes the interrupt descriptor for a request or a wake. The poll of the
-        // descriptor in the ring then completes, which ends the wait.
+        // A wait in the kernel ends only at a completion, so a request or a wake from another
+        // thread, which only writes a descriptor, would not end it. That thread also writes the
+        // interrupt descriptor, and the poll of it in the ring then completes. The poll does not
+        // watch the wake descriptor, because the kernel signals that one at each completion.
         if !self.waking {
             let poll = Sqe::poll_readable(self.shared.interrupt.as_raw_fd()).with_user_data(WAKE);
             // SAFETY: a poll names no memory.
