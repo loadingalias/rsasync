@@ -9,7 +9,7 @@ use std::os::fd::OwnedFd;
 use rsnetwork_udp::SockAddrStorage;
 
 use super::{Driver, Finish, Held, Operation, Reason, Refused, Resource};
-use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease};
+use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use crate::uring::Sqe;
 
 /// A listening TCP socket that a driver owns.
@@ -100,7 +100,7 @@ impl Driver {
     pub fn recv(
         &mut self,
         stream: &TcpStream,
-        mut buffer: Backing,
+        buffer: Backing,
     ) -> Result<Operation<(io::Result<usize>, Backing)>, Refused<Backing>> {
         let Some(fd) = self.fd(stream.resource) else {
             return Err(Refused {
@@ -108,20 +108,26 @@ impl Driver {
                 value: buffer,
             });
         };
-        let start = buffer.initialized();
-        let len = u32::try_from(buffer.capacity() - start).unwrap_or(u32::MAX);
-        // The address of the buffer stays the same when the buffer moves into the resources.
-        let entry = Sqe::recv(fd, buffer.as_mut_ptr().wrapping_add(start), len);
-        let held = |buffer| Held {
-            buffer: Some(buffer),
+        // The kernel writes into the loan, and the terminal event records its extent.
+        let mut loan = WriteLoan::new(buffer);
+        let len = u32::try_from(loan.capacity()).unwrap_or(u32::MAX);
+        // The address of the loan stays the same when the loan moves into the resources.
+        let entry = Sqe::recv(fd, loan.as_mut_ptr(), len);
+        let held = |loan| Held {
+            loan: Some(loan),
             finish: Finish::Received,
             ..Held::default()
         };
-        // SAFETY: the entry names the capacity of the buffer, which the resources keep, and the
+        // SAFETY: the entry names the capacity of the loan, which the resources keep, and the
         // stream.
-        let completion = unsafe { self.submit(buffer, Some(stream.resource), held, |_| entry, true) }?;
+        let completion = unsafe { self.submit(loan, Some(stream.resource), held, |_| entry, true) }.map_err(
+            |refused: Refused<WriteLoan<Backing>>| Refused {
+                reason: refused.reason,
+                value: refused.value.into_inner(),
+            },
+        )?;
         Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.buffer?))
+            Some((count(result), held.loan?.into_inner()))
         }))
     }
 

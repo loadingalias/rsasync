@@ -40,9 +40,13 @@ impl Completion {
 impl Future for Completion {
     type Output = Result<(i32, Held), Gone>;
 
+    #[expect(
+        clippy::panic,
+        reason = "a poll after `Ready` breaks the contract of `Future`, and the caller has no recovery path"
+    )]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.done {
-            return Poll::Ready(Err(Gone));
+            panic!("an `Operation` was polled after it gave `Ready`");
         }
         let id = self.id;
         let Some(entry) = self.entry() else {

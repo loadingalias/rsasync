@@ -29,13 +29,17 @@ Each command runs the tests of the whole workspace. Only the glibc run includes 
 
 Today, the tests check the repository tools, the shared types, and the io_uring ring of the Linux
 driver: ring creation, a message from one ring to another, the probes of kernel features, the
-operation table with the completions of the kernel, and the driver-only surface (turns, waits,
-wakes, and teardown). The ring is the only part of the library that
-makes system calls. Thus a pass shows that the build
-links and runs on musl, and that the ring works through the system calls of musl. It does not show
-that a runtime operation works on musl. From the Linux driver stage on, each stage exit also runs
-the tests on x86_64 and aarch64 Linux hosts with both C libraries. This page then names each
-operation that has that evidence.
+operation table with the completions of the kernel, the driver-only surface (turns, waits, wakes,
+and teardown), and TCP on the driver. The TCP tests bind, listen, and accept; receive into an
+owned buffer and into a buffer that the kernel selects; and send from a lease. The receive into an
+owned buffer and the send from a lease keep the addresses of their buffers and allocate nothing
+for each operation. The driver is the only part of the library that makes system calls: the
+io_uring ring and its waits in the kernel, its two event descriptors, and the bind and listen of a
+TCP socket through `std`. Thus a pass shows that the build links and runs on musl, and that these
+calls work through the system calls of musl. It does not show that a runtime with a scheduler
+works on musl: the library has no scheduler yet. From the Linux driver stage on, each stage exit
+also runs the tests on x86_64 and aarch64 Linux hosts with both C libraries. This page then names
+each operation that has that evidence.
 
 ## WebAssembly
 

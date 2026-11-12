@@ -16,7 +16,7 @@ use std::thread::{self, Thread};
 use std::vec::Vec;
 
 use super::{Completion, Config, Driver, Held, Reason, Refused};
-use crate::buffer::{Backing, Buffer as _, BufferMut, Lease, Pool, Release, WriteLoan};
+use crate::buffer::{Backing, Buffer as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
 use crate::uring::Sqe;
@@ -133,15 +133,15 @@ fn driver(config: Config) -> Driver {
     Driver::new(config).expect("the test host allows io_uring")
 }
 
-/// Submits a read of the pipe `fd`, which the driver then owns, into the buffer of `held`.
+/// Submits a read of the pipe `fd`, which the driver then owns, into the loan of `held`.
 #[expect(unsafe_code, reason = "the read names the buffer of its resources")]
 fn read(driver: &mut Driver, fd: OwnedFd, mut held: Held) -> Completion {
     let resource = driver.adopt(fd).expect("the test driver has a free resource slot");
     let fd = driver.fd(resource).expect("the driver owns the pipe");
-    let buffer = held.buffer.as_mut().expect("a read has a buffer");
-    let len = u32::try_from(buffer.capacity()).expect("a test buffer is small");
-    let entry = Sqe::read(fd, buffer.as_mut_ptr(), len);
-    // SAFETY: the buffer of `held` keeps its address while `held` moves, and the pipe is a resource
+    let loan = held.loan.as_mut().expect("a read has a loan");
+    let len = u32::try_from(loan.capacity()).expect("a test buffer is small");
+    let entry = Sqe::read(fd, loan.as_mut_ptr(), len);
+    // SAFETY: the loan of `held` keeps its address while `held` moves, and the pipe is a resource
     // of the driver.
     unsafe { driver.submit(held, Some(resource), |held| held, |_| entry, true) }.expect("the test driver has room")
 }
@@ -190,7 +190,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn held(log: &Log, budget: &Budget) -> Held {
     Held {
-        buffer: Some(recorded(log, 16)),
+        loan: Some(WriteLoan::new(recorded(log, 16))),
         charge: Some(budget.reserve(10).expect("the test budget has room")),
         ..Held::default()
     }
@@ -381,12 +381,25 @@ fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     else {
         panic!("a full driver refuses");
     };
-    assert!(held.buffer.is_some());
+    assert!(held.loan.is_some());
     assert_eq!(budget.available(), 90);
     drop(held);
     assert_eq!(taken(&log), ["released"]);
     assert_eq!(budget.available(), 100);
     drop(running);
+}
+
+/// A future polled after it gave `Ready` panics, as the futures of the standard library do. It
+/// does not report that the driver ended, which it did not.
+#[test]
+#[should_panic(expected = "polled after it gave `Ready`")]
+#[expect(unsafe_code, reason = "a no-op names no memory")]
+fn a_poll_after_ready_panics() {
+    let mut driver = driver(Config::new());
+    // SAFETY: a no-op names no memory.
+    let mut nop = unsafe { driver.submit((), None, |()| Held::default(), |_| Sqe::nop(), false) }.unwrap();
+    drive(&mut driver, &mut nop).unwrap();
+    drop(Pin::new(&mut nop).poll(&mut Context::from_waker(Waker::noop())));
 }
 
 /// Turns the driver and polls `future` on the home thread, until it gives its output. It polls

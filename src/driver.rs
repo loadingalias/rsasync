@@ -58,7 +58,7 @@ use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd
 
 use rsnetwork_udp::SockAddrStorage;
 
-use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool};
+use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
 use crate::capacity::Permit;
 use crate::sync::Arc;
 use crate::table::{CONTROL, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
@@ -164,7 +164,10 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// The completions that the turn gave to their operations.
+    /// The completions that the turn took from the ring, which the bound of the turn counts.
+    /// They include the completions of the driver itself, such as the result of a cancel and the
+    /// end of the poll of its interrupt descriptor, so the count can exceed the operations that
+    /// the turn ended.
     #[must_use]
     pub const fn completed(self) -> u32 {
         self.completed
@@ -207,7 +210,8 @@ impl WakeHandle {
 /// operation.
 #[derive(Debug, Default)]
 pub(crate) struct Held {
-    pub(crate) buffer: Option<Backing>,
+    /// The loan of the buffer that a receive or a read fills.
+    pub(crate) loan: Option<WriteLoan<Backing>>,
     pub(crate) lease: Option<Lease>,
     #[cfg_attr(
         any(not(test), loom),
@@ -230,7 +234,7 @@ pub(crate) struct Held {
 pub(crate) enum Finish {
     #[default]
     Nothing,
-    /// The result counts the bytes that the kernel wrote after the initialized bytes of `buffer`.
+    /// The result counts the bytes that the kernel wrote into `loan`.
     Received,
     /// The kernel selected a buffer of the provided ring, which becomes `lease`.
     Selected,
@@ -299,6 +303,10 @@ impl core::error::Error for Ended {}
 /// The future of one operation. It can move to another thread while the driver stays driven, and
 /// it wakes the waker of its latest poll. A drop ends the interest, not the operation: the driver
 /// keeps the buffer until the kernel releases it.
+///
+/// # Panics
+///
+/// A poll after the future gave `Ready` panics, as for the futures of the standard library.
 pub struct Operation<T> {
     completion: Completion,
     output: fn(i32, Held) -> Option<T>,
@@ -808,11 +816,10 @@ fn finish(held: &mut Held, cqe: &Cqe, abandoned: bool, resources: &mut Resources
     match held.finish {
         Finish::Nothing => {}
         Finish::Received => {
-            if let (Ok(count), Some(buffer)) = (count, held.buffer.as_mut()) {
-                let len = buffer.initialized() + count;
-                // SAFETY: the receive named the capacity after the initialized bytes, and the
-                // kernel wrote `count` bytes there.
-                unsafe { buffer.set_initialized(len) };
+            if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
+                // SAFETY: the receive named the capacity of the loan, and the kernel wrote `count`
+                // bytes at its start, at most that capacity.
+                unsafe { loan.set_filled(count) };
             }
         }
         Finish::Selected => {

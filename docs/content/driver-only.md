@@ -19,7 +19,7 @@ it.
 | Call | What it does |
 | --- | --- |
 | `Driver::new(Config)` | Starts the driver and allocates its bounded memory one time. It gives `Error::Refused` if the kernel or its policy refuses io_uring, for example in a container with the default seccomp profile |
-| `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and gives up to `Config::completions_per_turn` completions to their futures |
+| `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and takes up to `Config::completions_per_turn` completions from the ring. It gives the completion of each operation to its future. The bound and `Turn::completed()` also count the completions of the driver itself, such as cancel results |
 | `Turn::more()` | Work remains. Turn again before you wait |
 | `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. The kernel runs its deferred work during the wait |
 | The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread. Some kernels signal deferred work only one time; see [Drive it from another reactor](#drive-it-from-another-reactor) |
@@ -121,7 +121,8 @@ driver.close(stream)?;
 ```
 
 The outer `Result` of each future is `Err(Ended)` only if the driver ended before the operation
-gave its result. A refused operation, for example when each operation slot is in use, gives its
+gave its result. A poll of a future after it gave its output panics, as for the futures of the
+standard library. A refused operation, for example when each operation slot is in use, gives its
 `Reason` and the buffer or lease back.
 
 ### Receive with no buffer while you wait
