@@ -1,11 +1,13 @@
 # Check the design models
 
-rsasync has a TLA+ model of its operation ownership rules:
-[`models/operation-ownership/`](../../models/operation-ownership/README.md). It checks that an
-operation keeps one home driver from its submission to its terminal release while its consumer
-moves between workers, drops, forgets, or cancels its future. It checks close, shutdown, and the
-detached debt of a zero-copy send, with the kernel events of io_uring and IOCP. The model checks
-the design, not the Rust code. Change the model when you change one of these rules.
+rsasync has two TLA+ models of its design rules:
+
+| Model | What it checks |
+| --- | --- |
+| [`models/operation-ownership/`](../../models/operation-ownership/README.md) | An operation keeps one home driver from its submission to its terminal release while its consumer moves between workers, drops, forgets, or cancels its future. Close, shutdown, and the detached debt of a zero-copy send, with the kernel events of io_uring and IOCP |
+| [`models/task-lifecycle/`](../../models/task-lifecycle/README.md) | A spawn reserves a task slot before it admits the task. One owner polls a task, and a local task stays on its home. A wake from any thread, also from a signal handler, reaches its task, and a stale wake has no effect. Cancellation at a poll boundary, block_on, and shutdown |
+
+A model checks the design, not the Rust code. Change a model when you change one of its rules.
 
 ## Install the checkers
 
@@ -31,8 +33,10 @@ present, it stops and names the directory.
 From the repository root:
 
 ```sh
-cargo xtask model operation-ownership                                   # every profile
+cargo xtask model                                                       # every profile of every model
+cargo xtask model operation-ownership                                   # every profile of one model
 cargo xtask model operation-ownership/OperationOwnership.ZcWait_bad.cfg # one profile
+cargo xtask model task-lifecycle/TaskLifecycle.cfg                      # the declared task-lifecycle profile
 ```
 
 You can give several selections to one command. One model run at a time holds the host lock;
@@ -93,9 +97,9 @@ input options for explicit settings.
 
 ## Large profiles
 
-The current gate has 55 profiles. Its 43 fault and witness checks take about 101 seconds of
-checker time on the shared development Mac. The complete searches take longer. The largest
-profiles have these results on a quiet EC2 c8g.4xlarge (16 vCPUs, 32 GiB, 2026-11-11):
+The operation-ownership gate has 55 profiles. Its 43 fault and witness checks take about 101
+seconds of checker time on the shared development Mac. The complete searches take longer. The
+largest profiles have these results on a quiet EC2 c8g.4xlarge (16 vCPUs, 32 GiB, 2026-11-11):
 
 | Profile | Distinct states | Time |
 | --- | --- | --- |
@@ -114,6 +118,20 @@ only in a way that keeps the result sound: symmetry over identical processes, a 
 model proves, or an inductive proof. Each such change needs a known-bad variant that still fails
 under it. A smaller bound must still reach each failure that the model names, and it needs a
 profile with that bound raised by one.
+
+The task-lifecycle gate has 27 profiles. Its 23 fault and witness checks take about 45 seconds of
+checker time on the development Mac, and its declared profile about one minute. Its three-slot
+profile is too large for that Mac; it has this result on a quiet EC2 c8g.4xlarge (16 vCPUs,
+32 GiB, 2026-11-12):
+
+| Profile | Distinct states | Time |
+| --- | --- | --- |
+| `TaskLifecycle.Slots3.cfg` | 9,177,449 | 19.1 minutes |
+
+The [model evidence record](../../models/task-lifecycle/README.md#evidence-record) gives every
+positive profile and its host. The model does not check a shutdown request during block_on, join
+handles and their outcomes, a task with more than one event, operations and I/O, or time. Its
+[limits](../../models/task-lifecycle/README.md#limits) give the full list.
 
 On a smaller host, select the profiles that your change touches, and run the whole model before
 you record evidence.
