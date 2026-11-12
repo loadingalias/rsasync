@@ -138,10 +138,13 @@ let receive = driver.recv_selected(&stream)?;
 let request = run(&mut driver, receive)???;
 ```
 
-If no slot is free when data comes, the receive ends with `ENOBUFS`.
+If no slot is free when the kernel tries the receive, the receive ends with the error `ENOBUFS`
+(`io::Error::raw_os_error`). The data stays in the socket, so receive again after a slot comes
+back.
 
 `Driver::close` closes a stream, and `Driver::close_listener` closes a listener. Each one refuses
-while an operation runs on the socket; its future must end first.
+with `Reason::Busy` while an operation runs on the socket. An operation runs until the kernel
+ends it, also after you drop its future, so turn the driver until then.
 
 ## Limits that you set
 
