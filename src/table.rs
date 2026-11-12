@@ -70,6 +70,22 @@ impl OpId {
         u64::from(self.index) << 32 | u64::from(self.generation)
     }
 
+    /// The slot of the operation.
+    pub(crate) fn index(self) -> u32 {
+        self.index
+    }
+
+    /// The generation of the slot that the operation has.
+    pub(crate) fn generation(self) -> u32 {
+        self.generation
+    }
+
+    /// The operation that `user_data` names, or `None` for the user data of a cancel result or of
+    /// another completion of the driver.
+    pub(crate) fn from_user_data(user_data: u64) -> Option<Self> {
+        (user_data & CONTROL == 0).then(|| Self::from_bits(user_data))
+    }
+
     /// The user data of a cancel of this operation, so that its result reaches
     /// [`Table::complete`] as a cancel result.
     pub(crate) fn cancel_user_data(self) -> u64 {
@@ -468,6 +484,24 @@ impl<T> Table<T> {
         }
     }
 
+    /// The running operations: each one whose terminal event can still come.
+    pub(crate) fn running(&self) -> impl Iterator<Item = OpId> {
+        self.slots.iter().zip(0..).filter_map(|(slot, index)| {
+            matches!(slot.state, State::Live { .. }).then_some(OpId {
+                index,
+                generation: slot.generation,
+            })
+        })
+    }
+
+    /// Whether an event can still come: an operation runs, or a zero-copy send waits for its
+    /// notice.
+    pub(crate) fn busy(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot.state, State::Live { .. } | State::Notice { .. }))
+    }
+
     /// The slot of a live operation, or `None` for a stale identity.
     fn live(&mut self, id: OpId) -> Option<&mut Slot<T>> {
         self.slots
@@ -516,6 +550,11 @@ struct Shared {
 pub(crate) struct Requests(Arc<Shared>);
 
 impl Requests {
+    /// Whether no request waits for the home.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.head.load(Ordering::Acquire) == NIL
+    }
+
     /// Records `request` in the entry of the slot of `id`. Requests for one operation combine. A
     /// request for an older generation than the entry holds is stale, and it changes nothing.
     pub(crate) fn post(&self, id: OpId, request: Request) {

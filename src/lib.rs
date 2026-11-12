@@ -15,12 +15,35 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+// The completion entries of the driver, which the exploration tests also check on each host.
+#[cfg(any(
+    all(test, loom),
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        feature = "std"
+    )
+))]
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        feature = "std"
+    )),
+    expect(dead_code, reason = "with no driver, only the exploration tests use the entries")
+)]
+mod completion;
 mod sync;
 #[cfg_attr(
-    not(test),
+    not(all(
+        test,
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        feature = "std"
+    )),
     expect(
         dead_code,
-        reason = "the tests use the table now; the driver is its first other user"
+        reason = "the driver uses only single operations so far, and only the driver uses some items"
     )
 )]
 mod table;
@@ -32,6 +55,14 @@ mod table;
     )
 )]
 mod wait;
+
+/// Driver-only use of the io_uring driver, on Linux.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "std"
+))]
+pub mod driver;
 
 // The io_uring declarations are checked against the kernel headers of these two architectures
 // only. Another architecture has different constants, so it gets no ring.

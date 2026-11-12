@@ -51,12 +51,14 @@ pub(super) const IORING_FEAT_NODROP: u32 = 1 << 1;
 /// Send and receive bundles, Linux 6.10.
 pub(super) const IORING_FEAT_RECVSEND_BUNDLE: u32 = 1 << 14;
 
+pub(super) const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
 pub(super) const IORING_SQ_TASKRUN: u32 = 1 << 2;
 pub(super) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 
 pub(super) const IORING_OFF_SQ_RING: i64 = 0;
 pub(super) const IORING_OFF_SQES: i64 = 0x1000_0000;
 
+pub(super) const IORING_REGISTER_EVENTFD: u32 = 4;
 pub(super) const IORING_REGISTER_PROBE: u32 = 8;
 pub(super) const IORING_REGISTER_PBUF_RING: u32 = 22;
 pub(super) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
@@ -72,6 +74,7 @@ pub(super) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
 pub(super) const IORING_OP_NOP: u8 = 0;
 pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
+pub(super) const IORING_OP_READ: u8 = 22;
 pub(super) const IORING_OP_MSG_RING: u8 = 40;
 /// Linux 6.7.
 pub(super) const IORING_OP_WAITID: u8 = 50;

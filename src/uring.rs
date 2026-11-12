@@ -76,6 +76,32 @@ pub(crate) struct Features {
 }
 
 impl Sqe {
+    /// A no-op (`IORING_OP_NOP`): it completes with 0 and names no memory.
+    pub(crate) fn nop() -> Self {
+        Self {
+            opcode: sys::IORING_OP_NOP,
+            ..Self::default()
+        }
+    }
+
+    /// A read of up to `len` bytes from `fd` into `buffer` (`IORING_OP_READ`), at the position of
+    /// the file.
+    pub(crate) fn read(fd: RawFd, buffer: *mut u8, len: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_READ,
+            fd,
+            off: u64::MAX,
+            addr: buffer.addr() as u64,
+            len,
+            ..Self::default()
+        }
+    }
+
+    /// The entry with the user data `user_data`, which its completion gives back.
+    pub(crate) fn with_user_data(self, user_data: u64) -> Self {
+        Self { user_data, ..self }
+    }
+
     /// A cancel of the request whose user data is `target` (`IORING_OP_ASYNC_CANCEL`). It cancels
     /// one request. Its own completion has the user data `user_data`.
     pub(crate) fn cancel(target: u64, user_data: u64) -> Self {
@@ -267,16 +293,40 @@ impl Ring {
     /// completions are ready. Gives the number of entries that the kernel took.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
         self.word(self.sq_tail).store(self.sq_pushed, Ordering::Release);
-        let pending = self
-            .sq_pushed
-            .wrapping_sub(self.word(self.sq_head).load(Ordering::Acquire));
-        enter(self.fd(), pending, wait, sys::IORING_ENTER_GETEVENTS)
+        enter(self.fd(), self.unsubmitted(), wait, sys::IORING_ENTER_GETEVENTS)
     }
 
     /// Whether the kernel holds deferred task work for the ring (`IORING_SQ_TASKRUN`). Only a
     /// [`submit`](Self::submit) runs it, also when no entry waits.
     pub(crate) fn task_run_pending(&self) -> bool {
         self.word(self.sq_flags).load(Ordering::Relaxed) & sys::IORING_SQ_TASKRUN != 0
+    }
+
+    /// Whether a [`submit`](Self::submit) has work with no entry to submit: deferred task work,
+    /// or completions that the kernel holds because the completion queue was full
+    /// (`IORING_SQ_CQ_OVERFLOW`).
+    pub(crate) fn needs_enter(&self) -> bool {
+        self.word(self.sq_flags).load(Ordering::Relaxed) & (sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW) != 0
+    }
+
+    /// The pushed entries that the kernel has not taken.
+    pub(crate) fn unsubmitted(&self) -> u32 {
+        self.sq_pushed
+            .wrapping_sub(self.word(self.sq_head).load(Ordering::Acquire))
+    }
+
+    /// Whether a completion is ready.
+    pub(crate) fn ready(&self) -> bool {
+        self.word(self.cq_tail).load(Ordering::Acquire) != self.word(self.cq_head).load(Ordering::Relaxed)
+    }
+
+    /// Makes the kernel signal the event descriptor `fd` when it posts a completion or queues
+    /// deferred task work (`IORING_REGISTER_EVENTFD`).
+    #[expect(unsafe_code, reason = "the kernel reads the descriptor number")]
+    pub(crate) fn register_eventfd(&self, fd: RawFd) -> io::Result<()> {
+        let mut fd = fd;
+        // SAFETY: `fd` is one `int` that is valid for reads during the call.
+        unsafe { register(self.fd(), sys::IORING_REGISTER_EVENTFD, (&raw mut fd).cast(), 1) }.map(drop)
     }
 
     /// The completions that are ready, in order. Each entry goes back to the kernel as the

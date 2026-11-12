@@ -12,9 +12,7 @@ use crate::table::{CONTROL, OpId, Request, Shape, Table, Taken};
 
 /// The opcodes and flags of the test operations (`include/uapi/linux/io_uring.h` of Linux 6.1),
 /// and `POLLIN` (`include/uapi/asm-generic/poll.h`).
-const IORING_OP_NOP: u8 = 0;
 const IORING_OP_POLL_ADD: u8 = 6;
-const IORING_OP_READ: u8 = 22;
 const IORING_OP_SEND_ZC: u8 = 47;
 const IORING_POLL_ADD_MULTI: u32 = 1 << 0;
 const POLLIN: u32 = 0x1;
@@ -86,14 +84,8 @@ impl Driver {
 }
 
 fn read(fd: RawFd, buffer: &mut Vec<u8>) -> Sqe {
-    Sqe {
-        opcode: IORING_OP_READ,
-        fd,
-        off: u64::MAX,
-        addr: buffer.as_mut_ptr().addr() as u64,
-        len: u32::try_from(buffer.capacity()).expect("a test buffer is small"),
-        ..Sqe::default()
-    }
+    let len = u32::try_from(buffer.capacity()).expect("a test buffer is small");
+    Sqe::read(fd, buffer.as_mut_ptr(), len)
 }
 
 /// The two orders in which a cancel result and the completion of its target can come.
@@ -132,10 +124,7 @@ fn a_stale_identity_from_the_kernel_changes_nothing() {
     let old = driver.start(
         Recorded::new(&driver.log, &budget, Vec::new()),
         Shape::Single,
-        Sqe {
-            opcode: IORING_OP_NOP,
-            ..Sqe::default()
-        },
+        Sqe::nop(),
     );
     assert_eq!(driver.turn(1), [0]);
     drop(driver.table.claim(old));
@@ -178,10 +167,7 @@ fn a_cancel_result_waits_for_the_completion_of_its_target() {
     let nop = driver.start(
         Recorded::new(&driver.log, &budget, Vec::new()),
         Shape::Single,
-        Sqe {
-            opcode: IORING_OP_NOP,
-            ..Sqe::default()
-        },
+        Sqe::nop(),
     );
     driver.table.requests().post(nop, Request::EndInterest);
     driver.table.requests().post(nop, Request::Cancel);
