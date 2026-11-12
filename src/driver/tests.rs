@@ -16,7 +16,7 @@ use std::thread::{self, Thread};
 use std::vec::Vec;
 
 use super::{Completion, Config, Driver, Held, Reason, Refused};
-use crate::buffer::{Backing, Buffer as _, BufferMut, Lease, Pool, Release};
+use crate::buffer::{Backing, Buffer as _, BufferMut, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
 use crate::uring::Sqe;
@@ -322,27 +322,39 @@ fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     drop(running);
 }
 
-/// Polls `future` on the home thread while the driver turns, until it gives its output.
+/// Turns the driver and polls `future` on the home thread, until it gives its output. It polls
+/// once after each turn, so it never polls a future that gave its output.
 fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
     loop {
+        let more = driver.turn().expect("a turn of the test driver works").more();
         if let Poll::Ready(output) = Pin::new(&mut future).poll(&mut cx) {
             return output;
         }
-        let turn = driver.turn().expect("a turn of the test driver works");
-        if !turn.more()
-            && let Poll::Pending = Pin::new(&mut future).poll(&mut cx)
-        {
+        if !more {
             driver.wait().expect("the wait of the test driver works");
-        } else if let Poll::Ready(output) = Pin::new(&mut future).poll(&mut cx) {
-            return output;
         }
     }
 }
 
+/// Enters the kernel until it posts a completion, and gives the `len` bytes at `address` before
+/// the driver takes that completion. A copy that the driver makes when it takes the completion is
+/// not in them, so they are the bytes that the kernel itself wrote at `address`.
+#[expect(unsafe_code, reason = "the test reads initialized memory that nothing writes now")]
+fn written_in_place(driver: &mut Driver, address: *const u8, len: usize) -> Vec<u8> {
+    while !driver.ring.ready() {
+        driver.ring.submit(1).expect("the test ring enters the kernel");
+    }
+    // SAFETY: `address` is in a buffer that the driver holds for the completed operation, and the
+    // test initialized its first `len` bytes before the submission. The kernel ended its writes
+    // before it posted the completion, and the driver writes nothing before it takes it.
+    unsafe { core::slice::from_raw_parts(address, len) }.to_vec()
+}
+
 /// A connection receives a request into an owned buffer after its earlier bytes, and sends a
-/// response from a lease. Each buffer comes back with its exact extent and at its own address: the
-/// kernel wrote and read it in place, with no staging buffer.
+/// response from a lease. Each buffer comes back with its exact extent and at its own address. The
+/// request is at the address of the buffer when the kernel completes, before the driver takes the
+/// completion: the kernel wrote it in place, with no staging buffer.
 #[test]
 fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses() {
     let mut driver = driver(Config::new());
@@ -358,11 +370,17 @@ fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_address
     let accept = driver.accept(&listener).unwrap();
     let (stream, peer) = drive(&mut driver, accept).unwrap().unwrap();
 
-    let mut request = Vec::with_capacity(64);
+    // Zero capacity, so that the check of the bytes in place reads initialized memory.
+    let mut request = Vec::from([0; 64]);
+    request.clear();
     request.extend_from_slice(b"seen:");
     let request = Backing::from(request);
     let request_address = request.as_ptr();
     let receive = driver.recv(&stream, request).unwrap();
+    assert_eq!(
+        written_in_place(&mut driver, request_address, 23),
+        b"seen:GET / HTTP/1.1\r\n\r\n"
+    );
     let (received, request) = drive(&mut driver, receive).unwrap();
     assert_eq!(received.unwrap(), 18);
     assert_eq!(request.as_ptr(), request_address);
@@ -381,14 +399,18 @@ fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_address
 }
 
 /// A request in a buffer that the kernel selected is read in place, at the address of the one
-/// slot of the pool. When the last view of that buffer drops on another thread, the buffer comes
-/// back to the kernel ring through the home, so the next selecting receive gets it again.
+/// slot of the pool, where the kernel wrote it before the driver took the completion. When the last
+/// view of that buffer drops on another thread, the buffer comes back to the kernel ring through
+/// the home, so the next selecting receive gets it again.
 #[test]
 fn a_selected_buffer_is_read_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere() {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut pool = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
-    let slot = pool.acquire().unwrap().as_ptr();
+    // Zero the slot, so that the check of the bytes in place reads initialized memory.
+    let mut zeroed = WriteLoan::new(pool.acquire().unwrap());
+    zeroed.fill_from(&[0; 64]);
+    let slot = zeroed.into_inner().as_ptr();
     let mut driver = driver(Config::new());
     driver.provide(pool).unwrap();
     let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -404,6 +426,7 @@ fn a_selected_buffer_is_read_in_place_and_returns_to_its_ring_when_its_last_view
     let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
 
     let receive = driver.recv_selected(&stream).unwrap();
+    assert_eq!(written_in_place(&mut driver, slot, 5), b"first");
     let first = drive(&mut driver, receive).unwrap().unwrap();
     assert_eq!((first.bytes(), first.as_ptr()), (&b"first"[..], slot));
     let view = first.view(1..).unwrap();
