@@ -1,7 +1,7 @@
 [package]
 name = "rsasync"
 version = "0.1.0-alpha.2"
-description = "A dual async runtime: thread-per-core and work-stealing tasks, completion I/O on owned buffers, bounded channels, permits, and time."
+description = "A dual async runtime (in development): thread-per-core and work-stealing tasks, completion I/O on owned buffers, bounded channels, permits, and time."
 repository = "https://github.com/loadingalias/rsasync"
 edition.workspace = true
 license.workspace = true

@@ -3,7 +3,10 @@
 Thread-per-core and work-stealing in one Rust runtime: one build, one lifecycle, one resource plan.
 
 Today you choose Monoio or Glommio for pinned cores, Tokio for everything else, and run two
-runtimes side by side. rsasync runs both modes under one shutdown and one memory budget.
+runtimes side by side. rsasync is built to run both modes under one shutdown and one memory
+budget.
+
+rsasync is built to give you:
 
 - **Both modes in one process.** Keep hot state on its core with `Rc` and no locks. Move other work
   between workers. A typed handoff connects the two.
@@ -23,7 +26,17 @@ win by at least 10% in throughput per core or 25% in tail latency, and no other 
 mixed-mode cell runs both modes in one build against Tokio alone and against Monoio or Compio
 composed with Tokio. Every loss is published, and no "fastest" claim ships without this evidence.
 
-Status: in development. Alpha releases are on crates.io; each one can change the API.
+**In this alpha.** These parts have run evidence:
+
+- The shared types: `rsasync::buffer`, `rsasync::capacity`, and `rsasync::time`. Their tests run on
+  macOS and Linux, and on WebAssembly (`wasm32-wasip1`) without `std`, the portable subset.
+- The driver-only io_uring surface, `rsasync::driver`, on Linux 6.1 (Debian 12) and Linux 7.0
+  (Ubuntu 26.04), on x86_64 and aarch64, with glibc: bounded turns, a wake descriptor for the event
+  loop of a host, terminal teardown, and TCP accept, receive (into an owned buffer or into a buffer
+  that the kernel selects), and send.
+
+There is no scheduler yet, and the driver has no other backend and no other platform yet. Each
+alpha can change the API.
 
 Part of one family on [rscrypto](https://github.com/loadingalias/rscrypto): rsasync (runtime),
 rsnetwork (networking), and rsauthnz (auth). Apache-2.0. Develop with `cargo xtask fix`,
