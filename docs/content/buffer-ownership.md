@@ -29,6 +29,7 @@ after its initialized bytes.
 | `Vec<u8>` | Yes | Yes |
 | `&'static [u8]` | Yes | No: its bytes are shared, so nothing can write them |
 | `Backing` | Yes | Yes |
+| `Lease` | Yes | No: its bytes do not change |
 | `Box<[u8]>` | No: use `Backing::from(boxed)`, which keeps the same bytes | No |
 | An inline array, for example `[u8; 4096]` | No: its bytes move when the array moves | No |
 
@@ -90,6 +91,52 @@ assert_eq!(buf, b"GET /index.html");
 A backend writes through `WriteLoan::as_mut_ptr` and then records its extent with the unsafe
 `WriteLoan::set_filled`.
 
+## Share bytes with leases and views
+
+A `Lease` freezes the initialized bytes of a buffer, for example after a receive and a change in
+place, such as a decryption. Make it with `Lease::from` from a `Backing`, a `Vec<u8>`, or a
+`&'static [u8]`. It is the one way to give the same bytes to more than one owner:
+
+- `Lease::view` gives a lease of a sub-range, for example one record, with no copy. It gives
+  `None` if the range is not in the lease.
+- A clone gives one more lease of the same bytes.
+- Each lease and view keeps the backing alive, also after the first lease, the buffer, and the
+  operation drop. The bytes do not change, and their address stays the same.
+- Leases and views can move to other threads and drop there. The last one that drops releases the
+  backing through its hook, one time, on its thread.
+
+A lease made from a backing costs one allocation, for its reference count. Views and clones cost
+no allocation. A lease of a static region has no reference count.
+
+A small view keeps the whole allocation. Its `Buffer::allocation_size` is that of the backing, not
+its own length. Thus a view of 4 bytes can keep a receive buffer of 64 KiB. To free a large
+allocation early, copy the small part into a new buffer and drop the view.
+
+```rust
+use rsasync::buffer::{Backing, Buffer, BufferMut, Lease};
+
+// A received record, changed in place, as a decryption does.
+let mut received = Vec::with_capacity(4096);
+received.extend_from_slice(b"HEAD:BODY");
+let mut record = Backing::from(received);
+record.bytes_mut().make_ascii_lowercase();
+
+// Freeze the record, then give its parts to two owners, with no copy.
+let lease = Lease::from(record);
+let head = lease.view(..4).unwrap();
+let body = lease.view(5..).unwrap();
+drop(lease);
+assert_eq!(head.bytes(), b"head");
+
+// The view of 4 bytes keeps the whole allocation of 4096 bytes.
+assert!(body.allocation_size() >= 4096);
+
+// A view can move to a different thread. The last view that drops releases the backing.
+let owner = std::thread::spawn(move || body.bytes() == b"body");
+assert!(owner.join().unwrap());
+drop(head);
+```
+
 ## Put your own memory in a backing
 
 A library that allocates its own memory, for example memory that it locks or clears, makes a
@@ -147,9 +194,14 @@ drop(buf); // calls `free_page` one time
 The capacity (1000), the allocation size (4096), and the alignment (at least 4096) are separate
 facts of this backing.
 
+To share the bytes of your memory, receive into the backing or change its bytes with
+`BufferMut::bytes_mut`, then make a lease with `Lease::from(backing)`. The hook then runs when the
+last lease or view drops. Your own rules for the memory, for example when other code can read it,
+stay in your code: the backing and the lease have no field for them.
+
 ## Check the examples and the unsafe code
 
-The two examples on this page are the doctests of `rsasync::buffer`. From the repository root,
+The three examples on this page are doctests of `rsasync::buffer`. From the repository root,
 `cargo xtask test` runs them with the other tests.
 
 Miri runs the tests of the buffer code and stops at undefined behavior, for example a read of

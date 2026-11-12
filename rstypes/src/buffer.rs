@@ -11,6 +11,8 @@
 //!   or returns the region through its one [`Release`] hook.
 //! - A [`WriteLoan`] holds a writable buffer during a receive. It records the exact extent that
 //!   the receive filled, and it makes only those bytes readable.
+//! - A [`Lease`] freezes the initialized bytes of a buffer. Its views share the backing with no
+//!   copy, and the last lease or view that drops releases the backing.
 //!
 //! A buffer gives four separate facts: the writable capacity, the initialized length, the
 //! allocation size, and the alignment. An inline array, for example `[u8; 4096]`, does not obey
@@ -36,10 +38,12 @@
 //! ```
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
+use core::slice::SliceIndex;
 
 /// Bytes whose address stays the same when the value that owns them moves.
 ///
@@ -132,6 +136,18 @@ pub unsafe trait BufferMut: Buffer {
     ///
     /// `len` is at most [`capacity`](Self::capacity), and the first `len` bytes are initialized.
     unsafe fn set_initialized(&mut self, len: usize);
+
+    /// The initialized bytes, for a change in place, for example a decryption.
+    #[expect(
+        unsafe_code,
+        reason = "the trait contract makes the initialized bytes valid for writes"
+    )]
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the trait contract makes `as_mut_ptr` valid for reads and writes of `capacity`
+        // bytes in one region, with the first `initialized` of them initialized. No other code
+        // reads or writes them while `self` is borrowed mutably.
+        unsafe { core::slice::from_raw_parts_mut(self.as_mut_ptr(), self.initialized()) }
+    }
 
     /// Shortens the initialized bytes to their first `len` bytes. A `len` that is not shorter
     /// changes nothing.
@@ -447,6 +463,141 @@ impl fmt::Debug for Backing {
             .field("initialized", &self.initialized)
             .field("allocation_size", &self.allocation_size)
             .finish_non_exhaustive()
+    }
+}
+
+/// An immutable owning lease over initialized bytes: all of the bytes of a backing, or a view of a
+/// part of them.
+///
+/// A lease keeps its backing alive, also after the buffer, the first lease, and the operation that
+/// made them drop. Its bytes do not change, and their address stays the same while any lease or
+/// view of the backing lives. [`view`](Self::view) gives a lease of a sub-range with no copy, and
+/// a clone gives one more lease of the same bytes. The last lease or view that drops releases the
+/// backing through its [`Release`] hook, one time, on the thread that drops it.
+///
+/// A small view keeps the whole allocation: its [`allocation_size`](Buffer::allocation_size) is
+/// that of the backing, not its own length. To free most of a large allocation, copy the small
+/// part into a new buffer and drop the view.
+///
+/// A lease is `Send` and `Sync`, because each backing is.
+///
+/// ```
+/// # extern crate rstypes as rsasync;
+/// use rsasync::buffer::{Backing, Buffer, BufferMut, Lease};
+///
+/// // A received record, changed in place, as a decryption does.
+/// let mut received = Vec::with_capacity(4096);
+/// received.extend_from_slice(b"HEAD:BODY");
+/// let mut record = Backing::from(received);
+/// record.bytes_mut().make_ascii_lowercase();
+///
+/// // Freeze the record, then give its parts to two owners, with no copy.
+/// let lease = Lease::from(record);
+/// let head = lease.view(..4).unwrap();
+/// let body = lease.view(5..).unwrap();
+/// drop(lease);
+/// assert_eq!(head.bytes(), b"head");
+///
+/// // The view of 4 bytes keeps the whole allocation of 4096 bytes.
+/// assert!(body.allocation_size() >= 4096);
+///
+/// // A view can move to a different thread. The last view that drops releases the backing.
+/// let owner = std::thread::spawn(move || body.bytes() == b"body");
+/// assert!(owner.join().unwrap());
+/// drop(head);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Lease {
+    owner: Owner,
+    /// The position of the first byte, from the first byte of the owner.
+    offset: usize,
+    len: usize,
+}
+
+/// What keeps the bytes of a lease alive.
+#[derive(Clone, Debug)]
+enum Owner {
+    /// A backing, which the last lease or view releases.
+    Backing(Arc<Backing>),
+    /// A static region, which nothing releases.
+    Static(&'static [u8]),
+}
+
+impl Lease {
+    /// A lease of the bytes at `range` of this lease, for example `4..9` or `..n`, with no copy.
+    /// It keeps the whole backing alive. Gives `None` if `range` is not in this lease.
+    pub fn view<R: SliceIndex<[u8], Output = [u8]>>(&self, range: R) -> Option<Self> {
+        let view = self.bytes().get(range)?;
+        let offset = self.offset + (view.as_ptr().addr() - self.as_ptr().addr());
+        Some(Self {
+            owner: self.owner.clone(),
+            offset,
+            len: view.len(),
+        })
+    }
+}
+
+impl From<Backing> for Lease {
+    /// Freezes the initialized bytes of `backing`, with no copy. The capacity after them stays
+    /// in the allocation until the release.
+    ///
+    /// This is the one allocation of a lease: its reference count. Views and clones add none.
+    fn from(backing: Backing) -> Self {
+        let len = backing.initialized();
+        Self {
+            owner: Owner::Backing(Arc::new(backing)),
+            offset: 0,
+            len,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Lease {
+    /// Freezes the initialized bytes of `vec`, with no copy, through [`Backing::from`].
+    fn from(vec: Vec<u8>) -> Self {
+        Self::from(Backing::from(vec))
+    }
+}
+
+impl From<&'static [u8]> for Lease {
+    /// Lends a static region. It has no reference count and no release.
+    fn from(region: &'static [u8]) -> Self {
+        Self {
+            owner: Owner::Static(region),
+            offset: 0,
+            len: region.len(),
+        }
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "a lease keeps its owner alive and gives only reads of its bytes"
+)]
+// SAFETY: the owner of a lease is a static region or a shared backing, and the lease keeps it
+// alive. A shared backing is never borrowed mutably: no code takes `&mut` from its `Arc`, so its
+// address, its initialized length, and its bytes stay the same until the last lease drops it.
+// Each lease covers `len` bytes from `offset`, in the initialized bytes of its owner: `From` takes
+// all of them, and `view` takes a sub-slice of them. A move of a lease copies the `Arc` pointer or
+// the shared reference, so the region does not move.
+unsafe impl Buffer for Lease {
+    fn as_ptr(&self) -> *const u8 {
+        let base = match &self.owner {
+            Owner::Backing(backing) => backing.as_ptr(),
+            Owner::Static(region) => region.as_ptr(),
+        };
+        base.wrapping_add(self.offset)
+    }
+
+    fn initialized(&self) -> usize {
+        self.len
+    }
+
+    fn allocation_size(&self) -> usize {
+        match &self.owner {
+            Owner::Backing(backing) => backing.allocation_size(),
+            Owner::Static(_) => 0,
+        }
     }
 }
 

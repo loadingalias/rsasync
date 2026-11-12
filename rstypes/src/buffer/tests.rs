@@ -10,16 +10,17 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, ThreadId};
 
-use super::{Backing, Buffer, BufferMut, Release, WriteLoan};
+use super::{Backing, Buffer, BufferMut, Lease, Release, WriteLoan};
 
 /// One page, aligned to the page: memory that a library allocates on its own.
 #[repr(C, align(4096))]
 struct Page([u8; 4096]);
 const PAGE: Layout = Layout::new::<Page>();
 
-/// What the release hook of a page backing saw.
+/// The address of a page backing, as the allocator gave it, and what its release hook saw.
 #[derive(Default)]
 struct Releases {
+    address: AtomicUsize,
     count: AtomicUsize,
     thread: Mutex<Option<ThreadId>>,
 }
@@ -51,6 +52,7 @@ unsafe fn release_page(data: *const (), ptr: NonNull<u8>, _: usize) {
 fn page(releases: &Arc<Releases>) -> Backing {
     // SAFETY: the size of `PAGE` is not zero.
     let ptr = NonNull::new(unsafe { std::alloc::alloc(PAGE) }).unwrap();
+    releases.address.store(ptr.addr().get(), Ordering::Relaxed);
     let data = Arc::into_raw(Arc::clone(releases)).cast::<()>();
     // SAFETY: the page is valid for reads and writes of 4096 bytes, and only the backing uses it.
     // `release_page` frees it, and it can run on any thread.
@@ -185,4 +187,97 @@ fn truncate_shortens_the_initialized_bytes_and_never_lengthens_them() {
     assert_eq!(loan.capacity(), 1000);
     backend_fill(&mut loan, b"second");
     assert_eq!(loan.into_inner().bytes(), b"second");
+}
+
+#[test]
+fn a_view_keeps_the_backing_address_and_reports_the_allocation_size_of_its_parent() {
+    let mut vec = Vec::with_capacity(64);
+    vec.extend_from_slice(b"header payload");
+    let (address, capacity) = (vec.as_ptr(), vec.capacity());
+
+    let lease = Lease::from(vec);
+    let view = lease.view(7..).unwrap();
+    assert_eq!(
+        (view.as_ptr(), view.bytes()),
+        (address.wrapping_add(7), &b"payload"[..])
+    );
+    // A view of a view keeps the same backing.
+    assert_eq!(view.view(1..4).unwrap().as_ptr(), address.wrapping_add(8));
+    // The view keeps the whole allocation, so it reports the allocation of its parent.
+    assert_eq!(view.allocation_size(), capacity);
+
+    let region: &'static [u8] = b"static";
+    let view = Lease::from(region).view(1..).unwrap();
+    assert_eq!(
+        (view.as_ptr(), view.allocation_size()),
+        (region.as_ptr().wrapping_add(1), 0)
+    );
+}
+
+#[test]
+fn a_view_keeps_its_backing_alive_after_the_first_lease_drops() {
+    let releases = Arc::<Releases>::default();
+    let mut loan = WriteLoan::new(page(&releases));
+    backend_fill(&mut loan, b"received");
+    let lease = Lease::from(loan.into_inner());
+    // The request of an operation keeps one more lease of the same bytes.
+    let request = lease.clone();
+    let view = lease.view(2..).unwrap();
+
+    drop(lease);
+    drop(request);
+    assert_eq!(releases.count.load(Ordering::Relaxed), 0);
+    assert_eq!(view.bytes(), b"ceived");
+
+    drop(view);
+    assert_eq!(releases.count.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_view_outside_its_lease_is_refused() {
+    let lease = Lease::from(b"bytes".to_vec());
+    let view = lease.view(1..4).unwrap();
+
+    // `2..4` is in the parent, but not in the view of 3 bytes.
+    assert!(view.view(2..4).is_none());
+    assert_eq!(view.view(1..3).unwrap().bytes(), b"te");
+}
+
+// The WebAssembly targets of the tests have no threads.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn a_region_changed_in_place_splits_into_views_that_release_it_once_on_the_last_thread() {
+    let releases = Arc::<Releases>::default();
+    let mut loan = WriteLoan::new(page(&releases));
+    backend_fill(&mut loan, b"HEADBODY");
+    let mut backing = loan.into_inner();
+    // A change in place, as a decryption makes it.
+    backing.bytes_mut().make_ascii_lowercase();
+
+    let lease = Lease::from(backing);
+    let (head, body) = (lease.view(..4).unwrap(), lease.view(4..).unwrap());
+    drop(lease);
+    let address = releases.address.load(Ordering::Relaxed);
+    assert_eq!((head.as_ptr().addr(), body.as_ptr().addr()), (address, address + 4));
+
+    // Two owners keep the views on two threads.
+    let head_owner = thread::spawn(move || assert_eq!(head.bytes(), b"head"));
+    let body = thread::spawn(move || {
+        assert_eq!(body.bytes(), b"body");
+        body
+    })
+    .join()
+    .unwrap();
+    head_owner.join().unwrap();
+    assert_eq!(releases.count.load(Ordering::Relaxed), 0);
+
+    // The last view drops on a third thread, which releases the backing.
+    let last = thread::spawn(move || {
+        drop(body);
+        thread::current().id()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(releases.count.load(Ordering::Relaxed), 1);
+    assert_eq!(*releases.thread.lock().unwrap(), Some(last));
 }
