@@ -34,9 +34,9 @@ operation table with the completions of the kernel, the driver-only surface (tur
 and teardown), and TCP on the driver. The TCP tests bind, listen, and accept; receive into an
 owned buffer and into a buffer that the kernel selects; and send from a lease. The receive into an
 owned buffer and the send from a lease keep the addresses of their buffers and allocate nothing
-for each operation. The driver is the only part of the library that makes system calls: the
-io_uring ring and its waits in the kernel, its two event descriptors, and the bind and listen of a
-TCP socket through `std`. Thus a pass shows that the build links and runs on musl, and that these
+for each operation. Only the driver and `rsnetwork-udp` make system calls: the io_uring ring and
+its waits in the kernel, its two event descriptors, the bind and listen of a TCP socket through
+`std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs on musl, and that these
 calls work through the system calls of musl. It does not show that a runtime with a scheduler
 works on musl: the library has no scheduler yet. From the Linux driver stage on, each stage exit
 also runs the tests on x86_64 and aarch64 Linux hosts with both C libraries. This page then names
