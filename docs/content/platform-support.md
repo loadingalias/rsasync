@@ -13,7 +13,8 @@ Linux support includes two C libraries, glibc and musl, on x86_64 and aarch64:
 | glibc | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` |
 | musl | `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` |
 
-The pinned toolchain in `rust-toolchain.toml` includes the two musl targets.
+The pinned toolchain in `rust-toolchain.toml` includes the two musl targets. The datagram calls of
+`rsnetwork-udp` support the same four targets: see [Datagram I/O on any socket](datagram-io.md).
 
 ## Evidence today
 
