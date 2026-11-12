@@ -79,6 +79,11 @@ fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
     let buffer = Backing::from(Vec::with_capacity(64));
     let lease = Lease::from(b"pong".to_vec());
 
+    // The counter sees an allocation of this thread.
+    let before = ALLOCATIONS.get();
+    drop(Vec::<u8>::with_capacity(1));
+    let counted = ALLOCATIONS.get() - before;
+
     let before = ALLOCATIONS.get();
     let receive = driver.recv(&stream, buffer).unwrap();
     let (received, buffer) = drive(&mut driver, receive).unwrap();
@@ -88,6 +93,6 @@ fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
 
     assert_eq!((received.unwrap(), buffer.bytes()), (4, &b"ping"[..]));
     assert_eq!(sent.unwrap(), 4);
-    assert_eq!(allocations, 0);
+    assert_eq!((counted, allocations), (1, 0));
     assert_eq!(&client.join().unwrap(), b"pong");
 }
