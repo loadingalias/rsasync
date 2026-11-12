@@ -1,5 +1,6 @@
 # cargo-nextest runs the unit and integration tests. `cargo xtask test` runs
-# the doctests separately. Retries stay at zero: a flaky test is a defect.
+# the doctests separately. Retries stay at zero: a flaky test is a defect. A
+# test that does not return fails at its slow timeout.
 nextest-version = { required = "0.9.150", recommended = "0.9.150" }
 
 [profile.default]
@@ -8,6 +9,11 @@ flaky-result = "fail"
 success-output = "never"
 failure-output = "immediate-final"
 fail-fast = true
+# A test that runs for three periods of 10 s ends as a failure. The longest
+# test on 2026-11-12 took 0.93 s (a loom model in `cargo xtask explore`); the
+# unit tests take at most 0.08 s here and 0.05 s on E1. The limit is thus about
+# 30 times the longest, which leaves room for a loaded shared host.
+slow-timeout = { period = "10s", terminate-after = 3 }
 
 # The CI gate: the same test semantics, reporting every failure.
 [profile.ci]
