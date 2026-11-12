@@ -16,6 +16,14 @@ extern crate alloc;
 extern crate std;
 
 mod sync;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the tests use the table now; the driver is its first other user"
+    )
+)]
+mod table;
 
 // The io_uring declarations are checked against the kernel headers of these two architectures
 // only. Another architecture has different constants, so it gets no ring.

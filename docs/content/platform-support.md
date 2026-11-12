@@ -28,8 +28,9 @@ these commands:
 Each command runs the tests of the whole workspace. Only the glibc run includes the doctests.
 
 Today, the tests check the repository tools, the shared types, and the io_uring ring of the Linux
-driver: ring creation, a message from one ring to another, and the probes of kernel features. The
-ring is the only part of the library that makes system calls. Thus a pass shows that the build
+driver: ring creation, a message from one ring to another, the probes of kernel features, and the
+operation table with the completions of the kernel. The ring is the only part of the library that
+makes system calls. Thus a pass shows that the build
 links and runs on musl, and that the ring works through the system calls of musl. It does not show
 that a runtime operation works on musl. From the Linux driver stage on, each stage exit also runs
 the tests on x86_64 and aarch64 Linux hosts with both C libraries. This page then names each

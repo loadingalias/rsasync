@@ -11,6 +11,8 @@
 //! These words are hardware atomics in every build, because the other party is the kernel.
 
 mod sys;
+#[cfg(all(test, not(loom)))]
+mod table_tests;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +24,8 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
 pub(crate) use sys::{Cqe, Sqe};
+
+use crate::table::Event;
 
 /// The setup flags of each ring.
 const FLAGS: u32 = sys::IORING_SETUP_SINGLE_ISSUER
@@ -72,6 +76,18 @@ pub(crate) struct Features {
 }
 
 impl Sqe {
+    /// A cancel of the request whose user data is `target` (`IORING_OP_ASYNC_CANCEL`). It cancels
+    /// one request. Its own completion has the user data `user_data`.
+    pub(crate) fn cancel(target: u64, user_data: u64) -> Self {
+        Self {
+            opcode: sys::IORING_OP_ASYNC_CANCEL,
+            fd: -1,
+            addr: target,
+            user_data,
+            ..Self::default()
+        }
+    }
+
     /// A cross-ring message (`IORING_OP_MSG_RING` with `IORING_MSG_DATA`). The ring of `target`
     /// gets a completion with the user data `data` and the result `result`. The entry names no
     /// memory.
@@ -263,8 +279,8 @@ impl Ring {
         self.word(self.sq_flags).load(Ordering::Relaxed) & sys::IORING_SQ_TASKRUN != 0
     }
 
-    /// The completions that are ready, in order. Each entry that the iterator gives goes back to
-    /// the kernel when the iterator drops, also during a panic.
+    /// The completions that are ready, in order. Each entry goes back to the kernel as the
+    /// iterator gives it, so a leaked iterator gives no entry two times.
     pub(crate) fn completions(&mut self) -> Completions<'_> {
         // Only this thread writes the head.
         let head = self.word(self.cq_head).load(Ordering::Relaxed);
@@ -390,14 +406,20 @@ impl Iterator for Completions<'_> {
         }
         let cqe = self.ring.cqe((self.head & self.ring.cq_mask) as usize);
         self.head = self.head.wrapping_add(1);
+        // The release keeps the read of the entry before the kernel can reuse it.
+        self.ring.word(self.ring.cq_head).store(self.head, Ordering::Release);
         Some(cqe)
     }
 }
 
-impl Drop for Completions<'_> {
-    fn drop(&mut self) {
-        // The release keeps the reads of the given entries before the kernel can reuse them.
-        self.ring.word(self.ring.cq_head).store(self.head, Ordering::Release);
+impl Cqe {
+    /// The completion in the terms of the operation table.
+    pub(crate) fn event(&self) -> Event {
+        Event {
+            result: self.res,
+            more: self.flags & sys::IORING_CQE_F_MORE != 0,
+            notice: self.flags & sys::IORING_CQE_F_NOTIF != 0,
+        }
     }
 }
 

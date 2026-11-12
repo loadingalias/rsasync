@@ -187,30 +187,32 @@ is the check that no reduction hid a failure.
 
 ## Correspondence
 
-Each action is one atomic step. The rule column names the design rule that the action implements;
-the R203, R206, and R603 transitions get a column when that code exists.
+Each action is one atomic step. The rule column names the design rule that the action implements.
+The R203 column names the transition of the operation table (`src/table.rs` of rsasync) for
+each action that the table implements, or the later task that implements the action. R206 and
+R603 add their transitions when their code exists.
 
-| Action | Design rule | Atomicity |
-| --- | --- | --- |
-| `BeginRx` | Driver Topology: one outstanding operation for each direction; the next receive returns held data before it submits, as a prefix with one copy, and keeps the rest. Each operation future borrows its direction exclusively, so no earlier future of the direction exists | One poll: the check of held data, or the submission and the return of the initiating call |
-| `BeginTx` | Driver Topology: after a partial or failed abandoned send, the next send returns a typed error with the transferred count. A next send that succeeds shows that each earlier abandoned send transferred all its bytes | One poll |
-| `BeginAc` | Driver Topology: the next accept returns a connection that the listener holds before it submits | One poll |
-| `Submit` (in `Begin*`) | Completion I/O: accepted submission gives the backing to the driver. Terminal-event table: an io_uring request waits for its completion; IOCP classifies the NT status of the return (pending, `NT_ERROR`, other, skip-on-success) | The submission and the return of the initiating call are one step |
-| `Repoll` | Future and Wake Contract: a pending poll gives a new waker, and the future honors the latest one | One poll |
-| `Claim` | Future and Wake Contract: the owned result and the slot return exactly once each. The claim of a zero-copy send returns its progress; its notice releases the backing | One step for both returns |
-| `Cancel` | Driver Topology: an explicit cancellation returns the original buffer with its exact progress; a send direction stays usable | Posts one request entry |
-| `Drop` | Driver Topology: a dropped future ends interest, not the operation. A receive and an accept ask their home to cancel; a send is not cancelled. A terminal result goes by the abandoned rule | Posts at most one request entry |
-| `Forget` | Driver Topology: a forgotten future ends interest with no destructor, so no request; `mem::forget` ends the exclusive borrow | One step |
-| `Complete` | Terminal-event table: one event at the home. Single completion; multishot item with `IORING_CQE_F_MORE` and its final completion; IOCP packet. A zero-copy send result ends the send and frees its direction (selected on 2026-11-08); with `IORING_CQE_F_MORE`, its backing joins the pending notices. With no waiting future, the abandoned rule applies | The kernel posts the event and the home harvests it in one step |
-| `Process` | Driver Topology: the request travels to the home through its entry, and close cancels each operation by its own `user_data`. Future and Wake Contract: the generation check rejects a stale identity. Completion I/O: a cancel result is not a terminal event; "done" and "already running" make the target's own event certain; "not found" changes nothing | One step at the home |
-| `TakeOver` | Driver Topology: close takes each result that a dropped future left, by the abandoned rule | One step |
-| `CloseDone` | Driver Topology: close waits for the terminal event of each operation, releases the data that no receive took, reports each owed and each cancelled send's progress, and closes each connection that no accept took. It does not wait for the pending notices: it half-closes, returns, and turns every pending notice of the stream into detached debt | One step after the last terminal event |
-| `Reset` | Driver Topology: `connect` with `AF_UNSPEC` at the drain limit, under budget pressure, or at grace expiry | One step: the purge of the send queue, for every pending notice of the connection |
-| `Notice(g)` | Terminal-event table: the zero-copy notice of send `g` releases its own buffer and charge, once. After the last notice of detached debt, the descriptor closes | The kernel posts the notice and the home of `g` harvests it in one step |
-| `Shutdown` | Startup, Shutdown, and Failures: shutdown closes ingress, and grace expiry escalates | The request and grace expiry are one step |
-| `EndTask` | Startup, Shutdown, and Failures: the task returns, or grace expiry cancels it. Its futures drop. Driver Topology: close first cancels each outstanding operation, a dropped send included. Each held slot and each pending notice gets the home of its submission | One step for the drops and the closes |
-| `Exit` | Driver Topology: a worker with live operations or pending notices cannot exit until they reach terminal release. Startup, Shutdown, and Failures: no worker exits while a task of the runtime remains | One step |
-| `Terminated` | None. The end state stutters, so deadlock checking stays on | One step |
+| Action | Design rule | Atomicity | R203 transition |
+| --- | --- | --- | --- |
+| `BeginRx` | Driver Topology: one outstanding operation for each direction; the next receive returns held data before it submits, as a prefix with one copy, and keeps the rest. Each operation future borrows its direction exclusively, so no earlier future of the direction exists | One poll: the check of held data, or the submission and the return of the initiating call | R206 |
+| `BeginTx` | Driver Topology: after a partial or failed abandoned send, the next send returns a typed error with the transferred count. A next send that succeeds shows that each earlier abandoned send transferred all its bytes | One poll | R206 |
+| `BeginAc` | Driver Topology: the next accept returns a connection that the listener holds before it submits | One poll | R206 |
+| `Submit` (in `Begin*`) | Completion I/O: accepted submission gives the backing to the driver. Terminal-event table: an io_uring request waits for its completion; IOCP classifies the NT status of the return (pending, `NT_ERROR`, other, skip-on-success) | The submission and the return of the initiating call are one step | `Table::begin` records the resources and the `Shape` before the push. A refused push takes them back with `Table::withdraw` |
+| `Repoll` | Future and Wake Contract: a pending poll gives a new waker, and the future honors the latest one | One poll | R204 |
+| `Claim` | Future and Wake Contract: the owned result and the slot return exactly once each. The claim of a zero-copy send returns its progress; its notice releases the backing | One step for both returns | `Table::claim`: the result and the resources, once. A zero-copy send gives its result, and `Table::complete` gives its resources at the notice |
+| `Cancel` | Driver Topology: an explicit cancellation returns the original buffer with its exact progress; a send direction stays usable | Posts one request entry | `Requests::post` with `Request::Cancel` |
+| `Drop` | Driver Topology: a dropped future ends interest, not the operation. A receive and an accept ask their home to cancel; a send is not cancelled. A terminal result goes by the abandoned rule | Posts at most one request entry | `Requests::post` with `Request::EndInterest`, and with `Request::Cancel` for a receive or an accept (R206) |
+| `Forget` | Driver Topology: a forgotten future ends interest with no destructor, so no request; `mem::forget` ends the exclusive borrow | One step | `Table::end_interest` when the next operation of the direction starts (R206) |
+| `Complete` | Terminal-event table: one event at the home. Single completion; multishot item with `IORING_CQE_F_MORE` and its final completion; IOCP packet. A zero-copy send result ends the send and frees its direction (selected on 2026-11-08); with `IORING_CQE_F_MORE`, its backing joins the pending notices. With no waiting future, the abandoned rule applies | The kernel posts the event and the home harvests it in one step | `Table::complete` with the `Event` of the backend (`Cqe::event`): `Outcome::Item`, `Ready`, or `Abandoned`. A zero-copy result with `more` keeps the resources for the notice |
+| `Process` | Driver Topology: the request travels to the home through its entry, and close cancels each operation by its own `user_data`. Future and Wake Contract: the generation check rejects a stale identity. Completion I/O: a cancel result is not a terminal event; "done" and "already running" make the target's own event certain; "not found" changes nothing | One step at the home | `Table::take_requests`: the generation check, then `Taken::Cancel` for a running target. The backend cancels it by its own user data (`Sqe::cancel` with `OpId::cancel_user_data`), and the result is `Outcome::CancelResult`, which changes nothing |
+| `TakeOver` | Driver Topology: close takes each result that a dropped future left, by the abandoned rule | One step | R206 |
+| `CloseDone` | Driver Topology: close waits for the terminal event of each operation, releases the data that no receive took, reports each owed and each cancelled send's progress, and closes each connection that no accept took. It does not wait for the pending notices: it half-closes, returns, and turns every pending notice of the stream into detached debt | One step after the last terminal event | R206 |
+| `Reset` | Driver Topology: `connect` with `AF_UNSPEC` at the drain limit, under budget pressure, or at grace expiry | One step: the purge of the send queue, for every pending notice of the connection | R603 |
+| `Notice(g)` | Terminal-event table: the zero-copy notice of send `g` releases its own buffer and charge, once. After the last notice of detached debt, the descriptor closes | The kernel posts the notice and the home of `g` harvests it in one step | `Table::complete` with `notice`: `Outcome::Released` |
+| `Shutdown` | Startup, Shutdown, and Failures: shutdown closes ingress, and grace expiry escalates | The request and grace expiry are one step | — |
+| `EndTask` | Startup, Shutdown, and Failures: the task returns, or grace expiry cancels it. Its futures drop. Driver Topology: close first cancels each outstanding operation, a dropped send included. Each held slot and each pending notice gets the home of its submission | One step for the drops and the closes | — |
+| `Exit` | Driver Topology: a worker with live operations or pending notices cannot exit until they reach terminal release. Startup, Shutdown, and Failures: no worker exits while a task of the runtime remains | One step | — |
+| `Terminated` | None. The end state stutters, so deadlock checking stays on | One step | — |
 
 ## Properties
 
@@ -395,8 +397,8 @@ The model does not cover these items. Each one is outside the task, or a later t
   the generations of task slots (stale wakes). A wake is part of the step that makes a future
   ready.
 - The drain before grace expiry, partial startup, panics, and unwinding.
-- The model proves no Rust code. When R203, R206, and R603 exist, the correspondence table gets
-  their transitions, and a change to either side reopens this check.
+- The model proves no Rust code. The correspondence table has the transitions of R203; R206 and
+  R603 add theirs. A change to either side reopens this check.
 
 ## Decisions of 2026-11-07
 

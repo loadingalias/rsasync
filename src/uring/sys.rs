@@ -71,6 +71,7 @@ pub(super) const IOU_PBUF_RING_INC: u16 = 2;
 pub(super) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
 pub(super) const IORING_OP_NOP: u8 = 0;
+pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
 pub(super) const IORING_OP_MSG_RING: u8 = 40;
 /// Linux 6.7.
 pub(super) const IORING_OP_WAITID: u8 = 50;
@@ -82,6 +83,9 @@ pub(super) const IORING_OP_BIND: u8 = 56;
 pub(super) const IORING_OP_LISTEN: u8 = 57;
 /// Linux 6.15.
 pub(super) const IORING_OP_RECV_ZC: u8 = 58;
+
+pub(super) const IORING_CQE_F_MORE: u32 = 1 << 1;
+pub(super) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
 
 /// The command of `IORING_OP_MSG_RING` that posts `len` and `off` as a completion of the target.
 pub(super) const IORING_MSG_DATA: u64 = 0;
