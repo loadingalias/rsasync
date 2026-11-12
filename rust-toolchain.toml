@@ -6,6 +6,14 @@ profile = "minimal"
 components = ["clippy", "rustfmt", "rust-analyzer", "rust-src", "miri"]
 # wasm32v1-none is a target with no `std`. `cargo xtask fix` and `check` lint
 # each crate that builds without `std` on it, so each use of `std` outside its
-# feature fails. The two musl targets run the tests on musl, the second Linux
-# C library: CI on x86_64, and the E1 hosts on both architectures.
-targets = ["wasm32v1-none", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+# feature fails. The portable subset builds for wasm32-unknown-unknown, and its
+# tests run on wasm32-wasip1 through Wasmtime (.cargo/config.toml). The two
+# musl targets run the tests on musl, the second Linux C library: CI on x86_64,
+# and the E1 hosts on both architectures.
+targets = [
+    "wasm32v1-none",
+    "wasm32-unknown-unknown",
+    "wasm32-wasip1",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
