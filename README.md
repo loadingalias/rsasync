@@ -24,7 +24,8 @@ rsasync is built to give you:
 **The bar.** A release that claims speed measures against Tokio, Monoio, Glommio, and Compio. A
 headline cell must win by at least 10% in throughput per core or 25% in tail latency, and no other
 cell may lose. The mixed-mode cell runs both modes in one build against Tokio alone and against
-Monoio or Compio composed with Tokio. Every loss is published, and no "fastest" claim ships without this evidence.
+Monoio or Compio composed with Tokio. Every loss is published, and no "fastest" claim ships without
+this evidence.
 
 **In this alpha.** These parts have run evidence:
 
