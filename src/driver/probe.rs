@@ -23,11 +23,15 @@
 //! same way on a kernel with `04fe9aeb4f3c`, and never on a kernel with the defect. The probe waits
 //! for it for 16 times the delay of the first signal, at least 10 ms and at most 1 s. A slower
 //! grace period can only make a kernel with no defect do the registrations, not the reverse.
+//!
+//! The defect is a fact of the kernel, not of a ring, so only the first driver of a process
+//! probes. Each later driver reads that result.
 
 use core::time::Duration;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
+// A physical measurement of the kernel at startup. A deterministic run does not replace it.
 use std::time::Instant;
 
 use super::{push_now, sys};
@@ -39,11 +43,28 @@ const FIRST: Duration = Duration::from_secs(1);
 const LEAST: Duration = Duration::from_millis(10);
 const MOST: Duration = Duration::from_secs(1);
 
+/// The result of the first probe of the process. `crate::sync` has no cell that is written one
+/// time, and loom explores no part of the probe, so this is the cell of `std`.
+static DEFECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// Gives `true` when the kernel signals the registered `wake` for deferred work only one time in
-/// the life of a registration. Call it on a new ring with no entry and no completion: it takes each
-/// completion that it makes.
-#[expect(unsafe_code, reason = "a poll names no memory")]
+/// the life of a registration. The first call of the process probes `ring`, and then registers
+/// `wake` again, because the probe used the registration. Call it on a new ring with no entry and
+/// no completion: a probe takes each completion that it makes.
 pub(super) fn signal_stops_after_first(ring: &mut Ring, wake: &File) -> io::Result<bool> {
+    if let Some(defect) = DEFECT.get() {
+        return Ok(*defect);
+    }
+    let defect = probe(ring, wake)?;
+    super::rearm(ring, wake)?;
+    // Two first drivers on two threads can both probe; each gets one result.
+    Ok(*DEFECT.get_or_init(|| defect))
+}
+
+/// Makes two deferred signals on the registration of `wake`, and gives `true` when only the first
+/// one comes.
+#[expect(unsafe_code, reason = "a poll names no memory")]
+fn probe(ring: &mut Ring, wake: &File) -> io::Result<bool> {
     let (mut reader, mut writer) = io::pipe()?;
     let mut limit = FIRST;
     for round in 0..2 {

@@ -557,8 +557,6 @@ impl Driver {
         let wake = File::from(wake);
         ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
         let rearm_wake = probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?;
-        // The probe used the registration. A new one starts with no deferred signal.
-        rearm(&ring, &wake).map_err(Error::System)?;
         let table = Table::new(config.operations);
         let shared = Arc::new(Shared {
             entries: (0..config.operations).map(|_| Entry::new()).collect(),
@@ -869,10 +867,10 @@ impl AsFd for Driver {
     ///
     /// A Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c` signals the
     /// descriptor for deferred work only one time in each registration, for example Ubuntu 26.04
-    /// with `7.0.0-1016-aws`. The driver finds such a kernel when it starts, and it then registers
-    /// the descriptor again in each turn that takes a wake, so the descriptor still becomes
-    /// readable for each completion and each deferred work. A kernel with no defect makes no extra
-    /// system call.
+    /// with `7.0.0-1016-aws`. The first driver of a process finds such a kernel, and each driver
+    /// then registers the descriptor again in each turn that takes a wake, so the descriptor still
+    /// becomes readable for each completion and each deferred work. A kernel with no defect makes
+    /// no extra system call.
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.shared.wake.as_fd()
     }

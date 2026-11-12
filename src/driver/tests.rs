@@ -13,6 +13,7 @@ use std::io::{ErrorKind, Read as _, Write as _};
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, Thread};
+use std::time::Instant;
 use std::vec::Vec;
 
 use super::{Completion, Config, Driver, Held, Reason, Refused, sys};
@@ -590,6 +591,26 @@ fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
     }
     drop(next);
     client.join().unwrap();
+}
+
+/// Only the first driver of a process probes the kernel: a second driver gets the same result and
+/// makes no probe. On a kernel with the defect, the probe waits for a deferred signal that does not
+/// come, so the start of the second driver is then far shorter than the start of the first.
+#[test]
+fn only_the_first_driver_of_a_process_probes_the_kernel() {
+    let start = Instant::now();
+    let first = driver(Config::new());
+    let probed = start.elapsed();
+    let start = Instant::now();
+    let second = driver(Config::new());
+    let read = start.elapsed();
+    assert_eq!(second.rearm_wake, first.rearm_wake);
+    if first.rearm_wake {
+        assert!(
+            read * 10 < probed,
+            "the second start took {read:?}, and the first {probed:?}"
+        );
+    }
 }
 
 /// The probe finds the eventfd defect on the kernels of the evidence hosts that have it: the

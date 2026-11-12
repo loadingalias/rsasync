@@ -60,8 +60,9 @@ each supported kernel, so a reactor that waits only for it misses no operation.
 One kernel defect needs a workaround in the driver. A Linux kernel with the io_uring change
 `cd305ee3633a` ("defer eventfd signaling when queued from a wakeup handler") and not
 `04fe9aeb4f3c` ("reset deferred signal state") signals the descriptor for deferred work only one
-time in each registration, for example Ubuntu 26.04 with `7.0.0-1016-aws`. `Driver::new` finds such
-a kernel with a probe of two deferred signals, which takes up to about 1 s on an affected kernel.
+time in each registration, for example Ubuntu 26.04 with `7.0.0-1016-aws`. The first `Driver::new`
+of a process finds such a kernel with a probe of two deferred signals, which takes up to about 1 s
+on an affected kernel. Each later driver of the process uses that result and makes no probe.
 The driver then registers the descriptor again in each turn that takes a wake: two system calls in
 that turn. A kernel with no defect makes no extra system call. The workaround goes when the
 supported kernels have `04fe9aeb4f3c`.
