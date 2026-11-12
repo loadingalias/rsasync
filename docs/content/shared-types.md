@@ -95,11 +95,14 @@ Each refusal is a `TimeError`:
 ## Build without `std`
 
 `rstypes` has a `std` feature, which is on by default. Without it, the crate needs only `core` and
-`alloc`. `rsasync` needs `std`, and it turns on this feature.
+`alloc`. `rsasync` has a `std` feature too, which is also on by default. It turns on the feature of
+`rstypes`, and without it `rsasync` also needs only `core` and `alloc`.
 
-`cargo xtask check` and `cargo xtask fix`, with no arguments, lint `rstypes` without `std` for
-`wasm32v1-none`. That target has no `std`, so each use of `std` outside the `std` feature fails the
-check. `rust-toolchain.toml` names the target. To run only this build, from the repository root:
+`cargo xtask check` and `cargo xtask fix`, with no arguments, lint `rstypes` and `rsasync` without
+`std`: the library for `wasm32v1-none`, and all targets, the tests too, for the host. That target
+has no `std`, so each use of `std` outside the `std` feature fails the check; the host lint compiles
+the tests without the feature, so a test that uses `std` with no gate fails it.
+`rust-toolchain.toml` names the target. To run only this build, from the repository root:
 
 ```sh
 rustup target add wasm32v1-none   # when rustup did not install it with the toolchain

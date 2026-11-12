@@ -40,8 +40,9 @@ Commands
 
 fix, check, test, and explore select the whole workspace unless their
 arguments select packages with -p or --package. With the whole workspace, fix
-and check also lint each crate that builds without `std` on wasm32v1-none, a
-target with no `std`.
+and check also lint each crate that builds without `std` with no default
+feature: its library on wasm32v1-none, a target with no `std`, and all of its
+targets, the tests too, on the host.
 
 An exploration test is a unit test in a module named `explore`. The explore
 command builds the unit tests with `--cfg loom`, in target/loom/, and runs only
@@ -208,10 +209,12 @@ impl Repo {
         self.clippy_no_std(&scope)
     }
 
-    /// Lints the library of each package in `NO_STD_PACKAGES` with no default
-    /// feature, on `NO_STD_TARGET`. It runs only when `scope` is the whole
-    /// workspace, and it says when it does not run. It takes no argument of
-    /// the caller: a feature or target argument applies to the other steps.
+    /// Lints each package in `NO_STD_PACKAGES` with no default feature: its
+    /// library on `NO_STD_TARGET`, and all of its targets on the host, so that
+    /// a test that uses `std` outside the `std` feature also fails. It runs
+    /// only when `scope` is the whole workspace, and it says when it does not
+    /// run. It takes no argument of the caller: a feature or target argument
+    /// applies to the other steps.
     fn clippy_no_std(&self, scope: &[&str]) -> Result<(), Failure> {
         if !scope.contains(&"--workspace") {
             eprintln!("── clippy without std\n   not run: the arguments select packages; run with no -p or --package");
@@ -226,10 +229,19 @@ impl Repo {
             "--target",
             NO_STD_TARGET,
         ]);
+        let mut tests = self.cargo(&[
+            "clippy",
+            "--locked",
+            "--quiet",
+            "--all-targets",
+            "--no-default-features",
+        ]);
         for package in NO_STD_PACKAGES {
             command.args(["--package", package]);
+            tests.args(["--package", package]);
         }
-        step("clippy without std", &mut command)
+        step("clippy without std", &mut command)?;
+        step("clippy tests without std", &mut tests)
     }
 
     /// Checks formatting, lints, and rustdoc. It changes no file.
