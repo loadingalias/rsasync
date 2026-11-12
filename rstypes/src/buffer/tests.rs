@@ -281,3 +281,76 @@ fn a_region_changed_in_place_splits_into_views_that_release_it_once_on_the_last_
     assert_eq!(releases.count.load(Ordering::Relaxed), 1);
     assert_eq!(*releases.thread.lock().unwrap(), Some(last));
 }
+
+/// An owner of immutable bytes that records its drop, as a `bytes::Bytes` or a memory map owns
+/// its bytes.
+struct Recorded {
+    bytes: Box<[u8]>,
+    releases: Arc<Releases>,
+}
+
+impl AsRef<[u8]> for Recorded {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        self.releases.count.fetch_add(1, Ordering::Relaxed);
+        *self.releases.thread.lock().unwrap() = Some(thread::current().id());
+    }
+}
+
+#[test]
+fn a_lease_from_an_owner_keeps_its_address_and_reports_the_given_allocation_size() {
+    let releases = Arc::default();
+    let bytes = Box::<[u8]>::from(&b"key=value"[..]);
+    let address = bytes.as_ptr();
+
+    let lease = Lease::from_owner(Recorded { bytes, releases }, 4096);
+    let value = lease.view(4..).unwrap();
+    assert_eq!(
+        (value.as_ptr(), value.bytes()),
+        (address.wrapping_add(4), &b"value"[..])
+    );
+    assert_eq!(value.allocation_size(), 4096);
+}
+
+#[test]
+fn an_owner_with_inline_bytes_keeps_them_after_the_lease_moves() {
+    // The bytes of an array are in the owner itself, so they move when the owner moves.
+    let lease = Lease::from_owner(*b"inline", 6);
+    let view = black_box(Box::new(lease.view(2..).unwrap()));
+    let lease = black_box(Box::new(lease));
+
+    assert_eq!(lease.bytes(), b"inline");
+    assert_eq!(view.bytes(), b"line");
+    assert_eq!(view.as_ptr(), lease.as_ptr().wrapping_add(2));
+}
+
+// The WebAssembly targets of the tests have no threads.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn the_owner_drops_once_at_the_last_lease_or_view_on_its_thread() {
+    let releases = Arc::<Releases>::default();
+    let owner = Recorded {
+        bytes: Box::from(&b"owned"[..]),
+        releases: Arc::clone(&releases),
+    };
+    let lease = Lease::from_owner(owner, 5);
+    let (clone, view) = (lease.clone(), lease.view(1..).unwrap());
+    drop(lease);
+    drop(clone);
+    assert_eq!(releases.count.load(Ordering::Relaxed), 0);
+
+    let last = thread::spawn(move || {
+        assert_eq!(view.bytes(), b"wned");
+        drop(view);
+        thread::current().id()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(releases.count.load(Ordering::Relaxed), 1);
+    assert_eq!(*releases.thread.lock().unwrap(), Some(last));
+}

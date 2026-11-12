@@ -95,7 +95,9 @@ A backend writes through `WriteLoan::as_mut_ptr` and then records its extent wit
 
 A `Lease` freezes the initialized bytes of a buffer, for example after a receive and a change in
 place, such as a decryption. Make it with `Lease::from` from a `Backing`, a `Vec<u8>`, or a
-`&'static [u8]`. It is the one way to give the same bytes to more than one owner:
+`&'static [u8]`, or with `Lease::from_owner` from a different owner (see
+[Lease the bytes of a different owner](#lease-the-bytes-of-a-different-owner)). It is the one way to
+give the same bytes to more than one owner:
 
 - `Lease::view` gives a lease of a sub-range, for example one record, with no copy. It gives
   `None` if the range is not in the lease.
@@ -199,9 +201,55 @@ To share the bytes of your memory, receive into the backing or change its bytes 
 last lease or view drops. Your own rules for the memory, for example when other code can read it,
 stay in your code: the backing and the lease have no field for them.
 
+## Lease the bytes of a different owner
+
+`Lease::from_owner(owner, allocation_size)` lends the bytes of a value that owns them, with no copy.
+The owner gives its bytes through `AsRef<[u8]>`, and it is `Send` and `Sync`: for example a
+`String`, an `Arc<[u8]>`, a `bytes::Bytes`, or a type of your library that owns a memory map. The
+last lease or view that drops drops the owner one time, on its thread. Thus the drop of the owner is
+the one release of its bytes.
+
+This is also the path for memory that your library can only read, for example a read-only memory
+map. A `Backing` needs memory that it can write, so give the type that owns the map instead. Its
+`Drop` unmaps the memory.
+
+The owner does not tell the size of the allocation that it keeps, so the caller gives it as
+`allocation_size`, and the leases report it. Give the true size. A smaller value makes a budget
+charge too little for the memory that the lease keeps. The length of the bytes is the minimum.
+
+The conversion costs one allocation: the reference count, with the owner in it.
+
+```rust
+use rsasync::buffer::{Buffer, Lease};
+
+let mut text = String::with_capacity(64);
+text.push_str("key=value");
+let (address, capacity) = (text.as_ptr(), text.capacity());
+
+let lease = Lease::from_owner(text, capacity);
+let value = lease.view(4..).unwrap();
+assert_eq!(value.bytes(), b"value");
+assert_eq!(value.as_ptr(), address.wrapping_add(4)); // no copy
+assert_eq!(value.allocation_size(), capacity);
+```
+
+## Convert to and from the `bytes` crate
+
+`rstypes` does not depend on the `bytes` crate. These conversions use `AsRef<[u8]>` and
+`Bytes::from_owner`, which `bytes` 1.9 and later has. Each conversion that exists keeps the address of
+the bytes:
+
+| From | To | Exists | How, or why not |
+| --- | --- | --- | --- |
+| `Lease` or `Backing` | `bytes::Bytes` | Yes, no copy, one allocation | `Bytes::from_owner(lease)`. The last `Bytes` that drops drops the lease, and the backing is then released as for each lease |
+| `bytes::Bytes` | `Lease` | Yes, no copy, one allocation | `Lease::from_owner(bytes, allocation_size)`. A `Bytes` does not tell the size of the allocation that it keeps, so give it |
+| `Lease` or `Backing` | `bytes::BytesMut` | No, it would copy | A `BytesMut` must own an allocation that it can grow and free as a `Vec<u8>`. Other memory cannot become one |
+| `bytes::Bytes` | `Backing` | No | A `Bytes` is shared and its bytes cannot change. A `Backing` needs memory that only it can write |
+| `bytes::BytesMut` | `Backing`, or a `BufferMut` | No | `BytesMut` gives no pointer that is valid for its full capacity, and it does not say that its bytes keep their address when it moves |
+
 ## Check the examples and the unsafe code
 
-The three examples on this page are doctests of `rsasync::buffer`. From the repository root,
+The four examples on this page are doctests of `rsasync::buffer`. From the repository root,
 `cargo xtask test` runs them with the other tests.
 
 Miri runs the tests of the buffer code and stops at undefined behavior, for example a read of

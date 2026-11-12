@@ -11,8 +11,9 @@
 //!   or returns the region through its one [`Release`] hook.
 //! - A [`WriteLoan`] holds a writable buffer during a receive. It records the exact extent that
 //!   the receive filled, and it makes only those bytes readable.
-//! - A [`Lease`] freezes the initialized bytes of a buffer. Its views share the backing with no
-//!   copy, and the last lease or view that drops releases the backing.
+//! - A [`Lease`] freezes the initialized bytes of a buffer, or lends the bytes of a different
+//!   owner, for example a `bytes::Bytes`. Its views share the backing with no copy, and the last
+//!   lease or view that drops releases the backing.
 //!
 //! A buffer gives four separate facts: the writable capacity, the initialized length, the
 //! allocation size, and the alignment. An inline array, for example `[u8; 4096]`, does not obey
@@ -44,6 +45,7 @@ use core::fmt;
 use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::slice::SliceIndex;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Bytes whose address stays the same when the value that owns them moves.
 ///
@@ -389,6 +391,14 @@ impl From<Box<[u8]>> for Backing {
     }
 }
 
+impl AsRef<[u8]> for Backing {
+    /// The initialized bytes. With it, `bytes::Bytes::from_owner(backing)` makes a `Bytes` of the
+    /// same bytes with no copy.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
 impl Drop for Backing {
     #[expect(unsafe_code, reason = "the drop is the one call of the release hook")]
     fn drop(&mut self) {
@@ -519,8 +529,47 @@ pub struct Lease {
 enum Owner {
     /// A backing, which the last lease or view releases.
     Backing(Arc<Backing>),
+    /// An owner from [`Lease::from_owner`], which the last lease or view drops.
+    Foreign(Arc<dyn ForeignBytes>),
     /// A static region, which nothing releases.
     Static(&'static [u8]),
+}
+
+/// The bytes of an owner from [`Lease::from_owner`], without the type of the owner.
+trait ForeignBytes: Send + Sync {
+    /// The address that `as_ref` gave one time, when the owner was at its final address.
+    fn as_ptr(&self) -> *const u8;
+
+    /// The allocation size that the caller gave.
+    fn allocation_size(&self) -> usize;
+}
+
+/// An owner from [`Lease::from_owner`], and the facts of its bytes.
+struct Foreign<T> {
+    /// Set one time, after the owner is in its `Arc`. It is atomic so that `from_owner` can set it
+    /// through a shared reference: a `&mut` would assert unique access to the bytes of an owner
+    /// that holds them inline.
+    ptr: AtomicPtr<u8>,
+    allocation_size: usize,
+    owner: T,
+}
+
+impl<T: Send + Sync> ForeignBytes for Foreign<T> {
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr.load(Ordering::Relaxed).cast_const()
+    }
+
+    fn allocation_size(&self) -> usize {
+        self.allocation_size
+    }
+}
+
+impl fmt::Debug for dyn ForeignBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Foreign")
+            .field("allocation_size", &self.allocation_size())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Lease {
@@ -534,6 +583,60 @@ impl Lease {
             offset,
             len: view.len(),
         })
+    }
+
+    /// Lends the bytes that `owner` gives through `AsRef<[u8]>`, with no copy, for example the bytes
+    /// of a `String`, a `bytes::Bytes`, or a read-only memory map. The last lease or view that drops
+    /// drops `owner` one time, on its thread.
+    ///
+    /// `allocation_size` is the size of the allocation that `owner` keeps, which the leases report.
+    /// Give the true size: a smaller value makes a budget charge too little for the memory that the
+    /// lease keeps. The length of the bytes is the minimum.
+    ///
+    /// This costs one allocation: the reference count, with `owner` in it.
+    ///
+    /// ```
+    /// # extern crate rstypes as rsasync;
+    /// use rsasync::buffer::{Buffer, Lease};
+    ///
+    /// let mut text = String::with_capacity(64);
+    /// text.push_str("key=value");
+    /// let (address, capacity) = (text.as_ptr(), text.capacity());
+    ///
+    /// let lease = Lease::from_owner(text, capacity);
+    /// let value = lease.view(4..).unwrap();
+    /// assert_eq!(value.bytes(), b"value");
+    /// assert_eq!(value.as_ptr(), address.wrapping_add(4)); // no copy
+    /// assert_eq!(value.allocation_size(), capacity);
+    /// ```
+    pub fn from_owner<T>(owner: T, allocation_size: usize) -> Self
+    where
+        T: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        let foreign = Arc::new(Foreign {
+            ptr: AtomicPtr::new(ptr::null_mut()),
+            allocation_size,
+            owner,
+        });
+        // The owner is at its final address: the `Arc` does not move it, and only its last drop
+        // borrows it mutably. Thus `as_ref` runs one time, here, and the lease keeps its address.
+        let bytes = foreign.owner.as_ref();
+        foreign
+            .ptr
+            .store(ptr::from_ref(bytes).cast::<u8>().cast_mut(), Ordering::Relaxed);
+        Self {
+            len: bytes.len(),
+            owner: Owner::Foreign(foreign),
+            offset: 0,
+        }
+    }
+}
+
+impl AsRef<[u8]> for Lease {
+    /// The bytes of the lease. With it, `bytes::Bytes::from_owner(lease)` makes a `Bytes` of the
+    /// same bytes with no copy.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
     }
 }
 
@@ -574,9 +677,13 @@ impl From<&'static [u8]> for Lease {
     unsafe_code,
     reason = "a lease keeps its owner alive and gives only reads of its bytes"
 )]
-// SAFETY: the owner of a lease is a static region or a shared backing, and the lease keeps it
-// alive. A shared backing is never borrowed mutably: no code takes `&mut` from its `Arc`, so its
-// address, its initialized length, and its bytes stay the same until the last lease drops it.
+// SAFETY: the owner of a lease is a static region, a shared backing, or a foreign owner, and the
+// lease keeps it alive. A shared backing is never borrowed mutably: no code takes `&mut` from its
+// `Arc`, so its address, its initialized length, and its bytes stay the same until the last lease
+// drops it. A foreign owner gave its bytes through `as_ref` one time, at its final address in its
+// `Arc`. After that, no code moves it, calls it, or borrows it mutably until its last drop. Two
+// shared borrows of a type can overlap, so a sound type cannot change bytes that it gave through
+// `&self` while it gives a shared borrow: only a `&mut` borrow or the drop can change them.
 // Each lease covers `len` bytes from `offset`, in the initialized bytes of its owner: `From` takes
 // all of them, and `view` takes a sub-slice of them. A move of a lease copies the `Arc` pointer or
 // the shared reference, so the region does not move.
@@ -584,6 +691,7 @@ unsafe impl Buffer for Lease {
     fn as_ptr(&self) -> *const u8 {
         let base = match &self.owner {
             Owner::Backing(backing) => backing.as_ptr(),
+            Owner::Foreign(foreign) => foreign.as_ptr(),
             Owner::Static(region) => region.as_ptr(),
         };
         base.wrapping_add(self.offset)
@@ -596,6 +704,7 @@ unsafe impl Buffer for Lease {
     fn allocation_size(&self) -> usize {
         match &self.owner {
             Owner::Backing(backing) => backing.allocation_size(),
+            Owner::Foreign(foreign) => foreign.allocation_size(),
             Owner::Static(_) => 0,
         }
     }
