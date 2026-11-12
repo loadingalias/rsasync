@@ -28,7 +28,7 @@ after its initialized bytes.
 | --- | --- | --- |
 | `Vec<u8>` | Yes | Yes |
 | `&'static [u8]` | Yes | No: its bytes are shared, so nothing can write them |
-| `Backing` | Yes | Yes |
+| `Backing`, also a pool slot | Yes | Yes |
 | `Lease` | Yes | No: its bytes do not change |
 | `Box<[u8]>` | No: use `Backing::from(boxed)`, which keeps the same bytes | No |
 | An inline array, for example `[u8; 4096]` | No: its bytes move when the array moves | No |
@@ -108,7 +108,9 @@ give the same bytes to more than one owner:
   backing through its hook, one time, on its thread.
 
 A lease made from a backing costs one allocation, for its reference count. Views and clones cost
-no allocation. A lease of a static region has no reference count.
+no allocation. A lease of a pool slot costs no allocation, because the slot counts the leases (see
+[Receive into pool slots](#receive-into-pool-slots)). A lease of a static region has no reference
+count.
 
 A small view keeps the whole allocation. Its `Buffer::allocation_size` is that of the backing, not
 its own length. Thus a view of 4 bytes can keep a receive buffer of 64 KiB. To free a large
@@ -137,6 +139,60 @@ assert!(body.allocation_size() >= 4096);
 let owner = std::thread::spawn(move || body.bytes() == b"body");
 assert!(owner.join().unwrap());
 drop(head);
+```
+
+## Receive into pool slots
+
+A `Pool` holds slots of one size and alignment, and gives each free slot as a `Backing`. Use it on
+a path that receives often: an acquire allocates nothing, and a slot comes back for the next
+receive.
+
+- `Pool::new(&budget, slots, layout)` charges all of the slots to the budget before it allocates:
+  the slot count times the rounded slot size, which is the slot size rounded up to its alignment.
+  Idle slots stay charged. The charge ends when the memory is freed, after the pool and each of its
+  slots drop. It refuses with a `PoolRefused` value: `Layout` for a slot size of zero or a size
+  that is too large, `Budget` when the budget has too few free units, and `Allocation` when the
+  allocator gives no memory. A refusal keeps no charge.
+- `Pool::acquire` gives a free slot, or refuses with `PoolEmpty`. It allocates nothing. The backing
+  has the capacity of the slot size and the allocation size of the rounded slot size, and none of
+  its bytes are initialized.
+- The slot is exclusive: only its backing writes it. A `Lease` of the backing counts its views in
+  the slot, so the lease and its views allocate nothing.
+- The last backing, lease, or view of a slot returns the slot, on any thread, with no allocation
+  and no lock, so the drop never blocks or fails. A slot never waits for an epoch or a reclaimer.
+- The owner of the pool is the home of its slots: only it acquires, through `&mut Pool`. A slot
+  that drops on a different thread goes into the return list of the pool. The list has at most one
+  entry for each slot, in the slot itself. The home takes the list when it has no free slot, so the
+  next acquire at the home gets the slot.
+
+```rust
+use core::alloc::Layout;
+use core::num::{NonZeroU32, NonZeroU64};
+
+use rsasync::buffer::{Buffer, BufferMut, Lease, Pool, PoolEmpty, WriteLoan};
+use rsasync::capacity::Budget;
+
+let budget = Budget::new(NonZeroU64::new(1024 * 1024).unwrap());
+// 2 slots of 4000 bytes, aligned to 4096 bytes: the pool charges 2 rounded slots.
+let slot = Layout::from_size_align(4000, 4096).unwrap();
+let mut pool = Pool::new(&budget, NonZeroU32::new(2).unwrap(), slot).unwrap();
+assert_eq!(budget.available(), 1024 * 1024 - 2 * 4096);
+
+// A receive fills a slot. Its lease and views need no allocation.
+let mut loan = WriteLoan::new(pool.acquire().unwrap());
+loan.fill_from(b"HEAD:BODY");
+let lease = Lease::from(loan.into_inner());
+let body = lease.view(5..).unwrap();
+drop(lease);
+
+// The view keeps its slot, so one slot is free.
+let other = pool.acquire().unwrap();
+assert_eq!(pool.acquire().unwrap_err(), PoolEmpty);
+
+// A view can drop on a different thread. Then its slot returns to the pool.
+std::thread::spawn(move || assert_eq!(body.bytes(), b"BODY")).join().unwrap();
+let again = pool.acquire().unwrap();
+assert_eq!((again.capacity(), again.allocation_size()), (4000, 4096));
 ```
 
 ## Put your own memory in a backing
@@ -249,7 +305,7 @@ the bytes:
 
 ## Check the examples and the unsafe code
 
-The four examples on this page are doctests of `rsasync::buffer`. From the repository root,
+The five examples on this page are doctests of `rsasync::buffer`. From the repository root,
 `cargo xtask test` runs them with the other tests.
 
 Miri runs the tests of the buffer code and stops at undefined behavior, for example a read of

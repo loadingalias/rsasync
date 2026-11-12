@@ -14,6 +14,8 @@
 //! - A [`Lease`] freezes the initialized bytes of a buffer, or lends the bytes of a different
 //!   owner, for example a `bytes::Bytes`. Its views share the backing with no copy, and the last
 //!   lease or view that drops releases the backing.
+//! - A [`Pool`] gives slots of one size as backings, with no allocation, and charges all of them
+//!   to a budget. The last backing, lease, or view of a slot returns it to the pool, on any thread.
 //!
 //! A buffer gives four separate facts: the writable capacity, the initialized length, the
 //! allocation size, and the alignment. An inline array, for example `[u8; 4096]`, does not obey
@@ -238,12 +240,19 @@ unsafe impl Buffer for &'static [u8] {
 pub struct Release {
     data: *const (),
     release: unsafe fn(*const (), NonNull<u8>, usize),
+    /// Set only by [`Pool::acquire`]: `data` is the pool of the slot, and the slot counts its owners,
+    /// so that a lease of the slot needs no allocation.
+    pool_slot: bool,
 }
 
 impl Release {
     /// Makes a hook that calls `release(data, ptr, capacity)` with the region of its backing.
     pub const fn new(data: *const (), release: unsafe fn(*const (), NonNull<u8>, usize)) -> Self {
-        Self { data, release }
+        Self {
+            data,
+            release,
+            pool_slot: false,
+        }
     }
 }
 
@@ -534,6 +543,8 @@ enum Owner {
     /// standard `Arc` in each form, because the loom `Arc` cannot hold a trait object. The count
     /// only drops the owner.
     Foreign(alloc::sync::Arc<dyn ForeignBytes>),
+    /// A pool slot, which the last lease or view returns to its pool. The count is in the slot.
+    Slot(pool::SlotRef),
     /// A static region, which nothing releases.
     Static(&'static [u8]),
 }
@@ -647,14 +658,15 @@ impl From<Backing> for Lease {
     /// Freezes the initialized bytes of `backing`, with no copy. The capacity after them stays
     /// in the allocation until the release.
     ///
-    /// This is the one allocation of a lease: its reference count. Views and clones add none.
+    /// This is the one allocation of a lease: its reference count. Views and clones add none. A
+    /// backing from a [`Pool`] needs no allocation, because its slot counts the leases.
     fn from(backing: Backing) -> Self {
         let len = backing.initialized();
-        Self {
-            owner: Owner::Backing(Arc::new(backing)),
-            offset: 0,
-            len,
-        }
+        let owner = match pool::SlotRef::try_from(backing) {
+            Ok(slot) => Owner::Slot(slot),
+            Err(backing) => Owner::Backing(Arc::new(backing)),
+        };
+        Self { owner, offset: 0, len }
     }
 }
 
@@ -680,21 +692,25 @@ impl From<&'static [u8]> for Lease {
     unsafe_code,
     reason = "a lease keeps its owner alive and gives only reads of its bytes"
 )]
-// SAFETY: the owner of a lease is a static region, a shared backing, or a foreign owner, and the
-// lease keeps it alive. A shared backing is never borrowed mutably: no code takes `&mut` from its
-// `Arc`, so its address, its initialized length, and its bytes stay the same until the last lease
-// drops it. A foreign owner gave its bytes through `as_ref` one time, at its final address in its
-// `Arc`. After that, no code moves it, calls it, or borrows it mutably until its last drop. Two
-// shared borrows of a type can overlap, so a sound type cannot change bytes that it gave through
-// `&self` while it gives a shared borrow: only a `&mut` borrow or the drop can change them.
-// Each lease covers `len` bytes from `offset`, in the initialized bytes of its owner: `From` takes
-// all of them, and `view` takes a sub-slice of them. A move of a lease copies the `Arc` pointer or
-// the shared reference, so the region does not move.
+// SAFETY: the owner of a lease is a static region, a shared backing, a foreign owner, or a pool
+// slot, and the lease keeps it alive. A shared backing is never borrowed mutably: no code takes
+// `&mut` from its `Arc`, so its address, its initialized length, and its bytes stay the same until
+// the last lease drops it. A foreign owner gave its bytes through `as_ref` one time, at its final
+// address in its `Arc`. After that, no code moves it, calls it, or borrows it mutably until its
+// last drop. Two shared borrows of a type can overlap, so a sound type cannot change bytes that it
+// gave through `&self` while it gives a shared borrow: only a `&mut` borrow or the drop can change
+// them. A pool slot stays in use while its count is above zero, so its pool does not give it again,
+// and its address in the arena of the pool is fixed. Its only writer was the backing that became
+// the lease, so nothing writes its bytes while a lease of it lives. Each lease covers `len` bytes
+// from `offset`, in the initialized bytes of its owner: `From` takes all of them, and `view` takes
+// a sub-slice of them. A move of a lease copies the `Arc` pointer or the shared reference, so the
+// region does not move.
 unsafe impl Buffer for Lease {
     fn as_ptr(&self) -> *const u8 {
         let base = match &self.owner {
             Owner::Backing(backing) => backing.as_ptr(),
             Owner::Foreign(foreign) => foreign.as_ptr(),
+            Owner::Slot(slot) => slot.as_ptr(),
             Owner::Static(region) => region.as_ptr(),
         };
         base.wrapping_add(self.offset)
@@ -708,6 +724,7 @@ unsafe impl Buffer for Lease {
         match &self.owner {
             Owner::Backing(backing) => backing.allocation_size(),
             Owner::Foreign(foreign) => foreign.allocation_size(),
+            Owner::Slot(slot) => slot.allocation_size(),
             Owner::Static(_) => 0,
         }
     }
@@ -791,6 +808,10 @@ impl<B: BufferMut> WriteLoan<B> {
         self.buffer
     }
 }
+
+mod pool;
+
+pub use pool::{Pool, PoolEmpty, PoolRefused};
 
 #[cfg(test)]
 mod tests;
