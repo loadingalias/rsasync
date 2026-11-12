@@ -1,33 +1,30 @@
-//! The memory-model substitution point. Each atomic, reference count, shared cell, and thread park
-//! of this crate comes from this module, so one algorithm runs in each form. The one exception is
+//! The memory-model substitution point. Each atomic, reference count, shared cell, spin hint, and
+//! thread park of this crate comes from this module, so one algorithm runs in each form. The one exception is
 //! the words of an io_uring ring that the kernel also reads and writes: they are hardware atomics
 //! in each form.
 //!
-//! - Native: the `core` atomics, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, and, with the
-//!   `std` feature, `std::thread` for parking.
+//! - Native: the `core` atomics, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, `core::hint`,
+//!   and, with the `std` feature, `std::thread` for parking.
 //! - Without `std`: the same items with no thread. Thus a wait in this build is asynchronous. On a
 //!   target with one thread, such as `wasm32v1-none`, the atomic operations compile to plain
 //!   memory operations.
 //! - Verification: with `--cfg loom`, the unit tests use the loom model of each item. Loom runs
 //!   each test in many thread orders, gives some loads an older value that the memory model
-//!   permits, and finds data races on the cells. `cargo xtask explore` runs these tests.
-
-#![expect(
-    unused_imports,
-    reason = "the module comes before its users; when each item has a user, this expectation fails, and then you remove it"
-)]
+//!   permits, and finds data races on the cells. Its spin hint lets another thread run.
+//!   `cargo xtask explore` runs these tests.
 
 #[cfg(all(test, loom, feature = "std"))]
 pub(crate) use loom::thread;
 #[cfg(all(test, loom))]
 pub(crate) use loom::{
     cell::UnsafeCell,
+    hint,
     sync::{Arc, atomic},
 };
 #[cfg(all(not(all(test, loom)), feature = "std"))]
 pub(crate) use std::thread;
 #[cfg(not(all(test, loom)))]
-pub(crate) use {alloc::sync::Arc, core::sync::atomic, native::UnsafeCell};
+pub(crate) use {alloc::sync::Arc, core::hint, core::sync::atomic, native::UnsafeCell};
 
 #[cfg(not(all(test, loom)))]
 mod native {

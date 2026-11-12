@@ -8,26 +8,27 @@ shared cells. This page tells you how to write and run these exploration tests.
 ## The `sync` module
 
 Each of the two crates has a private `sync` module. Each atomic, `Arc` reference count,
-`UnsafeCell` shared cell, and thread park of the crate comes from that module. One algorithm thus
+`UnsafeCell` shared cell, and thread park of the crate comes from that module. In rsasync, the
+spin hint also comes from it, so loom can run another thread at the hint. One algorithm thus
 runs in three forms:
 
 | Form | Selected by | Items |
 | --- | --- | --- |
-| Native | The default build | `core::sync::atomic`, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, and, in rsasync with the `std` feature, `std::thread` |
+| Native | The default build | `core::sync::atomic`, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, in rsasync `core::hint`, and, in rsasync with the `std` feature, `std::thread` |
 | Without `std` | `--no-default-features` | The same items with no `thread`. Thus a wait in this build is asynchronous |
-| Verification | `--cfg loom`, in the unit tests only | `loom::sync::atomic`, `loom::sync::Arc`, `loom::cell::UnsafeCell`, and, with the `std` feature, `loom::thread` |
+| Verification | `--cfg loom`, in the unit tests only | `loom::sync::atomic`, `loom::sync::Arc`, `loom::cell::UnsafeCell`, in rsasync `loom::hint`, and, with the `std` feature, `loom::thread` |
 
 The native form adds no run-time work. Get access to a cell only through `with` and `with_mut`.
 Each one gives a raw pointer while its closure runs, so loom knows when each access starts and
 ends.
 
-Do not use `core::sync`, `alloc::sync`, `std::sync`, `std::thread`, or `core::cell::UnsafeCell`
-in other production code of the two crates. Loom cannot see an item that does not come from the
+Do not use `core::sync`, `alloc::sync`, `std::sync`, `std::thread`, `core::cell::UnsafeCell`, or
+`core::hint` in other production code of the two crates. Loom cannot see an item that does not come from the
 module. A native test can use them to drive the code under test, for example to start a thread.
 Run this search from the repository root:
 
 ```sh
-git grep -nE '(^|[^:[:alnum:]_])(core|alloc|std)::(\{|sync|thread|cell::UnsafeCell)' -- rstypes/src src ':!rstypes/src/sync.rs' ':!src/sync.rs' ':(glob,exclude)**/tests.rs'
+git grep -nE '(^|[^:[:alnum:]_])(core|alloc|std)::(\{|sync|thread|hint|cell::UnsafeCell)' -- rstypes/src src ':!rstypes/src/sync.rs' ':!src/sync.rs' ':(glob,exclude)**/tests.rs'
 ```
 
 The search also finds each import with braces, such as `use core::{...}`, because such an import

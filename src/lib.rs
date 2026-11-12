@@ -24,6 +24,14 @@ mod sync;
     )
 )]
 mod table;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the channels, the one-shot, and the permit wait are its first users"
+    )
+)]
+mod wait;
 
 // The io_uring declarations are checked against the kernel headers of these two architectures
 // only. Another architecture has different constants, so it gets no ring.
