@@ -8,7 +8,7 @@ rsasync shares three groups of types with networking libraries and with applicat
 | `rsasync::capacity` | Capacity permits, and the caller-owned budget that contains them. See [Capacity](capacity.md) |
 | `rsasync::time` | Clock domains, instants and deadlines, and physical-time readings |
 
-rsasync is in development and has no release.
+rsasync is in development, and its alpha releases are on crates.io.
 
 ## Use the types through `rsasync`
 

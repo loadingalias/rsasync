@@ -2,8 +2,8 @@
 
 An rsasync I/O operation takes each buffer by value and gives it back when the operation ends. This
 page tells who owns the bytes before, during, and after an operation, and which buffers obey the
-contract. The types are in `rsasync::buffer`. rsasync is in development and has no release. It
-has the buffer types, but no I/O operation yet.
+contract. The types are in `rsasync::buffer`. rsasync is in development, and its alpha releases
+are on crates.io. It has the buffer types, but no I/O operation yet.
 
 ## Who owns the bytes
 

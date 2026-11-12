@@ -134,7 +134,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rsasync"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "loom",
  "rsnetwork-udp",
@@ -149,11 +149,11 @@ checksum = "e708a799aaf045099fc91c80bb60a63e8e3da710a6a17953d97afc5ecb192861"
 
 [[package]]
 name = "rsnetwork-udp"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 
 [[package]]
 name = "rstypes"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "loom",
 ]

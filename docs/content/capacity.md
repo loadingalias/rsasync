@@ -2,8 +2,9 @@
 
 `rsasync::capacity` counts the capacity that the runtime, the libraries, and the application
 reserve, for example bytes of memory. The application makes one budget and gives it to each of
-them, so all of their charges come from one total. rsasync is in development and has no release.
-The waiting reservation, which waits until capacity is free, is not available yet.
+them, so all of their charges come from one total. rsasync is in development, and its alpha
+releases are on crates.io. The waiting reservation, which waits until capacity is free, is not
+available yet.
 
 ## One budget for the runtime, the libraries, and the application
 

@@ -1,8 +1,8 @@
 # Platform support
 
-rsasync is in development and has no release. This page gives the Linux C libraries that rsasync
-supports, the WebAssembly targets of its portable subset, and the evidence that its tests give
-today.
+rsasync is in development, and its alpha releases are on crates.io. This page gives the Linux C
+libraries that rsasync supports, the WebAssembly targets of its portable subset, and the evidence
+that its tests give today.
 
 ## Linux C libraries
 

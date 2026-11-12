@@ -1,11 +1,13 @@
 [package]
 name = "rsasync"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 description = "A dual async runtime: thread-per-core and work-stealing tasks, completion I/O on owned buffers, bounded channels, permits, and time."
 repository = "https://github.com/loadingalias/rsasync"
 edition.workspace = true
 license.workspace = true
-publish.workspace = true
+# The crate is at the workspace root: the package holds only its sources, its license, and its
+# README.
+include = ["/src", "/LICENSE", "/README.md"]
 
 [features]
 default = ["std"]
@@ -14,11 +16,11 @@ std = ["rstypes/std", "dep:rsnetwork-udp"]
 
 [dependencies]
 # The shared types. Users reach them through this crate and never name it.
-rstypes = { path = "rstypes", version = "=0.1.0-alpha.1", default-features = false }
+rstypes = { path = "rstypes", version = "=0.1.0-alpha.2", default-features = false }
 
 # The socket-address declarations that the networking family shares, for the driver.
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
-rsnetwork-udp = { path = "rsnetwork-udp", version = "=0.1.0-alpha.1", optional = true }
+rsnetwork-udp = { path = "rsnetwork-udp", version = "=0.1.0-alpha.2", optional = true }
 
 # The exploration tests (`cargo xtask explore`) use loom. A build without
 # `--cfg loom` compiles none of it.
@@ -37,8 +39,6 @@ members = [".", "rsnetwork-udp", "rstypes", "xtask"]
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-# Private during stealth. Publication is a later, separate decision.
-publish = false
 
 [workspace.dependencies]
 # Features off: the exploration tests use only the models of the `sync`

@@ -23,7 +23,7 @@ win by at least 10% in throughput per core or 25% in tail latency, and no other 
 mixed-mode cell runs both modes in one build against Tokio alone and against Monoio or Compio
 composed with Tokio. Every loss is published, and no "fastest" claim ships without this evidence.
 
-Status: in development. No release yet.
+Status: in development. Alpha releases are on crates.io; each one can change the API.
 
 Part of one family on [rscrypto](https://github.com/loadingalias/rscrypto): rsasync (runtime),
 rsnetwork (networking), and rsauthnz (auth). Apache-2.0. Develop with `cargo xtask fix`,
