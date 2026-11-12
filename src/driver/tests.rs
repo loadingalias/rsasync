@@ -1,6 +1,6 @@
 use alloc::task::Wake;
 use core::alloc::Layout;
-use core::ffi::{c_int, c_short, c_ulong};
+use core::ffi::c_int;
 use core::future::Future;
 use core::mem::{self, ManuallyDrop};
 use core::num::{NonZeroU32, NonZeroU64};
@@ -15,47 +15,29 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, Thread};
 use std::vec::Vec;
 
-use super::{Completion, Config, Driver, Held, Reason, Refused};
+use super::{Completion, Config, Driver, Held, Reason, Refused, sys};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
 use crate::uring::Sqe;
 
-#[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+#[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
 unsafe extern "C" {
     /// `int pipe2(int pipefd[2], int flags)`.
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
-    /// `int poll(struct pollfd *fds, nfds_t nfds, int timeout)`, with `nfds_t` an
-    /// `unsigned long`.
-    fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
 }
-
-/// `struct pollfd` (`poll.h` of glibc and musl), and `POLLIN`
-/// (`include/uapi/asm-generic/poll.h`).
-#[repr(C)]
-struct PollFd {
-    fd: c_int,
-    events: c_short,
-    revents: c_short,
-}
-const POLLIN: c_short = 0x1;
-
-const _: () = {
-    assert!(size_of::<PollFd>() == 8);
-    assert!(core::mem::offset_of!(PollFd, events) == 4);
-};
 
 /// Blocks until the wake descriptor of `driver` is readable, as the reactor of a host waits for
 /// it.
 #[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
 fn wait_readable(driver: &Driver) {
-    let mut fd = PollFd {
+    let mut fd = sys::PollFd {
         fd: driver.as_fd().as_raw_fd(),
-        events: POLLIN,
+        events: sys::POLLIN,
         revents: 0,
     };
     // SAFETY: `fd` is one valid `pollfd` during the call.
-    assert_eq!(unsafe { poll(&raw mut fd, 1, -1) }, 1);
+    assert_eq!(unsafe { sys::poll(&raw mut fd, 1, -1) }, 1);
 }
 
 /// `O_NONBLOCK` and `O_CLOEXEC` (`include/uapi/asm-generic/fcntl.h`).
@@ -559,4 +541,70 @@ fn a_selecting_receive_with_no_free_buffer_gives_enobufs() {
     assert_eq!(drive(&mut driver, receive).unwrap().unwrap().bytes(), b"second");
     next.send(()).unwrap();
     client.join().unwrap();
+}
+
+/// Turns the driver each time that its wake descriptor is readable, as the reactor of a host does,
+/// and polls `future` after each turn, until it gives its output. It never calls `Driver::wait`.
+fn drive_from_reactor<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        let more = driver.turn().expect("a turn of the test driver works").more();
+        if let Poll::Ready(output) = Pin::new(&mut future).poll(&mut cx) {
+            return output;
+        }
+        if !more {
+            wait_readable(driver);
+        }
+    }
+}
+
+/// A reactor that waits only for the wake descriptor sees each of two selecting receives that wait
+/// for their data. On a kernel with the eventfd defect of `probe`, the second receive completes
+/// only because the driver registers the descriptor again.
+#[test]
+fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
+    let budget = budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut driver = driver(Config::new());
+    driver
+        .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
+        .unwrap();
+    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.local_addr();
+    let (next, wait) = std::sync::mpsc::channel::<&'static [u8]>();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        for bytes in wait {
+            stream.write_all(bytes).unwrap();
+        }
+    });
+    let accept = driver.accept(&listener).unwrap();
+    let (stream, _) = drive_from_reactor(&mut driver, accept).unwrap().unwrap();
+    for bytes in [&b"first"[..], b"second"] {
+        let receive = driver.recv_selected(&stream).unwrap();
+        // The turn submits the receive, which finds no data and waits for it.
+        driver.turn().unwrap();
+        next.send(bytes).unwrap();
+        let received = drive_from_reactor(&mut driver, receive).unwrap().unwrap();
+        assert_eq!(received.bytes(), bytes);
+    }
+    drop(next);
+    client.join().unwrap();
+}
+
+/// The probe finds the eventfd defect on the kernels of the evidence hosts that have it: the
+/// kernel `7.0.0-1016-aws` of Ubuntu 26.04 has `cd305ee3633a` and not `04fe9aeb4f3c`, and Linux
+/// 6.1 of Debian 12 has neither. On another kernel, only the start of the driver is checked.
+#[test]
+fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+    let driver = driver(Config::new());
+    let expected = match release.trim() {
+        "7.0.0-1016-aws" => Some(true),
+        release if release.starts_with("6.1.") => Some(false),
+        _ => None,
+    };
+    if let Some(expected) = expected {
+        assert_eq!(driver.rearm_wake, expected, "the kernel {release}");
+    }
 }

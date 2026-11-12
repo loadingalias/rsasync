@@ -13,8 +13,7 @@
 //! - [`Driver::wait`] blocks in the kernel until work comes: a completion, or a request or wake
 //!   from another thread. The kernel runs its deferred work during the wait.
 //! - The wake descriptor, [`AsFd`] of the driver, becomes readable when work comes, so a host's
-//!   reactor can wait for it. Some kernels signal it for deferred work only one time, as the
-//!   documentation of its `AsFd` implementation says.
+//!   reactor can wait for it.
 //! - [`Driver::teardown`] cancels each running operation, drives until each terminal event, and
 //!   closes each resource. Its [`Teardown`] reports the cancelled operations.
 //!
@@ -40,6 +39,7 @@
 //! ```
 
 mod completion;
+mod probe;
 mod sys;
 mod tcp;
 #[cfg(all(test, not(loom)))]
@@ -487,13 +487,12 @@ impl Shared {
         }
     }
 
-    /// Clears the wake descriptors.
-    fn clear(&self) {
+    /// Clears the wake descriptors. Gives `true` when the wake descriptor had a wake.
+    fn clear(&self) -> bool {
         let mut count = [0; 8];
-        for fd in [&self.wake, &self.interrupt] {
-            // A descriptor with no wake gives `WouldBlock`, which is the clear state.
-            drop((&*fd).read(&mut count));
-        }
+        // A descriptor with no wake gives `WouldBlock`, which is the clear state.
+        drop((&self.interrupt).read(&mut count));
+        (&self.wake).read(&mut count).is_ok()
     }
 }
 
@@ -516,6 +515,9 @@ pub struct Driver {
     /// The ring polls the interrupt descriptor, so that a request or wake from another thread
     /// ends a wait.
     waking: bool,
+    /// The kernel signals the wake descriptor for deferred work only one time in each
+    /// registration (`probe`), so each turn that takes a wake registers it again.
+    rearm_wake: bool,
 }
 
 impl fmt::Debug for Driver {
@@ -525,6 +527,7 @@ impl fmt::Debug for Driver {
             .field("resources", &self.resources.0.len())
             .field("selected", &self.selected)
             .field("completions_per_turn", &self.completions_per_turn)
+            .field("rearm_wake", &self.rearm_wake)
             .finish_non_exhaustive()
     }
 }
@@ -545,18 +548,22 @@ impl Driver {
             return Err(Error::Config);
         }
         let completions = config.operations.max(config.submissions).saturating_mul(2).min(1 << 16);
-        let ring = Ring::new(config.submissions, completions).map_err(|error| match error {
+        let mut ring = Ring::new(config.submissions, completions).map_err(|error| match error {
             SetupError::Refused(error) => Error::Refused(error),
             SetupError::Failed(error) if error.kind() == io::ErrorKind::InvalidInput => Error::Config,
             SetupError::Failed(error) => Error::System(error),
         })?;
         let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
+        let wake = File::from(wake);
         ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
+        let rearm_wake = probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?;
+        // The probe used the registration. A new one starts with no deferred signal.
+        rearm(&ring, &wake).map_err(Error::System)?;
         let table = Table::new(config.operations);
         let shared = Arc::new(Shared {
             entries: (0..config.operations).map(|_| Entry::new()).collect(),
             requests: table.requests(),
-            wake: File::from(wake),
+            wake,
             interrupt: File::from(interrupt),
         });
         Ok(Self {
@@ -567,6 +574,7 @@ impl Driver {
             selected: None,
             completions_per_turn: config.completions_per_turn,
             waking: false,
+            rearm_wake,
         })
     }
 
@@ -620,7 +628,12 @@ impl Driver {
         let completed = self.harvest(self.completions_per_turn);
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
         // the descriptor already, so this turn reports it, or a later wake comes.
-        self.shared.clear();
+        if self.shared.clear() && self.rearm_wake {
+            // On a kernel with the defect of `probe`, the next deferred work signals only a new
+            // registration. Deferred work that comes before the new registration sets
+            // `IORING_SQ_TASKRUN` before it tries the signal, so the look below sees it.
+            rearm(&self.ring, &self.shared.wake)?;
+        }
         more |= self.ring.ready()
             || self.ring.needs_enter()
             || self.ring.unsubmitted() > 0
@@ -854,11 +867,12 @@ impl AsFd for Driver {
     /// deferred work for the driver, and when another thread posts a request or a wake. Turn the
     /// driver when it is readable.
     ///
-    /// Some kernels signal the descriptor for deferred work only one time in the life of the
-    /// driver: a Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c`. The
-    /// driver tests saw it on Ubuntu 26.04 with `7.0.0-1016-aws`. A reactor that waits only for
-    /// this descriptor can then miss an operation that waited for readiness, such as a receive
-    /// that waited for its data. [`Driver::wait`] does not depend on the signal.
+    /// A Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c` signals the
+    /// descriptor for deferred work only one time in each registration, for example Ubuntu 26.04
+    /// with `7.0.0-1016-aws`. The driver finds such a kernel when it starts, and it then registers
+    /// the descriptor again in each turn that takes a wake, so the descriptor still becomes
+    /// readable for each completion and each deferred work. A kernel with no defect makes no extra
+    /// system call.
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.shared.wake.as_fd()
     }
@@ -905,6 +919,13 @@ unsafe fn push_now(ring: &mut Ring, entry: &Sqe) -> io::Result<()> {
     ring.submit(0)?;
     // SAFETY: as above.
     unsafe { ring.push(entry) }.map_err(|_| io::ErrorKind::WouldBlock.into())
+}
+
+/// Ends the registration of the wake descriptor and makes a new one, which starts with no
+/// deferred signal (`probe`).
+fn rearm(ring: &Ring, wake: &File) -> io::Result<()> {
+    ring.unregister_eventfd()?;
+    ring.register_eventfd(wake.as_raw_fd())
 }
 
 /// A failure of the kernel entry that leaves the work for the next turn: an interrupt, or a full

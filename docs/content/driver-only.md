@@ -54,14 +54,17 @@ example epoll or the reactor of another runtime. When it reports the descriptor 
 turn the driver, and turn it again while `Turn::more()` gives `true`. The turn clears the
 descriptor, so the reactor reports it again only for new work.
 
-Some kernels signal the wake descriptor for deferred work of the kernel only one time in the life
-of the driver. In Linux, the defect is in a kernel that has the io_uring change `cd305ee3633a`
-("defer eventfd signaling when queued from a wakeup handler") and not `04fe9aeb4f3c` ("reset
-deferred signal state"). The driver tests saw it on Ubuntu 26.04 with `7.0.0-1016-aws`. On such a
-kernel, a reactor that waits only for the descriptor can miss an operation that waited for
-readiness, for example a receive that waited for its data, and the operation does not complete.
-`Driver::wait` does not depend on that signal, so use your own loop with `Driver::wait` on such a
-kernel.
+The descriptor becomes readable for each completion and for each deferred work of the kernel, on
+each supported kernel, so a reactor that waits only for it misses no operation.
+
+One kernel defect needs a workaround in the driver. A Linux kernel with the io_uring change
+`cd305ee3633a` ("defer eventfd signaling when queued from a wakeup handler") and not
+`04fe9aeb4f3c` ("reset deferred signal state") signals the descriptor for deferred work only one
+time in each registration, for example Ubuntu 26.04 with `7.0.0-1016-aws`. `Driver::new` finds such
+a kernel with a probe of two deferred signals, which takes up to about 1 s on an affected kernel.
+The driver then registers the descriptor again in each turn that takes a wake: two system calls in
+that turn. A kernel with no defect makes no extra system call. The workaround goes when the
+supported kernels have `04fe9aeb4f3c`.
 
 ## Accept, receive, and send on TCP
 

@@ -406,6 +406,14 @@ impl Ring {
         unsafe { register(self.fd(), sys::IORING_REGISTER_EVENTFD, (&raw mut fd).cast(), 1) }.map(drop)
     }
 
+    /// Ends the registration of `register_eventfd` (`IORING_UNREGISTER_EVENTFD`). A new
+    /// registration then starts with a new state in the kernel.
+    #[expect(unsafe_code, reason = "the call reads no argument")]
+    pub(crate) fn unregister_eventfd(&self) -> io::Result<()> {
+        // SAFETY: the operation reads no argument, and `nr_args` is 0.
+        unsafe { register(self.fd(), sys::IORING_UNREGISTER_EVENTFD, core::ptr::null_mut(), 0) }.map(drop)
+    }
+
     /// The completions that are ready, in order. Each entry goes back to the kernel as the
     /// iterator gives it, so a leaked iterator gives no entry two times.
     pub(crate) fn completions(&mut self) -> Completions<'_> {

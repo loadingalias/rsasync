@@ -61,6 +61,7 @@ pub(super) const IORING_OFF_SQ_RING: i64 = 0;
 pub(super) const IORING_OFF_SQES: i64 = 0x1000_0000;
 
 pub(super) const IORING_REGISTER_EVENTFD: u32 = 4;
+pub(super) const IORING_UNREGISTER_EVENTFD: u32 = 5;
 pub(super) const IORING_REGISTER_PROBE: u32 = 8;
 pub(super) const IORING_REGISTER_PBUF_RING: u32 = 22;
 pub(super) const IORING_UNREGISTER_PBUF_RING: u32 = 23;
