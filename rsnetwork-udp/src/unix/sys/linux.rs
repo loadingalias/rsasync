@@ -1,4 +1,4 @@
-//! The declarations of the datagram calls, their message headers, and their control messages.
+//! The declarations of the datagram calls, their message headers, and their control messages on Linux.
 //!
 //! Each item agrees with `include/uapi/linux/socket.h`, `in.h`, `in6.h`, `udp.h`, `uio.h`,
 //! `include/linux/socket.h`, and `include/uapi/asm-generic/errno.h` of Linux 6.1, on x86_64 and
@@ -150,14 +150,14 @@ pub const EMSGSIZE: c_int = 90;
 #[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
 unsafe extern "C" {
     /// `ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)`.
-    pub(super) fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
+    pub(crate) fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     /// `ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)`.
-    pub(super) fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    pub(crate) fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     /// `int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)`.
-    pub(super) fn sendmmsg(sockfd: c_int, msgvec: *mut MmsgHdr, vlen: c_uint, flags: c_int) -> c_int;
+    pub(crate) fn sendmmsg(sockfd: c_int, msgvec: *mut MmsgHdr, vlen: c_uint, flags: c_int) -> c_int;
     /// `int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
     /// struct timespec *timeout)`.
-    pub(super) fn recvmmsg(
+    pub(crate) fn recvmmsg(
         sockfd: c_int,
         msgvec: *mut MmsgHdr,
         vlen: c_uint,
@@ -165,9 +165,9 @@ unsafe extern "C" {
         timeout: *mut c_void,
     ) -> c_int;
     /// `int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)`.
-    pub(super) fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
+    pub(crate) fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
     /// `int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)`.
-    pub(super) fn getsockopt(
+    pub(crate) fn getsockopt(
         sockfd: c_int,
         level: c_int,
         optname: c_int,
@@ -175,5 +175,5 @@ unsafe extern "C" {
         optlen: *mut u32,
     ) -> c_int;
     /// `int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`.
-    pub(super) fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    pub(crate) fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
 }

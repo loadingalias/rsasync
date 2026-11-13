@@ -11,10 +11,19 @@ default = ["std"]
 # The datagram calls on a socket. Without `std`, the crate has only its
 # declarations and its control-message encoding, which need only `core`.
 std = []
+# On macOS, `send_batch` and `recv_batch` use one system call for the batch: the private calls
+# `sendmsg_x` and `recvmsg_x`. It has no effect on another target, so iOS never builds them.
+macos-private-batch = ["std"]
 
 # The tests of datagram I/O through a socket that Tokio owns.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
 tokio = { version = "1.54.1", default-features = false, features = ["net", "rt"] }
 
 [lints]
 workspace = true
+
+# The measurement of the batches of macOS. It uses the datagram calls, and it is its own program.
+[[bench]]
+name = "macos_batch"
+harness = false
+required-features = ["std"]

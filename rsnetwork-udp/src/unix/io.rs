@@ -9,11 +9,20 @@ use std::os::fd::{AsRawFd as _, BorrowedFd};
 
 use super::control::{Control, Metadata, Transmit};
 use super::sys::{
-    self, EINTR, EIO, EMSGSIZE, IP_MTU_DISCOVER, IP_PKTINFO, IP_PMTUDISC_DO, IP_RECVTOS, IPPROTO_IP, IPPROTO_IPV6,
-    IPV6_DONTFRAG, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_DO, IPV6_RECVPKTINFO, IPV6_RECVTCLASS, IPV6_V6ONLY, IoVec,
-    MSG_DONTWAIT, MSG_TRUNC, MmsgHdr, MsgHdr, SOL_UDP, UDP_GRO,
+    self, EINTR, EMSGSIZE, IP_PKTINFO, IP_RECVTOS, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, IPV6_RECVPKTINFO,
+    IPV6_RECVTCLASS, IPV6_V6ONLY, IoVec, MSG_DONTWAIT, MSG_TRUNC, MsgHdr,
 };
 use super::{AF_INET, AF_INET6, SockAddrStorage};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{recv_batch, send_batch, set_gro};
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{recv_batch, send_batch};
 
 /// The most datagrams of one [`send_batch`] or [`recv_batch`].
 pub const BATCH: usize = 32;
@@ -23,11 +32,13 @@ pub const BATCH: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
     /// The datagram is larger than the path MTU, and the don't-fragment option is on
-    /// (`EMSGSIZE`). Send smaller datagrams.
+    /// (`EMSGSIZE`). Send smaller datagrams. macOS also gives it for a datagram that is larger
+    /// than the send buffer of the socket.
     TooLarge,
-    /// The device cannot segment the batch (`EIO` on a send with a segment size). The kernel sent
-    /// none of it. Send its segments as separate datagrams, for example with [`send_batch`], and
-    /// send no segment size on this path again.
+    /// The path cannot segment the batch. On Linux, the device cannot (`EIO` on a send with a
+    /// segment size), and macOS has no segmentation offload. No datagram of it was sent. Send its
+    /// segments as separate datagrams, for example with [`send_batch`], and send no segment size
+    /// on this path again.
     NoSegmentation,
 }
 
@@ -43,7 +54,7 @@ impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::TooLarge => "the datagram is larger than the path MTU, and it cannot be fragmented",
-            Self::NoSegmentation => "the device cannot segment the batch; send its segments as separate datagrams",
+            Self::NoSegmentation => "the path cannot segment the batch; send its segments as separate datagrams",
         })
     }
 }
@@ -57,7 +68,9 @@ pub struct Received {
     pub len: usize,
     /// The peer. A dual-stack IPv6 socket gives an IPv4 peer as its IPv4-mapped address.
     pub source: SocketAddr,
-    /// The datagram did not fit in the buffer, and the kernel dropped its rest.
+    /// The datagram did not fit in the buffer, and the kernel dropped its rest. With the
+    /// `macos-private-batch` feature, [`recv_batch`] of macOS cannot tell a datagram that fits its
+    /// buffer exactly from a longer one, and it reports both as truncated.
     pub truncated: bool,
     /// The segment size, the ECN codepoint, and the local address.
     pub metadata: Metadata,
@@ -78,7 +91,9 @@ impl Default for Received {
 /// datagram. A dual-stack IPv6 socket gets them for IPv4 datagrams too.
 pub fn configure(socket: BorrowedFd<'_>) -> io::Result<()> {
     let (ipv4, ipv6) = families(socket)?;
-    if ipv4 {
+    // Linux gives the metadata of the IPv4 datagrams of a dual-stack socket through its IPv4
+    // options. macOS gives them through its IPv6 options.
+    if ipv4 && (cfg!(target_os = "linux") || !ipv6) {
         set(socket, IPPROTO_IP, IP_RECVTOS, 1)?;
         set(socket, IPPROTO_IP, IP_PKTINFO, 1)?;
     }
@@ -89,21 +104,21 @@ pub fn configure(socket: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-/// Turns coalesced receive (GRO) on or off. A coalesced receive gives several datagrams of one
-/// peer in one buffer, with their segment size in [`Metadata::segment_size`].
-pub fn set_gro(socket: BorrowedFd<'_>, on: bool) -> io::Result<()> {
-    set(socket, SOL_UDP, UDP_GRO, c_int::from(on))
-}
-
 /// Turns the don't-fragment option on, which path MTU discovery needs: a datagram above the path
 /// MTU is refused with [`Refused::TooLarge`].
 pub fn set_dont_fragment(socket: BorrowedFd<'_>) -> io::Result<()> {
     let (ipv4, ipv6) = families(socket)?;
+    #[cfg(target_os = "linux")]
     if ipv4 {
-        set(socket, IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)?;
+        set(socket, IPPROTO_IP, sys::IP_MTU_DISCOVER, sys::IP_PMTUDISC_DO)?;
+    }
+    #[cfg(target_os = "macos")]
+    if ipv4 && !ipv6 {
+        set(socket, IPPROTO_IP, sys::IP_DONTFRAG, 1)?;
     }
     if ipv6 {
-        set(socket, IPPROTO_IPV6, IPV6_MTU_DISCOVER, IPV6_PMTUDISC_DO)?;
+        #[cfg(target_os = "linux")]
+        set(socket, IPPROTO_IPV6, sys::IPV6_MTU_DISCOVER, sys::IPV6_PMTUDISC_DO)?;
         set(socket, IPPROTO_IPV6, IPV6_DONTFRAG, 1)?;
     }
     Ok(())
@@ -115,10 +130,14 @@ pub fn set_dont_fragment(socket: BorrowedFd<'_>) -> io::Result<()> {
 /// # Errors
 ///
 /// `WouldBlock` when the socket has no room, a [`Refused`] payload, or another error of
-/// `sendmsg`.
+/// `sendmsg`. On macOS, each segment size gives [`Refused::NoSegmentation`].
 #[expect(unsafe_code, reason = "the message header names memory that lives during the call")]
 pub fn send(socket: BorrowedFd<'_>, transmit: &Transmit<'_>) -> io::Result<usize> {
-    let (mut name, name_len) = SockAddrStorage::new(transmit.destination);
+    #[cfg(target_os = "macos")]
+    if transmit.segment_size.is_some() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, Refused::NoSegmentation));
+    }
+    let (mut name, name_len) = name(transmit);
     let mut region = region(transmit.contents);
     let mut control = Control::new();
     let control_len = control.encode(transmit);
@@ -132,54 +151,6 @@ pub fn send(socket: BorrowedFd<'_>, transmit: &Transmit<'_>) -> io::Result<usize
         match io::Error::last_os_error() {
             error if error.raw_os_error() == Some(EINTR) => {}
             error => return Err(refusal(error, transmit.segment_size.is_some())),
-        }
-    }
-}
-
-/// Sends up to [`BATCH`] datagrams or batches of segments in one call (`sendmmsg`), each with its
-/// own metadata, with no wait. Gives the number of `transmits` that the kernel sent, from the
-/// first. Send the rest again; their bytes never join another datagram.
-///
-/// # Errors
-///
-/// As for [`send`], when the kernel sent none of them.
-#[expect(unsafe_code, reason = "the message headers name memory that lives during the call")]
-pub fn send_batch(socket: BorrowedFd<'_>, transmits: &[Transmit<'_>]) -> io::Result<usize> {
-    let transmits = &transmits[..transmits.len().min(BATCH)];
-    let mut names = [SockAddrStorage::EMPTY; BATCH];
-    let mut regions = [region(&[]); BATCH];
-    let mut controls = [Control::new(); BATCH];
-    let mut headers = [MmsgHdr {
-        msg_hdr: header_empty(),
-        msg_len: 0,
-    }; BATCH];
-    let mut segmented = false;
-    for (index, transmit) in transmits.iter().enumerate() {
-        let name_len;
-        (names[index], name_len) = SockAddrStorage::new(transmit.destination);
-        regions[index] = region(transmit.contents);
-        let control_len = controls[index].encode(transmit);
-        headers[index].msg_hdr = header(
-            &mut names[index],
-            name_len,
-            &mut regions[index],
-            &mut controls[index],
-            control_len,
-        );
-        segmented |= transmit.segment_size.is_some();
-    }
-    let count = c_uint_len(transmits.len());
-    loop {
-        // SAFETY: the first `count` headers name the addresses, the regions, and the control
-        // messages of `transmits`, which live during the call. The kernel reads them, and writes
-        // only the `msg_len` of each header.
-        let sent = unsafe { sys::sendmmsg(socket.as_raw_fd(), headers.as_mut_ptr(), count, MSG_DONTWAIT) };
-        if let Ok(sent) = usize::try_from(sent) {
-            return Ok(sent);
-        }
-        match io::Error::last_os_error() {
-            error if error.raw_os_error() == Some(EINTR) => {}
-            error => return Err(refusal(error, segmented)),
         }
     }
 }
@@ -203,7 +174,11 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
         // live during the call. The kernel writes at most their lengths.
         let len = unsafe { sys::recvmsg(socket.as_raw_fd(), &raw mut header, MSG_DONTWAIT) };
         if let Ok(len) = usize::try_from(len) {
-            return finish(&name, &header, &control, len);
+            #[cfg(target_os = "linux")]
+            let control_len = header.msg_controllen;
+            #[cfg(target_os = "macos")]
+            let control_len = usize::try_from(header.msg_controllen).unwrap_or(usize::MAX);
+            return finish(&name, header.msg_namelen, header.msg_flags, &control, control_len, len);
         }
         match io::Error::last_os_error() {
             error if error.raw_os_error() == Some(EINTR) => {}
@@ -212,59 +187,12 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
     }
 }
 
-/// Receives up to [`BATCH`] datagrams in one call (`recvmmsg`), one into each of `buffers`, with
-/// no wait. Writes each into `received`, from the first, and gives the number of datagrams.
-///
-/// # Errors
-///
-/// `WouldBlock` when no datagram is ready, or another error of `recvmmsg`.
-#[expect(unsafe_code, reason = "the message headers name memory that lives during the call")]
-pub fn recv_batch(socket: BorrowedFd<'_>, buffers: &mut [&mut [u8]], received: &mut [Received]) -> io::Result<usize> {
-    let count = buffers.len().min(received.len()).min(BATCH);
-    let mut names = [SockAddrStorage::EMPTY; BATCH];
-    let mut regions = [region(&[]); BATCH];
-    let mut controls = [Control::new(); BATCH];
-    let mut headers = [MmsgHdr {
-        msg_hdr: header_empty(),
-        msg_len: 0,
-    }; BATCH];
-    for (index, buffer) in buffers.iter_mut().take(count).enumerate() {
-        regions[index] = IoVec {
-            iov_base: buffer.as_mut_ptr().cast(),
-            iov_len: buffer.len(),
-        };
-        headers[index].msg_hdr = header(
-            &mut names[index],
-            SockAddrStorage::LEN,
-            &mut regions[index],
-            &mut controls[index],
-            Control::LEN,
-        );
-    }
-    loop {
-        // SAFETY: the first `count` headers name address storage, the buffers, and control storage,
-        // which live during the call. The kernel writes at most their lengths.
-        let done = unsafe {
-            sys::recvmmsg(
-                socket.as_raw_fd(),
-                headers.as_mut_ptr(),
-                c_uint_len(count),
-                MSG_DONTWAIT,
-                ptr::null_mut(),
-            )
-        };
-        if let Ok(done) = usize::try_from(done) {
-            for (index, slot) in received.iter_mut().take(done).enumerate() {
-                let len = usize::try_from(headers[index].msg_len).unwrap_or(usize::MAX);
-                *slot = finish(&names[index], &headers[index].msg_hdr, &controls[index], len)?;
-            }
-            return Ok(done);
-        }
-        match io::Error::last_os_error() {
-            error if error.raw_os_error() == Some(EINTR) => {}
-            error => return Err(error),
-        }
-    }
+/// The address of the destination of `transmit`, and its length. A send to the peer of a connected
+/// socket has no address, and its length is 0.
+fn name(transmit: &Transmit<'_>) -> (SockAddrStorage, u32) {
+    transmit
+        .destination
+        .map_or((SockAddrStorage::EMPTY, 0), SockAddrStorage::new)
 }
 
 /// The region of `bytes`, which the kernel only reads.
@@ -275,7 +203,8 @@ fn region(bytes: &[u8]) -> IoVec {
     }
 }
 
-/// A header that names one address, one region, and `control_len` bytes of control messages.
+/// A header that names one address of `name_len` bytes, or none for a length of 0, one region, and
+/// `control_len` bytes of control messages.
 fn header(
     name: &mut SockAddrStorage,
     name_len: u32,
@@ -284,7 +213,11 @@ fn header(
     control_len: usize,
 ) -> MsgHdr {
     MsgHdr {
-        msg_name: ptr::from_mut(name).cast(),
+        msg_name: if name_len == 0 {
+            ptr::null_mut()
+        } else {
+            ptr::from_mut(name).cast()
+        },
         msg_namelen: name_len,
         msg_iov: region,
         msg_iovlen: 1,
@@ -293,42 +226,45 @@ fn header(
         } else {
             control.as_mut_ptr().cast()
         },
+        #[cfg(target_os = "linux")]
         msg_controllen: control_len,
+        #[cfg(target_os = "macos")]
+        msg_controllen: c_uint_len(control_len),
         msg_flags: 0,
     }
 }
 
-/// A header that names nothing.
-const fn header_empty() -> MsgHdr {
-    MsgHdr {
-        msg_name: ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: ptr::null_mut(),
-        msg_iovlen: 0,
-        msg_control: ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    }
-}
-
-/// The datagram that a receive wrote, from its header and its storage.
-fn finish(name: &SockAddrStorage, header: &MsgHdr, control: &Control, len: usize) -> io::Result<Received> {
+/// The datagram that a receive wrote: `len` bytes, the peer address of `name_len` bytes in `name`,
+/// the received `flags`, and `control_len` bytes of control messages in `control`.
+fn finish(
+    name: &SockAddrStorage,
+    name_len: u32,
+    flags: c_int,
+    control: &Control,
+    control_len: usize,
+    len: usize,
+) -> io::Result<Received> {
     let source = name
-        .to_socket_addr(header.msg_namelen)
+        .to_socket_addr(name_len)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the datagram has no IP peer address"))?;
     Ok(Received {
         len,
         source,
-        truncated: header.msg_flags & MSG_TRUNC != 0,
-        metadata: control.decode(header.msg_controllen),
+        truncated: flags & MSG_TRUNC != 0,
+        metadata: control.decode(control_len),
     })
 }
 
 /// A send error with its [`Refused`] payload when it has one.
+#[cfg_attr(
+    target_os = "macos",
+    expect(unused_variables, reason = "macOS refuses a segment size before the call")
+)]
 fn refusal(error: io::Error, segmented: bool) -> io::Error {
     match error.raw_os_error() {
         Some(EMSGSIZE) => io::Error::new(io::ErrorKind::InvalidInput, Refused::TooLarge),
-        Some(EIO) if segmented => io::Error::new(io::ErrorKind::Unsupported, Refused::NoSegmentation),
+        #[cfg(target_os = "linux")]
+        Some(sys::EIO) if segmented => io::Error::new(io::ErrorKind::Unsupported, Refused::NoSegmentation),
         _ => error,
     }
 }

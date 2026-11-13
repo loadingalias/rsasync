@@ -8,17 +8,32 @@ pub mod sys;
 
 pub use control::{Control, Ecn, Metadata, Transmit};
 
-/// The address family of IPv4 (`AF_INET`).
-pub const AF_INET: u16 = 2;
-/// The address family of IPv6 (`AF_INET6`).
-pub const AF_INET6: u16 = 10;
+/// `sa_family_t`: the type of an address family.
+#[cfg(target_os = "linux")]
+pub type SaFamily = u16;
+/// `sa_family_t`: the type of an address family.
+#[cfg(target_os = "macos")]
+pub type SaFamily = u8;
 
-/// `struct sockaddr_in`: an IPv4 address and port, both in network byte order.
+/// The address family of IPv4 (`AF_INET`).
+pub const AF_INET: SaFamily = 2;
+/// The address family of IPv6 (`AF_INET6`).
+#[cfg(target_os = "linux")]
+pub const AF_INET6: SaFamily = 10;
+/// The address family of IPv6 (`AF_INET6`).
+#[cfg(target_os = "macos")]
+pub const AF_INET6: SaFamily = 30;
+
+/// `struct sockaddr_in`: an IPv4 address and port, both in network byte order. The layout agrees with
+/// `netinet/in.h` of Linux 6.1 and of the macOS 27.2 SDK.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SockAddrIn {
+    /// The length of the address, 16.
+    #[cfg(target_os = "macos")]
+    pub sin_len: u8,
     /// [`AF_INET`].
-    pub sin_family: u16,
+    pub sin_family: SaFamily,
     /// The port, in network byte order.
     pub sin_port: u16,
     /// The address, in network byte order.
@@ -27,12 +42,16 @@ pub struct SockAddrIn {
     pub sin_zero: [u8; 8],
 }
 
-/// `struct sockaddr_in6`: an IPv6 address, port, flow label, and scope.
+/// `struct sockaddr_in6`: an IPv6 address, port, flow label, and scope. The layout agrees with `linux/in6.h` of
+/// Linux 6.1 and `netinet6/in6.h` of the macOS 27.2 SDK.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SockAddrIn6 {
+    /// The length of the address, 28.
+    #[cfg(target_os = "macos")]
+    pub sin6_len: u8,
     /// [`AF_INET6`].
-    pub sin6_family: u16,
+    pub sin6_family: SaFamily,
     /// The port, in network byte order.
     pub sin6_port: u16,
     /// The flow information, in network byte order.
@@ -43,19 +62,25 @@ pub struct SockAddrIn6 {
     pub sin6_scope_id: u32,
 }
 
-/// `struct __kernel_sockaddr_storage`: room for each socket address, with the alignment of a
-/// pointer. The kernel writes an address into it, for example at an accept.
+/// `struct __kernel_sockaddr_storage` of Linux 6.1, or `struct sockaddr_storage` of the macOS 27.2 SDK: room for
+/// each socket address, with the alignment of a pointer. The kernel writes an address into it, for example at an
+/// accept.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy)]
 pub struct SockAddrStorage {
+    /// The length of the address.
+    #[cfg(target_os = "macos")]
+    pub ss_len: u8,
     /// The address family, which tells the layout of the bytes.
-    pub ss_family: u16,
+    pub ss_family: SaFamily,
     data: [u8; 126],
 }
 
 impl SockAddrStorage {
     /// Storage with no address.
     pub const EMPTY: Self = Self {
+        #[cfg(target_os = "macos")]
+        ss_len: 0,
         ss_family: 0,
         data: [0; 126],
     };
@@ -70,6 +95,8 @@ impl SockAddrStorage {
         match address {
             SocketAddr::V4(address) => {
                 storage.write(SockAddrIn {
+                    #[cfg(target_os = "macos")]
+                    sin_len: 16,
                     sin_family: AF_INET,
                     sin_port: address.port().to_be(),
                     sin_addr: address.ip().octets(),
@@ -79,6 +106,8 @@ impl SockAddrStorage {
             }
             SocketAddr::V6(address) => {
                 storage.write(SockAddrIn6 {
+                    #[cfg(target_os = "macos")]
+                    sin6_len: 28,
                     sin6_family: AF_INET6,
                     sin6_port: address.port().to_be(),
                     sin6_flowinfo: address.flowinfo().to_be(),
@@ -156,6 +185,12 @@ const _: () = {
     assert!(align_of::<SockAddrStorage>() == 8);
     assert!(align_of::<SockAddrIn>() <= align_of::<SockAddrStorage>());
     assert!(align_of::<SockAddrIn6>() <= align_of::<SockAddrStorage>());
+    #[cfg(target_os = "macos")]
+    assert!(
+        offset_of!(SockAddrIn, sin_family) == 1
+            && offset_of!(SockAddrIn6, sin6_family) == 1
+            && offset_of!(SockAddrStorage, ss_family) == 1
+    );
 };
 
 #[cfg(test)]
@@ -177,6 +212,8 @@ mod tests {
     #[test]
     fn an_address_in_network_order_decodes_to_its_socket_address() {
         let v4 = storage(SockAddrIn {
+            #[cfg(target_os = "macos")]
+            sin_len: 16,
             sin_family: AF_INET,
             sin_port: 8080_u16.to_be(),
             sin_addr: [127, 0, 0, 1],
@@ -191,6 +228,8 @@ mod tests {
         let mut addr = [0; 16];
         addr[15] = 1;
         let v6 = storage(SockAddrIn6 {
+            #[cfg(target_os = "macos")]
+            sin6_len: 28,
             sin6_family: AF_INET6,
             sin6_port: 443_u16.to_be(),
             sin6_flowinfo: 0,

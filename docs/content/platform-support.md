@@ -1,8 +1,8 @@
 # Platform support
 
 rsasync is in development, and its alpha releases are on crates.io. This page gives the Linux C
-libraries that rsasync supports, the WebAssembly targets of its portable subset, and the evidence
-that its tests give today.
+libraries that rsasync supports, the macOS part of `rsnetwork-udp`, the WebAssembly targets of its
+portable subset, and the evidence that its tests give today.
 
 ## Linux C libraries
 
@@ -41,6 +41,18 @@ on musl, and that these calls work through the system calls of musl. It does not
 runtime with a scheduler works on musl: the library has no scheduler yet. From the Linux driver
 stage on, each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C
 libraries. This page then names each operation that has that evidence.
+
+## macOS
+
+The datagram calls of `rsnetwork-udp` also support macOS on aarch64 (`aarch64-apple-darwin`): see
+[Datagram I/O on any socket](datagram-io.md). The runtime has no macOS backend yet. CI does not run
+on macOS. On an aarch64 Mac with macOS 27.2, the tests of `rsnetwork-udp` pass through Tokio
+sockets, with each of these commands:
+
+```sh
+cargo xtask test -p rsnetwork-udp
+cargo xtask test -p rsnetwork-udp --features macos-private-batch
+```
 
 ## WebAssembly
 
