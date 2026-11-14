@@ -28,11 +28,6 @@ pub(crate) use {alloc::sync::Arc, core::hint, core::sync::atomic, native::Unsafe
 
 #[cfg(not(all(test, loom)))]
 mod native {
-    #![expect(
-        dead_code,
-        reason = "the module comes before its users; when the cell has a user, this expectation fails, and then you remove it"
-    )]
-
     /// `core::cell::UnsafeCell` with the access API of the loom form. Each access is a closure,
     /// so the loom form knows when the access starts and ends.
     pub(crate) struct UnsafeCell<T: ?Sized>(core::cell::UnsafeCell<T>);

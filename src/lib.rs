@@ -8,6 +8,8 @@
 //! use rsasync::{buffer, capacity, time};
 //! ```
 //!
+//! The [`channel`] module holds the bounded channels, which need no scheduler or driver.
+//!
 //! Without the `std` feature, which is on by default, the crate needs only `core` and `alloc`.
 
 #![no_std]
@@ -16,6 +18,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod channel;
 // The completion entries of the driver, which the exploration tests also check on each host.
 #[cfg(any(
     all(test, loom),
@@ -52,7 +55,7 @@ mod table;
     all(not(test), feature = "std"),
     expect(
         dead_code,
-        reason = "the blocking wait has no user yet: the channels, the one-shot, and the permit wait are its first users"
+        reason = "the blocking wait has no user yet: the one-shot and the permit wait are its first users"
     )
 )]
 mod wait;
