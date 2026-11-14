@@ -23,9 +23,9 @@ the same type, so a value goes from a library to the runtime with no conversion.
 
 ## Time
 
-`rsasync::time` holds time values. It has no clock, and rsasync does not have a clock source yet.
-You can make each value directly, for example in a test. To wait for a deadline, use a timer: see
-[Timers](timers.md).
+`rsasync::time` holds time values. It has no clock: a clock of [Clocks](clocks.md) gives the
+instants of its domain. You can also make each value directly, for example in a test. To wait for a
+deadline, use a timer: see [Timers](timers.md).
 
 - A `ClockDomain` identifies one monotonic clock. It has a `u32` identifier and a `Suspend` value:
   `Advances` when the clock counts the time while the system is suspended, and `Pauses` when it

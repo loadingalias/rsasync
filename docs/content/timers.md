@@ -5,8 +5,9 @@ clock domain. A `Timer` is a future that is ready at its deadline. The storage w
 scheduler and no driver, also without `std`. rsasync is in development, and its alpha releases are
 on crates.io.
 
-The storage reads no clock. Its owner, the home, gives it the instants of its clock domain, so a
-test can give it the instants of an injected clock. rsasync does not have a clock source yet.
+The storage reads no clock. Its owner, the home, gives it the instants of its clock domain, for
+example from a native clock, and a test can give it the instants of an injected clock (see
+[Clocks](clocks.md)).
 
 ## Drive a timer storage
 

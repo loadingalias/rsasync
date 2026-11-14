@@ -1,14 +1,14 @@
 //! Dual async runtime. This crate is in development.
 //!
 //! The [`buffer`], [`capacity`], and [`time`] modules hold the types that the runtime shares with
-//! networking and applications. [`timer`] holds bounded timers, which work with no scheduler. Use
-//! the shared types through this crate:
+//! networking and applications. Use them through this crate:
 //!
 //! ```
 //! use rsasync::{buffer, capacity, time};
 //! ```
 //!
-//! The [`channel`] module holds the bounded channels, which need no scheduler or driver.
+//! The [`channel`] module holds the bounded channels, [`clock`] holds the native and the injected
+//! clocks, and [`timer`] holds bounded timers. None of them needs a scheduler or driver.
 //!
 //! Without the `std` feature, which is on by default, the crate needs only `core` and `alloc`.
 
@@ -60,6 +60,7 @@ mod table;
 )]
 mod wait;
 
+pub mod clock;
 pub mod timer;
 
 /// Driver-only use of the io_uring driver, on Linux.
