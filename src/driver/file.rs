@@ -21,7 +21,8 @@ use rsnetwork_udp::sys::IoVec;
 
 use super::tcp::{Regions, count};
 use super::{
-    Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Reason, Refused, Resource, Resources, Tag, sys,
+    Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources, Tag,
+    sys,
 };
 use crate::blocking::Submitter;
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
@@ -46,7 +47,7 @@ const PAGE: Alignment = Alignment {
 /// The file operation of [`Kind::File`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op {
-    /// An open of the path of [`Held::path`]: the result is a new descriptor, which becomes a
+    /// An open of the path of [`Payload::Open`]: the result is a new descriptor, which becomes a
     /// resource. A direct-I/O open also reads the alignment of the file.
     Open { direct: bool },
     /// A read into the loan.
@@ -523,7 +524,9 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
             match resources.adopt(fd, Medium::File) {
                 Ok(resource) => {
                     held.accepted = Some(resource);
-                    held.alignment = alignment;
+                    if let Payload::Open { alignment: field, .. } = &mut held.payload {
+                        *field = alignment;
+                    }
                 }
                 Err(_closed) => held.error = Some(io::ErrorKind::OutOfMemory),
             }
@@ -536,7 +539,7 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
             }
         }
         Op::ReadVectored => {
-            if let Some(buffers) = held.buffers.as_mut() {
+            if let Payload::Buffers(buffers) = &mut held.payload {
                 buffers.fill(count);
             }
         }
@@ -596,11 +599,6 @@ fn c_path(path: &Path) -> Option<CString> {
     CString::new(path.as_os_str().as_bytes()).ok()
 }
 
-/// The pointer of a C string that the resources of an operation hold.
-fn pointer(path: Option<&CString>) -> *const u8 {
-    path.map_or(EMPTY.as_ptr(), |path| path.as_ptr()).cast()
-}
-
 /// The result of an operation that gives no value, or the error of the home.
 fn done(result: i32, held: &Held) -> io::Result<()> {
     if let Some(kind) = held.error {
@@ -615,8 +613,12 @@ fn opened(result: i32, held: &Held) -> io::Result<(Resource, Option<Alignment>)>
     if let Some(kind) = held.error {
         return Err(kind.into());
     }
+    let alignment = match held.payload {
+        Payload::Open { alignment, .. } => alignment,
+        _ => None,
+    };
     held.accepted
-        .map(|resource| (resource, held.alignment))
+        .map(|resource| (resource, alignment))
         .ok_or_else(|| io::ErrorKind::OutOfMemory.into())
 }
 
@@ -628,7 +630,9 @@ fn submitted(len: usize) -> u32 {
 
 /// Polls the job of an operation, for [`Driver::poll_jobs`].
 fn poll_job(held: Option<&mut Held>, cx: &Context<'_>) -> Option<i32> {
-    let job = held?.job.as_mut()?;
+    let Payload::Job(job) = &mut held?.payload else {
+        return None;
+    };
     match job.poll(cx) {
         Poll::Ready(result) => Some(result.unwrap_or(-ECANCELED)),
         Poll::Pending => None,
@@ -779,19 +783,22 @@ impl Driver {
             });
         }
         let held = |buffers| Held {
-            buffers: Some(buffers),
+            payload: Payload::Buffers(buffers),
             ..Held::default()
         };
-        let entry = move |fd, held: &mut Held| match held.buffers.as_mut() {
-            Some(buffers) => {
+        let entry = move |fd, held: &mut Held| match &mut held.payload {
+            Payload::Buffers(buffers) => {
                 let (vectors, count) = buffers.vectors();
                 Sqe::readv(fd, vectors, count).at(offset)
             }
-            None => Sqe::nop(),
+            _ => Sqe::nop(),
         };
         let completion = self.begin_file(Some(file.resource), Op::ReadVectored, buffers, held, entry, true)?;
         Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.buffers?))
+            let Payload::Buffers(buffers) = held.payload else {
+                return None;
+            };
+            Some((count(result), buffers))
         }))
     }
 
@@ -820,18 +827,21 @@ impl Driver {
             });
         }
         let held = |lease| Held {
-            lease: Some(lease),
+            payload: Payload::Lease(lease),
             ..Held::default()
         };
-        let entry = move |fd, held: &mut Held| match held.lease.as_ref() {
-            Some(lease) => Sqe::write(fd, lease.as_ptr(), len)
+        let entry = move |fd, held: &mut Held| match &held.payload {
+            Payload::Lease(lease) => Sqe::write(fd, lease.as_ptr(), len)
                 .at(offset)
                 .with_rw_flags(mode.flags()),
-            None => Sqe::nop(),
+            _ => Sqe::nop(),
         };
         let completion = self.begin_file(Some(file.resource), Op::Plain, lease, held, entry, false)?;
         Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.lease?))
+            let Payload::Lease(lease) = held.payload else {
+                return None;
+            };
+            Some((count(result), lease))
         }))
     }
 
@@ -860,19 +870,22 @@ impl Driver {
             });
         }
         let held = |regions| Held {
-            regions: Some(regions),
+            payload: Payload::Regions(regions),
             ..Held::default()
         };
-        let entry = move |fd, held: &mut Held| match held.regions.as_mut() {
-            Some(regions) => {
+        let entry = move |fd, held: &mut Held| match &mut held.payload {
+            Payload::Regions(regions) => {
                 let (vectors, count) = regions.vectors();
                 Sqe::writev(fd, vectors, count).at(offset).with_rw_flags(mode.flags())
             }
-            None => Sqe::nop(),
+            _ => Sqe::nop(),
         };
         let completion = self.begin_file(Some(file.resource), Op::Plain, regions, held, entry, false)?;
         Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.regions?))
+            let Payload::Regions(regions) = held.payload else {
+                return None;
+            };
+            Some((count(result), regions))
         }))
     }
 
@@ -883,22 +896,30 @@ impl Driver {
     /// A refusal when the driver has no room for the operation. The future gives an error of the
     /// system.
     pub fn file_len<'a>(&mut self, file: &'a File) -> Result<Operation<'a, io::Result<u64>>, Refused<()>> {
-        let entry = |fd, held: &mut Held| {
-            Sqe::statx(
+        let held = |()| Held {
+            payload: Payload::Stat(sys::Statx::default()),
+            ..Held::default()
+        };
+        let entry = |fd, held: &mut Held| match &mut held.payload {
+            Payload::Stat(stat) => Sqe::statx(
                 fd,
                 EMPTY.as_ptr().cast(),
                 sys::AT_EMPTY_PATH.cast_unsigned(),
                 sys::STATX_SIZE,
-                (&raw mut held.stat).cast(),
-            )
+                (&raw mut *stat).cast(),
+            ),
+            _ => Sqe::nop(),
         };
-        let completion = self.begin_file(Some(file.resource), Op::Plain, (), |()| Held::default(), entry, true)?;
+        let completion = self.begin_file(Some(file.resource), Op::Plain, (), held, entry, true)?;
         Ok(Operation::new(completion, |result, held| {
+            let Payload::Stat(stat) = held.payload else {
+                return None;
+            };
             Some(count(result).and_then(|_| {
-                if held.stat.mask & sys::STATX_SIZE == 0 {
+                if stat.mask & sys::STATX_SIZE == 0 {
                     return Err(io::ErrorKind::Unsupported.into());
                 }
-                Ok(held.stat.size)
+                Ok(stat.size)
             }))
         }))
     }
@@ -996,19 +1017,25 @@ impl Driver {
     pub fn rename(&mut self, from: &Path, to: &Path) -> Result<Operation<'static, io::Result<()>>, Refused<()>> {
         let completion = match (c_path(from), c_path(to)) {
             (Some(from), Some(to)) => {
-                let held = |(from, to)| Held {
-                    path: Some(from),
-                    target: Some(to),
+                let held = |(path, target)| Held {
+                    payload: Payload::Paths {
+                        path,
+                        target: Some(target),
+                    },
                     ..Held::default()
                 };
-                let entry = |_, held: &mut Held| {
-                    Sqe::renameat(
+                let entry = |_, held: &mut Held| match &held.payload {
+                    Payload::Paths {
+                        path,
+                        target: Some(target),
+                    } => Sqe::renameat(
                         sys::AT_FDCWD,
-                        pointer(held.path.as_ref()),
+                        path.as_ptr().cast(),
                         sys::AT_FDCWD,
-                        pointer(held.target.as_ref()),
+                        target.as_ptr().cast(),
                         0,
-                    )
+                    ),
+                    _ => Sqe::nop(),
                 };
                 self.begin_file(None, Op::Plain, (from, to), held, entry, false)
                     .map_err(|refused| Refused {
@@ -1031,10 +1058,13 @@ impl Driver {
         let completion = match c_path(path) {
             Some(path) => {
                 let held = |path| Held {
-                    path: Some(path),
+                    payload: Payload::Paths { path, target: None },
                     ..Held::default()
                 };
-                let entry = |_, held: &mut Held| Sqe::unlinkat(sys::AT_FDCWD, pointer(held.path.as_ref()), 0);
+                let entry = |_, held: &mut Held| match &held.payload {
+                    Payload::Paths { path, .. } => Sqe::unlinkat(sys::AT_FDCWD, path.as_ptr().cast(), 0),
+                    _ => Sqe::nop(),
+                };
                 self.begin_file(None, Op::Plain, path, held, entry, false)
                     .map_err(|refused| Refused {
                         reason: refused.reason,
@@ -1109,11 +1139,12 @@ impl Driver {
             return self.fail_now(EINVAL);
         };
         let held = |path| Held {
-            path: Some(path),
+            payload: Payload::Open { path, alignment: None },
             ..Held::default()
         };
-        let entry = move |_, held: &mut Held| {
-            Sqe::openat(sys::AT_FDCWD, pointer(held.path.as_ref()), flags.cast_unsigned(), mode)
+        let entry = move |_, held: &mut Held| match &held.payload {
+            Payload::Open { path, .. } => Sqe::openat(sys::AT_FDCWD, path.as_ptr().cast(), flags.cast_unsigned(), mode),
+            _ => Sqe::nop(),
         };
         self.begin_file(None, op, path, held, entry, cancel_on_drop)
             .map_err(|refused| Refused {
@@ -1261,7 +1292,7 @@ impl Driver {
         };
         let held = move |()| match submitter.submit(job) {
             Ok(waiter) => Ok(Held {
-                job: Some(waiter),
+                payload: Payload::Job(waiter),
                 ..Held::default()
             }),
             // The job drops, and its descriptor closes.

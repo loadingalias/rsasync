@@ -17,7 +17,9 @@ use rsnetwork_udp::sys::{self, IoVec, MsgHdr};
 use rsnetwork_udp::{AF_INET6, Received, SockAddrStorage};
 
 use super::udp::{self, Arrivals, Batch};
-use super::{Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Reason, Refused, Resource, Resources, Tag};
+use super::{
+    Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources, Tag,
+};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
 use crate::table::OpId;
@@ -692,11 +694,17 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
     if tag.kind == Kind::Accept {
         // A stream that the home gave to a future that dropped before it took it goes back to a
         // descriptor.
-        let connection = held
-            .connection
-            .or_else(|| held.accepted.and_then(|stream| resources.release(stream)));
+        let Payload::Socket {
+            peer,
+            peer_len,
+            connection,
+        } = held.payload
+        else {
+            return;
+        };
+        let connection = connection.or_else(|| held.accepted.and_then(|stream| resources.release(stream)));
         if let (Some(fd), Some(listener)) = (connection, resources.get(resource)) {
-            listener.directions.keep_connection(fd, held.peer, held.peer_len);
+            listener.directions.keep_connection(fd, peer, peer_len);
         }
         return;
     }
@@ -734,18 +742,24 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
                 return;
             }
             let sent = usize::try_from(result).unwrap_or(0);
-            let len = match (&held.lease, &held.regions) {
-                (Some(lease), _) => lease.initialized(),
-                (None, Some(regions)) => regions.total(),
-                (None, None) => 0,
+            let len = match &held.payload {
+                Payload::Lease(lease) => lease.initialized(),
+                Payload::Regions(regions) => regions.total(),
+                _ => 0,
             };
             directions.unreported = directions.unreported.saturating_add(sent);
             if (result < 0 || sent < len || held.cancelled) && directions.sent == Sent::Ok {
                 directions.sent = Sent::Owe;
             }
         }
-        Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.received) {
-            (Some(loan), Some(received)) if result >= 0 => {
+        Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.payload) {
+            (
+                Some(loan),
+                Payload::Receive {
+                    received: Some(received),
+                    ..
+                },
+            ) if result >= 0 => {
                 directions.kept = Some(Kept::Datagram {
                     buffer: loan.into_inner(),
                     received,
@@ -756,8 +770,11 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
             }
             _ => {}
         },
-        Kind::RecvBatch => match held.batch {
-            Some(Batch::Receive(arrivals)) if !arrivals.is_empty() => {
+        Kind::RecvBatch => match held.payload {
+            Payload::Batch {
+                batch: Batch::Receive(arrivals),
+                ..
+            } if !arrivals.is_empty() => {
                 directions.kept = Some(Kept::Arrivals(arrivals));
             }
             _ if result < 0 && result != -ECANCELED && result != -ENOBUFS && result != -EAGAIN => {
@@ -829,12 +846,13 @@ impl Driver {
             options.apply(socket)
         };
         let completion = self.bind_socket(address, true, setup)?;
-        Ok(Operation::new(completion, |result, held| {
+        Ok(Operation::new(completion, |result, mut held| {
             Some(count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
                 let local = held
-                    .peer
-                    .to_socket_addr(held.peer_len)
+                    .payload
+                    .peer()
+                    .and_then(|(peer, len)| peer.to_socket_addr(*len))
                     .ok_or(io::ErrorKind::InvalidData)?;
                 Ok(TcpListener { resource, local })
             }))
@@ -866,8 +884,11 @@ impl Driver {
             kind: Kind::Bind,
         };
         let held = |()| Held {
-            peer: storage,
-            peer_len: len,
+            payload: Payload::Socket {
+                peer: storage,
+                peer_len: len,
+                connection: None,
+            },
             ..Held::default()
         };
         let id = self
@@ -883,13 +904,17 @@ impl Driver {
                 // each entry, so the bind links only to the listen.
                 #[expect(unsafe_code, reason = "the kernel reads the address in the resources of the bind")]
                 unsafe {
+                    // A bind always has its address.
+                    let bind = |held: &mut Held| {
+                        held.payload
+                            .peer()
+                            .map_or_else(Sqe::nop, |(peer, len)| Sqe::bind(fd, (&raw const *peer).cast(), *len))
+                    };
                     if listen {
-                        self.push(id, |held| {
-                            Sqe::bind(fd, (&raw const held.peer).cast(), held.peer_len).linked_quiet()
-                        });
+                        self.push(id, |held| bind(held).linked_quiet());
                         self.push(id, |_| Sqe::listen(fd, BACKLOG.cast_unsigned()));
                     } else {
-                        self.push(id, |held| Sqe::bind(fd, (&raw const held.peer).cast(), held.peer_len));
+                        self.push(id, bind);
                     }
                 }
             }
@@ -904,7 +929,11 @@ impl Driver {
                     });
                 match done {
                     Ok(local) => {
-                        self.hold(id, |held| (held.peer, held.peer_len) = local);
+                        self.hold(id, |held| {
+                            if let Some((peer, len)) = held.payload.peer() {
+                                (*peer, *len) = local;
+                            }
+                        });
                         self.complete_now(id, 0);
                     }
                     Err(error) => {
@@ -938,8 +967,11 @@ impl Driver {
             kind: Kind::Connect,
         };
         let held = |()| Held {
-            peer: storage,
-            peer_len: len,
+            payload: Payload::Socket {
+                peer: storage,
+                peer_len: len,
+                connection: None,
+            },
             ..Held::default()
         };
         let id = self
@@ -955,7 +987,10 @@ impl Driver {
                 #[expect(unsafe_code, reason = "the kernel reads the address in the resources of the connect")]
                 unsafe {
                     self.push(id, |held| {
-                        Sqe::connect(fd, (&raw const held.peer).cast(), held.peer_len)
+                        // A connect always has its address.
+                        held.payload.peer().map_or_else(Sqe::nop, |(peer, len)| {
+                            Sqe::connect(fd, (&raw const *peer).cast(), *len)
+                        })
                     });
                 }
             }
@@ -979,7 +1014,7 @@ impl Driver {
         regions: Regions,
     ) -> Result<Operation<'a, (io::Result<usize>, Regions)>, Refused<Regions>> {
         let held = |regions| Held {
-            regions: Some(regions),
+            payload: Payload::Regions(regions),
             ..Held::default()
         };
         let completion = self.begin(writer.as_mut().resource, Kind::Vectored, regions, held)?;
@@ -987,7 +1022,10 @@ impl Driver {
             let sent = held
                 .failed
                 .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
-            Some((sent, held.regions?))
+            let Payload::Regions(regions) = held.payload else {
+                return None;
+            };
+            Some((sent, regions))
         }))
     }
 
@@ -1096,16 +1134,21 @@ impl Driver {
         listener: &'a mut TcpListener,
     ) -> Result<Operation<'a, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
         let held = |()| Held {
-            peer_len: SockAddrStorage::LEN,
+            payload: Payload::Socket {
+                peer: SockAddrStorage::default(),
+                peer_len: SockAddrStorage::LEN,
+                connection: None,
+            },
             ..Held::default()
         };
         let completion = self.begin(listener.resource, Kind::Accept, (), held)?;
-        Ok(Operation::new(completion, |result, held| {
+        Ok(Operation::new(completion, |result, mut held| {
             Some(count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
                 let peer = held
-                    .peer
-                    .to_socket_addr(held.peer_len)
+                    .payload
+                    .peer()
+                    .and_then(|(peer, len)| peer.to_socket_addr(*len))
                     .ok_or(io::ErrorKind::InvalidData)?;
                 Ok((TcpStream::new(resource), peer))
             }))
@@ -1179,7 +1222,7 @@ impl Driver {
         lease: Lease,
     ) -> Result<Operation<'a, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let held = |lease| Held {
-            lease: Some(lease),
+            payload: Payload::Lease(lease),
             ..Held::default()
         };
         let completion = self.begin(writer.as_mut().resource, Kind::Send, lease, held)?;
@@ -1187,7 +1230,10 @@ impl Driver {
             let sent = held
                 .failed
                 .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
-            Some((sent, held.lease?))
+            let Payload::Lease(lease) = held.payload else {
+                return None;
+            };
+            Some((sent, lease))
         }))
     }
 
@@ -1467,8 +1513,9 @@ impl Driver {
                     Ok(stream) => slot.update(id, |held| {
                         if let Some(held) = held {
                             held.accepted = Some(stream);
-                            held.peer = peer;
-                            held.peer_len = peer_len;
+                            if let Some((kept, len)) = held.payload.peer() {
+                                (*kept, *len) = (peer, peer_len);
+                            }
                         }
                     }),
                     // With no free resource slot, the listener keeps the connection, and this
@@ -1506,10 +1553,7 @@ impl Driver {
             (Kind::RecvBatch, Some(Kept::Datagram { buffer, received })) => {
                 let mut taken = Some((buffer, received));
                 slot.update(id, |held| {
-                    if let Some(Held {
-                        batch: Some(Batch::Receive(arrivals)),
-                        ..
-                    }) = held
+                    if let Some(Batch::Receive(arrivals)) = held.as_mut().and_then(|held| held.payload.batch())
                         && let Some((buffer, received)) = taken.take()
                     {
                         taken = arrivals.add(buffer, received);
@@ -1521,11 +1565,7 @@ impl Driver {
             (Kind::RecvBatch, Some(Kept::Arrivals(mut kept))) => {
                 let mut count = 0;
                 slot.update(id, |held| {
-                    if let Some(Held {
-                        batch: Some(Batch::Receive(arrivals)),
-                        ..
-                    }) = held
-                    {
+                    if let Some(Batch::Receive(arrivals)) = held.as_mut().and_then(|held| held.payload.batch()) {
                         while arrivals.len() < arrivals.capacity() {
                             let Some((buffer, received)) = kept.take_first() else {
                                 break;
@@ -1578,69 +1618,50 @@ impl Driver {
         }
         let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
         let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
-        let entry = move |held: &mut Held| match kind {
-            Kind::Recv => match held.loan.as_mut() {
-                Some(loan) => {
-                    let (buffer, len) = (loan.as_mut_ptr(), u32::try_from(loan.capacity()).unwrap_or(u32::MAX));
-                    if pipe {
-                        Sqe::read(fd, buffer, len)
-                    } else {
-                        Sqe::recv(fd, buffer, len)
-                    }
+        // A batch submits in `start_batch`, and each other kind always has its resources, so the
+        // last arm gives no entry that the kernel runs.
+        let entry = move |held: &mut Held| match (kind, &mut held.payload, held.loan.as_mut()) {
+            (Kind::Recv, _, Some(loan)) => {
+                let (buffer, len) = (loan.as_mut_ptr(), u32::try_from(loan.capacity()).unwrap_or(u32::MAX));
+                if pipe {
+                    Sqe::read(fd, buffer, len)
+                } else {
+                    Sqe::recv(fd, buffer, len)
                 }
-                // A receive always has its loan.
-                None => Sqe::nop(),
-            },
-            Kind::Selected if pipe => Sqe::read_selected(fd, group),
-            Kind::Selected => Sqe::recv_selected(fd, group),
-            Kind::Send => match held.lease.as_ref() {
-                Some(lease) => {
-                    let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
-                    if pipe {
-                        Sqe::write(fd, bytes, len)
-                    } else {
-                        Sqe::send(fd, bytes, len)
-                    }
-                }
-                // A send always has its lease.
-                None => Sqe::nop(),
-            },
-            Kind::Vectored => match held.regions.as_mut() {
-                Some(regions) if pipe => {
-                    let (vectors, count) = regions.vectors();
-                    Sqe::writev(fd, vectors, count)
-                }
-                Some(regions) => Sqe::send_message(fd, regions.message()),
-                // A vectored send always has its regions.
-                None => Sqe::nop(),
-            },
-            Kind::Shutdown => Sqe::shutdown(fd, sys::SHUT_WR),
-            Kind::RecvFrom => match held.loan.as_mut() {
-                Some(loan) => {
-                    let (region, len) = (loan.as_mut_ptr(), loan.capacity());
-                    Sqe::recv_message(fd, held.message.receive(region, len), 0)
-                }
-                // A receive always has its loan.
-                None => Sqe::nop(),
-            },
-            Kind::RecvSelectedFrom => {
-                Sqe::recv_message_selected(fd, held.message.receive(ptr::null_mut(), slot_len), 0, group)
             }
-            Kind::SendTo => match held.datagram.as_ref() {
-                Some(datagram) => Sqe::send_message(fd, held.message.send(datagram)),
-                // A datagram send always has its datagram.
-                None => Sqe::nop(),
-            },
-            // A batch submits in `start_batch`.
-            Kind::SendBatch | Kind::RecvBatch => Sqe::nop(),
-            Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::File(_) => {
-                Sqe::accept(fd, (&raw mut held.peer).cast(), &raw mut held.peer_len)
+            (Kind::Selected, _, _) if pipe => Sqe::read_selected(fd, group),
+            (Kind::Selected, _, _) => Sqe::recv_selected(fd, group),
+            (Kind::Send, Payload::Lease(lease), _) => {
+                let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
+                if pipe {
+                    Sqe::write(fd, bytes, len)
+                } else {
+                    Sqe::send(fd, bytes, len)
+                }
             }
+            (Kind::Vectored, Payload::Regions(regions), _) if pipe => {
+                let (vectors, count) = regions.vectors();
+                Sqe::writev(fd, vectors, count)
+            }
+            (Kind::Vectored, Payload::Regions(regions), _) => Sqe::send_message(fd, regions.message()),
+            (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SHUT_WR),
+            (Kind::RecvFrom, Payload::Receive { message, .. }, Some(loan)) => {
+                let (region, len) = (loan.as_mut_ptr(), loan.capacity());
+                Sqe::recv_message(fd, message.receive(region, len), 0)
+            }
+            (Kind::RecvSelectedFrom, Payload::Receive { message, .. }, _) => {
+                Sqe::recv_message_selected(fd, message.receive(ptr::null_mut(), slot_len), 0, group)
+            }
+            (Kind::SendTo, Payload::SendTo { message, datagram }, _) => Sqe::send_message(fd, message.send(datagram)),
+            (Kind::Accept, Payload::Socket { peer, peer_len, .. }, _) => {
+                Sqe::accept(fd, (&raw mut *peer).cast(), &raw mut *peer_len)
+            }
+            _ => Sqe::nop(),
         };
-        // SAFETY: the entry names the loan, the lease, the message, or the peer address in the
-        // resources of `id`, which the home keeps until its terminal event, and the descriptor of
-        // `resource`, which stays open until its close, after each of its operations ends. The
-        // queue has room.
+        // SAFETY: the entry names the loan, the lease, the regions, the message, or the peer
+        // address in the resources of `id`, which the home keeps until its terminal event, and the
+        // descriptor of `resource`, which stays open until its close, after each of its operations
+        // ends. The queue has room.
         #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
         unsafe {
             self.push(id, entry);
@@ -1654,7 +1675,7 @@ impl Driver {
     fn start_batch(&mut self, id: OpId, fd: std::os::fd::RawFd) -> bool {
         let mut entries = 0;
         self.hold(id, |held| {
-            entries = match &held.batch {
+            entries = match held.payload.batch() {
                 Some(Batch::Send(datagrams)) => datagrams.len(),
                 Some(Batch::Receive(arrivals)) => arrivals.capacity(),
                 None => 0,
@@ -1672,7 +1693,7 @@ impl Driver {
         for index in 0..entries {
             let last = index + 1 == entries;
             let entry = move |held: &mut Held| {
-                let sqe = match held.batch.as_mut() {
+                let sqe = match held.payload.batch() {
                     Some(Batch::Send(datagrams)) => datagrams
                         .message(index)
                         .map_or_else(Sqe::nop, |message| Sqe::send_message(fd, message)),
@@ -1847,10 +1868,10 @@ fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backin
     let mut copied = 0;
     slot.update(id, |held| {
         if let Some(held) = held
-            && let Some(loan) = held.loan.as_mut()
+            && let (Some(loan), Payload::Receive { received: kept, .. }) = (held.loan.as_mut(), &mut held.payload)
         {
             let (facts, count) = udp::copy_kept(buffer, received, loan);
-            held.received = Some(facts);
+            *kept = Some(facts);
             copied = count;
         }
     });
@@ -1863,9 +1884,11 @@ fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backin
 fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, received: Received) -> i32 {
     let len = i32::try_from(received.len).unwrap_or(i32::MAX);
     slot.update(id, |held| {
-        if let Some(held) = held {
+        if let Some(held) = held
+            && let Payload::Receive { received: facts, .. } = &mut held.payload
+        {
             held.loan = Some(WriteLoan::new(buffer));
-            held.received = Some(received);
+            *facts = Some(received);
         }
     });
     len

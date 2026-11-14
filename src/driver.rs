@@ -227,58 +227,108 @@ impl WakeHandle {
 }
 
 /// The resources of a driver operation. The driver keeps them until the terminal event of the
-/// operation.
+/// operation, in the slot of the operation, so each address that the kernel uses stays the same.
+/// The fields hold what the home writes for the kinds of more than one medium, and the payload
+/// holds the resources of the kind.
 #[derive(Debug, Default)]
 pub(crate) struct Held {
+    /// The resources of the kind of the operation. Its start sets the variant, and nothing
+    /// changes the variant before the terminal event.
+    pub(crate) payload: Payload,
     /// The loan of the buffer that a receive or a read fills.
     pub(crate) loan: Option<WriteLoan<Backing>>,
-    pub(crate) lease: Option<Lease>,
     #[cfg_attr(
         any(not(test), loom),
         expect(dead_code, reason = "no operation takes a charge yet; the tests do")
     )]
     pub(crate) charge: Option<Permit>,
-    /// The peer address that an accept writes, and its length.
-    pub(crate) peer: SockAddrStorage,
-    pub(crate) peer_len: u32,
-    /// The socket that an accept, a connect, or a bind gave.
+    /// The socket that an accept, a connect, or a bind gave, or the file that an open gave.
     pub(crate) accepted: Option<Resource>,
-    /// The connection of an accept with no consumer, which the listener keeps.
-    pub(crate) connection: Option<OwnedFd>,
-    /// The home asked the kernel to cancel the operation.
-    pub(crate) cancelled: bool,
-    /// The bytes that a receive copied from the data that an abandoned receive left.
-    pub(crate) copied: usize,
+    /// The next operation that waits in the same direction, in start order.
+    pub(crate) next: Option<OpId>,
     /// A send on a failed direction gives this error, with no submission.
     pub(crate) failed: Option<WriteFailed>,
     /// The report of a close.
     pub(crate) closed: Option<Closed>,
-    /// The regions of a vectored send, and the message header that names them.
-    pub(crate) regions: Option<Regions>,
-    /// The datagram of a send.
-    pub(crate) datagram: Option<Datagram>,
-    /// The message of a datagram send or receive, which the kernel reads or writes.
-    pub(crate) message: udp::Message,
-    /// The facts of a received datagram.
-    pub(crate) received: Option<rsnetwork_udp::Received>,
-    /// The datagrams of a batch, and its progress while its completions come.
-    pub(crate) batch: Option<udp::Batch>,
-    pub(crate) progress: udp::Progress,
-    /// The next operation that waits in the same direction, in start order.
-    pub(crate) next: Option<OpId>,
-    /// The C strings of the paths of a file operation, which the kernel reads.
-    pub(crate) path: Option<std::ffi::CString>,
-    pub(crate) target: Option<std::ffi::CString>,
-    /// The structure that a `statx` of a file writes.
-    pub(crate) stat: sys::Statx,
-    /// The buffers of a vectored read of a file.
-    pub(crate) buffers: Option<Buffers>,
-    /// The alignment of direct I/O of a file that an open gave.
-    pub(crate) alignment: Option<Alignment>,
-    /// The waiter of the job of an operation that runs on the blocking service.
-    pub(crate) job: Option<crate::blocking::Waiter<i32>>,
+    /// The bytes that a receive copied from the data that an abandoned receive left.
+    pub(crate) copied: usize,
+    /// The home asked the kernel to cancel the operation.
+    pub(crate) cancelled: bool,
     /// An error of the home that the future gives in place of the result of the kernel.
     pub(crate) error: Option<io::ErrorKind>,
+}
+
+// Each of the `Config::operations` slots holds one `Held`, so a kind with large inline resources
+// goes into its own variant of `Payload`, and a larger bound needs a reviewed change. The bound is
+// the size on a 64-bit target, where the largest variant is `Payload::SendTo`.
+const _: () = assert!(
+    size_of::<Held>() <= 576,
+    "the resources of an operation grew: put the new resources into the payload of their kind"
+);
+
+/// The resources of one kind of operation.
+#[derive(Debug, Default)]
+pub(crate) enum Payload {
+    /// No resources: for example a shutdown, a close, a receive, or a sync of a file.
+    #[default]
+    Empty,
+    /// The lease of a send or a write.
+    Lease(Lease),
+    /// The regions of a vectored send or write, and the message header that names them.
+    Regions(Regions),
+    /// The address of a connect or a bind, the local address that a bind gives, or the peer
+    /// address that an accept writes, with its length.
+    Socket {
+        peer: SockAddrStorage,
+        peer_len: u32,
+        /// The connection of an accept with no consumer, which the listener keeps.
+        connection: Option<OwnedFd>,
+    },
+    /// The message of a datagram receive, which the kernel writes, and the facts of the datagram.
+    Receive {
+        message: udp::Message,
+        received: Option<rsnetwork_udp::Received>,
+    },
+    /// The datagram of a send, and its message, which the kernel reads.
+    SendTo { message: udp::Message, datagram: Datagram },
+    /// The datagrams of a batch, and its progress while its completions come.
+    Batch { batch: udp::Batch, progress: udp::Progress },
+    /// The C strings of the paths of a rename or an unlink, which the kernel reads.
+    Paths {
+        path: std::ffi::CString,
+        target: Option<std::ffi::CString>,
+    },
+    /// The C string of the path of an open, which the kernel reads, and the alignment of direct
+    /// I/O of the file that the open gave.
+    Open {
+        path: std::ffi::CString,
+        alignment: Option<Alignment>,
+    },
+    /// The structure that a `statx` of a file writes.
+    Stat(sys::Statx),
+    /// The buffers of a vectored read of a file.
+    Buffers(Buffers),
+    /// The waiter of the job of an operation that runs on the blocking service.
+    Job(crate::blocking::Waiter<i32>),
+}
+
+impl Payload {
+    /// The address of a connect or a bind, the local address that a bind gives, or the peer
+    /// address that an accept writes, with its length.
+    pub(crate) fn peer(&mut self) -> Option<(&mut SockAddrStorage, &mut u32)> {
+        match self {
+            Self::Socket { peer, peer_len, .. } => Some((peer, peer_len)),
+            _ => None,
+        }
+    }
+
+    /// The datagrams of a batch.
+    pub(crate) fn batch(&mut self) -> Option<&mut udp::Batch> {
+        match self {
+            Self::Batch { batch, .. } => Some(batch),
+            _ => None,
+        }
+    }
 }
 
 /// What an operation is: the direction that it uses, and what the home does at its terminal
@@ -1221,8 +1271,9 @@ impl Driver {
         let mut sqe = None;
         slot.update(id, |held| sqe = held.as_mut().map(entry));
         if let Some(sqe) = sqe {
-            // SAFETY: the entry of the slot keeps the resources until the terminal event of `id`,
-            // and the caller keeps the descriptor open. The queue has room.
+            // SAFETY: the entry of the slot keeps the resources in place until the terminal event
+            // of `id`, and nothing changes the variant of their payload before it. The caller keeps
+            // the descriptor open. The queue has room.
             let pushed = unsafe { self.ring.push(&sqe.with_user_data(id.user_data())) }.is_ok();
             debug_assert!(pushed, "the queue has room for the entry");
         }
@@ -1444,7 +1495,9 @@ fn finish(
                 // SAFETY: the receive named the capacity of the loan in its message, and the kernel
                 // wrote `count` bytes at its start, at most that capacity.
                 unsafe { loan.set_filled(count) };
-                held.received = held.message.received(count).ok();
+                if let Payload::Receive { message, received } = &mut held.payload {
+                    *received = message.received(count).ok();
+                }
             }
         }
         Kind::RecvSelectedFrom => {
@@ -1460,7 +1513,9 @@ fn finish(
                 // most the slot capacity that the message names.
                 unsafe { loan.set_filled(count) };
                 held.loan = Some(loan);
-                held.received = held.message.received(count).ok();
+                if let Payload::Receive { message, received } = &mut held.payload {
+                    *received = message.received(count).ok();
+                }
             }
         }
         // A failed connect or bind closes its socket. The abandoned rule closes the socket of an
@@ -1476,8 +1531,9 @@ fn finish(
                 if let Some((address, len)) = resources
                     .get(socket)
                     .and_then(|owned| tcp::local_address(owned.fd.as_ref()?))
+                    && let Some((peer, peer_len)) = held.payload.peer()
                 {
-                    (held.peer, held.peer_len) = (address, len);
+                    (*peer, *peer_len) = (address, len);
                 }
             }
             _ => {}
@@ -1507,8 +1563,17 @@ fn finish(
             if cqe.res >= 0 {
                 // SAFETY: the kernel gave a new descriptor that nothing else owns.
                 let fd = unsafe { OwnedFd::from_raw_fd(cqe.res) };
+                let Payload::Socket {
+                    peer,
+                    peer_len,
+                    connection,
+                } = &mut held.payload
+                else {
+                    // An accept always has its address, and the drop closes the descriptor.
+                    return;
+                };
                 if abandoned {
-                    held.connection = Some(fd);
+                    *connection = Some(fd);
                 } else {
                     match resources.adopt(fd, Medium::Tcp) {
                         Ok(stream) => held.accepted = Some(stream),
@@ -1516,7 +1581,7 @@ fn finish(
                         // next accept, and this one gives `OutOfMemory`.
                         Err(fd) => {
                             if let Some(listener) = tag.resource.and_then(|listener| resources.get(listener)) {
-                                listener.directions.keep_connection(fd, held.peer, held.peer_len);
+                                listener.directions.keep_connection(fd, *peer, *peer_len);
                             }
                         }
                     }

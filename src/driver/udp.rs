@@ -17,7 +17,7 @@ use rsnetwork_udp::sys::{IoVec, MsgHdr};
 use rsnetwork_udp::{Control, Ecn, Received, SockAddrStorage, Transmit};
 
 use super::tcp::{ReadHalf, TcpOptions, WriteHalf};
-use super::{Completion, Driver, Held, Kind, Operation, Reason, Refused, Resource};
+use super::{Completion, Driver, Held, Kind, Operation, Payload, Reason, Refused, Resource};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 
 /// A UDP socket that a driver owns: its read half and its write half.
@@ -480,7 +480,10 @@ pub(crate) struct Progress {
 /// came, from the first, or the error of the first entry when none did.
 #[expect(unsafe_code, reason = "the kernel initialized the bytes that the result counts")]
 pub(super) fn batch_completion(held: &mut Held, result: i32, buffer: Option<Backing>) -> (bool, i32) {
-    let progress = &mut held.progress;
+    // A batch always has its datagrams.
+    let Payload::Batch { batch, progress } = &mut held.payload else {
+        return (false, result);
+    };
     let index = progress.done;
     progress.done = progress.done.saturating_add(1);
     progress.remaining = progress.remaining.saturating_sub(1);
@@ -488,9 +491,9 @@ pub(super) fn batch_completion(held: &mut Held, result: i32, buffer: Option<Back
     // failure, for example `EAGAIN` when no more datagrams wait, or `ECANCELED` after a failed
     // entry, ends the batch with no error.
     if progress.count == index {
-        match (usize::try_from(result), &mut held.batch) {
-            (Ok(_), Some(Batch::Send(_))) => progress.count = progress.count.saturating_add(1),
-            (Ok(len), Some(Batch::Receive(arrivals))) => {
+        match (usize::try_from(result), batch) {
+            (Ok(_), Batch::Send(_)) => progress.count = progress.count.saturating_add(1),
+            (Ok(len), Batch::Receive(arrivals)) => {
                 // A datagram of no bytes can come with no selected buffer.
                 let buffer = buffer.unwrap_or_else(|| Backing::from(Vec::new()));
                 if let Some(Ok(received)) = arrivals.received(index as usize, len) {
@@ -530,12 +533,13 @@ impl Driver {
         options: UdpOptions,
     ) -> Result<Operation<'static, io::Result<UdpSocket>>, Refused<()>> {
         let completion = self.bind_socket(address, false, |socket| options.apply(socket))?;
-        Ok(Operation::new(completion, |result, held| {
+        Ok(Operation::new(completion, |result, mut held| {
             Some(super::tcp::count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
                 let local = held
-                    .peer
-                    .to_socket_addr(held.peer_len)
+                    .payload
+                    .peer()
+                    .and_then(|(peer, len)| peer.to_socket_addr(*len))
                     .ok_or(io::ErrorKind::InvalidData)?;
                 Ok(UdpSocket {
                     read: ReadHalf { resource },
@@ -561,12 +565,17 @@ impl Driver {
         datagram: Datagram,
     ) -> Result<Operation<'a, (io::Result<usize>, Datagram)>, Refused<Datagram>> {
         let held = |datagram| Held {
-            datagram: Some(datagram),
+            payload: Payload::SendTo {
+                message: Message::default(),
+                datagram,
+            },
             ..Held::default()
         };
         let completion = self.begin(writer.as_mut().resource, Kind::SendTo, datagram, held)?;
         Ok(Operation::new(completion, |result, held| {
-            let datagram = held.datagram?;
+            let Payload::SendTo { datagram, .. } = held.payload else {
+                return None;
+            };
             let sent = super::tcp::count(result)
                 .map(|_| datagram.datagrams())
                 .map_err(|error| rsnetwork_udp::Refused::of_send(error, datagram.segment_size.is_some()));
@@ -591,16 +600,22 @@ impl Driver {
     ) -> Result<Operation<'a, (io::Result<usize>, Datagrams)>, Refused<Datagrams>> {
         let entries = u32::try_from(datagrams.len()).unwrap_or(u32::MAX);
         let held = |datagrams| Held {
-            batch: Some(Batch::Send(datagrams)),
-            progress: Progress {
-                remaining: entries,
-                ..Progress::default()
+            payload: Payload::Batch {
+                batch: Batch::Send(datagrams),
+                progress: Progress {
+                    remaining: entries,
+                    ..Progress::default()
+                },
             },
             ..Held::default()
         };
         let completion = self.begin_entries(writer.as_mut().resource, Kind::SendBatch, entries, datagrams, held)?;
         Ok(Operation::new(completion, |result, held| {
-            let Some(Batch::Send(datagrams)) = held.batch else {
+            let Payload::Batch {
+                batch: Batch::Send(datagrams),
+                ..
+            } = held.payload
+            else {
                 return None;
             };
             let sent = super::tcp::count(result).map_err(|error| rsnetwork_udp::Refused::of_send(error, false));
@@ -621,12 +636,19 @@ impl Driver {
         buffer: Backing,
     ) -> Result<Operation<'a, (io::Result<Received>, Backing)>, Refused<Backing>> {
         let held = |buffer| Held {
+            payload: Payload::Receive {
+                message: Message::default(),
+                received: None,
+            },
             loan: Some(WriteLoan::new(buffer)),
             ..Held::default()
         };
         let completion = self.begin(reader.as_mut().resource, Kind::RecvFrom, buffer, held)?;
         Ok(Operation::new(completion, |result, held| {
-            Some((received(result, held.received), held.loan?.into_inner()))
+            let Payload::Receive { received: facts, .. } = held.payload else {
+                return None;
+            };
+            Some((received(result, facts), held.loan?.into_inner()))
         }))
     }
 
@@ -647,14 +669,22 @@ impl Driver {
                 value: (),
             });
         }
-        let completion = self.begin(reader.as_mut().resource, Kind::RecvSelectedFrom, (), |()| {
-            Held::default()
-        })?;
+        let held = |()| Held {
+            payload: Payload::Receive {
+                message: Message::default(),
+                received: None,
+            },
+            ..Held::default()
+        };
+        let completion = self.begin(reader.as_mut().resource, Kind::RecvSelectedFrom, (), held)?;
         Ok(Operation::new(completion, |result, held| {
+            let Payload::Receive { received: facts, .. } = held.payload else {
+                return None;
+            };
             let buffer = held
                 .loan
                 .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner);
-            Some(received(result, held.received).map(|received| (received, buffer)))
+            Some(received(result, facts).map(|received| (received, buffer)))
         }))
     }
 
@@ -683,16 +713,22 @@ impl Driver {
         arrivals.datagrams.clear();
         let entries = u32::try_from(arrivals.capacity()).unwrap_or(u32::MAX);
         let held = |arrivals| Held {
-            batch: Some(Batch::Receive(arrivals)),
-            progress: Progress {
-                remaining: entries,
-                ..Progress::default()
+            payload: Payload::Batch {
+                batch: Batch::Receive(arrivals),
+                progress: Progress {
+                    remaining: entries,
+                    ..Progress::default()
+                },
             },
             ..Held::default()
         };
         let completion = self.begin_entries(reader.as_mut().resource, Kind::RecvBatch, entries, arrivals, held)?;
         Ok(Operation::new(completion, |result, held| {
-            let Some(Batch::Receive(arrivals)) = held.batch else {
+            let Payload::Batch {
+                batch: Batch::Receive(arrivals),
+                ..
+            } = held.payload
+            else {
                 return None;
             };
             Some((super::tcp::count(result), arrivals))

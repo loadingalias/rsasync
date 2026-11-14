@@ -188,7 +188,7 @@ operations that run on the socket, and its future is ready after the kernel ends
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `submissions` | 64 | Entries of the submission queue. The kernel rounds up to a power of two |
-| `operations` | 256 | Operations that can run at one time. A submission beyond them is refused with the reason, and its resources come back |
+| `operations` | 256 | Operations that can run at one time. A submission beyond them is refused with the reason, and its resources come back. The driver allocates one slot for each when it starts. On a 64-bit target, the state of an operation in its slot takes at most 576 bytes, not counting its buffers |
 | `resources` | 256 | Descriptors that the driver can own at one time |
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
 
