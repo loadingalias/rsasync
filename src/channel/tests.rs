@@ -30,7 +30,7 @@ impl Drop for Counted {
 }
 
 /// The drop counter, and a function that makes counted values.
-pub(super) fn counted() -> (Arc<AtomicU32>, impl Fn(u32) -> Counted + Clone) {
+pub(super) fn counted() -> (Arc<AtomicU32>, impl Fn(u32) -> Counted) {
     let drops = Arc::new(AtomicU32::new(0));
     let make = {
         let drops = Arc::clone(&drops);

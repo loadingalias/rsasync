@@ -1,44 +1,10 @@
-use alloc::sync::Arc;
-use core::future::Future;
-use core::num::NonZeroU64;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicU32, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::sync::atomic::Ordering;
+use core::task::{Poll, Waker};
 
 use super::channel;
-use crate::capacity::Budget;
+use crate::channel::tests::{BOUND, budget, counted, poll};
 use crate::channel::{Closed, SendError, TryRecvError};
 use crate::wait::tests::counter;
-
-const BOUND: u64 = 1 << 20;
-
-pub(super) fn budget() -> Budget {
-    Budget::new(NonZeroU64::new(BOUND).unwrap())
-}
-
-pub(super) fn poll<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output> {
-    Pin::new(future).poll(&mut Context::from_waker(waker))
-}
-
-/// A value that counts its drops. It drives the code under test, so it uses the native atomics.
-#[derive(Debug)]
-pub(super) struct Counted(pub(super) u32, Arc<AtomicU32>);
-
-impl Drop for Counted {
-    fn drop(&mut self) {
-        self.1.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// The drop counter, and a function that makes counted values.
-pub(super) fn counted() -> (Arc<AtomicU32>, impl Fn(u32) -> Counted + Send) {
-    let drops = Arc::new(AtomicU32::new(0));
-    let make = {
-        let drops = Arc::clone(&drops);
-        move |id| Counted(id, Arc::clone(&drops))
-    };
-    (drops, make)
-}
 
 #[test]
 fn a_sent_value_reaches_the_receiver_once_by_each_receive() {

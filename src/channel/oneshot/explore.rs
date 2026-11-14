@@ -7,7 +7,7 @@ use core::sync::atomic::Ordering;
 use core::task::Poll;
 
 use super::channel;
-use super::tests::{budget, counted, poll};
+use crate::channel::tests::{budget, counted, poll};
 use crate::channel::{Closed, SendError, TryRecvError};
 use crate::wait::tests::counter;
 
