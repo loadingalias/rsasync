@@ -236,7 +236,7 @@ pub(crate) enum Finish {
     Nothing,
     /// The result counts the bytes that the kernel wrote into `loan`.
     Received,
-    /// The kernel selected a buffer of the provided ring, which becomes `lease`.
+    /// The kernel selected a buffer of the provided ring, which becomes `loan`.
     Selected,
     /// The result is a new descriptor, which becomes `accepted`.
     Accepted,
@@ -834,17 +834,18 @@ fn finish(held: &mut Held, cqe: &Cqe, abandoned: bool, resources: &mut Resources
             }
         }
         Finish::Selected => {
-            if let Some(mut buffer) = cqe
+            if let Some(buffer) = cqe
                 .buffer()
                 .zip(selected)
                 .and_then(|(bid, selected)| selected.take(bid))
             {
-                // SAFETY: the kernel wrote the bytes that the result counts at the start of the
-                // buffer that it selected.
-                unsafe { buffer.set_initialized(count.unwrap_or(0)) };
-                let lease = Lease::from(buffer);
+                let mut loan = WriteLoan::new(buffer);
+                // SAFETY: a slot of the pool has no initialized bytes, so the loan starts at the
+                // start of the buffer. The kernel wrote the bytes that the result counts there, at
+                // most the slot capacity that the ring names.
+                unsafe { loan.set_filled(count.unwrap_or(0)) };
                 if !abandoned {
-                    held.lease = Some(lease);
+                    held.loan = Some(loan);
                 }
             }
         }

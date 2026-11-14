@@ -2,6 +2,7 @@
 //! the kernel selects, send from a lease, and close. Each socket is nonblocking, and the driver
 //! owns its descriptor.
 
+use alloc::vec::Vec;
 use core::net::SocketAddr;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -132,15 +133,17 @@ impl Driver {
     }
 
     /// Receives into a buffer that the kernel selects from the buffers of [`Driver::provide`] when
-    /// the data comes, so the wait holds no buffer. The future gives a lease of the received bytes
-    /// in that buffer. When its last lease or view drops, on any thread, the buffer goes back to
-    /// the kernel. A drop of the future asks for a cancel.
+    /// the data comes, so the wait holds no buffer. The future gives that buffer as an exclusive
+    /// backing with the received bytes initialized, so the caller can change them in place, for
+    /// example to decrypt them, and then freeze them with `Lease::from`, with no allocation. When
+    /// the backing, or its last lease or view, drops, on any thread, the buffer goes back to the
+    /// kernel. A drop of the future asks for a cancel.
     ///
     /// # Errors
     ///
     /// A refusal when the driver has no provided buffers or no room for the operation.
     #[expect(unsafe_code, reason = "a selecting receive names no memory of its own")]
-    pub fn recv_selected(&mut self, stream: &TcpStream) -> Result<Operation<io::Result<Lease>>, Refused<()>> {
+    pub fn recv_selected(&mut self, stream: &TcpStream) -> Result<Operation<io::Result<Backing>>, Refused<()>> {
         let Some(group) = self.selected.as_ref().map(|selected| selected.ring.group()) else {
             return Err(Refused {
                 reason: Reason::Buffers,
@@ -160,7 +163,12 @@ impl Driver {
         let completion =
             unsafe { self.submit((), Some(stream.resource), held, |_| Sqe::recv_selected(fd, group), true) }?;
         Ok(Operation::new(completion, |result, held| {
-            Some(count(result).map(|_| held.lease.unwrap_or_else(|| Lease::from(&[][..]))))
+            // With no selected buffer, for example at the end of the stream, the backing is empty, and an
+            // empty `Vec` allocates nothing.
+            Some(count(result).map(|_| {
+                held.loan
+                    .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner)
+            }))
         }))
     }
 

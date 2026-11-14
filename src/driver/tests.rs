@@ -17,7 +17,7 @@ use std::time::Instant;
 use std::vec::Vec;
 
 use super::{Completion, Config, Driver, Held, Reason, Refused, sys};
-use crate::buffer::{Backing, Buffer as _, Lease, Pool, Release, WriteLoan};
+use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
 use crate::uring::Sqe;
@@ -461,12 +461,14 @@ fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_address
     assert_eq!(bytes, b"HTTP/1.1 200 OK\r\n\r\n");
 }
 
-/// A request in a buffer that the kernel selected is read in place, at the address of the one
-/// slot of the pool, where the kernel wrote it before the driver took the completion. When the last
-/// view of that buffer drops on another thread, the buffer comes back to the kernel ring through
-/// the home, so the next selecting receive gets it again.
+/// A record in a buffer that the kernel selected is decrypted in place, at the address of the one
+/// slot of the pool, where the kernel wrote it before the driver took the completion. The receive
+/// gives the slot as a writable backing, so the decryption needs no copy, and the decrypted bytes
+/// become a lease at the same address. When the last view of that buffer drops on another thread,
+/// the buffer comes back to the kernel ring through the home, so the next selecting receive gets it
+/// again.
 #[test]
-fn a_selected_buffer_is_read_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere() {
+fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere() {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut pool = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
@@ -479,9 +481,11 @@ fn a_selected_buffer_is_read_in_place_and_returns_to_its_ring_when_its_last_view
     let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<()>();
+    // The "cipher" of the record: each byte XOR this key.
+    const KEY: u8 = 0x5a;
     let client = thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(address).unwrap();
-        stream.write_all(b"first").unwrap();
+        stream.write_all(&b"first".map(|byte| byte ^ KEY)).unwrap();
         wait.recv().unwrap();
         stream.write_all(b"second").unwrap();
     });
@@ -489,8 +493,12 @@ fn a_selected_buffer_is_read_in_place_and_returns_to_its_ring_when_its_last_view
     let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
 
     let receive = driver.recv_selected(&stream).unwrap();
-    assert_eq!(written_in_place(&mut driver, slot, 5), b"first");
-    let first = drive(&mut driver, receive).unwrap().unwrap();
+    assert_eq!(written_in_place(&mut driver, slot, 5), b"first".map(|byte| byte ^ KEY));
+    let mut first = drive(&mut driver, receive).unwrap().unwrap();
+    for byte in first.bytes_mut() {
+        *byte ^= KEY;
+    }
+    let first = Lease::from(first);
     assert_eq!((first.bytes(), first.as_ptr()), (&b"first"[..], slot));
     let view = first.view(1..).unwrap();
     drop(first);

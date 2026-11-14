@@ -134,9 +134,10 @@ standard library. A refused operation, for example when each operation slot is i
 
 `Driver::provide` gives the slots of an `rsasync::buffer::Pool` to the kernel. Then
 `Driver::recv_selected` waits with no buffer, and the kernel takes a free slot only when the data
-comes. The future gives a `Lease` of the received bytes in that slot. When the last lease or view of
-the slot drops, on any thread, the slot goes back to the pool, and the next turn gives it to the
-kernel again:
+comes. The future gives that slot as an exclusive `Backing` with the received bytes, so you can
+change them in place, for example to decrypt them. `Lease::from` then freezes them at the same
+address, with no allocation. When the backing, or the last lease or view of the slot, drops, on any
+thread, the slot goes back to the pool, and the next turn gives it to the kernel again:
 
 ```rust
 use core::alloc::Layout;
