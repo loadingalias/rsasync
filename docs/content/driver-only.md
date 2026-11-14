@@ -3,8 +3,8 @@
 An rsasync I/O driver can run with no scheduler: your code owns it and drives it. This page tells
 how to start a driver, drive it from your own loop or from the reactor of another host, use TCP on
 it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development, and its alpha
-releases are on crates.io. The driver has TCP accept, receive, send, and close; the other operations
-come in later changes. [TCP on the driver](tcp.md) is the reference for each TCP operation and its
+releases are on crates.io. The driver has TCP bind, connect, accept, receive, send, half-close, and
+close; the other operations come in later changes. [TCP on the driver](tcp.md) is the reference for each TCP operation and its
 results.
 
 The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It needs no helper
@@ -72,7 +72,8 @@ supported kernels have `04fe9aeb4f3c`.
 ## Accept, receive, and send on TCP
 
 The driver owns each socket that it makes. `Driver::bind` binds a nonblocking socket and listens on
-it. `Driver::accept` gives the future of a connection: a `TcpStream` and the address of its peer.
+it, and `Driver::connect` connects one. `Driver::accept` gives the future of a connection: a
+`TcpStream` and the address of its peer.
 Each operation gives an `Operation` future. You poll it, and you turn the driver until it is ready.
 This helper does both:
 
@@ -108,10 +109,11 @@ back. Neither operation copies the bytes:
 
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};
-use rsasync::driver::{Config, Driver};
+use rsasync::driver::{Config, Driver, TcpOptions};
 
 let mut driver = Driver::new(Config::new())?;
-let mut listener = driver.bind("127.0.0.1:8080".parse()?)?;
+let bind = driver.bind("127.0.0.1:8080".parse()?, TcpOptions::default())?;
+let mut listener = run(&mut driver, bind)???;
 let accept = driver.accept(&mut listener)?;
 let (mut stream, peer) = run(&mut driver, accept)???;
 

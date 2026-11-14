@@ -1,8 +1,9 @@
-//! The declarations of the datagram calls, their message headers, and their control messages on Linux.
+//! The declarations of the datagram calls, their message headers, and their control messages on
+//! Linux, and of the socket calls and options that the networking family and its runtimes share.
 //!
-//! Each item agrees with `include/uapi/linux/socket.h`, `in.h`, `in6.h`, `udp.h`, `uio.h`,
-//! `include/linux/socket.h`, and `include/uapi/asm-generic/errno.h` of Linux 6.1, on x86_64 and
-//! aarch64. The structures have the layout of the kernel. glibc and musl give the functions; musl
+//! Each item agrees with `include/uapi/linux/socket.h`, `in.h`, `in6.h`, `udp.h`, `tcp.h`, `uio.h`,
+//! `include/uapi/asm-generic/socket.h`, `include/linux/socket.h`, `include/linux/net.h`, and
+//! `include/uapi/asm-generic/errno.h` of Linux 6.1, on x86_64 and aarch64. The structures have the layout of the kernel. glibc and musl give the functions; musl
 //! declares the `size_t` length fields as an `int` and padding, which is the same memory on these
 //! little-endian targets.
 
@@ -90,6 +91,35 @@ const _: () = {
     assert!(size_of::<In6PktInfo>() == 20);
 };
 
+/// `SOCK_STREAM` (`include/linux/net.h`): a byte stream, such as TCP.
+pub const SOCK_STREAM: c_int = 1;
+/// `SOCK_NONBLOCK` (`include/linux/net.h`, `O_NONBLOCK`): the new descriptor does not block.
+pub const SOCK_NONBLOCK: c_int = 0o4_000;
+/// `SOCK_CLOEXEC` (`include/linux/net.h`, `O_CLOEXEC`): the new descriptor closes at an exec.
+pub const SOCK_CLOEXEC: c_int = 0o2_000_000;
+/// `SHUT_WR` (`include/linux/net.h`): end the write side of a stream; the peer reads the end of
+/// the stream after the bytes that came before.
+pub const SHUT_WR: c_int = 1;
+
+/// `SOL_SOCKET` (`include/uapi/asm-generic/socket.h`), the level of the socket options.
+pub const SOL_SOCKET: c_int = 1;
+/// `SO_REUSEADDR`: a listener can bind an address whose earlier connections still wait.
+pub const SO_REUSEADDR: c_int = 2;
+/// `SO_SNDBUF`: the send buffer size. Linux doubles the value that it takes, for its own
+/// bookkeeping, and gives the doubled value back.
+pub const SO_SNDBUF: c_int = 7;
+/// `SO_RCVBUF`: the receive buffer size, which Linux doubles as it does [`SO_SNDBUF`].
+pub const SO_RCVBUF: c_int = 8;
+/// `SO_KEEPALIVE`: send keepalive probes on an idle connection.
+pub const SO_KEEPALIVE: c_int = 9;
+/// `SO_REUSEPORT`: sockets of one user can bind the same address, and the kernel spreads the
+/// connections or datagrams between them.
+pub const SO_REUSEPORT: c_int = 15;
+/// `IPPROTO_TCP` (`include/uapi/linux/in.h`), the level of the TCP options.
+pub const IPPROTO_TCP: c_int = 6;
+/// `TCP_NODELAY` (`include/uapi/linux/tcp.h`): send small segments at once, with no Nagle delay.
+pub const TCP_NODELAY: c_int = 1;
+
 /// `IPPROTO_IP`, the level of the IPv4 options.
 pub const IPPROTO_IP: c_int = 0;
 /// `IPPROTO_IPV6`, the level of the IPv6 options.
@@ -165,15 +195,15 @@ unsafe extern "C" {
         timeout: *mut c_void,
     ) -> c_int;
     /// `int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)`.
-    pub(crate) fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
+    pub fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
     /// `int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)`.
-    pub(crate) fn getsockopt(
-        sockfd: c_int,
-        level: c_int,
-        optname: c_int,
-        optval: *mut c_void,
-        optlen: *mut u32,
-    ) -> c_int;
+    pub fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *mut c_void, optlen: *mut u32) -> c_int;
     /// `int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`.
-    pub(crate) fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    pub fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    /// `int socket(int domain, int type, int protocol)`.
+    pub fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+    /// `int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.
+    pub fn bind(sockfd: c_int, addr: *const c_void, addrlen: u32) -> c_int;
+    /// `int listen(int sockfd, int backlog)`.
+    pub fn listen(sockfd: c_int, backlog: c_int) -> c_int;
 }

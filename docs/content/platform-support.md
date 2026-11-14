@@ -32,12 +32,14 @@ Today, the tests check the repository tools, the shared types, and the io_uring 
 driver: ring creation, a message from one ring to another, the probes of kernel features, the
 operation table with the completions of the kernel, the driver-only surface (turns, waits, wakes,
 and teardown), and TCP on the driver. The TCP tests bind, listen, and accept; receive into an
-owned buffer and into a buffer that the kernel selects; send from a lease; and close. They also
+owned buffer and into a buffer that the kernel selects; send from a lease and from several regions;
+connect; half-close; set and read the socket options; and close. Bind and listen run on the ring
+where the kernel has them (Ubuntu 26.04), and as system calls elsewhere (Debian 12). They also
 check that a dropped, forgotten, or cancelled receive, send, or accept loses no byte and no
 connection, on IPv4 and IPv6. The receive into an owned buffer and the send from a lease keep the
 addresses of their buffers and allocate nothing for each operation. Only the driver and `rsnetwork-udp` make system calls: the io_uring ring and
-its waits in the kernel, its two event descriptors, the bind and listen of a TCP socket through
-`std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
+its waits in the kernel, its two event descriptors, the socket, option, bind, and listen calls of
+a TCP socket, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
 on musl, and that these calls work through the system calls of musl. It does not show that a
 runtime with a scheduler works on musl: the library has no scheduler yet. From the Linux driver
 stage on, each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C

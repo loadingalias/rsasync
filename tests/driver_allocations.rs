@@ -18,7 +18,7 @@ use std::io::{Read as _, Write as _};
 use std::thread;
 
 use rsasync::buffer::{Backing, Buffer as _, Lease};
-use rsasync::driver::{Config, Driver};
+use rsasync::driver::{Config, Driver, TcpOptions};
 
 /// Counts the allocations of each thread.
 struct Counting;
@@ -65,7 +65,10 @@ fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
 #[test]
 fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
     let mut driver = Driver::new(Config::new()).unwrap();
-    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let bind = driver
+        .bind("127.0.0.1:0".parse().unwrap(), TcpOptions::default())
+        .unwrap();
+    let mut listener = drive(&mut driver, bind).unwrap().unwrap();
     let address = listener.local_addr();
     let client = thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(address).unwrap();

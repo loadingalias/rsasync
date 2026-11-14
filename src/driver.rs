@@ -65,9 +65,9 @@ use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
 use crate::capacity::Permit;
 use crate::sync::Arc;
 use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
-use crate::uring::{BufferRing, Cqe, Ring, SetupError, Sqe};
+use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
 
-pub use tcp::{Closed, ReadHalf, TcpListener, TcpStream, WriteFailed, WriteHalf};
+pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
@@ -224,7 +224,7 @@ pub(crate) struct Held {
     /// The peer address that an accept writes, and its length.
     pub(crate) peer: SockAddrStorage,
     pub(crate) peer_len: u32,
-    /// The stream that an accept gave.
+    /// The socket that an accept, a connect, or a bind gave.
     pub(crate) accepted: Option<Resource>,
     /// The connection of an accept with no consumer, which the listener keeps.
     pub(crate) connection: Option<OwnedFd>,
@@ -236,6 +236,8 @@ pub(crate) struct Held {
     pub(crate) failed: Option<WriteFailed>,
     /// The report of a close.
     pub(crate) closed: Option<Closed>,
+    /// The regions of a vectored send, and the message header that names them.
+    pub(crate) regions: Option<Regions>,
     /// The next operation that waits in the same direction, in start order.
     pub(crate) next: Option<OpId>,
 }
@@ -253,10 +255,26 @@ pub(crate) enum Kind {
     Selected,
     /// A send of the lease.
     Send,
+    /// A send of the regions, in order.
+    Vectored,
+    /// A shutdown of the write side of a stream.
+    Shutdown,
+    /// A connect of a new socket, which `accepted` holds.
+    Connect,
+    /// A bind and a listen of a new socket, which `accepted` holds.
+    Bind,
     /// An accept: the result is a new descriptor.
     Accept,
     /// A close, which ends after each operation of its resource ends.
     Close,
+}
+
+impl Kind {
+    /// Whether the operation uses the write direction of a stream. A drop of its future does not
+    /// cancel it.
+    pub(crate) const fn writes(self) -> bool {
+        matches!(self, Self::Send | Self::Vectored | Self::Shutdown)
+    }
 }
 
 /// The facts of an operation that the operation table keeps for the home: its resource and its
@@ -415,6 +433,16 @@ impl Resources {
             .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())
     }
 
+    /// The descriptor of `resource`, while the driver owns it.
+    fn borrow(&self, resource: Resource) -> Option<BorrowedFd<'_>> {
+        self.0
+            .get(resource.index as usize)
+            .filter(|slot| slot.generation == resource.generation)?
+            .fd
+            .as_ref()
+            .map(AsFd::as_fd)
+    }
+
     /// Ends `resource` and gives its descriptor. The identity is stale from now on.
     fn release(&mut self, resource: Resource) -> Option<OwnedFd> {
         let slot = self.get(resource)?;
@@ -554,6 +582,8 @@ pub struct Driver {
     /// The bytes that receives copied from the data that an abandoned receive left.
     copied: u64,
     selected: Option<Selected>,
+    /// The later operations of the kernel, from the probe of the ring.
+    features: Features,
     completions_per_turn: u32,
     /// The ring polls the interrupt descriptor, so that a request or wake from another thread
     /// ends a wait.
@@ -596,6 +626,8 @@ impl Driver {
             SetupError::Failed(error) if error.kind() == io::ErrorKind::InvalidInput => Error::Config,
             SetupError::Failed(error) => Error::System(error),
         })?;
+        // The probe needs a new ring, with no entry, completion, or buffer group.
+        let features = ring.probe().map_err(Error::System)?;
         let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
         let wake = File::from(wake);
         ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
@@ -616,6 +648,7 @@ impl Driver {
             pending: Vec::with_capacity(config.resources as usize),
             copied: 0,
             selected: None,
+            features,
             completions_per_turn: config.completions_per_turn,
             waking: false,
             rearm_wake,
@@ -1033,7 +1066,26 @@ fn finish(
 ) {
     let count = usize::try_from(cqe.res);
     match tag.kind {
-        Kind::Other | Kind::Send | Kind::Close => {}
+        Kind::Other | Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::Close => {}
+        // A failed connect or bind closes its socket. The abandoned rule closes the socket of an
+        // operation with no consumer.
+        Kind::Connect | Kind::Bind if abandoned => {}
+        Kind::Connect | Kind::Bind => match held.accepted {
+            Some(socket) if cqe.res < 0 => {
+                drop(resources.release(socket));
+                held.accepted = None;
+            }
+            // A listener gives its local address, for example the port of a bind to port 0.
+            Some(socket) if tag.kind == Kind::Bind => {
+                if let Some((address, len)) = resources
+                    .get(socket)
+                    .and_then(|owned| tcp::local_address(owned.fd.as_ref()?))
+                {
+                    (held.peer, held.peer_len) = (address, len);
+                }
+            }
+            _ => {}
+        },
         Kind::Recv => {
             if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
                 // SAFETY: the receive named the capacity of the loan, and the kernel wrote `count`

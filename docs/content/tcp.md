@@ -11,14 +11,22 @@ Each operation gives an `Operation` future. Turn the driver until the future is 
 
 | Call | Borrows | Output | Refusal |
 | --- | --- | --- | --- |
-| `Driver::bind(address)` | Nothing | `io::Result<TcpListener>`, a nonblocking socket that listens | An error of the system, or `OutOfMemory` when each resource slot is in use |
+| `Driver::bind(address, options)` | Nothing | `io::Result<TcpListener>`: a nonblocking socket that listens. See [Bind and listen](#bind-and-listen) | `Refused<()>` |
+| `Driver::connect(address, options)` | Nothing | `io::Result<TcpStream>`: a nonblocking stream to `address` | `Refused<()>` |
 | `Driver::accept(&mut listener)` | The listener | `io::Result<(TcpStream, SocketAddr)>`: the stream and the address of its peer | `Refused<()>` |
 | `Driver::recv(&mut stream, backing)` | The read half | `(io::Result<usize>, Backing)`: the count, and the buffer with the bytes after its earlier bytes | `Refused<Backing>`, with the buffer |
 | `Driver::recv_selected(&mut stream)` | The read half | `io::Result<Backing>`: the buffer that the kernel selected from the pool of `Driver::provide`, with the bytes | `Refused<()>`, also with `Reason::Buffers` when the driver has no pool |
 | `Driver::send(&mut stream, lease)` | The write half | `(io::Result<usize>, Lease)`: the count, and the lease | `Refused<Lease>`, with the lease |
+| `Driver::send_vectored(&mut stream, regions)` | The write half | `(io::Result<usize>, Regions)`: the count across the regions, and the regions. See [Send several regions](#send-several-regions) | `Refused<Regions>`, with the regions |
+| `Driver::shutdown_write(&mut stream)` | The write half | `io::Result<()>`. See [Half-close](#half-close) | `Refused<()>` |
 | `Driver::close(stream)` | Takes the stream | `Closed` | `Refused<TcpStream>`, with the stream |
 | `Driver::close_listener(listener)` | Takes the listener | `Closed` | `Refused<TcpListener>`, with the listener |
 | `Operation::cancel(&self)` | Nothing | The future gives its output later, as usual | None |
+| `Driver::set_options(&socket, options)` | Nothing | `io::Result<()>`, at once. See [Socket options](#socket-options) | None |
+| `Driver::options(&socket)` | Nothing | `io::Result<TcpOptions>`, at once | None |
+
+The future of `bind` and `connect` gives an error of the system, for example `ConnectionRefused`
+when no listener has the port, or `OutOfMemory` when each resource slot of the driver is in use.
 
 A refusal gives a `Reason`: `Operations` (each operation slot is in use), `Queue` (the submission
 queue stays full), `Resource` (the driver does not own the socket), or `Buffers`.
@@ -26,6 +34,79 @@ queue stays full), `Resource` (the driver does not own the socket), or `Buffers`
 `TcpStream::split` gives the read half and the write half, so that a receive and a send can run at
 one time. A receive and a send take the stream or its half: `driver.recv(&mut stream, ...)` and
 `driver.recv(reader, ...)` are the same operation.
+
+## Bind and listen
+
+`Driver::bind` makes a nonblocking socket, sets its options, binds it, and listens on it. The
+listener reuses its address (`SO_REUSEADDR`), as `std` does. Its backlog is the most that the
+kernel takes (`net.core.somaxconn`). The listener gives its local address with
+`TcpListener::local_addr`, for example the port of a bind to port 0.
+
+Where the kernel has the bind and listen operations of io_uring (Linux 6.11 and later), the ring
+runs them, and the future is ready after the next turn. On an earlier kernel, the driver makes
+the system calls, and the future is ready at once. The driver finds the operations with a probe
+of the ring when it starts, not from the kernel version.
+
+## Socket options
+
+`TcpOptions` has one field for each option. `None` keeps the value of the system.
+`Driver::bind` and `Driver::connect` set the options before the bind or the connect. Set
+`reuse_port` and `only_v6` there, because the kernel uses them at the bind.
+`Driver::set_options` sets the options of a stream or a listener later, and `Driver::options`
+reads each one back, with the value of the kernel.
+
+| Field | Option | Effect |
+| --- | --- | --- |
+| `no_delay` | `TCP_NODELAY` | Send small segments at once, with no Nagle delay |
+| `keepalive` | `SO_KEEPALIVE` | Send keepalive probes on an idle connection |
+| `only_v6` | `IPV6_V6ONLY` | An IPv6 socket takes no IPv4 traffic. `options` gives `None` for an IPv4 socket. Linux sets it on a socket that binds one IPv6 address, for example `::1` |
+| `send_buffer` | `SO_SNDBUF` | The send buffer size in bytes |
+| `receive_buffer` | `SO_RCVBUF` | The receive buffer size in bytes |
+| `reuse_port` | `SO_REUSEPORT` | Sockets of one user can bind the same address, and the kernel spreads the connections between them |
+
+Linux takes a buffer size of at most `net.core.wmem_max` (send) or `net.core.rmem_max`
+(receive), and it doubles the value for its own bookkeeping. So `options` gives twice the value
+that you set, when that value is not above the limit. Other kernels may not double the value; the
+driver runs only on Linux now.
+
+## Send several regions
+
+`Driver::send_vectored` sends the bytes of several leases, in order, in one operation, with no copy
+that joins them. `Regions` owns the leases and the array that names them for the kernel. Make it
+one time and use it again, so that each send allocates nothing.
+
+The count can end inside a region. `Regions::advance` then drops each region that went and makes
+the region that went in part a view of its rest, with no copy, so the next send continues the
+stream:
+
+```rust
+use rsasync::buffer::Lease;
+use rsasync::driver::Regions;
+
+let mut regions = Regions::with_capacity(3);
+regions.push(Lease::from(b"HTTP/1.1 200 OK\r\n".to_vec()));
+regions.push(Lease::from(b"content-length: 5\r\n\r\n".to_vec()));
+regions.push(Lease::from(b"hello".to_vec()));
+while !regions.is_empty() {
+    let send = driver.send_vectored(&mut stream, regions)?;
+    let (sent, back) = run(&mut driver, send)??;
+    regions = back;
+    regions.advance(sent?);
+}
+```
+
+A vectored send is a send of the write direction: it waits for the sends before it, and the rules
+for a dropped send apply to it.
+
+## Half-close
+
+`Driver::shutdown_write` ends the write side of the stream (`SHUT_WR`) after the sends before it.
+The peer reads the bytes of those sends, and then the end of the stream. Receives on this side go
+on, so you can read the reply of the peer. A dropped half-close still runs, as a send does.
+
+On a failed write direction (see [A failed write direction](#a-failed-write-direction)), the
+half-close gives `WriteFailed` and does nothing. So the peer never reads a clean end of the stream
+after a message that was cut.
 
 ## One operation for each direction
 
@@ -49,8 +130,10 @@ No byte and no connection is lost. These rules apply:
 | Operation | Its future drops or is forgotten | `Operation::cancel` |
 | --- | --- | --- |
 | Receive | The driver asks the kernel to cancel. The bytes that the receive got before the cancel took effect stay with the stream, in the receive's own buffer. The next receive gives them before it submits: `recv` copies as many as fit its buffer, and the stream keeps the rest; `recv_selected` gives that buffer. An error of the receive also stays, and the next receive gives it. Close releases the bytes that no receive took | The future gives the original buffer with the bytes that came before the cancel took effect, with no copy, or `ECANCELED` |
-| Send | The send is not cancelled. If it sends all its bytes, it reports nothing. If it fails, sends only part of its bytes, or was cancelled, the write direction fails: see below | The future gives the lease with its exact count, or `ECANCELED`. The direction stays usable |
+| Send, vectored send, and half-close | The operation is not cancelled. If a send sends all its bytes, it reports nothing. If it fails, sends only part of its bytes, or was cancelled, the write direction fails: see below | The future gives the lease or the regions with the exact count, or `ECANCELED`. The direction stays usable |
 | Accept | The driver asks the kernel to cancel. A connection that the accept took before the cancel took effect stays with the listener, and the next accept gives it, with its peer address, before it submits. Close of the listener closes it | The future gives the connection that the accept took before the cancel took effect, or `ECANCELED` |
+| Connect | The driver asks the kernel to cancel. A connection that completes after the drop is closed at its end, so no descriptor stays open, and the peer reads the end of the stream | The future gives the stream that the connect made before the cancel took effect, or `ECANCELED` |
+| Bind | The driver asks the kernel to cancel, and it closes the listener that the bind made | The future gives the listener that the bind made before the cancel took effect, or `ECANCELED` |
 
 `Driver::copied()` gives the total of the bytes that receives copied from bytes that a dropped or
 forgotten receive left. Each other byte of a receive goes from the kernel into its buffer with no

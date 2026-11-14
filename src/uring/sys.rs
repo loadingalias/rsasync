@@ -80,6 +80,9 @@ pub(super) const IORING_OP_POLL_ADD: u8 = 6;
 pub(super) const IORING_OP_ACCEPT: u8 = 13;
 pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
 pub(super) const IORING_OP_READ: u8 = 22;
+pub(super) const IORING_OP_SENDMSG: u8 = 9;
+pub(super) const IORING_OP_CONNECT: u8 = 16;
+pub(super) const IORING_OP_SHUTDOWN: u8 = 34;
 pub(super) const IORING_OP_SEND: u8 = 26;
 pub(super) const IORING_OP_RECV: u8 = 27;
 pub(super) const IORING_OP_MSG_RING: u8 = 40;
@@ -94,7 +97,12 @@ pub(super) const IORING_OP_LISTEN: u8 = 57;
 /// Linux 6.15.
 pub(super) const IORING_OP_RECV_ZC: u8 = 58;
 
+/// `IOSQE_IO_LINK`: the next entry starts after this one succeeds, and fails with `ECANCELED`
+/// when this one fails.
+pub(super) const IOSQE_IO_LINK: u8 = 1 << 2;
 pub(super) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+/// `IOSQE_CQE_SKIP_SUCCESS` (Linux 5.17): the entry posts a completion only when it fails.
+pub(super) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
 
 pub(super) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub(super) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
@@ -106,9 +114,10 @@ pub(super) const POLLIN: u32 = 0x1;
 /// `MSG_NOSIGNAL` (`include/linux/socket.h`): a send to a closed peer gives `EPIPE` and raises no
 /// `SIGPIPE`.
 pub(super) const MSG_NOSIGNAL: u32 = 0x4000;
-/// `SOCK_NONBLOCK` and `SOCK_CLOEXEC` (`include/linux/net.h`): `O_NONBLOCK` and `O_CLOEXEC`.
-pub(super) const SOCK_NONBLOCK: u32 = 0o4_000;
-pub(super) const SOCK_CLOEXEC: u32 = 0o2_000_000;
+/// The flags of a new descriptor, from their declarations in `rsnetwork_udp::sys`, as the `u32`
+/// flags of an entry.
+pub(super) const SOCK_NONBLOCK: u32 = rsnetwork_udp::sys::SOCK_NONBLOCK.cast_unsigned();
+pub(super) const SOCK_CLOEXEC: u32 = rsnetwork_udp::sys::SOCK_CLOEXEC.cast_unsigned();
 
 /// The command of `IORING_OP_MSG_RING` that posts `len` and `off` as a completion of the target.
 pub(super) const IORING_MSG_DATA: u64 = 0;

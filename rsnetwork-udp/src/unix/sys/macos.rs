@@ -134,17 +134,11 @@ unsafe extern "C" {
     /// `ssize_t recvmsg(int, struct msghdr *, int)`.
     pub(crate) fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     /// `int setsockopt(int, int, int, const void *, socklen_t)`.
-    pub(crate) fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
+    pub fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
     /// `int getsockopt(int, int, int, void *restrict, socklen_t *restrict)`.
-    pub(crate) fn getsockopt(
-        sockfd: c_int,
-        level: c_int,
-        optname: c_int,
-        optval: *mut c_void,
-        optlen: *mut u32,
-    ) -> c_int;
+    pub fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *mut c_void, optlen: *mut u32) -> c_int;
     /// `int getsockname(int, struct sockaddr *restrict, socklen_t *restrict)`.
-    pub(crate) fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    pub fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
 }
 
 /// `struct msghdr_x`: one datagram of a batch of `sendmsg_x` or `recvmsg_x`. A receive writes the length of

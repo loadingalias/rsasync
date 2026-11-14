@@ -154,6 +154,74 @@ impl Sqe {
         }
     }
 
+    /// A send of the message `message` on the socket `fd` (`IORING_OP_SENDMSG`): the regions that
+    /// its iovec array names, in order. A closed peer gives `EPIPE` and no `SIGPIPE`.
+    pub(crate) fn send_message(fd: RawFd, message: *const rsnetwork_udp::sys::MsgHdr) -> Self {
+        Self {
+            opcode: sys::IORING_OP_SENDMSG,
+            fd,
+            addr: message.addr() as u64,
+            len: 1,
+            rw_flags: sys::MSG_NOSIGNAL,
+            ..Self::default()
+        }
+    }
+
+    /// A connect of the socket `fd` to the address of `len` bytes at `address`
+    /// (`IORING_OP_CONNECT`).
+    pub(crate) fn connect(fd: RawFd, address: *const u8, len: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_CONNECT,
+            fd,
+            addr: address.addr() as u64,
+            off: u64::from(len),
+            ..Self::default()
+        }
+    }
+
+    /// A shutdown of the socket `fd` (`IORING_OP_SHUTDOWN`), with `how`, for example `SHUT_WR`.
+    /// The entry names no memory.
+    pub(crate) fn shutdown(fd: RawFd, how: i32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_SHUTDOWN,
+            fd,
+            len: how.cast_unsigned(),
+            ..Self::default()
+        }
+    }
+
+    /// A bind of the socket `fd` to the address of `len` bytes at `address` (`IORING_OP_BIND`,
+    /// Linux 6.11).
+    pub(crate) fn bind(fd: RawFd, address: *const u8, len: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_BIND,
+            fd,
+            addr: address.addr() as u64,
+            off: u64::from(len),
+            ..Self::default()
+        }
+    }
+
+    /// A listen on the bound socket `fd` with `backlog` (`IORING_OP_LISTEN`, Linux 6.11). The
+    /// kernel takes at most `net.core.somaxconn`. The entry names no memory.
+    pub(crate) fn listen(fd: RawFd, backlog: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_LISTEN,
+            fd,
+            len: backlog,
+            ..Self::default()
+        }
+    }
+
+    /// The entry, linked to the next one, which starts only after this one succeeds. This one posts
+    /// a completion only when it fails, and the next one then fails with `ECANCELED`.
+    pub(crate) fn linked_quiet(self) -> Self {
+        Self {
+            flags: self.flags | sys::IOSQE_IO_LINK | sys::IOSQE_CQE_SKIP_SUCCESS,
+            ..self
+        }
+    }
+
     /// A one-shot poll of `fd` for readability (`IORING_OP_POLL_ADD`). It completes at once when
     /// `fd` is readable already. The entry names no memory.
     pub(crate) fn poll_readable(fd: RawFd) -> Self {
@@ -381,9 +449,15 @@ impl Ring {
 
     /// Whether the submission queue has a free entry for a push.
     pub(crate) fn has_room(&self) -> bool {
-        self.sq_pushed
-            .wrapping_sub(self.word(self.sq_head).load(Ordering::Acquire))
-            < self.sq_entries
+        self.room() > 0
+    }
+
+    /// The entries that the submission queue has room for.
+    pub(crate) fn room(&self) -> u32 {
+        let used = self
+            .sq_pushed
+            .wrapping_sub(self.word(self.sq_head).load(Ordering::Acquire));
+        self.sq_entries.saturating_sub(used)
     }
 
     /// The pushed entries that the kernel has not taken.

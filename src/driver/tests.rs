@@ -16,7 +16,9 @@ use std::thread::{self, Thread};
 use std::time::Instant;
 use std::vec::Vec;
 
-use super::{Completion, Config, Driver, ECANCELED, Held, Reason, Refused, TcpStream, WriteFailed, sys};
+use super::{
+    Completion, Config, Driver, ECANCELED, Held, Reason, Refused, TcpListener, TcpOptions, TcpStream, WriteFailed, sys,
+};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
@@ -421,7 +423,7 @@ fn written_in_place(driver: &mut Driver, address: *const u8, len: usize) -> Vec<
 #[test]
 fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses() {
     let mut driver = driver(Config::new());
-    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
     let client = thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(address).unwrap();
@@ -479,7 +481,7 @@ fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last
     let slot = zeroed.into_inner().as_ptr();
     let mut driver = driver(Config::new());
     driver.provide(pool).unwrap();
-    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<()>();
     // The "cipher" of the record: each byte XOR this key.
@@ -526,7 +528,7 @@ fn a_selecting_receive_with_no_free_buffer_gives_enobufs() {
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
-    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<()>();
     let client = thread::spawn(move || {
@@ -579,7 +581,7 @@ fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
-    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<&'static [u8]>();
     let client = thread::spawn(move || {
@@ -647,11 +649,21 @@ fn numbered(start: usize, len: usize) -> Vec<u8> {
         .collect()
 }
 
+/// A listener of the driver at `address`, with the default options.
+fn listen(driver: &mut Driver, address: &str) -> TcpListener {
+    let address = address.parse().expect("the test gives a socket address");
+    let bind = driver
+        .bind(address, TcpOptions::default())
+        .expect("the test driver has room");
+    drive(driver, bind)
+        .expect("the driver runs")
+        .expect("the test host binds loopback")
+}
+
 /// A stream of the driver that a listener at `address` accepted, and its peer. The listener is
 /// closed.
 fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStream) {
-    let address = address.parse().expect("the test gives a socket address");
-    let mut listener = driver.bind(address).expect("the test host binds loopback");
+    let mut listener = listen(driver, address);
     let peer = std::net::TcpStream::connect(listener.local_addr()).expect("the peer connects");
     let accept = driver.accept(&mut listener).expect("the test driver has room");
     let (stream, _) = drive(driver, accept)
@@ -875,7 +887,7 @@ fn an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usabl
 fn a_dropped_accept_leaves_its_connection_to_the_next_accept() {
     for address in ["127.0.0.1:0", "[::1]:0"] {
         let mut driver = driver(Config::new());
-        let mut listener = driver.bind(address.parse().unwrap()).unwrap();
+        let mut listener = listen(&mut driver, address);
         let address = listener.local_addr();
         let accept = driver.accept(&mut listener).unwrap();
         let mut client = std::net::TcpStream::connect(address).unwrap();
@@ -911,7 +923,7 @@ fn close_releases_the_bytes_and_the_connection_that_no_operation_took() {
     drive(&mut driver, close).unwrap();
     assert_eq!(taken(&log), ["released"]);
 
-    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
     let accept = driver.accept(&mut listener).unwrap();
     let mut client = std::net::TcpStream::connect(address).unwrap();
@@ -991,4 +1003,268 @@ fn idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer() {
     assert_eq!(drive(&mut driver, last).unwrap().unwrap().bytes(), b"last");
     drop(waiting);
     driver.teardown().unwrap();
+}
+
+/// Turns the driver until no operation runs and no event can come, for at most 1000 turns.
+fn settle(driver: &mut Driver) {
+    for _ in 0..1000 {
+        if !driver.table.busy() {
+            break;
+        }
+        let more = driver.turn().expect("a turn of the test driver works").more();
+        // A wait with no operation in flight would wait for an event that cannot come.
+        if !more && driver.table.busy() {
+            driver.wait().expect("the wait of the test driver works");
+        }
+    }
+    assert!(!driver.table.busy(), "an operation still runs after 1000 turns");
+}
+
+/// The descriptors that this process has open.
+fn descriptors() -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("Linux lists the descriptors of a process")
+        .count()
+}
+
+/// A connect to a port with no listener gives the typed refusal of the system, on IPv4 and IPv6.
+#[test]
+fn a_connect_to_a_port_with_no_listener_is_refused() {
+    let mut driver = driver(Config::new());
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        // A port that was free and has no listener now.
+        let free = std::net::TcpListener::bind(address).unwrap().local_addr().unwrap();
+        let connect = driver.connect(free, TcpOptions::default()).unwrap();
+        let refused = drive(&mut driver, connect).unwrap().unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
+    }
+}
+
+/// A connect whose future drops after the kernel connected leaves no descriptor open after its
+/// terminal event: the driver closes the connection, and the peer reads the end of the stream.
+#[test]
+fn a_dropped_connect_that_completes_closes_its_connection() {
+    let mut driver = driver(Config::new());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let open = descriptors();
+    let connect = driver
+        .connect(listener.local_addr().unwrap(), TcpOptions::default())
+        .unwrap();
+    assert_eq!(posted(&mut driver, 1)[0].res, 0, "the kernel did not connect");
+    drop(connect);
+    settle(&mut driver);
+    assert_eq!(descriptors(), open, "a descriptor stayed open");
+    listener.set_nonblocking(true).unwrap();
+    let start = Instant::now();
+    let mut peer = loop {
+        match listener.accept() {
+            Ok((peer, _)) => break peer,
+            Err(error) if error.kind() == ErrorKind::WouldBlock && start.elapsed().as_secs() < 2 => {}
+            Err(error) => panic!("the listener has no connection: {error}"),
+        }
+    };
+    peer.set_nonblocking(false).unwrap();
+    peer.set_read_timeout(Some(core::time::Duration::from_secs(2))).unwrap();
+    let mut byte = [0];
+    assert_eq!(peer.read(&mut byte).unwrap(), 0, "the peer read a byte");
+}
+
+/// The regions of a numbered stream from `start`, with these lengths.
+fn regions(start: usize, lens: &[usize]) -> super::Regions {
+    let mut regions = super::Regions::with_capacity(lens.len());
+    let mut at = start;
+    for &len in lens {
+        regions.push(Lease::from(numbered(at, len)));
+        at += len;
+    }
+    regions
+}
+
+/// A vectored send that the socket buffers stop gives the exact count across its regions: it
+/// ends in the third region, and the peer reads exactly those bytes. After `Regions::advance`, a
+/// second vectored send sends the rest, and the peer reads one numbered stream.
+#[test]
+fn a_vectored_send_gives_its_exact_progress_across_regions() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "[::1]:0");
+    let lens = [1000, 2000, 64 << 20];
+    let send = driver.send_vectored(&mut stream, regions(0, &lens)).unwrap();
+    let (sent, mut rest) = drive(&mut driver, send).unwrap();
+    let sent = sent.unwrap();
+    assert!(
+        3000 < sent && sent < 3000 + (64 << 20),
+        "the send ended outside the third region: {sent}"
+    );
+
+    let reader = thread::spawn(move || {
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        received
+    });
+    rest.advance(sent);
+    assert_eq!(rest.total(), 3000 + (64 << 20) - sent);
+    while !rest.is_empty() {
+        let send = driver.send_vectored(&mut stream, rest).unwrap();
+        let (more, back) = drive(&mut driver, send).unwrap();
+        rest = back;
+        rest.advance(more.unwrap());
+    }
+    let close = driver.close(stream).unwrap();
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert!(
+        reader.join().unwrap() == numbered(0, 3000 + (64 << 20)),
+        "the peer read other bytes"
+    );
+}
+
+/// A vectored send whose future drops sends only part of its regions, so the write direction
+/// fails, and the next send gives the count of the bytes that went: the bytes that the peer
+/// reads.
+#[test]
+fn a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    drop(
+        driver
+            .send_vectored(&mut stream, regions(0, &[1000, 64 << 20]))
+            .unwrap(),
+    );
+    let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
+    driver.turn().unwrap();
+    let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
+    let failed = drive(&mut driver, next).unwrap().0.unwrap_err();
+    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+    let close = driver.close(stream).unwrap();
+    drive(&mut driver, close).unwrap();
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert!(received == numbered(0, sent), "the peer read other bytes");
+}
+
+/// Each option reads back the value that the caller set, on a listener that set them before its
+/// bind and on a stream that sets them after its accept. Linux doubles the buffer sizes.
+#[test]
+fn each_socket_option_reads_back_the_value_that_was_set() {
+    let mut driver = driver(Config::new());
+    for (on, off) in [(true, false), (false, true)] {
+        let options = TcpOptions {
+            no_delay: Some(on),
+            keepalive: Some(off),
+            only_v6: Some(on),
+            send_buffer: Some(64 << 10),
+            receive_buffer: Some(32 << 10),
+            reuse_port: Some(off),
+        };
+        // A bind to one IPv6 address makes Linux set `only_v6` itself, so the test binds `::`.
+        let bind = driver.bind("[::]:0".parse().unwrap(), options).unwrap();
+        let mut listener = drive(&mut driver, bind).unwrap().unwrap();
+        let doubled = TcpOptions {
+            send_buffer: Some(128 << 10),
+            receive_buffer: Some(64 << 10),
+            ..options
+        };
+        assert_eq!(driver.options(&listener).unwrap(), doubled);
+
+        let port = listener.local_addr().port();
+        let _client = std::net::TcpStream::connect(("::1", port)).unwrap();
+        let accept = driver.accept(&mut listener).unwrap();
+        let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+        let options = TcpOptions {
+            no_delay: Some(off),
+            keepalive: Some(on),
+            send_buffer: Some(16 << 10),
+            receive_buffer: Some(8 << 10),
+            ..TcpOptions::default()
+        };
+        driver.set_options(&stream, options).unwrap();
+        let read = driver.options(&stream).unwrap();
+        assert_eq!(
+            (read.no_delay, read.keepalive, read.send_buffer, read.receive_buffer),
+            (Some(off), Some(on), Some(32 << 10), Some(16 << 10))
+        );
+    }
+    let bind = driver
+        .bind("127.0.0.1:0".parse().unwrap(), TcpOptions::default())
+        .unwrap();
+    let listener = drive(&mut driver, bind).unwrap().unwrap();
+    assert_eq!(
+        driver.options(&listener).unwrap().only_v6,
+        None,
+        "an IPv4 socket has no IPv6 option"
+    );
+}
+
+/// A half-close ends the peer's receive after the bytes that went before it, and the receives of
+/// this side still complete.
+#[test]
+fn a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let send = driver.send(&mut stream, Lease::from(numbered(0, 1000))).unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 1000);
+    let shutdown = driver.shutdown_write(&mut stream).unwrap();
+    drive(&mut driver, shutdown).unwrap().unwrap();
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert_eq!(received, numbered(0, 1000));
+
+    peer.write_all(b"reply").unwrap();
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
+    assert_eq!(drive(&mut driver, receive).unwrap().1.bytes(), b"reply");
+}
+
+/// On a failed write direction, a half-close gives `WriteFailed` and sends nothing: the peer reads
+/// the bytes that went, and then no end of the stream, until the close.
+#[test]
+fn a_half_close_on_a_failed_write_direction_sends_no_end_of_stream() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    drop(driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap());
+    let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
+    driver.turn().unwrap();
+    let shutdown = driver.shutdown_write(&mut stream).unwrap();
+    let failed = drive(&mut driver, shutdown).unwrap().unwrap_err();
+    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+
+    let mut received = std::vec![0; sent];
+    peer.read_exact(&mut received).unwrap();
+    assert!(received == numbered(0, sent), "the peer read other bytes");
+    peer.set_read_timeout(Some(core::time::Duration::from_millis(200)))
+        .unwrap();
+    let mut byte = [0];
+    let wait = peer.read(&mut byte).unwrap_err();
+    assert!(
+        matches!(wait.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+        "the peer read the end of the stream"
+    );
+}
+
+/// The bind and the listen run as linked entries of the ring where the probe of the kernel finds
+/// both, and as system calls with a future that is ready at once elsewhere. On IPv4 and IPv6, the
+/// listener then accepts.
+#[test]
+fn bind_and_listen_run_on_the_ring_exactly_where_the_probe_finds_them() {
+    let mut driver = driver(Config::new());
+    let ring = driver.features.bind && driver.features.listen;
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let mut bind = driver.bind(address.parse().unwrap(), TcpOptions::default()).unwrap();
+        let unsubmitted = driver.ring.unsubmitted();
+        let mut listener = match Pin::new(&mut bind).poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(listener) => {
+                assert!(!ring && unsubmitted == 0, "the bind did not use the ring that has it");
+                listener.unwrap().unwrap()
+            }
+            Poll::Pending => {
+                assert!(ring && unsubmitted == 2, "the bind used the ring that lacks it");
+                // The bind posts no completion when it succeeds, and the listen posts 0.
+                let posted: Vec<i32> = posted(&mut driver, 1).iter().map(|cqe| cqe.res).collect();
+                assert_eq!(posted, [0], "the ring did not bind and listen");
+                drive(&mut driver, bind).unwrap().unwrap()
+            }
+        };
+        let client = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+        let accept = driver.accept(&mut listener).unwrap();
+        let (_, peer) = drive(&mut driver, accept).unwrap().unwrap();
+        assert_eq!(peer, client.local_addr().unwrap());
+    }
 }
