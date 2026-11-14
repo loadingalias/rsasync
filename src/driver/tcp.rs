@@ -645,7 +645,9 @@ impl Directions {
                 Some(&mut self.read)
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::File(_) => None,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => {
+                None
+            }
         }
     }
 
@@ -664,9 +666,15 @@ impl Directions {
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch | Kind::File(_) => {
-                false
-            }
+            Kind::Other
+            | Kind::Close
+            | Kind::Connect
+            | Kind::Bind
+            | Kind::SendTo
+            | Kind::SendBatch
+            | Kind::File(_)
+            | Kind::Spawn(_)
+            | Kind::Exit(_) => false,
         }
     }
 }
@@ -791,7 +799,9 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
         | Kind::Bind
         | Kind::SendTo
         | Kind::SendBatch
-        | Kind::File(_) => {}
+        | Kind::File(_)
+        | Kind::Spawn(_)
+        | Kind::Exit(_) => {}
     }
 }
 

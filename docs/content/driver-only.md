@@ -7,10 +7,11 @@ releases are on crates.io.
 
 The driver has TCP bind, connect, accept, receive, send, half-close, and close. It also has UDP
 datagrams with their metadata, local streams at a path, the receive, send, and close of pipe ends,
-and files. The other operations come in later changes. [TCP on the driver](tcp.md),
+files, and child processes. The other operations come in later changes. [TCP on the driver](tcp.md),
 [UDP on the driver](udp.md), [Local streams on the driver](local-streams.md),
-[Pipes on the driver](pipes.md), and [Files on the driver](files.md) are the references for each
-operation and its results.
+[Pipes on the driver](pipes.md), [Files on the driver](files.md), and
+[Child processes on the driver](processes.md) are the references for each operation and its
+results.
 
 The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It starts no helper
 thread. Before Linux 6.9, a change of the length of a file runs on your
@@ -193,16 +194,20 @@ operations that run on the socket, and its future is ready after the kernel ends
 | `submissions` | 64 | Entries of the submission queue. The kernel rounds up to a power of two |
 | `operations` | 256 | Operations that can run at one time. A submission beyond them is refused with the reason, and its resources come back. The driver allocates one slot for each when it starts. On a 64-bit target, the state of an operation in its slot takes at most 576 bytes, not counting its buffers |
 | `resources` | 256 | Descriptors that the driver can own at one time |
+| `children` | 64 | Child processes that the driver can own at one time. Each child also holds an operation slot until its status is taken or its handle drops. 0 refuses each spawn |
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
 
-A limit of 0 gives `Error::Config`.
+A limit of 0, other than `children`, gives `Error::Config`.
 
 ## End the driver
 
 Call `Driver::teardown()`. It cancels each operation that still runs, by its own identity, and it
 waits until the kernel ends each one, so it releases no buffer that the kernel can still use. Then
 it closes each resource. `Teardown::cancelled()` gives the number of cancelled operations. A future
-that did not take its result before teardown then ends with no result.
+that did not take its result before teardown then ends with no result. Teardown also applies the end
+policy of each child process: it kills a child with `End::Kill` and waits for its reap, and it
+leaves a child with `End::Keep` running. `Teardown::kept()` counts those children (see
+[Child processes on the driver](processes.md#end-policy-and-teardown)).
 
 If you drop the driver without teardown, its futures end with no result, and the driver keeps the
 buffers of the operations that still run: it leaks them, because the kernel can still use them.

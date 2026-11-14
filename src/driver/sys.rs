@@ -167,3 +167,55 @@ unsafe extern "C" {
     /// `uid_t geteuid(void)`, with `uid_t` an `unsigned int`.
     pub(super) fn geteuid() -> c_uint;
 }
+
+/// `pidfd_open` and `pidfd_send_signal` (`include/uapi/asm-generic/unistd.h` and
+/// `arch/x86/entry/syscalls/syscall_64.tbl`): a new system call has one number on each
+/// architecture. Older C libraries do not have their functions.
+pub(super) const SYS_PIDFD_SEND_SIGNAL: c_long = 424;
+pub(super) const SYS_PIDFD_OPEN: c_long = 434;
+
+/// The kind of the identity of a `waitid` that names a process descriptor
+/// (`include/uapi/linux/wait.h`).
+pub(super) const P_PIDFD: c_int = 3;
+/// The options of a `waitid` (`include/uapi/linux/wait.h`).
+pub(super) const WNOHANG: c_int = 0x1;
+pub(super) const WEXITED: c_int = 0x4;
+pub(super) const WNOWAIT: c_int = 0x0100_0000;
+
+/// The codes of a `SIGCHLD` (`include/uapi/asm-generic/siginfo.h`) for an exit and for a core dump.
+/// The third code of an end, `CLD_KILLED`, is 2.
+pub(super) const CLD_EXITED: c_int = 1;
+pub(super) const CLD_DUMPED: c_int = 3;
+
+/// `siginfo_t` of 128 bytes (`include/uapi/asm-generic/siginfo.h`, which x86_64 and aarch64 both
+/// use): the fields of a `SIGCHLD`, which a `waitid` writes, and the others as spare words.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SigInfo {
+    pub(super) signo: c_int,
+    errno: c_int,
+    pub(super) code: c_int,
+    pad: c_int,
+    pub(super) pid: c_int,
+    uid: c_uint,
+    pub(super) status: c_int,
+    spare: [c_int; 25],
+}
+
+const _: () = {
+    assert!(size_of::<SigInfo>() == 128);
+    assert!(core::mem::offset_of!(SigInfo, code) == 8);
+    assert!(core::mem::offset_of!(SigInfo, pid) == 16);
+    assert!(core::mem::offset_of!(SigInfo, status) == 24);
+};
+
+#[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+unsafe extern "C" {
+    /// `int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options)`, with `idtype_t` an
+    /// `int` and `id_t` an `unsigned int`. Both C libraries give `P_PIDFD` to the kernel as it is.
+    pub(super) fn waitid(idtype: c_int, id: c_uint, infop: *mut SigInfo, options: c_int) -> c_int;
+    /// `int kill(pid_t pid, int sig)`: a negative `pid` names a process group.
+    pub(super) fn kill(pid: c_int, sig: c_int) -> c_int;
+    /// `pid_t getpid(void)`.
+    pub(super) fn getpid() -> c_int;
+}

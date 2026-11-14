@@ -59,7 +59,7 @@ use super::{Driver, Medium, Operation, Reason, Refused, Resource, sys};
 /// ```
 #[derive(Debug)]
 pub struct PipeReader {
-    read: ReadHalf,
+    pub(super) read: ReadHalf,
 }
 
 /// The write end of a pipe, which the driver owns. [`Driver::send`] and [`Driver::send_vectored`]
@@ -72,7 +72,7 @@ pub struct PipeReader {
 /// ends the process. The driver changes no disposition.
 #[derive(Debug)]
 pub struct PipeWriter {
-    write: WriteHalf,
+    pub(super) write: WriteHalf,
 }
 
 impl AsMut<ReadHalf> for PipeReader {
@@ -160,14 +160,25 @@ impl Driver {
         if flags < 0 || (mode != wanted && mode != sys::O_RDWR) {
             return refuse(Reason::Direction, fd);
         }
-        // SAFETY: the command names no memory, and its argument is an `int`.
-        if flags & sys::O_NONBLOCK != 0 && unsafe { sys::fcntl(raw, sys::F_SETFL, flags & !sys::O_NONBLOCK) } < 0 {
+        if !blocks(&fd) {
             return refuse(Reason::Unsupported, fd);
         }
         self.resources
             .adopt(fd, Medium::Pipe)
             .or_else(|fd| refuse(Reason::Resources, fd))
     }
+}
+
+/// Clears `O_NONBLOCK` of the open file description of `fd`, because a nonblocking read or write
+/// ends at once instead of waiting. Gives whether the description blocks now.
+#[expect(unsafe_code, reason = "fcntl names no memory with these commands")]
+pub(super) fn blocks(fd: &OwnedFd) -> bool {
+    let raw = fd.as_raw_fd();
+    // SAFETY: the command names no memory.
+    let flags = unsafe { sys::fcntl(raw, sys::F_GETFL) };
+    // SAFETY: the command names no memory, and its argument is an `int`.
+    flags >= 0
+        && (flags & sys::O_NONBLOCK == 0 || unsafe { sys::fcntl(raw, sys::F_SETFL, flags & !sys::O_NONBLOCK) } >= 0)
 }
 
 #[cfg(all(test, not(loom)))]

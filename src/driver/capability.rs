@@ -123,6 +123,8 @@ pub enum Call {
     BindUdp,
     /// [`Driver::set_file_len`](super::Driver::set_file_len): a change of the length of a file.
     SetFileLen,
+    /// The exit of a [`Child`](super::Child): the reap of the child and its status.
+    WaitChild,
 }
 
 /// How a call runs.
@@ -137,10 +139,13 @@ pub enum Route {
     /// gives. With no service, the call refuses with
     /// [`Reason::Blocking`](super::Reason::Blocking).
     BlockingService,
+    /// A poll of a descriptor on the ring, then one nonblocking system call on the thread of the
+    /// driver when the descriptor is readable.
+    Poll,
 }
 
 /// Each call, in the order of the report.
-const CALLS: [Call; 3] = [Call::Bind, Call::BindUdp, Call::SetFileLen];
+const CALLS: [Call; 4] = [Call::Bind, Call::BindUdp, Call::SetFileLen, Call::WaitChild];
 
 /// What a driver found and applied when it started, for its io_uring backend. The report does not
 /// change after [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each
@@ -181,11 +186,13 @@ impl Report {
             Call::Bind => self.probed.contains(Feature::Bind) && self.probed.contains(Feature::Listen),
             Call::BindUdp => self.probed.contains(Feature::Bind),
             Call::SetFileLen => self.probed.contains(Feature::Truncate),
+            Call::WaitChild => self.probed.contains(Feature::ChildWait),
         };
         match (ring, call) {
             (true, _) => Route::Ring,
             (false, Call::Bind | Call::BindUdp) => Route::SystemCall,
             (false, Call::SetFileLen) => Route::BlockingService,
+            (false, Call::WaitChild) => Route::Poll,
         }
     }
 

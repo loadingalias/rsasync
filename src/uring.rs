@@ -432,6 +432,20 @@ impl Sqe {
         }
     }
 
+    /// A `waitid` of the type `idtype` for the identity `id`, with `options`, which writes the
+    /// `siginfo_t` at `info` (`IORING_OP_WAITID`, Linux 6.7). The entry holds the type in `len`,
+    /// the options in `file_index`, and the structure in `addr2` (`io_uring/waitid.c`).
+    pub(crate) fn waitid(idtype: u32, id: RawFd, options: u32, info: *mut u8) -> Self {
+        Self {
+            opcode: sys::IORING_OP_WAITID,
+            fd: id,
+            len: idtype,
+            splice_fd_in: options.cast_signed(),
+            off: info.addr() as u64,
+            ..Self::default()
+        }
+    }
+
     /// A cancel of the request whose user data is `target` (`IORING_OP_ASYNC_CANCEL`). It cancels
     /// one request. Its own completion has the user data `user_data`.
     pub(crate) fn cancel(target: u64, user_data: u64) -> Self {

@@ -1085,6 +1085,22 @@ impl Driver {
         let cx = Context::from_waker(&waker);
         let mut index = 0;
         while let Some(&id) = self.jobs.get(index) {
+            if let Some(&Tag {
+                kind: Kind::Spawn(child),
+                ..
+            }) = self.table.resources(id)
+            {
+                // The end of a spawn pushes the entry of the exit operation of its child, so its
+                // result waits for room in the queue.
+                match self.room(1).then(|| self.poll_spawn(id, &cx)).flatten() {
+                    Some(spawned) => {
+                        self.jobs.swap_remove(index);
+                        self.spawn_ended(id, child, spawned);
+                    }
+                    None => index += 1,
+                }
+                continue;
+            }
             let mut ended = None;
             if let Some(slot) = self.shared.entries.get(id.index() as usize) {
                 slot.update(id, |held| ended = poll_job(held.as_mut(), &cx));

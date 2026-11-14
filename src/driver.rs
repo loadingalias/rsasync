@@ -55,6 +55,7 @@ mod file;
 mod local;
 mod pipe;
 mod probe;
+mod process;
 mod signal;
 mod sys;
 mod tcp;
@@ -86,6 +87,7 @@ pub use capability::{Call, Feature, Features, Report, Route};
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 pub use local::{LocalListener, LocalStream, Peer, Stale};
 pub use pipe::{PipeReader, PipeWriter};
+pub use process::{Child, ChildOptions, End, SignalChildError, Wait};
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
 pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
@@ -100,19 +102,21 @@ pub struct Config {
     submissions: u32,
     operations: u32,
     resources: u32,
+    children: u32,
     completions_per_turn: u32,
     required: Features,
 }
 
 impl Config {
-    /// 64 submission entries, 256 operations, 256 resources, 64 completions per turn, and no
-    /// required feature.
+    /// 64 submission entries, 256 operations, 256 resources, 64 children, 64 completions per turn,
+    /// and no required feature.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             submissions: 64,
             operations: 256,
             resources: 256,
+            children: 64,
             completions_per_turn: 64,
             required: Features::NONE,
         }
@@ -145,6 +149,13 @@ impl Config {
     #[must_use]
     pub const fn resources(self, resources: u32) -> Self {
         Self { resources, ..self }
+    }
+
+    /// The child processes that the driver can own at one time ([`Driver::spawn`]). Each one also
+    /// holds an operation slot until its status is taken or it drops.
+    #[must_use]
+    pub const fn children(self, children: u32) -> Self {
+        Self { children, ..self }
     }
 
     /// The most completions that one turn gives to their futures.
@@ -227,6 +238,7 @@ impl Turn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Teardown {
     cancelled: u32,
+    kept: u32,
 }
 
 impl Teardown {
@@ -234,6 +246,13 @@ impl Teardown {
     #[must_use]
     pub const fn cancelled(self) -> u32 {
         self.cancelled
+    }
+
+    /// The children with [`End::Keep`] that teardown left unreaped, because they still ran.
+    /// Nothing reaps them now: each one stays a zombie after its end until this process ends.
+    #[must_use]
+    pub const fn kept(self) -> u32 {
+        self.kept
     }
 }
 
@@ -332,6 +351,13 @@ pub(crate) enum Payload {
     Buffers(Buffers),
     /// The waiter of the job of an operation that runs on the blocking service.
     Job(crate::blocking::Waiter<i32>),
+    /// The waiter of the job of a spawn, and the child that the home makes at the end of the job.
+    Spawn {
+        waiter: crate::blocking::Waiter<io::Result<process::Spawned>>,
+        child: Option<Child>,
+    },
+    /// The status of a child, which a `waitid` of the exit operation writes.
+    Exit(sys::SigInfo),
 }
 
 impl Payload {
@@ -392,6 +418,11 @@ pub(crate) enum Kind {
     /// An operation of a file or a directory, which runs at the same time as the others of its
     /// file.
     File(file::Op),
+    /// A spawn of a child in the child slot of the index, as a job of the blocking service.
+    Spawn(u32),
+    /// The exit of the child in the child slot of the index: it ends when the driver reaps the
+    /// child.
+    Exit(u32),
 }
 
 impl Kind {
@@ -445,6 +476,11 @@ pub enum Reason {
     /// The operation runs on the blocking service on this kernel ([`Route::BlockingService`]),
     /// and the driver has no service ([`Driver::use_blocking`]), or the service refused the job.
     Blocking,
+    /// Each child slot of the driver is in use ([`Config::children`]).
+    Children,
+    /// The child ended, and the [`std::process::Child`] that the refusal gives back has its
+    /// status.
+    Exited,
 }
 
 /// A refused operation: the reason, and the value that the caller gave, which it keeps.
@@ -615,12 +651,53 @@ enum Medium {
 
 /// The descriptors that the driver owns, in a slice that it allocates once.
 #[derive(Debug)]
-struct Resources(Box<[Owned]>);
+struct Resources {
+    slots: Box<[Owned]>,
+    /// The free slots that spawns keep for the pipe ends of their children.
+    reserved: u32,
+}
 
 impl Resources {
-    /// Takes `fd`, a descriptor of `medium`. Refuses with `fd` when each slot is in use.
+    /// Takes `fd`, a descriptor of `medium`. Refuses with `fd` when each slot that no spawn keeps
+    /// is in use.
     fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
-        let Some((index, slot)) = (0..).zip(self.0.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
+        if self.reserved > 0 && self.free() <= self.reserved {
+            return Err(fd);
+        }
+        self.take(fd, medium)
+    }
+
+    /// Takes `fd` into a slot that [`Resources::reserve`] kept.
+    fn adopt_reserved(&mut self, fd: OwnedFd, medium: Medium) -> Option<Resource> {
+        self.reserved = self.reserved.checked_sub(1)?;
+        self.take(fd, medium).ok()
+    }
+
+    /// Keeps `count` free slots for [`Resources::adopt_reserved`]. Gives whether that many are
+    /// free.
+    fn reserve(&mut self, count: u32) -> bool {
+        let free = self.free().saturating_sub(self.reserved);
+        if free < count {
+            return false;
+        }
+        self.reserved += count;
+        true
+    }
+
+    /// Ends the keep of `count` slots.
+    fn unreserve(&mut self, count: u32) {
+        self.reserved = self.reserved.saturating_sub(count);
+    }
+
+    /// The free slots.
+    fn free(&self) -> u32 {
+        let free = self.slots.iter().filter(|slot| slot.fd.is_none()).count();
+        u32::try_from(free).unwrap_or(u32::MAX)
+    }
+
+    /// Takes `fd` into the first free slot.
+    fn take(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
+        let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
             return Err(fd);
         };
         slot.fd = Some(fd);
@@ -632,14 +709,14 @@ impl Resources {
     }
 
     fn get(&mut self, resource: Resource) -> Option<&mut Owned> {
-        self.0
+        self.slots
             .get_mut(resource.index as usize)
             .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())
     }
 
     /// The descriptor of `resource`, while the driver owns it.
     fn borrow(&self, resource: Resource) -> Option<BorrowedFd<'_>> {
-        self.0
+        self.slots
             .get(resource.index as usize)
             .filter(|slot| slot.generation == resource.generation)?
             .fd
@@ -839,6 +916,8 @@ pub struct Driver {
     rearm_wake: bool,
     /// The signal streams whose home is this driver.
     signals: Vec<Arc<signal::Home>>,
+    /// The child processes that this driver owns.
+    children: process::Children,
     /// The blocking service of the operations that the kernel cannot run
     /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
     blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
@@ -855,7 +934,7 @@ impl fmt::Debug for Driver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Driver")
             .field("ring", &self.ring)
-            .field("resources", &self.resources.0.len())
+            .field("resources", &self.resources.slots.len())
             .field("selected", &self.selected)
             .field("completions_per_turn", &self.completions_per_turn)
             .field("rearm_wake", &self.rearm_wake)
@@ -912,7 +991,11 @@ impl Driver {
             ring,
             table,
             shared,
-            resources: Resources((0..config.resources).map(|_| Owned::default()).collect()),
+            resources: Resources {
+                slots: (0..config.resources).map(|_| Owned::default()).collect(),
+                reserved: 0,
+            },
+            children: process::Children::new(config.children),
             taken: Vec::with_capacity(config.operations as usize * 2),
             pending: Vec::with_capacity(config.resources as usize),
             copied: 0,
@@ -1134,13 +1217,28 @@ impl Driver {
     /// blocking service ([`Route::BlockingService`]) cannot be cancelled, so the teardown waits until
     /// it returns.
     ///
+    /// Teardown applies the [`End`] of each child: it kills a child with [`End::Kill`], or each
+    /// process of its tree, and waits until the driver reaps it. A child with [`End::Keep`] runs
+    /// on, and [`Teardown::kept`] counts it.
+    ///
     /// # Errors
     ///
     /// A failure of the kernel entry other than an interrupt.
     pub fn teardown(mut self) -> io::Result<Teardown> {
+        // A spawn cannot be cancelled, and its child starts at the end of its job, so teardown
+        // applies the end of each child after each spawn ended.
+        while self.spawns() {
+            self.take_requests();
+            self.poll_jobs();
+            if self.spawns() {
+                self.wait()?;
+                self.harvest(u32::MAX);
+                self.attend();
+            }
+        }
         // An operation that waits for the one before it never ran, so it ends now.
-        for index in 0..self.resources.0.len() {
-            let Some(resource) = self.resources.0.get(index).map(|owned| Resource {
+        for index in 0..self.resources.slots.len() {
+            let Some(resource) = self.resources.slots.get(index).map(|owned| Resource {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 generation: owned.generation,
             }) else {
@@ -1153,10 +1251,18 @@ impl Driver {
             }
         }
         let mut cancelled = 0_u32;
+        self.children.ending = true;
         for id in self.table.running() {
-            // A close ends when the operations of its resource end.
-            if self.table.resources(id).is_some_and(|tag| tag.kind == Kind::Close) {
-                continue;
+            match self.table.resources(id).map(|tag| tag.kind) {
+                // A close ends when the operations of its resource end.
+                Some(Kind::Close) => continue,
+                // The exit of a child with `End::Kill` ends after its kill. A cancel ends the exit
+                // operation of a child with `End::Keep`.
+                Some(Kind::Exit(child)) if self.children.kills(child) => {
+                    self.children.kill(child);
+                    continue;
+                }
+                _ => {}
             }
             push_cancel(&mut self.ring, id)?;
             cancelled = cancelled.saturating_add(1);
@@ -1174,7 +1280,23 @@ impl Driver {
             self.attend();
         }
         self.take_requests();
-        Ok(Teardown { cancelled })
+        Ok(Teardown {
+            cancelled,
+            kept: self.children.kept,
+        })
+    }
+
+    /// Whether the job of a spawn runs.
+    fn spawns(&self) -> bool {
+        self.jobs.iter().any(|&id| {
+            matches!(
+                self.table.resources(id),
+                Some(Tag {
+                    kind: Kind::Spawn(_),
+                    ..
+                })
+            )
+        })
     }
 
     /// Takes `fd`, a descriptor of `medium`, so that teardown closes it. Refuses with `fd` when
@@ -1395,6 +1517,12 @@ impl Driver {
         if tag.kind == Kind::Close {
             return;
         }
+        // The cancel of the exit of a child is a kill by its end policy, and no cancel of the
+        // kernel: the operation ends when the child ends.
+        if let Kind::Exit(child) = tag.kind {
+            self.children.kill(child);
+            return;
+        }
         if self.unqueue(tag, id) {
             self.complete_now(id, -ECANCELED);
             return;
@@ -1427,9 +1555,34 @@ impl Driver {
         let (shared, table, pending) = (&self.shared, &mut self.table, &mut self.pending);
         let (resources, selected, waking) = (&mut self.resources, &mut self.selected, &mut self.waking);
         let messages = &mut self.messages;
+        let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
         for cqe in self.ring.completions().take(limit as usize) {
             completed += 1;
             let mut event = cqe.event();
+            // The completion of an exit operation ends it when the home has the status of its child.
+            if let Some(id) = OpId::from_user_data(cqe.user_data)
+                && let Some(&Tag {
+                    kind: Kind::Exit(child),
+                    ..
+                }) = table.resources(id)
+                && table.runs(id)
+                && let Some(slot) = shared.entries.get(id.index() as usize)
+            {
+                let mut ended = Some(cqe.res);
+                slot.update(id, |held| {
+                    if let Some(Held {
+                        payload: Payload::Exit(info),
+                        ..
+                    }) = held
+                    {
+                        ended = children.exited(id, child, cqe.res, ring_wait, info);
+                    }
+                });
+                match ended {
+                    Some(result) => event.result = result,
+                    None => continue,
+                }
+            }
             // A completion of a batch is one of its entries: its last one ends the batch, and the
             // result of the batch is its count.
             if let Some(id) = OpId::from_user_data(cqe.user_data)
@@ -1497,6 +1650,7 @@ impl Driver {
                 slot.publish(id, event.result);
             }
         }
+        self.poll_again();
         completed
     }
 }
@@ -1525,7 +1679,9 @@ fn finish(
         | Kind::Close
         | Kind::SendTo
         | Kind::SendBatch
-        | Kind::RecvBatch => {}
+        | Kind::RecvBatch
+        | Kind::Spawn(_)
+        | Kind::Exit(_) => {}
         Kind::RecvFrom => {
             if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
                 // SAFETY: the receive named the capacity of the loan in its message, and the kernel

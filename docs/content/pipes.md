@@ -11,7 +11,8 @@ tells how to start, turn, and end the driver.
 `Driver::adopt_reader(fd)` takes the read end of a pipe or a FIFO and gives a `PipeReader`.
 `Driver::adopt_writer(fd)` takes the write end and gives a `PipeWriter`. The descriptor is an
 `OwnedFd`, for example from `std::io::pipe()`, or from the standard output of a child:
-`OwnedFd::from(child.stdout.take().unwrap())`.
+`OwnedFd::from(child.stdout.take().unwrap())`. A child of the driver has its piped streams as pipe
+ends already (see [Child processes on the driver](processes.md#standard-streams)).
 
 The driver clears `O_NONBLOCK` of the open file description of the end, because a nonblocking
 read or write ends at once instead of waiting. Another descriptor of the same open file

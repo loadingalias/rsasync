@@ -48,6 +48,9 @@ only a stale socket file, refuse a path that does not fit a socket address, and 
 stream with no gap through a dropped accept, send, and receive. Run as root on Debian 12 on x86_64,
 they also check that a second OS user cannot connect, that an accepted stream reports the user,
 group, and process of its peer, and that a bind does not replace the socket file of another user.
+The [child process](processes.md) tests spawn and adopt children, report each exit once, signal and
+kill through the process descriptor, kill a process tree, and apply each end policy. They also check
+that the driver installs no `SIGCHLD` handler and never reaps a child that the test started itself.
 
 The receive into an owned buffer and the send from a lease keep the addresses of their buffers and
 allocate nothing for each operation. The tests also check the
@@ -55,7 +58,8 @@ allocate nothing for each operation. The tests also check the
 charges of its threads. Only the driver, the blocking service, and `rsnetwork-udp` make system calls: the io_uring
 ring and its waits in the kernel, its two event descriptors, the socket, option, and bind calls of a
 socket, the listen call of a TCP socket, the `statx` call of a direct-I/O open, the threads that the
-blocking service starts through `std` and their length changes of a file, and the datagram calls of
+blocking service starts through `std` and their length changes of a file and spawns of a child, the
+process descriptor, `waitid`, and `kill` calls of a child, and the datagram calls of
 `rsnetwork-udp`. Thus a pass shows that the build links and runs on musl,
 and that these calls work through the system calls of musl. It does not show that a runtime with a
 scheduler works on musl: the library has no scheduler yet.

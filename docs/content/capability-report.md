@@ -24,7 +24,7 @@ println!("{report:#?}");
 | --- | --- | --- |
 | Requested | `required()` | The features of `Config::require`. The driver has each of them |
 | Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing |
-| Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring`, `Route::SystemCall`, or `Route::BlockingService` |
+| Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring`, `Route::SystemCall`, `Route::BlockingService`, or `Route::Poll` |
 | Applied | `helper_threads()` | The threads that the driver starts: 0. A call on `Route::BlockingService` runs on a thread of your service |
 | Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so only on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws` |
 
@@ -38,6 +38,7 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 | `Call::Bind` (`Driver::bind`, `Driver::bind_local`) | `Bind` and `Listen` | `Route::SystemCall`: the bind and the listen are system calls, and the future is ready at once |
 | `Call::BindUdp` (`Driver::bind_udp`) | `Bind` | `Route::SystemCall` |
 | `Call::SetFileLen` (`Driver::set_file_len`) | `Truncate` | `Route::BlockingService`: the call is a job of the service of `Driver::use_blocking`. With no service, it refuses with `Reason::Blocking` |
+| `Call::WaitChild` (the exit of a `Child`, see [child processes](processes.md)) | `ChildWait` | `Route::Poll`: the ring polls the process descriptor of the child, and when it is readable, the driver takes the status with one nonblocking `waitid` |
 
 ## Strict and permissive selection
 
@@ -80,6 +81,7 @@ Report {
         Bind: SystemCall,
         BindUdp: SystemCall,
         SetFileLen: BlockingService,
+        WaitChild: Poll,
     },
     helper_threads: 0,
     rearms_wake: false,
