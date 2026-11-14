@@ -1,0 +1,97 @@
+# Tasks
+
+`rsasync::task` runs local tasks: futures that one thread polls, and drops, only on itself. A task
+can hold `!Send` state, such as an `Rc`. rsasync is in development, and the tasks on this page are
+not in a published release yet. They need the `std` feature, which is on by default.
+
+## Run tasks on a local owner
+
+1. Make a `LocalOwner` with `LocalOwner::new(&budget, slots)`. `slots` is the number of tasks that
+   can be live at one time, from 1 to 2^16. The owner charges its tables to the `Budget` (see
+   [Capacity](capacity.md)), and it charges each task at its spawn.
+2. Call `owner.block_on(root)`. The calling thread is the owner while the call runs: it polls the
+   root future and the tasks, and it parks when no task is ready.
+3. In the root future or in a task, call `spawn_local(future)`. It gives a `JoinHandle`.
+4. When the root future gives its output, `block_on` cancels each task that is still live. It
+   returns after each of them ended.
+
+The owner stays on the thread that made it. `LocalOwner::new` refuses with `Refused::Zero` for zero
+slots, `Refused::TooLarge` for more than 2^16, `Refused::Budget` with the `Exhausted` value of the
+budget, or `Refused::Allocation`.
+
+## A spawn that has no capacity
+
+A spawn claims a free slot and charges the memory of the task before it allocates. When it cannot,
+it allocates nothing, and `SpawnRefused` gives the future back with its reason:
+
+| `Reason` | Cause | What to do |
+| --- | --- | --- |
+| `NoSlot` | Each slot of the owner holds a live task | Join or cancel a task, or use `spawn_local_waiting` |
+| `Budget(Exhausted)` | The budget has fewer free units than the task | Free units, or spawn a smaller future |
+| `Closed` | `block_on` is at its end, and it cancels its tasks | Do the work in the root future, or before the end |
+| `NoOwner` | No `block_on` runs on this thread | Spawn from the root future or from a task |
+
+`SpawnRefused::into_future` gives the future back, so the caller can run it in place, keep it, or
+drop it.
+
+`spawn_local_waiting(future)` gives a future that waits for a free slot, and then spawns. The
+waiting spawns get the free slots first in, first out. It does not wait for budget units: for each
+other reason, it gives the same `SpawnRefused`.
+
+This example fills the one slot of an owner, and gets the refusal of a second spawn:
+
+```rust
+use core::num::NonZeroU64;
+
+use rsasync::capacity::Budget;
+use rsasync::task::{LocalOwner, Outcome, Reason, spawn_local};
+
+let budget = Budget::new(NonZeroU64::new(64 * 1024).unwrap());
+let mut owner = LocalOwner::new(&budget, 1)?;
+
+let sum = owner.block_on(async {
+    let task = spawn_local(async { 2 + 2 }).expect("the owner has a free slot");
+    // The one slot is in use: the refusal gives the future back, with its reason.
+    let refused = spawn_local(async { 3 }).unwrap_err();
+    assert_eq!(refused.reason(), Reason::NoSlot);
+    let _future = refused.into_future();
+    match task.join().await {
+        Outcome::Completed(sum) => sum,
+        Outcome::Cancelled | Outcome::Panicked(_) | Outcome::OwnerFailed(_) => 0,
+    }
+});
+assert_eq!(sum, 4);
+```
+
+## Join and cancel
+
+A `JoinHandle` observes the outcome of its task:
+
+- `join()` gives a future of the `Outcome`. `join_blocking()` waits on the calling thread: use it on
+  another thread, never on the thread of the owner, which then cannot poll the task.
+- A drop of the join handle does not cancel the task. The task runs on, and the owner drops its
+  output.
+- The outcome of a task stays in the channel of its join handle, charged to the budget, until the
+  join takes it or the handle drops.
+- A join handle can move to another thread if the output can.
+
+`JoinHandle::cancel_handle` gives a `CancelHandle`, which works from each thread. Its `cancel`
+requests the cancel of the task. The owner drops the future at a poll boundary, never during a
+poll: at the start of the next poll, or after the poll that runs now. A cancel after the task ended
+does nothing.
+
+| `Outcome` | When |
+| --- | --- |
+| `Completed(output)` | The future gave its output |
+| `Cancelled` | A cancel was requested, or `block_on` ended: the owner dropped the future at a poll boundary |
+| `Panicked(panic)` | A poll of the future panicked: the owner dropped the future. `Panic::into_payload` gives the payload |
+| `OwnerFailed(OwnerFailure)` | The owner dropped the future with no outcome, because `block_on` ended with a panic |
+
+When the root future panics, each live task ends with `OwnerFailed`, and the panic continues out of
+`block_on`. The owner can then run `block_on` again.
+
+## Wakes
+
+The waker of a task works from each thread. A wake on another thread schedules the task on its
+owner, and unparks the owner thread if it parks. A wake after the task ended does nothing, also when
+a later task uses the same slot.

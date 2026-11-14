@@ -119,8 +119,19 @@ unsafe impl<T: Send> Sync for Shared<T> {}
 ///
 /// [`Refused::Budget`] when the budget has fewer free units than the size of the shared state.
 pub fn channel<T>(budget: &Budget) -> Result<(Sender<T>, Receiver<T>), Refused> {
-    let charge = u64::try_from(size_of::<Shared<T>>()).map_err(|_| Refused::TooLarge)?;
+    let charge = u64::try_from(size::<T>()).map_err(|_| Refused::TooLarge)?;
     let charge = budget.reserve(charge).map_err(Refused::Budget)?;
+    Ok(with_charge(charge))
+}
+
+/// The size of the shared state of a one-shot channel of `T`, which its charge pays for.
+pub(crate) fn size<T>() -> usize {
+    size_of::<Shared<T>>()
+}
+
+/// Makes a one-shot channel whose shared state `charge` pays for. The caller reserved at least
+/// [`size`] units for it.
+pub(crate) fn with_charge<T>(charge: Permit) -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         state: AtomicU32::new(0),
         waiter: Waiter::new(),
@@ -131,7 +142,7 @@ pub fn channel<T>(budget: &Budget) -> Result<(Sender<T>, Receiver<T>), Refused> 
         shared: Some(Arc::clone(&shared)),
     };
     let receiver = Receiver { shared, taken: false };
-    Ok((sender, receiver))
+    (sender, receiver)
 }
 
 /// The sending endpoint. Its drop with no send closes the channel: a receive then gives
@@ -220,6 +231,18 @@ impl<T> Receiver<T> {
         let Self { shared, taken } = self;
         shared.waiter.wait(|| ready(shared, taken))
     }
+
+    /// The handshake of a waiting receive, for a future that holds the receiver. After a
+    /// `Pending`, the future calls [`Receiver::unwait`] if it drops before its result.
+    pub(crate) fn poll_recv(&mut self, cx: &Context<'_>) -> Poll<Result<T, Closed>> {
+        let Self { shared, taken } = self;
+        shared.waiter.poll_wait(cx, || ready(shared, taken))
+    }
+
+    /// Ends the interest of a waiting receive that gave `Pending`.
+    pub(crate) fn unwait(&self) {
+        self.shared.waiter.cancel();
+    }
 }
 
 /// Takes the value from `shared` for a receiver that took no value before, as `taken` tells.
@@ -292,8 +315,7 @@ impl<T> Future for RecvFuture<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let Receiver { shared, taken } = &mut *this.receiver;
-        let polled = shared.waiter.poll_wait(cx, || ready(shared, taken));
+        let polled = this.receiver.poll_recv(cx);
         this.waits = polled.is_pending();
         polled
     }
@@ -302,7 +324,7 @@ impl<T> Future for RecvFuture<'_, T> {
 impl<T> Drop for RecvFuture<'_, T> {
     fn drop(&mut self) {
         if self.waits {
-            self.receiver.shared.waiter.cancel();
+            self.receiver.unwait();
         }
     }
 }

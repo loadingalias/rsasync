@@ -8,7 +8,8 @@
 //! ```
 //!
 //! The [`channel`] module holds the bounded channels, [`clock`] holds the native and the injected
-//! clocks, and [`timer`] holds bounded timers. None of them needs a scheduler or driver.
+//! clocks, and [`timer`] holds bounded timers. None of them needs a scheduler or driver. With the
+//! `std` feature, the [`task`] module runs local tasks on a local owner.
 //!
 //! With the `std` feature, the `blocking` module holds the bounded blocking service, which runs
 //! blocking host work on a fixed number of threads.
@@ -60,6 +61,8 @@ mod table;
 mod wait;
 
 pub mod clock;
+#[cfg(feature = "std")]
+pub mod task;
 pub mod timer;
 
 /// Driver-only use of the io_uring driver, on Linux.
