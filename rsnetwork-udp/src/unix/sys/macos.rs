@@ -39,29 +39,6 @@ pub struct MsgHdr {
     pub msg_flags: c_int,
 }
 
-/// `struct msghdr_x`: one datagram of a batch of `sendmsg_x` or `recvmsg_x`. A receive writes the length of
-/// the datagram in `msg_datalen`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct MsgHdrX {
-    /// The socket address of the peer, or null.
-    pub msg_name: *mut c_void,
-    /// The length of the address.
-    pub msg_namelen: u32,
-    /// The regions of the datagram.
-    pub msg_iov: *mut IoVec,
-    /// The number of regions.
-    pub msg_iovlen: c_int,
-    /// The control messages, or null.
-    pub msg_control: *mut c_void,
-    /// The length of the control messages.
-    pub msg_controllen: u32,
-    /// The flags of a received datagram.
-    pub msg_flags: c_int,
-    /// The length of a received datagram. A send ignores it.
-    pub msg_datalen: usize,
-}
-
 /// The size of `struct cmsghdr`: a `socklen_t` length, a level, and a type. Its data follows it, at a multiple of
 /// 4 bytes (`__DARWIN_ALIGN32`).
 pub const CMSG_HEADER: usize = 12;
@@ -98,9 +75,6 @@ const _: () = {
     assert!(offset_of!(MsgHdr, msg_control) == 32);
     assert!(offset_of!(MsgHdr, msg_controllen) == 40);
     assert!(offset_of!(MsgHdr, msg_flags) == 44);
-    assert!(size_of::<MsgHdrX>() == 56);
-    assert!(offset_of!(MsgHdrX, msg_flags) == 44);
-    assert!(offset_of!(MsgHdrX, msg_datalen) == 48);
     assert!(size_of::<InPktInfo>() == 12);
     assert!(offset_of!(InPktInfo, ipi_spec_dst) == 4);
     assert!(offset_of!(InPktInfo, ipi_addr) == 8);
@@ -172,6 +146,37 @@ unsafe extern "C" {
     /// `int getsockname(int, struct sockaddr *restrict, socklen_t *restrict)`.
     pub(crate) fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
 }
+
+/// `struct msghdr_x`: one datagram of a batch of `sendmsg_x` or `recvmsg_x`. A receive writes the length of
+/// the datagram in `msg_datalen`.
+#[cfg(feature = "macos-private-batch")]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MsgHdrX {
+    /// The socket address of the peer, or null.
+    pub msg_name: *mut c_void,
+    /// The length of the address.
+    pub msg_namelen: u32,
+    /// The regions of the datagram.
+    pub msg_iov: *mut IoVec,
+    /// The number of regions.
+    pub msg_iovlen: c_int,
+    /// The control messages, or null.
+    pub msg_control: *mut c_void,
+    /// The length of the control messages.
+    pub msg_controllen: u32,
+    /// The flags of a received datagram.
+    pub msg_flags: c_int,
+    /// The length of a received datagram. A send ignores it.
+    pub msg_datalen: usize,
+}
+
+#[cfg(feature = "macos-private-batch")]
+const _: () = {
+    assert!(size_of::<MsgHdrX>() == 56);
+    assert!(offset_of!(MsgHdrX, msg_flags) == 44);
+    assert!(offset_of!(MsgHdrX, msg_datalen) == 48);
+};
 
 #[cfg(all(feature = "std", feature = "macos-private-batch"))]
 #[expect(unsafe_code, reason = "libsystem_kernel of macOS gives these private calls")]

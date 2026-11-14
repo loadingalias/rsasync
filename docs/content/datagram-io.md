@@ -159,9 +159,10 @@ With the feature, these limits also apply:
 
 ## Declarations for other backends
 
-`rsnetwork_udp::sys` declares the message headers (`MsgHdr` and `IoVec`, with `MmsgHdr` on Linux
-and `MsgHdrX` on macOS), the packet information, and the constants of the calls and of the control
-messages, each with the values and the layout of the target system. `Control` is the one
+`rsnetwork_udp::sys` declares the message headers (`MsgHdr` and `IoVec`, with `MmsgHdr` on Linux,
+and `MsgHdrX` on macOS with the `macos-private-batch` feature), the packet information, and the
+constants of the calls and of the control messages, each with the values and the layout of the
+target system. `Control` is the one
 encoding of the control messages: `Control::encode` writes those of a `Transmit`, and
 `Control::decode` reads those of a received datagram. They need only `core`, so a completion
 backend, such as the io_uring driver of rsasync, builds its messages with them. The calls need the
