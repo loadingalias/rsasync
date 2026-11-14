@@ -78,8 +78,11 @@ pub mod driver;
     feature = "std"
 ))]
 #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the tests use the ring now; the driver is its first other user")
+    not(all(test, not(loom))),
+    expect(
+        dead_code,
+        reason = "the driver uses only some items. The tests of the ring and the driver use the others, and the loom build leaves those tests out"
+    )
 )]
 mod uring;
 
