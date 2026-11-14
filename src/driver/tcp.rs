@@ -81,6 +81,49 @@ impl TcpListener {
 ///
 /// [`Driver::close`] cancels each operation that runs, waits until each one ends, and reports the
 /// progress that dropped sends owe.
+///
+/// An accept, a receive, a send, and a close, with `run` as in [`Operation`]:
+///
+/// ```no_run
+/// # fn run<F: std::future::Future>(driver: &mut rsasync::driver::Driver, future: F) -> std::io::Result<F::Output> {
+/// #     use std::future::Future as _;
+/// #     let mut future = std::pin::pin!(future);
+/// #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+/// #     loop {
+/// #         if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+/// #             return Ok(output);
+/// #         }
+/// #         if !driver.turn()?.more() {
+/// #             if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+/// #                 return Ok(output);
+/// #             }
+/// #             driver.wait()?;
+/// #         }
+/// #     }
+/// # }
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use rsasync::buffer::{Backing, Buffer as _, Lease};
+/// use rsasync::driver::{Config, Driver, TcpOptions};
+///
+/// let mut driver = Driver::new(Config::new())?;
+/// let bind = driver.bind("127.0.0.1:8080".parse()?, TcpOptions::default())?;
+/// let mut listener = run(&mut driver, bind)???;
+/// let accept = driver.accept(&mut listener)?;
+/// let (mut stream, peer) = run(&mut driver, accept)???;
+///
+/// let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(4096)))?;
+/// let (received, request) = run(&mut driver, receive)??;
+/// let count = received?;
+/// assert_eq!(request.bytes().len(), count);
+///
+/// let send = driver.send(&mut stream, Lease::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()))?;
+/// let (sent, _response) = run(&mut driver, send)??;
+/// sent?;
+/// let close = driver.close(stream)?;
+/// run(&mut driver, close)??;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct TcpStream {
     read: ReadHalf,
@@ -251,6 +294,48 @@ impl TcpOptions {
 /// allocates nothing for each send. After a send that sent only part of the bytes,
 /// [`Regions::advance`] drops the regions that went and keeps the rest of the partial one, so that
 /// the next send continues the stream.
+///
+/// For example, with `run` as in [`Operation`]:
+///
+/// ```no_run
+/// # fn run<F: std::future::Future>(driver: &mut rsasync::driver::Driver, future: F) -> std::io::Result<F::Output> {
+/// #     use std::future::Future as _;
+/// #     let mut future = std::pin::pin!(future);
+/// #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+/// #     loop {
+/// #         if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+/// #             return Ok(output);
+/// #         }
+/// #         if !driver.turn()?.more() {
+/// #             if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+/// #                 return Ok(output);
+/// #             }
+/// #             driver.wait()?;
+/// #         }
+/// #     }
+/// # }
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let mut driver = rsasync::driver::Driver::new(rsasync::driver::Config::new())?;
+/// # let bind = driver.bind("127.0.0.1:8080".parse()?, rsasync::driver::TcpOptions::default())?;
+/// # let mut listener = run(&mut driver, bind)???;
+/// # let accept = driver.accept(&mut listener)?;
+/// # let (mut stream, _) = run(&mut driver, accept)???;
+/// use rsasync::buffer::Lease;
+/// use rsasync::driver::WriteFailed;
+///
+/// let next = driver.send(&mut stream, Lease::from(b"next".to_vec()))?;
+/// let (result, _lease) = run(&mut driver, next)??;
+/// match result {
+///     Ok(_) => {} // Each earlier dropped send sent all its bytes.
+///     Err(error) => match WriteFailed::of(&error) {
+///         // `failed.sent()` bytes of the dropped sends went to the peer. Close the stream.
+///         Some(failed) => eprintln!("{failed}"),
+///         None => return Err(error.into()),
+///     },
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Regions {
     leases: Vec<Lease>,
@@ -385,6 +470,48 @@ impl From<Vec<Lease>> for Regions {
 /// The write direction of a stream failed, because a send whose future dropped failed, sent only
 /// part of its bytes, or was cancelled. The caller no longer knows the framing of its stream. It
 /// is the payload of the `io::Error` of a send: get it with [`WriteFailed::of`].
+///
+/// For example, with `run` as in [`Operation`]:
+///
+/// ```no_run
+/// # fn run<F: std::future::Future>(driver: &mut rsasync::driver::Driver, future: F) -> std::io::Result<F::Output> {
+/// #     use std::future::Future as _;
+/// #     let mut future = std::pin::pin!(future);
+/// #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+/// #     loop {
+/// #         if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+/// #             return Ok(output);
+/// #         }
+/// #         if !driver.turn()?.more() {
+/// #             if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+/// #                 return Ok(output);
+/// #             }
+/// #             driver.wait()?;
+/// #         }
+/// #     }
+/// # }
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let mut driver = rsasync::driver::Driver::new(rsasync::driver::Config::new())?;
+/// # let bind = driver.bind("127.0.0.1:8080".parse()?, rsasync::driver::TcpOptions::default())?;
+/// # let mut listener = run(&mut driver, bind)???;
+/// # let accept = driver.accept(&mut listener)?;
+/// # let (mut stream, _) = run(&mut driver, accept)???;
+/// use rsasync::buffer::Lease;
+/// use rsasync::driver::Regions;
+///
+/// let mut regions = Regions::with_capacity(3);
+/// regions.push(Lease::from(b"HTTP/1.1 200 OK\r\n".to_vec()));
+/// regions.push(Lease::from(b"content-length: 5\r\n\r\n".to_vec()));
+/// regions.push(Lease::from(b"hello".to_vec()));
+/// while !regions.is_empty() {
+///     let send = driver.send_vectored(&mut stream, regions)?;
+///     let (sent, back) = run(&mut driver, send)??;
+///     regions = back;
+///     regions.advance(sent?);
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteFailed {
     sent: Option<usize>,

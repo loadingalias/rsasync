@@ -26,18 +26,19 @@
 //! The io_uring driver needs no helper thread: [`Driver::helper_threads`] gives 0.
 //!
 //! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use rsasync::driver::{Config, Driver};
 //!
 //! let mut driver = Driver::new(Config::new())?;
-//! // ... submit operations, and keep their futures ...
-//! for _ in 0..1000 {
-//!     if !driver.turn()?.more() {
+//! // Submit operations here, and keep their futures.
+//! loop {
+//!     let turn = driver.turn()?;
+//!     if !turn.more() {
 //!         driver.wait()?;
 //!     }
+//!     // Stop when your work is done.
 //! }
-//! let report = driver.teardown()?;
-//! assert_eq!(report.cancelled(), 0);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! # }
 //! ```
 
 mod completion;
@@ -347,6 +348,33 @@ impl core::error::Error for Ended {}
 ///
 /// The future borrows the direction of its stream, or its listener, for `'a`, so no other
 /// operation can start in that direction while it exists.
+///
+/// Poll the future while you turn the driver, for example with this helper:
+///
+/// ```
+/// use std::future::Future;
+/// use std::pin::pin;
+/// use std::task::{Context, Poll, Waker};
+///
+/// use rsasync::driver::Driver;
+///
+/// /// Polls `future` while the driver turns, until it gives its output.
+/// fn run<F: Future>(driver: &mut Driver, future: F) -> std::io::Result<F::Output> {
+///     let mut future = pin!(future);
+///     let mut cx = Context::from_waker(Waker::noop());
+///     loop {
+///         if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+///             return Ok(output);
+///         }
+///         if !driver.turn()?.more() {
+///             if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+///                 return Ok(output);
+///             }
+///             driver.wait()?;
+///         }
+///     }
+/// }
+/// ```
 ///
 /// # Panics
 ///
@@ -677,6 +705,47 @@ impl Driver {
     /// Gives the slots of `pool` to the kernel as the buffers of [`Driver::recv_selected`]: a
     /// receive then takes a buffer only when its data comes. A selected buffer comes back to the
     /// kernel when its last lease or view drops, on any thread, at the next turn.
+    ///
+    /// For example, with `run` as in [`Operation`]:
+    ///
+    /// ```no_run
+    /// # fn run<F: std::future::Future>(driver: &mut rsasync::driver::Driver, future: F) -> std::io::Result<F::Output> {
+    /// #     use std::future::Future as _;
+    /// #     let mut future = std::pin::pin!(future);
+    /// #     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    /// #     loop {
+    /// #         if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+    /// #             return Ok(output);
+    /// #         }
+    /// #         if !driver.turn()?.more() {
+    /// #             if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+    /// #                 return Ok(output);
+    /// #             }
+    /// #             driver.wait()?;
+    /// #         }
+    /// #     }
+    /// # }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut driver = rsasync::driver::Driver::new(rsasync::driver::Config::new())?;
+    /// # let bind = driver.bind("127.0.0.1:8080".parse()?, rsasync::driver::TcpOptions::default())?;
+    /// # let mut listener = run(&mut driver, bind)???;
+    /// # let accept = driver.accept(&mut listener)?;
+    /// # let (mut stream, _) = run(&mut driver, accept)???;
+    /// use core::alloc::Layout;
+    /// use core::num::{NonZeroU32, NonZeroU64};
+    ///
+    /// use rsasync::buffer::Pool;
+    /// use rsasync::capacity::Budget;
+    ///
+    /// // The pool charges its memory to a budget: 64 slots of 4096 bytes.
+    /// let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    /// let slot = Layout::from_size_align(4096, 4096)?;
+    /// driver.provide(Pool::new(&budget, NonZeroU32::new(64).unwrap(), slot)?)?;
+    /// let receive = driver.recv_selected(&mut stream)?;
+    /// let request = run(&mut driver, receive)???;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
