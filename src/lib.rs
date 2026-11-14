@@ -51,13 +51,6 @@ mod sync;
     )
 )]
 mod table;
-#[cfg_attr(
-    all(not(test), feature = "std"),
-    expect(
-        dead_code,
-        reason = "the blocking wait has no user yet: the one-shot and the permit wait are its first users"
-    )
-)]
 mod wait;
 
 pub mod clock;

@@ -1,7 +1,8 @@
 //! Bounded channels, which move values from producers to consumers with no scheduler or driver.
 //!
-//! [`spsc`] has one sender and one receiver. Each send, receive, and reservation has a
-//! nonblocking form, which is the kernel. The asynchronous waits, and with the `std` feature the
+//! [`spsc`] has one sender and one receiver. [`oneshot`] moves one value, such as a reply or a
+//! startup outcome. Each send, receive, and reservation has a nonblocking form, which is the
+//! kernel. The asynchronous waits, and with the `std` feature the
 //! blocking waits, use the same publication and close rules. The outcome types in this module
 //! state who owns the value after each result.
 //!
@@ -13,6 +14,7 @@ use core::fmt;
 
 use crate::capacity::Exhausted;
 
+pub mod oneshot;
 pub mod spsc;
 
 /// A refusal to make a channel. A refusal keeps no charge and no memory.

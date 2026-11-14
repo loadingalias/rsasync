@@ -3,8 +3,9 @@
 `rsasync::channel` moves values between tasks and threads through a bounded channel. A channel
 needs no scheduler, driver, or runtime, so it works also with another executor or with plain
 threads. rsasync is in development, and the channels on this page are not in a published release
-yet. Today the module has one topology, the SPSC channel (one sender and one receiver), in
-`rsasync::channel::spsc`.
+yet. Today the module has two topologies: the SPSC channel (one sender and one receiver), in
+`rsasync::channel::spsc`, and the [one-shot channel](#one-shot) (one value), in
+`rsasync::channel::oneshot`.
 
 ## Make a channel
 
@@ -135,3 +136,47 @@ waiting bit, so a close and a send have one order. [rtrb](https://docs.rs/rtrb/0
 publishes each position with a plain store, but it has no close and no wait. A wait needs a
 store-load order on the publication path: the publisher stores the position and then loads the
 waiting bit. One read-modify-write takes the place of the store, a fence, and the load.
+
+## One-shot
+
+`rsasync::channel::oneshot` moves one value from one sender to one receiver, such as a reply, a
+join result, or a startup outcome. `oneshot::channel(&budget)` gives a `Sender` and a `Receiver`.
+It charges its shared state to the budget before it allocates, and the charge ends when both
+endpoints drop. A refusal is `Refused::Budget`.
+
+`Sender::send(value)` takes the sender, so it sends at most one value. It never waits: the channel
+has room for the one value. The receiver has the three forms of a receive: `try_recv`, the future
+of `recv`, and `recv_blocking`, which needs the `std` feature.
+
+| Outcome | Owner of the value |
+| --- | --- |
+| `send` succeeds | The channel, until the receiver takes it or the receiver drops |
+| `send` finds the receiver gone | The caller: `SendError` gives the value back |
+| The receiver drops before it takes a sent value | The receiver drops the value |
+| A `RecvFuture` drops | The channel keeps the value: a later receive takes it |
+
+A drop of the sender with no send closes the channel: a receive gives `Closed`, and
+`try_recv` gives `TryRecvError::Closed`. After the receiver took the value, each later receive
+gives `Closed` too. A send and a drop of the receiver change one word with one atomic
+read-modify-write each, so the first of them decides the owner: the value never has two owners
+and is never lost.
+
+```rust
+use core::num::NonZeroU64;
+use std::thread;
+
+use rsasync::capacity::Budget;
+use rsasync::channel::{Closed, oneshot};
+
+let budget = Budget::new(NonZeroU64::new(4096).unwrap());
+let (sender, mut receiver) = oneshot::channel::<u32>(&budget)?;
+
+let worker = thread::spawn(move || sender.send(7));
+assert_eq!(receiver.recv_blocking(), Ok(7));
+assert!(worker.join().expect("the worker does not panic").is_ok());
+// The one value is taken, and no other can come.
+assert_eq!(receiver.recv_blocking(), Err(Closed));
+```
+
+The example is the example of the `rsasync::channel::oneshot` documentation, which `cargo xtask
+test` runs.
