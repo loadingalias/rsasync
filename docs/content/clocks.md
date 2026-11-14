@@ -2,7 +2,8 @@
 
 `rsasync::clock` gives the instants of a clock domain. `NativeClock` reads the monotonic clock of
 the operating system. `InjectedClock` moves only when its owner advances it, so a test controls the
-time. rsasync is in development, and its alpha releases are on crates.io.
+time. For the civil time with an uncertainty bound, see [Physical time](physical-time.md). rsasync
+is in development, and its alpha releases are on crates.io.
 
 ## Select a clock domain
 

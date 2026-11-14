@@ -38,7 +38,8 @@ deadline, use a timer: see [Timers](timers.md).
 - A `Reading` is physical time: an estimate, an uncertainty bound or "unknown", and its source.
   The estimate is a `Duration` since the Unix epoch, 1970-01-01 00:00:00 UTC, with no leap
   seconds. A bound of `None` is unknown. The source is `ReadingSource::SystemClock` or
-  `ReadingSource::Caller`, when the caller supplied the bound.
+  `ReadingSource::Caller`, when the caller supplied the bound. [Physical time](physical-time.md)
+  gives the readings of the system.
 
 Instants have no `<` operator, because instants of two domains have no order. Use `compare`. A
 reading is separate from the clock domains, so a correction of the civil clock never moves a

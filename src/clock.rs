@@ -28,6 +28,8 @@
 
 #[cfg(feature = "std")]
 mod native;
+#[cfg(feature = "std")]
+mod physical;
 #[cfg(test)]
 mod tests;
 
@@ -40,6 +42,8 @@ use crate::time::{ClockDomain, Instant, TimeError};
 
 #[cfg(feature = "std")]
 pub use native::NativeClock;
+#[cfg(feature = "std")]
+pub use physical::PhysicalClock;
 
 /// The identifier of the two native clock domains. They differ by their
 /// [`Suspend`](crate::time::Suspend) value. An
