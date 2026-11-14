@@ -3,18 +3,26 @@
 `rsasync::channel` moves values between tasks and threads through a bounded channel. A channel
 needs no scheduler, driver, or runtime, so it works also with another executor or with plain
 threads. rsasync is in development, and the channels on this page are not in a published release
-yet. Today the module has two topologies: the SPSC channel (one sender and one receiver), in
-`rsasync::channel::spsc`, and the [one-shot channel](#one-shot) (one value), in
-`rsasync::channel::oneshot`.
+yet. Select the topology from the transfer that you have:
+
+| Transfer | Module | Constructor |
+| --- | --- | --- |
+| One sender and one receiver | `rsasync::channel::spsc` | `spsc::channel(&budget, capacity)` |
+| Many senders and one receiver | `rsasync::channel::mpsc` | `mpsc::channel(&budget, capacity, senders)` |
+| One value, such as a reply (see [One-shot](#one-shot)) | `rsasync::channel::oneshot` | `oneshot::channel(&budget)` |
+
+The SPSC channel costs less for each value, so use it when one owner sends.
 
 ## Make a channel
 
-`spsc::channel(&budget, capacity)` gives a `Sender` and a `Receiver`, or a refusal:
+The SPSC and MPSC constructors give a `Sender` and a `Receiver`, or a refusal:
 
 - The channel charges its slots and its shared state to the `Budget` (see [Capacity](capacity.md))
-  before it allocates. The charge ends when both endpoints drop.
+  before it allocates. The charge ends when each endpoint has dropped.
 - The capacity is the number of slots, from 1 to 2^27. A capacity of zero is a refusal,
   `Refused::Zero`. It does not make a rendezvous channel or an unbounded channel.
+- For MPSC, `senders` is the number of sender places, from 1 to 2^16. Zero is also
+  `Refused::Zero`.
 - Other refusals are `Refused::TooLarge`, `Refused::Budget` with the `Exhausted` value of the
   budget, and `Refused::Allocation`. A refusal keeps no charge and no memory.
 
@@ -23,9 +31,9 @@ for that memory in the value, so that the charge moves with the value.
 
 ## Send and receive
 
-Neither endpoint can be cloned. Each operation borrows its endpoint mutably, so each endpoint has
-at most one operation at a time. The receiver gets the values in the order that the sender
-published them.
+Each operation borrows its endpoint mutably, so each endpoint has at most one operation at a
+time. No endpoint can be cloned, except an MPSC `Sender` (see [Many senders](#many-senders)). The
+receiver gets the values of each sender in the order that the sender published them.
 
 Each operation has a nonblocking form, which never waits, an asynchronous form, which gives a
 future, and a blocking form, which needs the `std` feature (on by default). The three forms obey
@@ -80,6 +88,67 @@ assert_eq!(values, [1, 2, 3]);
 producer.join().expect("the producer does not panic")?;
 ```
 
+## Many senders
+
+An MPSC channel has one ring of exactly `capacity` slots, which all of its senders share. A slot
+is in use from the send or the reservation that claims it until the receiver takes the value or
+passes the slot. A clone of a sender adds no slot, so the bound holds with any number of senders.
+
+- `Sender::try_clone` makes another sender in a free sender place. When each place is in use, it
+  gives `TooManySenders`. A place is free again when its sender drops.
+- The channel closes when the last sender drops.
+- Order: the values of one sender reach the receiver in the order of its sends and publications.
+  The channel states no order between the values of different senders.
+- Fairness: for each slot that it frees, the receiver wakes one waiting sender, in rotating order
+  of the sender places. A sender that does not wait can take a free slot first, so a woken sender
+  can find the ring full and wait again.
+
+A `Reservation` holds its place in the order of the channel: the receiver cannot pass its slots
+until it ends. Thus one slow reservation stops the receiver for every sender. Fill and publish a
+reservation with no wait between `try_reserve` and `publish`.
+
+This example sends from two threads, each with a clone of the sender:
+
+```rust
+use core::num::NonZeroU64;
+use std::thread;
+
+use rsasync::capacity::Budget;
+use rsasync::channel::mpsc;
+
+type Error = Box<dyn core::error::Error + Send + Sync>;
+
+let budget = Budget::new(NonZeroU64::new(64 * 1024).unwrap());
+// 4 slots for all senders, and 3 sender places.
+let (sender, mut receiver) = mpsc::channel::<(u32, u32)>(&budget, 4, 3)?;
+
+let producers: Vec<_> = (0..2)
+    .map(|producer| {
+        let mut sender = sender.try_clone()?;
+        Ok(thread::spawn(move || {
+            for number in 0..10 {
+                // Wait for a free slot, then send.
+                sender.send_blocking((producer, number))?;
+            }
+            Ok::<(), Error>(())
+        }))
+    })
+    .collect::<Result<_, Error>>()?;
+// The channel closes when the last sender drops.
+drop(sender);
+
+let mut next = [0, 0];
+while let Ok((producer, number)) = receiver.recv_blocking() {
+    // The values of each sender come in the order of its sends.
+    assert_eq!(number, next[producer as usize]);
+    next[producer as usize] += 1;
+}
+assert_eq!(next, [10, 10]);
+for producer in producers {
+    producer.join().expect("a producer does not panic")?;
+}
+```
+
 ## Who owns the value
 
 Each send that fails gives the value back to the caller, or this table names the party that drops
@@ -112,7 +181,7 @@ which drops them.
 
 | Event | Later sends and reservations | Values in the channel | A pending send |
 | --- | --- | --- | --- |
-| The sender drops | None can start | The receiver gets them, then `Closed` | None can exist |
+| The last sender drops | None can start | The receiver gets them, then `Closed` | None can exist |
 | `Receiver::close` (the drain) | Fail. A send gives its value back | The receiver gets them, then `Closed` | Ends with `SendError` and its value |
 | The receiver drops (the abort) | Fail. A send gives its value back | The receiver drops them | Ends with `SendError` and its value |
 
@@ -130,12 +199,15 @@ the end of an accepted reservation. The channel keeps the waker of the latest po
 the send, receive, or close that ends the wait wakes that waker. A dropped `SendFuture` or
 `RecvFuture` ends its interest.
 
-With no waiting endpoint, a transfer costs one write of a slot and one atomic read-modify-write on
-each side, and it wakes nothing. The read-modify-write also carries the close flags and the
-waiting bit, so a close and a send have one order. [rtrb](https://docs.rs/rtrb/0.4.1/rtrb/)
+With no waiting endpoint, an SPSC transfer costs one write of a slot and one atomic
+read-modify-write on each side, and it wakes nothing. The read-modify-write also carries the close
+flags and the waiting bit, so a close and a send have one order. [rtrb](https://docs.rs/rtrb/0.4.1/rtrb/)
 publishes each position with a plain store, but it has no close and no wait. A wait needs a
 store-load order on the publication path: the publisher stores the position and then loads the
 waiting bit. One read-modify-write takes the place of the store, a fence, and the load.
+
+An MPSC send costs one compare-exchange of the claimed position, which all senders share, and
+one swap of the state of its slot. An MPSC receive costs one swap of the read position.
 
 ## One-shot
 

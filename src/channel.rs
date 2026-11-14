@@ -1,10 +1,10 @@
 //! Bounded channels, which move values from producers to consumers with no scheduler or driver.
 //!
-//! [`spsc`] has one sender and one receiver. [`oneshot`] moves one value, such as a reply or a
-//! startup outcome. Each send, receive, and reservation has a nonblocking form, which is the
-//! kernel. The asynchronous waits, and with the `std` feature the
-//! blocking waits, use the same publication and close rules. The outcome types in this module
-//! state who owns the value after each result.
+//! [`spsc`] has one sender and one receiver. [`mpsc`] has many senders and one receiver.
+//! [`oneshot`] moves one value, such as a reply or a startup outcome. Each send, receive, and
+//! reservation has a nonblocking form, which is the kernel. The asynchronous waits, and with the
+//! `std` feature the blocking waits, use the same publication and close rules. The outcome types in
+//! this module state who owns the value after each result.
 //!
 //! A channel charges its slots and its shared state to a [`Budget`](crate::capacity::Budget)
 //! before it allocates. A value that holds memory of its own carries its own charge, for example
@@ -14,8 +14,11 @@ use core::fmt;
 
 use crate::capacity::Exhausted;
 
+pub mod mpsc;
 pub mod oneshot;
 pub mod spsc;
+#[cfg(test)]
+mod tests;
 
 /// A refusal to make a channel. A refusal keeps no charge and no memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,3 +166,16 @@ impl fmt::Display for ReserveError {
 }
 
 impl core::error::Error for ReserveError {}
+
+/// A refusal to clone a sender: each sender place of the channel is in use. A later clone can
+/// succeed after a sender drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooManySenders;
+
+impl fmt::Display for TooManySenders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("each sender place of the channel is in use")
+    }
+}
+
+impl core::error::Error for TooManySenders {}
