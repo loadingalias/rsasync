@@ -381,6 +381,17 @@ fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     drop(running);
 }
 
+/// The message of a refused send names the reason and none of the bytes that the refusal gives
+/// back, so a log of the error shows no data of the caller.
+#[test]
+fn the_debug_of_a_refused_send_shows_its_reason_and_none_of_its_bytes() {
+    let refused = Refused {
+        reason: Reason::Queue,
+        value: Lease::from(b"secret".to_vec()),
+    };
+    assert_eq!(alloc::format!("{refused:?}"), "Refused { reason: Queue, .. }");
+}
+
 /// A submission that finds the table full takes the requests of ended futures first, and the
 /// cancel of one of them takes the last free entry of the queue. The submission then still gets an
 /// entry, so it goes to the kernel and completes.

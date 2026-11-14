@@ -426,7 +426,6 @@ pub enum Reason {
 }
 
 /// A refused operation: the reason, and the value that the caller gave, which it keeps.
-#[derive(Debug)]
 pub struct Refused<T> {
     reason: Reason,
     value: T,
@@ -446,13 +445,23 @@ impl<T> Refused<T> {
     }
 }
 
+// Not derived: the value need not be `Debug`, and the message does not show it, so a refused
+// send shows none of the bytes of its lease.
+impl<T> fmt::Debug for Refused<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Refused")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> fmt::Display for Refused<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "the driver refused the operation: {:?}", self.reason)
     }
 }
 
-impl<T: fmt::Debug> core::error::Error for Refused<T> {}
+impl<T> core::error::Error for Refused<T> {}
 
 /// The driver ended before the operation gave its result to its future: teardown released the
 /// result, or the driver dropped.

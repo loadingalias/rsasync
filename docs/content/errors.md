@@ -14,8 +14,8 @@ its recovery. rsasync is in development, and these errors are not in a published
   refusal, and the `io::Error` for a failure of the system.
 - A refusal of `rsasync::task` and its text need no allocation, so a report completes when the
   allocator refuses each request.
-- The `Debug` form of each error of `rsasync::task`, `rsasync::channel`, and `rsasync::blocking`
-  shows no output, value, job, or panic message.
+- The `Debug` form of each error of `rsasync::task`, `rsasync::channel`, and `rsasync::blocking`,
+  and of `driver::Refused`, shows no output, value, job, or panic message.
 
 ## Tasks
 
