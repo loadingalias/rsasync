@@ -28,7 +28,7 @@ it allocates nothing, and `SpawnRefused` gives the future back with its reason:
 | --- | --- | --- |
 | `NoSlot` | Each slot of the owner holds a live task | Join or cancel a task, or use `spawn_local_waiting` |
 | `Budget(Exhausted)` | The budget has fewer free units than the task | Free units, or spawn a smaller future |
-| `Closed` | `block_on` is at its end, and it cancels its tasks | Do the work in the root future, or before the end |
+| `Closed` | `block_on` is at its end and cancels its tasks, or it failed and drops them | Do the work in the root future, or before the end |
 | `NoOwner` | No `block_on` runs on this thread | Spawn from the root future or from a task |
 
 `SpawnRefused::into_future` gives the future back, so the caller can run it in place, keep it, or
@@ -84,11 +84,28 @@ does nothing.
 | --- | --- |
 | `Completed(output)` | The future gave its output |
 | `Cancelled` | A cancel was requested, or `block_on` ended: the owner dropped the future at a poll boundary |
-| `Panicked(panic)` | A poll of the future panicked: the owner dropped the future. `Panic::into_payload` gives the payload |
+| `Panicked(panic)` | A poll of the future, or the drop of the future, panicked: the owner dropped the future. `Panic::into_payload` gives the payload |
 | `OwnerFailed(OwnerFailure)` | The owner dropped the future with no outcome, because `block_on` ended with a panic |
 
 When the root future panics, each live task ends with `OwnerFailed`, and the panic continues out of
 `block_on`. The owner can then run `block_on` again.
+
+## Panics
+
+The owner contains each panic of the state of a task: a poll of its future, and the drop of its
+future or of an output that no join takes. That task ends with `Panicked`, and the other tasks
+continue. A panic in the drop of one task does not stop the drop of the others, also after a panic
+of the root, and each charge returns to the budget.
+
+- The owner drops each panic payload that no join takes. If that drop panics, the owner drops the
+  new payload in the same way. If that drop panics too, its payload leaks: one allocation.
+- A panic of the root future, or of a waker that the owner calls, ends `block_on` with that panic.
+  Each live task then ends with `OwnerFailed`.
+- With `panic = "abort"`, each panic ends the process, and no task ends with `Panicked`.
+
+The destructor of a task can use the owner again: it can spawn, wake, and cancel. At the end of
+`block_on`, and after a panic of the root, a spawn gives `Reason::Closed` and its future back.
+[Errors](errors.md) gives each error of a task and its recovery.
 
 ## Wakes
 

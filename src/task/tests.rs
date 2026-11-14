@@ -1,5 +1,7 @@
+use alloc::format;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::future::{Future, pending, poll_fn};
 use core::num::NonZeroU64;
@@ -9,7 +11,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::panic::catch_unwind;
 
-use super::{JoinHandle, LocalOwner, Outcome, OwnerFailure, Reason, Refused, spawn_local, spawn_local_waiting};
+use super::{
+    CancelHandle, JoinHandle, LocalOwner, Outcome, OwnerFailure, Reason, Refused, spawn_local, spawn_local_waiting,
+};
 use crate::capacity::Budget;
 use crate::channel::oneshot;
 
@@ -285,4 +289,144 @@ fn a_wake_from_another_thread_reaches_a_local_task() {
         assert!(matches!(task.join().await, Outcome::Completed(5)));
         other.join().unwrap().unwrap();
     });
+}
+
+/// A future that is ready at its first poll if `ready`, and pending if not. Its drop enters the
+/// owner again: it spawns a task and records the result in `spawns`, and it cancels `victim`.
+struct Reenters {
+    ready: bool,
+    victim: Option<CancelHandle>,
+    spawns: Rc<RefCell<Vec<Result<(), Reason>>>>,
+}
+
+impl Future for Reenters {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready { Poll::Ready(()) } else { Poll::Pending }
+    }
+}
+
+impl Drop for Reenters {
+    fn drop(&mut self) {
+        let spawned = spawn_local(async {}).map(drop).map_err(|refused| refused.reason());
+        self.spawns.borrow_mut().push(spawned);
+        if let Some(victim) = self.victim.take() {
+            victim.cancel();
+        }
+    }
+}
+
+#[test]
+fn a_destructor_that_enters_the_owner_again_does_not_deadlock() {
+    let budget = budget();
+    let mut owner = LocalOwner::new(&budget, 8).unwrap();
+    let spawns = Rc::default();
+    let reenters = |ready, victim| Reenters {
+        ready,
+        victim,
+        spawns: Rc::clone(&spawns),
+    };
+    owner.block_on(async {
+        // The future drops after its output, in the poll of its task.
+        let victim = spawn_local(pending::<()>()).unwrap();
+        let task = spawn_local(reenters(true, Some(victim.cancel_handle()))).unwrap();
+        assert!(matches!(task.join().await, Outcome::Completed(())));
+        assert!(matches!(victim.join().await, Outcome::Cancelled));
+
+        // The future drops at its cancel, at the start of its next poll.
+        let victim = spawn_local(pending::<()>()).unwrap();
+        let task = spawn_local(reenters(false, Some(victim.cancel_handle()))).unwrap();
+        yield_once().await;
+        task.cancel_handle().cancel();
+        assert!(matches!(task.join().await, Outcome::Cancelled));
+        assert!(matches!(victim.join().await, Outcome::Cancelled));
+
+        // The future drops at the cancel at the end of `block_on`.
+        drop(spawn_local(reenters(false, None)).unwrap());
+    });
+
+    // The future drops when the owner fails.
+    let failed = catch_unwind(AssertUnwindSafe(|| {
+        owner.block_on(async {
+            drop(spawn_local(reenters(false, None)).unwrap());
+            yield_once().await;
+            panic!("the root panics");
+        })
+    }));
+    assert!(failed.is_err());
+    assert_eq!(
+        *spawns.borrow(),
+        [Ok(()), Ok(()), Err(Reason::Closed), Err(Reason::Closed)]
+    );
+}
+
+/// A pending future whose drop panics.
+struct PanicsOnDrop;
+
+impl Future for PanicsOnDrop {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+impl Drop for PanicsOnDrop {
+    fn drop(&mut self) {
+        panic!("the drop of the future panics");
+    }
+}
+
+#[test]
+fn a_panic_in_the_drop_of_one_task_does_not_skip_the_others() {
+    let budget = budget();
+    let mut owner = LocalOwner::new(&budget, 4).unwrap();
+    let free = budget.available();
+
+    // At the end of `block_on`, the owner cancels each live task.
+    let tasks = owner.block_on(async {
+        let tasks = [
+            spawn_local(pending::<()>()).unwrap(),
+            spawn_local(PanicsOnDrop).unwrap(),
+            spawn_local(pending::<()>()).unwrap(),
+        ];
+        yield_once().await;
+        tasks
+    });
+    let [first, panicked, last] = tasks.map(JoinHandle::join_blocking);
+    assert!(matches!(first, Outcome::Cancelled));
+    assert!(matches!(panicked, Outcome::Panicked(_)));
+    assert!(matches!(last, Outcome::Cancelled));
+    drop(panicked);
+    assert_eq!(budget.available(), free);
+
+    // After a panic of the root, the owner drops each live task with no outcome.
+    let kept = RefCell::new(Vec::new());
+    let failed = catch_unwind(AssertUnwindSafe(|| {
+        owner.block_on(async {
+            kept.borrow_mut().extend([
+                spawn_local(pending::<()>()).unwrap(),
+                spawn_local(PanicsOnDrop).unwrap(),
+                spawn_local(pending::<()>()).unwrap(),
+            ]);
+            yield_once().await;
+            panic!("the root panics");
+        })
+    }));
+    assert!(failed.is_err());
+    for task in kept.take() {
+        assert!(matches!(task.join_blocking(), Outcome::OwnerFailed(OwnerFailure)));
+    }
+    assert_eq!(budget.available(), free);
+}
+
+#[test]
+fn the_debug_of_a_panic_holds_no_payload() {
+    let budget = budget();
+    let mut owner = LocalOwner::new(&budget, 1).unwrap();
+    let outcome = owner.block_on(async { spawn_local(async { panic!("secret 7f3a") }).unwrap().join().await });
+    let debug = format!("{outcome:?}");
+    assert!(matches!(outcome, Outcome::Panicked(_)));
+    assert!(!debug.contains("7f3a"), "{debug}");
 }

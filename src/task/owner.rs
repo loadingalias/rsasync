@@ -69,9 +69,11 @@ impl<F: Future> TaskCell<F> {
     fn send(self: Pin<&mut Self>, outcome: Outcome<F::Output>) {
         // SAFETY: the sender is not structurally pinned, and this moves only the sender.
         let sender = unsafe { &mut self.get_unchecked_mut().sender };
-        if let Some(sender) = sender.take() {
-            // A join handle that dropped leaves the outcome to this send, which drops it.
-            let _unjoined = sender.send(outcome);
+        if let Some(sender) = sender.take()
+            && let Err(unjoined) = sender.send(outcome)
+        {
+            // A join handle that dropped leaves the outcome to this send.
+            discard(unjoined);
         }
     }
 }
@@ -85,17 +87,43 @@ impl<F: Future> Task for TaskCell<F> {
         let Poll::Ready(output) = running.poll(cx) else {
             return Poll::Pending;
         };
-        future.set(None);
-        self.send(Outcome::Completed(output));
+        // A panic of the drop of the future makes the task panicked, and its output drops.
+        match catch_unwind(AssertUnwindSafe(|| future.set(None))) {
+            Ok(()) => self.send(Outcome::Completed(output)),
+            Err(payload) => {
+                discard(output);
+                self.send(Outcome::Panicked(Panic(payload)));
+            }
+        }
         Poll::Ready(())
     }
 
     fn end(mut self: Pin<&mut Self>, end: End) {
-        self.as_mut().future().set(None);
-        self.send(match end {
-            End::Cancelled => Outcome::Cancelled,
-            End::Panicked(payload) => Outcome::Panicked(Panic(payload)),
-        });
+        // A panic of the drop of the future makes a cancelled task panicked. A task that panicked
+        // already keeps the payload of its poll.
+        let dropped = catch_unwind(AssertUnwindSafe(|| self.as_mut().future().set(None)));
+        let outcome = match (end, dropped) {
+            (End::Cancelled, Ok(())) => Outcome::Cancelled,
+            (End::Cancelled, Err(payload)) => Outcome::Panicked(Panic(payload)),
+            (End::Panicked(payload), dropped) => {
+                if let Err(second) = dropped {
+                    discard(second);
+                }
+                Outcome::Panicked(Panic(payload))
+            }
+        };
+        self.send(outcome);
+    }
+}
+
+/// Drops `value`, which holds code of a task, such as an output or a panic payload. A panic of
+/// that drop is contained, and its payload drops in the same way. The payload of a panic of that
+/// second drop leaks: one allocation, so that the owner continues.
+fn discard<T>(value: T) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value)))
+        && let Err(second) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
+    {
+        Box::leak(second);
     }
 }
 
@@ -342,12 +370,15 @@ impl Local {
     /// Drops each live task with no outcome, after the owner failed. A join of such a task gives
     /// `OwnerFailed`.
     fn fail_all(&self) {
+        // A destructor that spawns gets its future back.
+        self.closed.set(true);
         self.queue.borrow_mut().clear();
         self.shared.harvest(|_| {});
         for (slot, entry) in (0..).zip(self.entries.iter()) {
             if let Some(entry) = entry.take() {
                 self.shared.end(slot);
-                drop(entry);
+                // A panic of the drop of one future does not stop the drop of the others.
+                discard(entry);
                 self.free.borrow_mut().push(slot);
                 self.live.set(self.live.get() - 1);
             }

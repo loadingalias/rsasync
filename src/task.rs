@@ -40,7 +40,7 @@
 //! | --- | --- |
 //! | [`Outcome::Completed`] | The future gave its output |
 //! | [`Outcome::Cancelled`] | A cancel was requested, or `block_on` ended: the owner dropped the future at a poll boundary |
-//! | [`Outcome::Panicked`] | A poll of the future panicked: the owner dropped the future |
+//! | [`Outcome::Panicked`] | A poll of the future, or the drop of the future, panicked: the owner dropped the future |
 //! | [`Outcome::OwnerFailed`] | The owner dropped the future with no outcome, because `block_on` ended with a panic |
 //!
 //! A drop of a [`JoinHandle`] does not cancel its task. The outcome of a task stays in the channel
@@ -49,6 +49,23 @@
 //! A cancel never drops a future during its poll: the owner drops it at the start of the next poll,
 //! or after the poll that is running ends. A [`CancelHandle`] works from each thread, and so does
 //! the waker of a task.
+//!
+//! # Panics
+//!
+//! The owner contains each panic of the state of a task: a poll of its future, and the drop of its
+//! future or of an output that no join takes. That task ends with [`Outcome::Panicked`], and the
+//! other tasks continue. A panic in the drop of one task does not stop the drop of the others, and
+//! each charge returns to the budget.
+//!
+//! The owner drops each panic payload that no join takes. If that drop panics, the owner drops the
+//! new payload in the same way. If that drop panics too, its payload leaks: one allocation.
+//!
+//! A panic of the root future, or of a waker that the owner calls, ends `block_on` with that panic.
+//! Each live task then ends with [`Outcome::OwnerFailed`]. With `panic = "abort"`, each panic ends
+//! the process, and no task ends with [`Outcome::Panicked`].
+//!
+//! A destructor of a task can use the owner again: it can spawn, wake, and cancel. At the end of
+//! `block_on`, and after a panic of the root, a spawn gives [`Reason::Closed`] and its future back.
 
 use core::any::Any;
 use core::cell::{Cell, RefCell};
@@ -122,7 +139,14 @@ impl fmt::Display for Refused {
     }
 }
 
-impl core::error::Error for Refused {}
+impl core::error::Error for Refused {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Budget(exhausted) => Some(exhausted),
+            Self::Zero | Self::TooLarge | Self::Allocation => None,
+        }
+    }
+}
 
 /// An owner of local tasks, with a fixed number of task slots. It stays on the thread that made it.
 pub struct LocalOwner {
@@ -206,7 +230,8 @@ pub enum Reason {
     NoSlot,
     /// The budget has fewer free units than the memory of the task.
     Budget(Exhausted),
-    /// The `block_on` of the owner is at its end, and it cancels its tasks.
+    /// The `block_on` of the owner is at its end, and it cancels its tasks, or it failed, and it
+    /// drops them.
     Closed,
     /// This thread has no owner: no `block_on` runs on it.
     NoOwner,
@@ -217,7 +242,7 @@ impl fmt::Display for Reason {
         match self {
             Self::NoSlot => f.write_str("each task slot of the owner is in use"),
             Self::Budget(refused) => write!(f, "the budget cannot charge the task: {refused}"),
-            Self::Closed => f.write_str("the owner is at the end of its block_on"),
+            Self::Closed => f.write_str("the owner is at the end of its block_on, or it failed"),
             Self::NoOwner => f.write_str("this thread has no local owner"),
         }
     }
@@ -256,7 +281,14 @@ impl<F> fmt::Display for SpawnRefused<F> {
     }
 }
 
-impl<F> core::error::Error for SpawnRefused<F> {}
+impl<F> core::error::Error for SpawnRefused<F> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match &self.reason {
+            Reason::Budget(exhausted) => Some(exhausted),
+            Reason::NoSlot | Reason::Closed | Reason::NoOwner => None,
+        }
+    }
+}
 
 /// A waiting spawn, from [`spawn_local_waiting`]. It holds the future until the spawn. A drop of
 /// this future drops it.
