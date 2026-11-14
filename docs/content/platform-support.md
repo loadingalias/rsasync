@@ -37,9 +37,12 @@ connect; half-close; set and read the socket options; and close. Bind and listen
 where the kernel has them (Ubuntu 26.04), and as system calls elsewhere (Debian 12). They also
 check that a dropped, forgotten, or cancelled receive, send, or accept loses no byte and no
 connection, on IPv4 and IPv6. The receive into an owned buffer and the send from a lease keep the
-addresses of their buffers and allocate nothing for each operation. Only the driver and `rsnetwork-udp` make system calls: the io_uring ring and
-its waits in the kernel, its two event descriptors, the socket, option, bind, and listen calls of
-a TCP socket, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
+addresses of their buffers and allocate nothing for each operation. The tests also check the
+[blocking service](blocking-service.md): its bound of jobs, its refusals, its teardown, and the
+charges of its threads. Only the driver, the blocking service, and `rsnetwork-udp` make system
+calls: the io_uring ring and its waits in the kernel, its two event descriptors, the socket,
+option, bind, and listen calls of a TCP socket, the threads that the blocking service starts
+through `std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
 on musl, and that these calls work through the system calls of musl. It does not show that a
 runtime with a scheduler works on musl: the library has no scheduler yet. From the Linux driver
 stage on, each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C

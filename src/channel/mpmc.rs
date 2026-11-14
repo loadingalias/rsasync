@@ -376,6 +376,12 @@ impl<T> Sender<T> {
 
     /// Sends `value` if a slot is free and the channel is open. Otherwise the value comes back.
     pub fn try_send(&mut self, value: T) -> Result<(), TrySendError<T>> {
+        self.try_send_shared(value)
+    }
+
+    /// [`Self::try_send`] through a shared borrow. It never waits and uses no sender place, so
+    /// several threads can send through one sender at the same time.
+    pub(crate) fn try_send_shared(&self, value: T) -> Result<(), TrySendError<T>> {
         self.send_now(value).map_err(|(refusal, value)| match refusal {
             Refusal::Full => TrySendError::Full(value),
             Refusal::Closed => TrySendError::Closed(value),

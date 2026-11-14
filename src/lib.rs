@@ -10,6 +10,9 @@
 //! The [`channel`] module holds the bounded channels, [`clock`] holds the native and the injected
 //! clocks, and [`timer`] holds bounded timers. None of them needs a scheduler or driver.
 //!
+//! With the `std` feature, the `blocking` module holds the bounded blocking service, which runs
+//! blocking host work on a fixed number of threads.
+//!
 //! Without the `std` feature, which is on by default, the crate needs only `core` and `alloc`.
 
 #![no_std]
@@ -18,6 +21,9 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+// The blocking service needs the threads of `std`.
+#[cfg(feature = "std")]
+pub mod blocking;
 pub mod channel;
 // The completion entries of the driver, which the exploration tests also check on each host.
 #[cfg(any(
