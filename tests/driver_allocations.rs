@@ -1,7 +1,8 @@
 //! A send and a receive of the driver allocate nothing for each operation: the kernel reads and
 //! writes the buffers of the caller in place. A send or a receive that stages its bytes through an
-//! allocated buffer fails this test. It is a test binary of its own, because a binary has one
-//! global allocator, and the unit tests of the crate have theirs.
+//! allocated buffer fails this test. The handler of a signal stream allocates nothing either,
+//! because a handler can interrupt the allocator. It is a test binary of its own, because a binary
+//! has one global allocator, and the unit tests of the crate have theirs.
 #![cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -18,7 +19,7 @@ use std::io::{Read as _, Write as _};
 use std::thread;
 
 use rsasync::buffer::{Backing, Buffer as _, Lease};
-use rsasync::driver::{Config, Driver, TcpOptions};
+use rsasync::driver::{Config, Driver, Escalation, Signal, TcpOptions};
 
 /// Counts the allocations of each thread.
 struct Counting;
@@ -98,4 +99,23 @@ fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
     assert_eq!(sent.unwrap(), 4);
     assert_eq!((counted, allocations), (1, 0));
     assert_eq!(&client.join().unwrap(), b"pong");
+}
+
+#[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
+unsafe extern "C" {
+    /// `int raise(int sig)`.
+    fn raise(sig: core::ffi::c_int) -> core::ffi::c_int;
+}
+
+#[test]
+#[expect(unsafe_code, reason = "raise names no memory")]
+fn the_handler_of_a_signal_stream_allocates_nothing() {
+    let mut driver = Driver::new(Config::new()).unwrap();
+    let _stream = driver.signal(Signal::TERMINATE, Escalation::Never).unwrap();
+    // `raise` runs the handler on this thread before it returns.
+    let before = ALLOCATIONS.get();
+    // SAFETY: `raise` names no memory.
+    let raised = unsafe { raise(Signal::TERMINATE.as_raw()) };
+    let allocations = ALLOCATIONS.get() - before;
+    assert_eq!((raised, allocations), (0, 0));
 }

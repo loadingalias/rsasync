@@ -43,6 +43,7 @@
 
 mod completion;
 mod probe;
+mod signal;
 mod sys;
 mod tcp;
 #[cfg(all(test, not(loom)))]
@@ -68,6 +69,7 @@ use crate::sync::Arc;
 use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
 
+pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
 
 use crate::completion::Entry;
@@ -619,6 +621,8 @@ pub struct Driver {
     /// The kernel signals the wake descriptor for deferred work only one time in each
     /// registration (`probe`), so each turn that takes a wake registers it again.
     rearm_wake: bool,
+    /// The signal streams whose home is this driver.
+    signals: Vec<Arc<signal::Home>>,
 }
 
 impl fmt::Debug for Driver {
@@ -680,6 +684,7 @@ impl Driver {
             completions_per_turn: config.completions_per_turn,
             waking: false,
             rearm_wake,
+            signals: Vec::new(),
         })
     }
 
@@ -700,6 +705,22 @@ impl Driver {
     #[must_use]
     pub fn wake_handle(&self) -> WakeHandle {
         WakeHandle(Arc::clone(&self.shared))
+    }
+
+    /// A stream of `signal`, whose home is this driver: a turn wakes it when the signal arrived.
+    /// The first stream of a signal installs its handler, and the last stream that closes restores
+    /// the earlier disposition. The driver connects no signal to its own end.
+    ///
+    /// # Errors
+    ///
+    /// [`SignalError`] gives the reason, and nothing changes.
+    pub fn signal(&mut self, signal: Signal, escalation: Escalation) -> Result<SignalStream, SignalError> {
+        let (stream, home) = signal::register(&self.shared, signal, escalation)?;
+        if self.signals.capacity() == 0 {
+            self.signals.reserve_exact(signal::STREAMS);
+        }
+        self.signals.push(home);
+        Ok(stream)
     }
 
     /// Gives the slots of `pool` to the kernel as the buffers of [`Driver::recv_selected`]: a
@@ -779,6 +800,7 @@ impl Driver {
             }
         }
         let completed = self.harvest(self.completions_per_turn);
+        signal::wake(&mut self.signals);
         // Start the operations that waited for an operation that ended, and end the closes.
         self.attend();
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
@@ -1224,6 +1246,7 @@ impl Drop for Driver {
         for entry in &self.shared.entries {
             entry.close();
         }
+        signal::end(&self.signals);
         if let Some(selected) = self.selected.take() {
             if busy {
                 let _leaked = ManuallyDrop::new(selected);

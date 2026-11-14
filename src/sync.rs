@@ -1,7 +1,10 @@
 //! The memory-model substitution point. Each atomic, reference count, shared cell, spin hint, and
-//! thread park of this crate comes from this module, so one algorithm runs in each form. The one exception is
-//! the words of an io_uring ring that the kernel also reads and writes: they are hardware atomics
-//! in each form.
+//! thread park of this crate comes from this module, so one algorithm runs in each form. Two
+//! exceptions are hardware atomics in each form: the words of an io_uring ring, which the kernel
+//! also reads and writes, and the statics of the signal handler (`driver::signal`), which a signal
+//! changes between any two instructions. The verification form cannot deliver a signal, and its
+//! atomics cannot be `const` in a static. The registrations of that handler share one
+//! `std::sync::Mutex`, which the handler never takes.
 //!
 //! - Native: the `core` atomics, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, `core::hint`,
 //!   and, with the `std` feature, `std::thread` for parking.
