@@ -83,6 +83,7 @@ pub(super) const IORING_OP_WRITEV: u8 = 2;
 pub(super) const IORING_OP_READ: u8 = 22;
 pub(super) const IORING_OP_WRITE: u8 = 23;
 pub(super) const IORING_OP_SENDMSG: u8 = 9;
+pub(super) const IORING_OP_RECVMSG: u8 = 10;
 pub(super) const IORING_OP_CONNECT: u8 = 16;
 pub(super) const IORING_OP_SHUTDOWN: u8 = 34;
 pub(super) const IORING_OP_SEND: u8 = 26;

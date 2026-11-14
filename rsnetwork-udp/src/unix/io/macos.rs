@@ -65,7 +65,7 @@ mod private {
     use std::os::fd::{AsRawFd as _, BorrowedFd};
 
     use crate::sys::{self, EINTR, IoVec, MSG_DONTWAIT, MSG_TRUNC, MsgHdr, MsgHdrX};
-    use crate::unix::io::{c_uint_len, finish, header, name, refusal, region};
+    use crate::unix::io::{c_uint_len, header, name, region};
     use crate::{BATCH, Control, Received, Refused, SockAddrStorage, Transmit};
 
     /// Sends up to [`BATCH`] datagrams in one call (`sendmsg_x`), each with its own metadata, with
@@ -116,7 +116,7 @@ mod private {
             }
             match io::Error::last_os_error() {
                 error if error.raw_os_error() == Some(EINTR) => {}
-                error => return Err(refusal(error, false)),
+                error => return Err(Refused::of_send(error, false)),
             }
         }
     }
@@ -175,7 +175,7 @@ mod private {
                 for (index, slot) in received.iter_mut().take(done).enumerate() {
                     let header = &headers[index];
                     let filled = header.msg_datalen >= regions[index].iov_len;
-                    *slot = finish(
+                    *slot = Received::from_message(
                         &names[index],
                         header.msg_namelen,
                         if filled {

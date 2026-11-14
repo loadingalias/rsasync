@@ -17,9 +17,8 @@ std = ["rstypes/std", "dep:rsnetwork-udp"]
 [dependencies]
 # The shared types. Users reach them through this crate and never name it.
 rstypes = { path = "rstypes", version = "=0.1.0-alpha.2", default-features = false }
-
-# The socket-address declarations that the networking family shares, for the driver.
-[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+# The datagram layer that the networking family shares: `rsasync::datagram`, and the socket
+# declarations of the driver. The crate selects its items for each target.
 rsnetwork-udp = { path = "rsnetwork-udp", version = "=0.1.0-alpha.2", optional = true }
 
 # The exploration tests (`cargo xtask explore`) use loom. A build without

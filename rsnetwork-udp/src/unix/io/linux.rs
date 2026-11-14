@@ -6,9 +6,9 @@ use core::ptr;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
-use super::{c_uint_len, finish, header, name, refusal, region, set};
+use super::{c_uint_len, header, name, region, set};
 use crate::sys::{self, EINTR, MSG_DONTWAIT, MmsgHdr, MsgHdr, SOL_UDP, UDP_GRO};
-use crate::{BATCH, Control, Received, SockAddrStorage, Transmit};
+use crate::{BATCH, Control, Received, Refused, SockAddrStorage, Transmit};
 
 /// Turns coalesced receive (GRO) on or off. A coalesced receive gives several datagrams of one
 /// peer in one buffer, with their segment size in [`Metadata::segment_size`](crate::Metadata::segment_size).
@@ -59,7 +59,7 @@ pub fn send_batch(socket: BorrowedFd<'_>, transmits: &[Transmit<'_>]) -> io::Res
         }
         match io::Error::last_os_error() {
             error if error.raw_os_error() == Some(EINTR) => {}
-            error => return Err(refusal(error, segmented)),
+            error => return Err(Refused::of_send(error, segmented)),
         }
     }
 }
@@ -109,7 +109,7 @@ pub fn recv_batch(socket: BorrowedFd<'_>, buffers: &mut [&mut [u8]], received: &
             for (index, slot) in received.iter_mut().take(done).enumerate() {
                 let len = usize::try_from(headers[index].msg_len).unwrap_or(usize::MAX);
                 let header = &headers[index].msg_hdr;
-                *slot = finish(
+                *slot = Received::from_message(
                     &names[index],
                     header.msg_namelen,
                     header.msg_flags,

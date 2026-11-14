@@ -206,6 +206,45 @@ impl Sqe {
         }
     }
 
+    /// A receive of one message on the socket `fd` into the regions, the address storage, and the
+    /// control storage that `message` names (`IORING_OP_RECVMSG`), with the call flags `flags`, for
+    /// example `MSG_DONTWAIT`. The kernel writes the lengths and the flags back into `message`.
+    pub(crate) fn recv_message(fd: RawFd, message: *mut rsnetwork_udp::sys::MsgHdr, flags: i32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_RECVMSG,
+            fd,
+            addr: message.addr() as u64,
+            len: 1,
+            rw_flags: flags.cast_unsigned(),
+            ..Self::default()
+        }
+    }
+
+    /// A receive of one message into a buffer that the kernel selects from the provided buffer
+    /// ring of `group` (`IOSQE_BUFFER_SELECT`). `message` names one region with no address, whose
+    /// length is the most that the kernel writes.
+    pub(crate) fn recv_message_selected(
+        fd: RawFd,
+        message: *mut rsnetwork_udp::sys::MsgHdr,
+        flags: i32,
+        group: u16,
+    ) -> Self {
+        Self {
+            flags: sys::IOSQE_BUFFER_SELECT,
+            buf_index: group,
+            ..Self::recv_message(fd, message, flags)
+        }
+    }
+
+    /// The entry, linked to the next one: the next one starts only after this one succeeds, and
+    /// it fails with `ECANCELED` when this one fails.
+    pub(crate) fn linked(self) -> Self {
+        Self {
+            flags: self.flags | sys::IOSQE_IO_LINK,
+            ..self
+        }
+    }
+
     /// A connect of the socket `fd` to the address of `len` bytes at `address`
     /// (`IORING_OP_CONNECT`).
     pub(crate) fn connect(fd: RawFd, address: *const u8, len: u32) -> Self {
@@ -256,7 +295,7 @@ impl Sqe {
     /// a completion only when it fails, and the next one then fails with `ECANCELED`.
     pub(crate) fn linked_quiet(self) -> Self {
         Self {
-            flags: self.flags | sys::IOSQE_IO_LINK | sys::IOSQE_CQE_SKIP_SUCCESS,
+            flags: self.linked().flags | sys::IOSQE_CQE_SKIP_SUCCESS,
             ..self
         }
     }
@@ -486,9 +525,9 @@ impl Ring {
         self.word(self.sq_flags).load(Ordering::Relaxed) & (sys::IORING_SQ_TASKRUN | sys::IORING_SQ_CQ_OVERFLOW) != 0
     }
 
-    /// Whether the submission queue has a free entry for a push.
-    pub(crate) fn has_room(&self) -> bool {
-        self.room() > 0
+    /// The entries of the submission queue.
+    pub(crate) const fn entries(&self) -> u32 {
+        self.sq_entries
     }
 
     /// The entries that the submission queue has room for.

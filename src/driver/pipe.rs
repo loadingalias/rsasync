@@ -164,14 +164,9 @@ impl Driver {
         if flags & sys::O_NONBLOCK != 0 && unsafe { sys::fcntl(raw, sys::F_SETFL, flags & !sys::O_NONBLOCK) } < 0 {
             return refuse(Reason::Unsupported, fd);
         }
-        let resource = match self.resources.adopt(fd) {
-            Ok(resource) => resource,
-            Err(fd) => return refuse(Reason::Resources, fd),
-        };
-        if let Some(owned) = self.resources.get(resource) {
-            owned.medium = Medium::Pipe;
-        }
-        Ok(resource)
+        self.resources
+            .adopt(fd, Medium::Pipe)
+            .or_else(|fd| refuse(Reason::Resources, fd))
     }
 }
 

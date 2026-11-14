@@ -14,8 +14,9 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
 use rsnetwork_udp::sys::{self, IoVec, MsgHdr};
-use rsnetwork_udp::{AF_INET6, SockAddrStorage};
+use rsnetwork_udp::{AF_INET6, Received, SockAddrStorage};
 
+use super::udp::{self, Arrivals, Batch};
 use super::{Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Reason, Refused, Resource, Resources, Tag};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
@@ -25,6 +26,8 @@ use crate::uring::Sqe;
 /// `ENOBUFS` (`include/uapi/asm-generic/errno.h`): a selecting receive found no free buffer, and
 /// the data stays in the socket.
 const ENOBUFS: i32 = 105;
+/// `EAGAIN`: a receive with no wait found no datagram.
+const EAGAIN: i32 = 11;
 /// `ENOMEM`: each resource slot of the driver is in use. It reads as `OutOfMemory`.
 const ENOMEM: i32 = 12;
 /// `EINVAL`: an option value that the kernel cannot take.
@@ -144,13 +147,15 @@ impl TcpStream {
     }
 }
 
-/// The read half of a [`TcpStream`]: [`Driver::recv`] and [`Driver::recv_selected`] borrow it.
+/// The read half of a [`TcpStream`], a [`UdpSocket`](super::UdpSocket), or a
+/// [`PipeReader`](super::PipeReader): its receives borrow it.
 #[derive(Debug)]
 pub struct ReadHalf {
     pub(super) resource: Resource,
 }
 
-/// The write half of a [`TcpStream`]: [`Driver::send`] borrows it.
+/// The write half of a [`TcpStream`], a [`UdpSocket`](super::UdpSocket), or a
+/// [`PipeWriter`](super::PipeWriter): its sends borrow it.
 #[derive(Debug)]
 pub struct WriteHalf {
     pub(super) resource: Resource,
@@ -237,7 +242,7 @@ pub struct TcpOptions {
 
 impl TcpOptions {
     /// Sets each option that is not `None` on `socket`.
-    fn apply(self, socket: BorrowedFd<'_>) -> io::Result<()> {
+    pub(super) fn apply(self, socket: BorrowedFd<'_>) -> io::Result<()> {
         let flags = [
             (self.no_delay, sys::IPPROTO_TCP, sys::TCP_NODELAY),
             (self.keepalive, sys::SOL_SOCKET, sys::SO_KEEPALIVE),
@@ -589,6 +594,10 @@ enum Kept {
     Bytes { buffer: Backing, start: usize },
     /// The error of a receive.
     Error(i32),
+    /// A datagram that a receive took, with its facts.
+    Datagram { buffer: Backing, received: Received },
+    /// The datagrams that a batch receive took, in order.
+    Arrivals(Arrivals),
     /// An accepted connection, and the address of its peer.
     Connection {
         fd: OwnedFd,
@@ -629,8 +638,10 @@ impl Directions {
     /// The direction of an operation of `kind`.
     fn direction(&mut self, kind: Kind) -> Option<&mut Direction> {
         match kind {
-            Kind::Recv | Kind::Selected | Kind::Accept => Some(&mut self.read),
-            Kind::Send | Kind::Vectored | Kind::Shutdown => Some(&mut self.write),
+            Kind::Recv | Kind::Selected | Kind::Accept | Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => {
+                Some(&mut self.read)
+            }
+            Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
         }
     }
@@ -646,13 +657,17 @@ impl Directions {
             Kind::Recv | Kind::Selected => matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_))),
             Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
             Kind::Send | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => false,
+            Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => matches!(
+                self.kept,
+                Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
+            ),
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
         }
     }
 }
 
 /// The result of an operation as a count of bytes, or the error of the kernel.
-fn count(result: i32) -> io::Result<usize> {
+pub(super) fn count(result: i32) -> io::Result<usize> {
     usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(result.saturating_neg()))
 }
 
@@ -727,7 +742,29 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
                 directions.sent = Sent::Owe;
             }
         }
-        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => {}
+        Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.received) {
+            (Some(loan), Some(received)) if result >= 0 => {
+                directions.kept = Some(Kept::Datagram {
+                    buffer: loan.into_inner(),
+                    received,
+                });
+            }
+            _ if result < 0 && result != -ECANCELED && result != -ENOBUFS => {
+                directions.kept = Some(Kept::Error(result));
+            }
+            _ => {}
+        },
+        Kind::RecvBatch => match held.batch {
+            Some(Batch::Receive(arrivals)) if !arrivals.is_empty() => {
+                directions.kept = Some(Kept::Arrivals(arrivals));
+            }
+            _ if result < 0 && result != -ECANCELED && result != -ENOBUFS && result != -EAGAIN => {
+                directions.kept = Some(Kept::Error(result));
+            }
+            _ => {}
+        },
+        // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
+        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
     }
 }
 
@@ -778,14 +815,42 @@ impl Driver {
         address: SocketAddr,
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<TcpListener>>, Refused<()>> {
-        let ring = self.features.bind && self.features.listen;
-        // The bind and the listen are two linked entries, so the queue needs room for both.
-        if ring && self.ring.room() < 2 && (self.ring.submit(0).is_err() || self.ring.room() < 2) {
-            return Err(Refused {
-                reason: Reason::Queue,
-                value: (),
-            });
-        }
+        let setup = |socket: BorrowedFd<'_>| {
+            set_int(socket, sys::SOL_SOCKET, sys::SO_REUSEADDR, 1)?;
+            options.apply(socket)
+        };
+        let completion = self.bind_socket(address, true, setup)?;
+        Ok(Operation::new(completion, |result, held| {
+            Some(count(result).and_then(|_| {
+                let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
+                let local = held
+                    .peer
+                    .to_socket_addr(held.peer_len)
+                    .ok_or(io::ErrorKind::InvalidData)?;
+                Ok(TcpListener { resource, local })
+            }))
+        }))
+    }
+
+    /// Makes a socket for `address`, sets it up with `setup`, binds it, and with `listen` listens
+    /// on it: a TCP listener, or a UDP socket with no `listen`. The ring runs the bind, and the
+    /// listen linked to it, where the kernel has those operations; elsewhere the driver makes the
+    /// system calls, and the operation ends at once. Its resources then hold the socket and its
+    /// local address.
+    pub(super) fn bind_socket(
+        &mut self,
+        address: SocketAddr,
+        listen: bool,
+        setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
+    ) -> Result<Completion, Refused<()>> {
+        let ring = self.features.bind && (self.features.listen || !listen);
+        // On the ring, the bind and the listen are two linked entries, so the queue needs room for
+        // both. A bind with system calls pushes no entry.
+        let entries = match (ring, listen) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+        };
         let (storage, len) = SockAddrStorage::new(address);
         let tag = Tag {
             resource: None,
@@ -797,21 +862,26 @@ impl Driver {
             ..Held::default()
         };
         let id = self
-            .open(tag, (), held)
+            .open(tag, entries, (), held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         let completion = Completion::new(Arc::clone(&self.shared), id, true);
-        match self.socket(id, address, options, true) {
+        let kind = if listen { sys::SOCK_STREAM } else { sys::SOCK_DGRAM };
+        match self.socket(id, address, kind, setup) {
             Err(error) => self.complete_now(id, errno(&error)),
             Ok((_, fd)) if ring => {
                 // SAFETY: the bind names the address in the resources of `id`, which the home keeps
                 // until its terminal event, and the socket, which `id` holds. The queue has room for
-                // both entries, so the bind links to the listen.
+                // each entry, so the bind links only to the listen.
                 #[expect(unsafe_code, reason = "the kernel reads the address in the resources of the bind")]
                 unsafe {
-                    self.push(id, |held| {
-                        Sqe::bind(fd, (&raw const held.peer).cast(), held.peer_len).linked_quiet()
-                    });
-                    self.push(id, |_| Sqe::listen(fd, BACKLOG.cast_unsigned()));
+                    if listen {
+                        self.push(id, |held| {
+                            Sqe::bind(fd, (&raw const held.peer).cast(), held.peer_len).linked_quiet()
+                        });
+                        self.push(id, |_| Sqe::listen(fd, BACKLOG.cast_unsigned()));
+                    } else {
+                        self.push(id, |held| Sqe::bind(fd, (&raw const held.peer).cast(), held.peer_len));
+                    }
                 }
             }
             Ok((socket, _)) => {
@@ -820,7 +890,7 @@ impl Driver {
                     .borrow(socket)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
                     .and_then(|fd| {
-                        bind_and_listen(fd, &storage, len)?;
+                        bind_now(fd, &storage, len, listen)?;
                         local_address(fd).ok_or_else(io::Error::last_os_error)
                     });
                 match done {
@@ -836,16 +906,7 @@ impl Driver {
                 }
             }
         }
-        Ok(Operation::new(completion, |result, held| {
-            Some(count(result).and_then(|_| {
-                let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                let local = held
-                    .peer
-                    .to_socket_addr(held.peer_len)
-                    .ok_or(io::ErrorKind::InvalidData)?;
-                Ok(TcpListener { resource, local })
-            }))
-        }))
+        Ok(completion)
     }
 
     /// Connects a new nonblocking TCP socket with `options` to `address`. The future gives the
@@ -862,12 +923,6 @@ impl Driver {
         address: SocketAddr,
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<TcpStream>>, Refused<()>> {
-        if !self.room() {
-            return Err(Refused {
-                reason: Reason::Queue,
-                value: (),
-            });
-        }
         let (storage, len) = SockAddrStorage::new(address);
         let tag = Tag {
             resource: None,
@@ -879,10 +934,10 @@ impl Driver {
             ..Held::default()
         };
         let id = self
-            .open(tag, (), held)
+            .open(tag, 1, (), held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         let completion = Completion::new(Arc::clone(&self.shared), id, true);
-        match self.socket(id, address, options, false) {
+        match self.socket(id, address, sys::SOCK_STREAM, |socket| options.apply(socket)) {
             Err(error) => self.complete_now(id, errno(&error)),
             Ok((_, fd)) => {
                 // SAFETY: the connect names the address in the resources of `id`, which the home
@@ -935,14 +990,15 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation, and [`Reason::Unsupported`] for a
-    /// resource that is not a TCP stream, such as a [`PipeWriter`](super::PipeWriter): close a
-    /// pipe writer instead. A refusal changes nothing.
+    /// resource that is not a TCP stream: a [`PipeWriter`](super::PipeWriter), which you close
+    /// instead, or a [`UdpSocket`](super::UdpSocket). A refusal changes nothing.
     pub fn shutdown_write<'a, W: AsMut<WriteHalf>>(
         &mut self,
         writer: &'a mut W,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let resource = writer.as_mut().resource;
-        // Only a TCP stream has a half-close. The close of a pipe is the end of its stream.
+        // Only a TCP stream has a half-close. The close of a pipe is the end of its stream, and a
+        // datagram socket has no stream.
         if self
             .resources
             .get(resource)
@@ -983,23 +1039,27 @@ impl Driver {
         TcpOptions::read(fd)
     }
 
-    /// Makes the socket of the connect or the bind `id`: a new nonblocking socket for `address`,
-    /// with `options`, which a listener sets before the bind, as a resource that `id` holds. A
-    /// listener also reuses its address. Gives the resource and its descriptor.
+    /// Makes the socket of the connect or the bind `id`: a new nonblocking socket of `kind` for
+    /// `address`, which `setup` sets up before the bind or the connect, as a resource that `id`
+    /// holds. Gives the resource and its descriptor.
     fn socket(
         &mut self,
         id: OpId,
         address: SocketAddr,
-        options: TcpOptions,
-        listener: bool,
+        kind: c_int,
+        setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
     ) -> io::Result<(Resource, std::os::fd::RawFd)> {
-        let socket = new_socket(address)?;
-        if listener {
-            set_int(socket.as_fd(), sys::SOL_SOCKET, sys::SO_REUSEADDR, 1)?;
-        }
-        options.apply(socket.as_fd())?;
+        let socket = new_socket(address, kind)?;
+        setup(socket.as_fd())?;
         let fd = socket.as_raw_fd();
-        let resource = self.adopt(socket).map_err(|_| io::Error::from_raw_os_error(ENOMEM))?;
+        let medium = if kind == sys::SOCK_DGRAM {
+            Medium::Udp
+        } else {
+            Medium::Tcp
+        };
+        let resource = self
+            .adopt(socket, medium)
+            .map_err(|_| io::Error::from_raw_os_error(ENOMEM))?;
         self.hold(id, |held| held.accepted = Some(resource));
         Ok((resource, fd))
     }
@@ -1154,13 +1214,33 @@ impl Driver {
     /// `held` makes from `value`. The caller holds the direction exclusively, so no future of an
     /// earlier operation of the direction exists: their interest ends first. The operation waits
     /// while the earlier one runs, and starts at its end.
-    fn begin<P>(
+    pub(super) fn begin<P>(
         &mut self,
         resource: Resource,
         kind: Kind,
         value: P,
         held: impl FnOnce(P) -> Held,
     ) -> Result<Completion, Refused<P>> {
+        self.begin_entries(resource, kind, 1, value, held)
+    }
+
+    /// [`Driver::begin`] for an operation that pushes `entries` submission entries at one time,
+    /// such as a batch. It refuses with [`Reason::Queue`] when the queue has fewer entries, because
+    /// the operation can then never start.
+    pub(super) fn begin_entries<P>(
+        &mut self,
+        resource: Resource,
+        kind: Kind,
+        entries: u32,
+        value: P,
+        held: impl FnOnce(P) -> Held,
+    ) -> Result<Completion, Refused<P>> {
+        if entries > self.ring.entries() {
+            return Err(Refused {
+                reason: Reason::Queue,
+                value,
+            });
+        }
         let Some((current, first)) = self
             .direction(resource, kind)
             .map(|direction| (direction.current, direction.first))
@@ -1195,25 +1275,24 @@ impl Driver {
         };
         direction.current = direction.current.filter(|&id| table.runs(id));
         let now = direction.current.is_none() && direction.first.is_none();
-        if now && !has_result && !self.room() {
-            return Err(Refused {
-                reason: Reason::Queue,
-                value,
-            });
-        }
         let tag = Tag {
             resource: Some(resource),
             kind,
         };
+        // An operation that waits, or that has its result here, pushes no entry now.
+        let pushed = if now && !has_result { entries } else { 0 };
         let id = self
-            .open(tag, value, held)
+            .open(tag, pushed, value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         if now {
             if let Some(direction) = self.direction(resource, kind) {
                 direction.current = Some(id);
             }
-            // The queue has room, or the operation has its result here, so it starts.
-            self.start(id, resource, kind);
+            // `open` made room for its entries, or the operation has its result here. A start that
+            // finds no room waits first, and the next turn starts it.
+            if !self.start(id, resource, kind) {
+                self.wait_first(resource, kind, id);
+            }
         } else {
             self.enqueue(resource, kind, id);
         }
@@ -1375,7 +1454,7 @@ impl Driver {
             }
             (Kind::Recv | Kind::Selected, Some(Kept::Error(error))) => Some(error),
             (Kind::Accept, Some(Kept::Connection { fd, peer, peer_len })) => {
-                match self.resources.adopt(fd) {
+                match self.resources.adopt(fd, Medium::Tcp) {
                     Ok(stream) => slot.update(id, |held| {
                         if let Some(held) = held {
                             held.accepted = Some(stream);
@@ -1393,6 +1472,65 @@ impl Driver {
                 }
                 Some(0)
             }
+            (Kind::RecvFrom, Some(Kept::Datagram { buffer, received })) => {
+                let (result, copied) = deliver_copy(slot, id, &buffer, received);
+                self.copied = self.copied.saturating_add(copied as u64);
+                Some(result)
+            }
+            (Kind::RecvFrom, Some(Kept::Arrivals(mut arrivals))) => {
+                let first = arrivals.take_first();
+                directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
+                first.map(|(buffer, received)| {
+                    let (result, copied) = deliver_copy(slot, id, &buffer, received);
+                    self.copied = self.copied.saturating_add(copied as u64);
+                    result
+                })
+            }
+            (Kind::RecvSelectedFrom, Some(Kept::Datagram { buffer, received })) => {
+                Some(deliver(slot, id, buffer, received))
+            }
+            (Kind::RecvSelectedFrom, Some(Kept::Arrivals(mut arrivals))) => {
+                let first = arrivals.take_first();
+                directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
+                first.map(|(buffer, received)| deliver(slot, id, buffer, received))
+            }
+            (Kind::RecvBatch, Some(Kept::Datagram { buffer, received })) => {
+                let mut taken = Some((buffer, received));
+                slot.update(id, |held| {
+                    if let Some(Held {
+                        batch: Some(Batch::Receive(arrivals)),
+                        ..
+                    }) = held
+                        && let Some((buffer, received)) = taken.take()
+                    {
+                        taken = arrivals.add(buffer, received);
+                    }
+                });
+                directions.kept = taken.map(|(buffer, received)| Kept::Datagram { buffer, received });
+                Some(1)
+            }
+            (Kind::RecvBatch, Some(Kept::Arrivals(mut kept))) => {
+                let mut count = 0;
+                slot.update(id, |held| {
+                    if let Some(Held {
+                        batch: Some(Batch::Receive(arrivals)),
+                        ..
+                    }) = held
+                    {
+                        while arrivals.len() < arrivals.capacity() {
+                            let Some((buffer, received)) = kept.take_first() else {
+                                break;
+                            };
+                            if arrivals.add(buffer, received).is_none() {
+                                count += 1;
+                            }
+                        }
+                    }
+                });
+                directions.kept = udp::keep_arrivals(kept).map(Kept::Arrivals);
+                Some(count)
+            }
+            (Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch, Some(Kept::Error(error))) => Some(error),
             (Kind::Send | Kind::Vectored | Kind::Shutdown, kept) => {
                 directions.kept = kept;
                 match directions.sent {
@@ -1423,10 +1561,14 @@ impl Driver {
             self.complete_now(id, result);
             return true;
         }
-        if !self.room() {
+        if kind.batch() {
+            return self.start_batch(id, fd);
+        }
+        if !self.room(1) {
             return false;
         }
         let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
+        let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
         let entry = move |held: &mut Held| match kind {
             Kind::Recv => match held.loan.as_mut() {
                 Some(loan) => {
@@ -1464,16 +1606,91 @@ impl Driver {
                 None => Sqe::nop(),
             },
             Kind::Shutdown => Sqe::shutdown(fd, sys::SHUT_WR),
+            Kind::RecvFrom => match held.loan.as_mut() {
+                Some(loan) => {
+                    let (region, len) = (loan.as_mut_ptr(), loan.capacity());
+                    Sqe::recv_message(fd, held.message.receive(region, len), 0)
+                }
+                // A receive always has its loan.
+                None => Sqe::nop(),
+            },
+            Kind::RecvSelectedFrom => {
+                Sqe::recv_message_selected(fd, held.message.receive(ptr::null_mut(), slot_len), 0, group)
+            }
+            Kind::SendTo => match held.datagram.as_ref() {
+                Some(datagram) => Sqe::send_message(fd, held.message.send(datagram)),
+                // A datagram send always has its datagram.
+                None => Sqe::nop(),
+            },
+            // A batch submits in `start_batch`.
+            Kind::SendBatch | Kind::RecvBatch => Sqe::nop(),
             Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => {
                 Sqe::accept(fd, (&raw mut held.peer).cast(), &raw mut held.peer_len)
             }
         };
-        // SAFETY: the entry names the loan, the lease, or the peer address in the resources of
-        // `id`, which the home keeps until its terminal event, and the descriptor of `resource`,
-        // which stays open until its close, after each of its operations ends. The queue has room.
+        // SAFETY: the entry names the loan, the lease, the message, or the peer address in the
+        // resources of `id`, which the home keeps until its terminal event, and the descriptor of
+        // `resource`, which stays open until its close, after each of its operations ends. The
+        // queue has room.
         #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
         unsafe {
             self.push(id, entry);
+        }
+        true
+    }
+
+    /// Submits the batch `id` on the socket `fd`: one entry for each datagram, each linked to the
+    /// next, in one kernel entry. A batch receive waits only in its first entry. Gives `false`, and
+    /// changes nothing, when the queue has no room for each entry.
+    fn start_batch(&mut self, id: OpId, fd: std::os::fd::RawFd) -> bool {
+        let mut entries = 0;
+        self.hold(id, |held| {
+            entries = match &held.batch {
+                Some(Batch::Send(datagrams)) => datagrams.len(),
+                Some(Batch::Receive(arrivals)) => arrivals.capacity(),
+                None => 0,
+            };
+        });
+        if entries == 0 {
+            self.complete_now(id, 0);
+            return true;
+        }
+        if !self.room(u32::try_from(entries).unwrap_or(u32::MAX)) {
+            return false;
+        }
+        let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
+        let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
+        for index in 0..entries {
+            let last = index + 1 == entries;
+            let entry = move |held: &mut Held| {
+                let sqe = match held.batch.as_mut() {
+                    Some(Batch::Send(datagrams)) => datagrams
+                        .message(index)
+                        .map_or_else(Sqe::nop, |message| Sqe::send_message(fd, message)),
+                    Some(Batch::Receive(arrivals)) => {
+                        // The first receive waits for a datagram; the next ones take only the
+                        // datagrams that wait.
+                        let flags = if index == 0 {
+                            0
+                        } else {
+                            rsnetwork_udp::sys::MSG_DONTWAIT
+                        };
+                        arrivals.message(index, slot_len).map_or_else(Sqe::nop, |message| {
+                            Sqe::recv_message_selected(fd, message, flags, group)
+                        })
+                    }
+                    None => Sqe::nop(),
+                };
+                if last { sqe } else { sqe.linked() }
+            };
+            // SAFETY: each entry names a message of the batch in the resources of `id`, in the heap
+            // array of the batch, which the home keeps until the last completion, and the socket,
+            // which stays open until its close. The queue has room for each entry, so the links
+            // join only these entries.
+            #[expect(unsafe_code, reason = "the kernel uses the messages of the batch")]
+            unsafe {
+                self.push(id, entry);
+            }
         }
         true
     }
@@ -1508,25 +1725,31 @@ impl Driver {
                     if self.start(id, resource, kind) {
                         break;
                     }
-                    // No room in the queue: the operation waits first again, and the next turn
-                    // starts it.
-                    let first = self.direction(resource, kind).and_then(|direction| direction.first);
-                    self.link(id, first);
-                    if let Some(direction) = self.direction(resource, kind) {
-                        direction.current = None;
-                        direction.first = Some(id);
-                        if direction.last.is_none() {
-                            direction.last = Some(id);
-                        }
-                    }
-                    if let Some(owned) = self.resources.get(resource) {
-                        owned.directions.pending = true;
-                    }
-                    self.pending.push(resource);
+                    self.wait_first(resource, kind, id);
                     return;
                 }
             }
             self.close_if_idle(resource);
+        }
+    }
+
+    /// Makes `id` wait first again in its direction of `resource`, because the queue had no room
+    /// for it. The next turn starts it.
+    fn wait_first(&mut self, resource: Resource, kind: Kind, id: OpId) {
+        let first = self.direction(resource, kind).and_then(|direction| direction.first);
+        self.link(id, first);
+        if let Some(direction) = self.direction(resource, kind) {
+            direction.current = None;
+            direction.first = Some(id);
+            if direction.last.is_none() {
+                direction.last = Some(id);
+            }
+        }
+        if let Some(owned) = self.resources.get(resource)
+            && !owned.directions.pending
+        {
+            owned.directions.pending = true;
+            self.pending.push(resource);
         }
     }
 
@@ -1543,7 +1766,7 @@ impl Driver {
             kind: Kind::Close,
         };
         let id = self
-            .open(tag, value, |_| Held::default())
+            .open(tag, 0, value, |_| Held::default())
             .map_err(|(reason, value)| Refused { reason, value })?;
         if let Some(owned) = self.resources.get(resource) {
             owned.directions.closing = Some(id);
@@ -1607,6 +1830,37 @@ impl Driver {
     }
 }
 
+/// Gives the kept datagram of `buffer` with `received` to the receive `id`, copied into its
+/// buffer: one copy, which [`Driver::copied`] counts. Gives the result of the receive and the
+/// bytes that it copied.
+fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backing, received: Received) -> (i32, usize) {
+    let mut copied = 0;
+    slot.update(id, |held| {
+        if let Some(held) = held
+            && let Some(loan) = held.loan.as_mut()
+        {
+            let (facts, count) = udp::copy_kept(buffer, received, loan);
+            held.received = Some(facts);
+            copied = count;
+        }
+    });
+    // The kept bytes came from one kernel result, so their count fits an `i32`.
+    (i32::try_from(copied).unwrap_or(i32::MAX), copied)
+}
+
+/// Gives the kept datagram of `buffer` with `received` to the selecting receive `id`, with no
+/// copy. Gives the result of the receive.
+fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, received: Received) -> i32 {
+    let len = i32::try_from(received.len).unwrap_or(i32::MAX);
+    slot.update(id, |held| {
+        if let Some(held) = held {
+            held.loan = Some(WriteLoan::new(buffer));
+            held.received = Some(received);
+        }
+    });
+    len
+}
+
 /// The negative errno of `error`, as a kernel result gives it.
 fn errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or(EINVAL).saturating_neg()
@@ -1617,15 +1871,15 @@ const INT_LEN: u32 = 4;
 
 const _: () = assert!(size_of::<c_int>() == 4);
 
-/// A new nonblocking TCP socket of the family of `address`.
+/// A new nonblocking socket of `kind`, `SOCK_STREAM` or `SOCK_DGRAM`, of the family of `address`.
 #[expect(unsafe_code, reason = "the C library gives a new descriptor")]
-fn new_socket(address: SocketAddr) -> io::Result<OwnedFd> {
+fn new_socket(address: SocketAddr, kind: c_int) -> io::Result<OwnedFd> {
     let family = if address.is_ipv4() {
         rsnetwork_udp::AF_INET
     } else {
         AF_INET6
     };
-    let kind = sys::SOCK_STREAM | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC;
+    let kind = kind | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC;
     // SAFETY: the call takes no pointer.
     let fd = unsafe { sys::socket(c_int::from(family), kind, 0) };
     if fd < 0 {
@@ -1674,15 +1928,16 @@ pub(super) fn local_address(socket: impl std::os::fd::AsFd) -> Option<(SockAddrS
     (result == 0).then_some((address, len))
 }
 
-/// Binds `socket` to the address of `len` bytes in `address`, and listens on it, with system calls.
+/// Binds `socket` to the address of `len` bytes in `address`, and with `listen` listens on it,
+/// with system calls.
 #[expect(unsafe_code, reason = "the call reads the address, which lives during the call")]
-fn bind_and_listen(socket: BorrowedFd<'_>, address: &SockAddrStorage, len: u32) -> io::Result<()> {
+fn bind_now(socket: BorrowedFd<'_>, address: &SockAddrStorage, len: u32, listen: bool) -> io::Result<()> {
     // SAFETY: `address` holds an address of `len` bytes during the call.
     if unsafe { sys::bind(socket.as_raw_fd(), ptr::from_ref(address).cast(), len) } < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the call takes no pointer.
-    if unsafe { sys::listen(socket.as_raw_fd(), BACKLOG) } < 0 {
+    if listen && unsafe { sys::listen(socket.as_raw_fd(), BACKLOG) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

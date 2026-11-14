@@ -3,7 +3,9 @@
 `rsnetwork-udp` sends and receives UDP datagrams on a socket that you own, with no wait, and with
 no scheduler, driver, or runtime. It works on a socket of Tokio, of another runtime, or of your own
 event loop. Each call is one system call. It is the datagram layer that the rsasync runtime and
-the networking family share, and it takes the place of quinn-udp.
+the networking family share, and it takes the place of quinn-udp. rsasync gives this crate as
+`rsasync::datagram`, so a user of rsasync adds no dependency. The io_uring driver of rsasync gives
+the same datagrams, metadata, and control messages as operations: see [UDP on the driver](udp.md).
 
 The crate is in development, and the calls on this page are not in a published release yet. It
 supports Linux on x86_64 and aarch64, with glibc or musl, and macOS on aarch64. Windows comes

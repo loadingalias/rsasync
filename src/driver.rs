@@ -49,6 +49,7 @@ mod sys;
 mod tcp;
 #[cfg(all(test, not(loom)))]
 mod tests;
+mod udp;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -73,6 +74,7 @@ use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
 pub use pipe::{PipeReader, PipeWriter};
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
+pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
@@ -243,6 +245,15 @@ pub(crate) struct Held {
     pub(crate) closed: Option<Closed>,
     /// The regions of a vectored send, and the message header that names them.
     pub(crate) regions: Option<Regions>,
+    /// The datagram of a send.
+    pub(crate) datagram: Option<Datagram>,
+    /// The message of a datagram send or receive, which the kernel reads or writes.
+    pub(crate) message: udp::Message,
+    /// The facts of a received datagram.
+    pub(crate) received: Option<rsnetwork_udp::Received>,
+    /// The datagrams of a batch, and its progress while its completions come.
+    pub(crate) batch: Option<udp::Batch>,
+    pub(crate) progress: udp::Progress,
     /// The next operation that waits in the same direction, in start order.
     pub(crate) next: Option<OpId>,
 }
@@ -270,6 +281,17 @@ pub(crate) enum Kind {
     Bind,
     /// An accept: the result is a new descriptor.
     Accept,
+    /// A receive of one datagram into the loan of the caller's buffer.
+    RecvFrom,
+    /// A receive of one datagram into a buffer that the kernel selects.
+    RecvSelectedFrom,
+    /// A receive of several datagrams, one linked receive for each, into buffers that the kernel
+    /// selects.
+    RecvBatch,
+    /// A send of one datagram, or of a batch of segments.
+    SendTo,
+    /// A send of several datagrams, one linked send for each.
+    SendBatch,
     /// A close, which ends after each operation of its resource ends.
     Close,
 }
@@ -278,7 +300,15 @@ impl Kind {
     /// Whether the operation uses the write direction of a stream. A drop of its future does not
     /// cancel it.
     pub(crate) const fn writes(self) -> bool {
-        matches!(self, Self::Send | Self::Vectored | Self::Shutdown)
+        matches!(
+            self,
+            Self::Send | Self::Vectored | Self::Shutdown | Self::SendTo | Self::SendBatch
+        )
+    }
+
+    /// Whether the operation is a batch of linked entries, one completion for each, in order.
+    pub(crate) const fn batch(self) -> bool {
+        matches!(self, Self::SendBatch | Self::RecvBatch)
     }
 }
 
@@ -462,6 +492,8 @@ enum Medium {
     /// A pipe end: its operations are reads and writes, because a receive and a send need a
     /// socket. It has no half-close.
     Pipe,
+    /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
+    Udp,
 }
 
 /// The descriptors that the driver owns, in a slice that it allocates once.
@@ -469,12 +501,13 @@ enum Medium {
 struct Resources(Box<[Owned]>);
 
 impl Resources {
-    /// Takes `fd`. Refuses with `fd` when each slot is in use.
-    fn adopt(&mut self, fd: OwnedFd) -> Result<Resource, OwnedFd> {
+    /// Takes `fd`, a descriptor of `medium`. Refuses with `fd` when each slot is in use.
+    fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
         let Some((index, slot)) = (0..).zip(self.0.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
             return Err(fd);
         };
         slot.fd = Some(fd);
+        slot.medium = medium;
         Ok(Resource {
             index,
             generation: slot.generation,
@@ -502,7 +535,6 @@ impl Resources {
         let slot = self.get(resource)?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
-        slot.medium = Medium::Tcp;
         slot.fd.take()
     }
 }
@@ -920,9 +952,10 @@ impl Driver {
         Ok(Teardown { cancelled })
     }
 
-    /// Takes `fd`, so that teardown closes it. Refuses with `fd` when each resource slot is in use.
-    pub(crate) fn adopt(&mut self, fd: OwnedFd) -> Result<Resource, OwnedFd> {
-        self.resources.adopt(fd)
+    /// Takes `fd`, a descriptor of `medium`, so that teardown closes it. Refuses with `fd` when
+    /// each resource slot is in use.
+    fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
+        self.resources.adopt(fd, medium)
     }
 
     /// The descriptor of `resource`, while the driver owns it.
@@ -956,40 +989,57 @@ impl Driver {
         {
             return refuse(Reason::Resource, value);
         }
-        if !self.room() {
-            return refuse(Reason::Queue, value);
-        }
         let tag = Tag {
             resource,
             kind: Kind::Other,
         };
         let id = self
-            .open(tag, value, held)
+            .open(tag, 1, value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         // SAFETY: the caller's contract, and the queue has room.
         unsafe { self.push(id, entry) };
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
     }
 
-    /// Whether the submission queue has room for one entry, after one submit if it is full.
-    fn room(&mut self) -> bool {
-        self.ring.has_room() || (self.ring.submit(0).is_ok() && self.ring.has_room())
+    /// Whether the submission queue has room for `entries` entries, after one submit if it does
+    /// not.
+    fn room(&mut self, entries: u32) -> bool {
+        self.ring.room() >= entries || (self.ring.submit(0).is_ok() && self.ring.room() >= entries)
     }
 
     /// Records a new operation at the home, before its submission, with the resources that
-    /// `held` makes from `value`. Refuses with `value` when each operation slot is in use.
-    pub(crate) fn open<P>(&mut self, tag: Tag, value: P, held: impl FnOnce(P) -> Held) -> Result<OpId, (Reason, P)> {
-        let id = match self.table.begin(tag, Shape::Single) {
+    /// `held` makes from `value`, and with room in the queue for its `entries` submission entries.
+    /// Refuses with `value` when each operation slot is in use or the queue has no room.
+    pub(crate) fn open<P>(
+        &mut self,
+        tag: Tag,
+        entries: u32,
+        value: P,
+        held: impl FnOnce(P) -> Held,
+    ) -> Result<OpId, (Reason, P)> {
+        // The table counts the completions of a batch until its last one.
+        let shape = if tag.kind.batch() {
+            Shape::Multishot
+        } else {
+            Shape::Single
+        };
+        let id = match self.table.begin(tag, shape) {
             Ok(id) => id,
             Err(_) => {
                 // Futures that ended give their slots back at the next take.
                 self.take_requests();
-                match self.table.begin(tag, Shape::Single) {
+                match self.table.begin(tag, shape) {
                     Ok(id) => id,
                     Err(_) => return Err((Reason::Operations, value)),
                 }
             }
         };
+        // The check of room comes after the take of requests, because their cancels and the
+        // operations that they let start push entries.
+        if !self.room(entries) {
+            self.table.withdraw(id);
+            return Err((Reason::Queue, value));
+        }
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             self.table.withdraw(id);
             return Err((Reason::Operations, value));
@@ -1124,7 +1174,25 @@ impl Driver {
         let (resources, selected, waking) = (&mut self.resources, &mut self.selected, &mut self.waking);
         for cqe in self.ring.completions().take(limit as usize) {
             completed += 1;
-            let outcome = table.complete(cqe.user_data, cqe.event());
+            let mut event = cqe.event();
+            // A completion of a batch is one of its entries: its last one ends the batch, and the
+            // result of the batch is its count.
+            if let Some(id) = OpId::from_user_data(cqe.user_data)
+                && table.resources(id).is_some_and(|tag| tag.kind.batch())
+                && table.runs(id)
+                && let Some(slot) = shared.entries.get(id.index() as usize)
+            {
+                let buffer = cqe
+                    .buffer()
+                    .zip(selected.as_mut())
+                    .and_then(|(bid, selected)| selected.take(bid));
+                slot.update(id, |held| {
+                    if let Some(held) = held {
+                        (event.more, event.result) = udp::batch_completion(held, cqe.res, buffer);
+                    }
+                });
+            }
+            let outcome = table.complete(cqe.user_data, event);
             let (id, abandoned, tag) = match (outcome, OpId::from_user_data(cqe.user_data)) {
                 // The poll of the interrupt descriptor ended: the next wait polls it again.
                 (Outcome::Control(WAKE), _) => {
@@ -1155,11 +1223,11 @@ impl Driver {
             });
             if abandoned {
                 if let Some(held) = slot.reclaim(id) {
-                    tcp::abandon(resources, tag, cqe.res, held);
+                    tcp::abandon(resources, tag, event.result, held);
                 }
                 tcp::after(resources, pending, tag);
             } else {
-                slot.publish(id, cqe.res);
+                slot.publish(id, event.result);
             }
         }
         completed
@@ -1182,7 +1250,38 @@ fn finish(
 ) {
     let count = usize::try_from(cqe.res);
     match tag.kind {
-        Kind::Other | Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::Close => {}
+        Kind::Other
+        | Kind::Send
+        | Kind::Vectored
+        | Kind::Shutdown
+        | Kind::Close
+        | Kind::SendTo
+        | Kind::SendBatch
+        | Kind::RecvBatch => {}
+        Kind::RecvFrom => {
+            if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
+                // SAFETY: the receive named the capacity of the loan in its message, and the kernel
+                // wrote `count` bytes at its start, at most that capacity.
+                unsafe { loan.set_filled(count) };
+                held.received = held.message.received(count).ok();
+            }
+        }
+        Kind::RecvSelectedFrom => {
+            if let (Ok(count), Some(buffer)) = (
+                count,
+                cqe.buffer()
+                    .zip(selected)
+                    .and_then(|(bid, selected)| selected.take(bid)),
+            ) {
+                let mut loan = WriteLoan::new(buffer);
+                // SAFETY: a slot of the pool has no initialized bytes, so the loan starts at the
+                // start of the buffer. The kernel wrote the bytes that the result counts there, at
+                // most the slot capacity that the message names.
+                unsafe { loan.set_filled(count) };
+                held.loan = Some(loan);
+                held.received = held.message.received(count).ok();
+            }
+        }
         // A failed connect or bind closes its socket. The abandoned rule closes the socket of an
         // operation with no consumer.
         Kind::Connect | Kind::Bind if abandoned => {}
@@ -1230,7 +1329,7 @@ fn finish(
                 if abandoned {
                     held.connection = Some(fd);
                 } else {
-                    match resources.adopt(fd) {
+                    match resources.adopt(fd, Medium::Tcp) {
                         Ok(stream) => held.accepted = Some(stream),
                         // With no free resource slot, the listener keeps the connection for the
                         // next accept, and this one gives `OutOfMemory`.

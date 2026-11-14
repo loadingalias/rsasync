@@ -16,8 +16,13 @@ use std::thread::{self, Thread};
 use std::time::Instant;
 use std::vec::Vec;
 
+use core::net::IpAddr;
+
+use rsnetwork_udp::{Ecn, Received};
+
 use super::{
-    Completion, Config, Driver, ECANCELED, Held, Reason, Refused, TcpListener, TcpOptions, TcpStream, WriteFailed, sys,
+    Arrivals, Completion, Config, Datagram, Datagrams, Driver, ECANCELED, Held, Medium, Reason, Refused, TcpListener,
+    TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, sys,
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
@@ -121,7 +126,9 @@ pub(super) fn driver(config: Config) -> Driver {
 /// Submits a read of the pipe `fd`, which the driver then owns, into the loan of `held`.
 #[expect(unsafe_code, reason = "the read names the buffer of its resources")]
 fn read(driver: &mut Driver, fd: OwnedFd, mut held: Held) -> Completion {
-    let resource = driver.adopt(fd).expect("the test driver has a free resource slot");
+    let resource = driver
+        .adopt(fd, Medium::Pipe)
+        .expect("the test driver has a free resource slot");
     let fd = driver.fd(resource).expect("the driver owns the pipe");
     let loan = held.loan.as_mut().expect("a read has a loan");
     let len = u32::try_from(loan.capacity()).expect("a test buffer is small");
@@ -372,6 +379,37 @@ fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     assert_eq!(taken(&log), ["released"]);
     assert_eq!(budget.available(), 100);
     drop(running);
+}
+
+/// A submission that finds the table full takes the requests of ended futures first, and the
+/// cancel of one of them takes the last free entry of the queue. The submission then still gets an
+/// entry, so it goes to the kernel and completes.
+#[test]
+#[expect(unsafe_code, reason = "a no-op names no memory")]
+fn a_submission_completes_after_the_requests_that_it_takes_fill_the_queue() {
+    let (log, budget) = (Log::default(), budget());
+    let mut driver = driver(Config::new().operations(9).submissions(8));
+    // SAFETY: a no-op names no memory.
+    let nop =
+        |driver: &mut Driver| unsafe { driver.submit((), None, |()| Held::default(), |_| Sqe::nop(), false) }.unwrap();
+    let mut done = nop(&mut driver);
+    let (reader, _writer) = pipe();
+    let waiting = read(&mut driver, reader, held(&log, &budget));
+    driver.turn().unwrap();
+    let ready = Pin::new(&mut done).poll(&mut Context::from_waker(Waker::noop()));
+    assert!(
+        matches!(ready, Poll::Ready(Ok((0, _)))),
+        "the first no-op did not complete"
+    );
+    // Seven entries wait in the queue of eight, and nine operations fill the table.
+    let queued: Vec<Completion> = (0..7).map(|_| nop(&mut driver)).collect();
+    // The ended no-op gives its slot back, and the cancel of the read takes the last entry.
+    drop(done);
+    drop(waiting);
+    let last = nop(&mut driver);
+    for future in queued.into_iter().chain([last]) {
+        assert!(matches!(drive(&mut driver, future), Ok((0, _))));
+    }
 }
 
 /// A future polled after it gave `Ready` panics, as the futures of the standard library do. It
@@ -1266,5 +1304,321 @@ fn bind_and_listen_run_on_the_ring_exactly_where_the_probe_finds_them() {
         let accept = driver.accept(&mut listener).unwrap();
         let (_, peer) = drive(&mut driver, accept).unwrap().unwrap();
         assert_eq!(peer, client.local_addr().unwrap());
+    }
+}
+
+/// A UDP socket of the driver at `address`, with `options`.
+fn udp(driver: &mut Driver, address: &str, options: UdpOptions) -> UdpSocket {
+    let address = address.parse().expect("the test gives a socket address");
+    let bind = driver.bind_udp(address, options).expect("the test driver has room");
+    drive(driver, bind)
+        .expect("the driver runs")
+        .expect("the test host binds loopback")
+}
+
+/// The options of a receiver that reports the metadata of each datagram.
+const METADATA: UdpOptions = UdpOptions {
+    only_v6: None,
+    send_buffer: None,
+    receive_buffer: None,
+    reuse_port: None,
+    metadata: true,
+    dont_fragment: false,
+    gro: false,
+};
+
+/// Receives one datagram on `socket` into a buffer of `capacity` bytes.
+fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Received, Vec<u8>) {
+    let receive = driver
+        .recv_from(socket, Backing::from(Vec::with_capacity(capacity)))
+        .expect("the test driver has room");
+    let (received, buffer) = drive(driver, receive).expect("the driver runs");
+    (received.expect("the receive works"), buffer.bytes().to_vec())
+}
+
+/// One send with a segment size sends one datagram for each segment, all of them, and its report
+/// counts them. A receiver with no GRO gets each segment as a datagram; a receiver with GRO gets
+/// them in one receive, with their segment size. On IPv4 and IPv6.
+#[test]
+fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size() {
+    let mut driver = driver(Config::new());
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let mut sender = udp(&mut driver, address, UdpOptions::default());
+        let mut plain = udp(&mut driver, address, UdpOptions::default());
+        let gro = UdpOptions {
+            gro: true,
+            ..UdpOptions::default()
+        };
+        let mut coalescing = udp(&mut driver, address, gro);
+        for receiver in [plain.local_addr(), coalescing.local_addr()] {
+            let datagram = Datagram {
+                segment_size: Some(1000),
+                ..Datagram::new(Lease::from(numbered(0, 4000)), receiver)
+            };
+            let send = driver.send_to(&mut sender, datagram).unwrap();
+            assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 4);
+        }
+        for segment in 0..4 {
+            let (received, bytes) = receive(&mut driver, &mut plain, 2000);
+            assert_eq!((received.len, received.metadata.segment_size), (1000, None));
+            assert!(
+                bytes == numbered(segment * 1000, 1000),
+                "the segments came out of order"
+            );
+        }
+        let (received, bytes) = receive(&mut driver, &mut coalescing, 8000);
+        assert_eq!((received.len, received.metadata.segment_size), (4000, Some(1000)));
+        assert!(bytes == numbered(0, 4000), "the coalesced bytes differ");
+    }
+}
+
+/// The receiver reports the local destination address and the ECN codepoint that the sender set,
+/// and the source address that the sender chose. On IPv4, with a source that is not the address
+/// of the route, and on IPv6.
+#[test]
+fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports() {
+    let mut driver = driver(Config::new());
+    for (any, receiver, source) in [("0.0.0.0:0", "127.0.0.1:0", "127.0.0.2"), ("[::]:0", "[::1]:0", "::1")] {
+        let mut sender = udp(&mut driver, any, UdpOptions::default());
+        let mut receiver = udp(&mut driver, receiver, METADATA);
+        let source: IpAddr = source.parse().unwrap();
+        let datagram = Datagram {
+            ecn: Some(Ecn::Ect1),
+            source: Some(source),
+            ..Datagram::new(Lease::from(b"metadata".to_vec()), receiver.local_addr())
+        };
+        let send = driver.send_to(&mut sender, datagram).unwrap();
+        assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 1);
+        let (received, bytes) = receive(&mut driver, &mut receiver, 64);
+        assert_eq!(bytes, b"metadata");
+        assert_eq!(received.source.ip(), source);
+        assert_eq!(received.metadata.ecn, Some(Ecn::Ect1));
+        assert_eq!(received.metadata.destination, Some(receiver.local_addr().ip()));
+    }
+}
+
+/// A half-close of a UDP socket refuses before any submission, and the socket goes on: a datagram
+/// goes and arrives after it.
+#[test]
+fn a_half_close_of_a_udp_socket_refuses_and_changes_nothing() {
+    let mut driver = driver(Config::new());
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let refused = driver.shutdown_write(&mut sender).unwrap_err();
+    assert_eq!(refused.reason(), Reason::Unsupported);
+    let send = driver
+        .send_to(
+            &mut sender,
+            Datagram::new(Lease::from(numbered(0, 100)), receiver.local_addr()),
+        )
+        .unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 1);
+    let (received, bytes) = receive(&mut driver, &mut receiver, 200);
+    assert_eq!((received.len, received.source), (100, sender.local_addr()));
+    assert!(bytes == numbered(0, 100), "the receive gave other bytes");
+}
+
+/// A datagram larger than its buffer gives the truncation outcome, with the bytes that fit.
+#[test]
+fn an_oversized_datagram_gives_the_truncation_outcome() {
+    let mut driver = driver(Config::new());
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let send = driver
+        .send_to(
+            &mut sender,
+            Datagram::new(Lease::from(numbered(0, 2000)), receiver.local_addr()),
+        )
+        .unwrap();
+    drive(&mut driver, send).unwrap().0.unwrap();
+    let (received, bytes) = receive(&mut driver, &mut receiver, 1000);
+    assert!(received.truncated, "the receive did not report the truncation");
+    assert!(bytes == numbered(0, 1000), "the receive gave other bytes");
+}
+
+/// A receive whose future drops after its datagram came leaves the datagram, its metadata, and its
+/// truncation result to the next receive, which gives them before it submits, with one counted
+/// copy. A close then releases a datagram that no receive took.
+#[test]
+fn a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive() {
+    let mut driver = driver(Config::new());
+    let mut sender = udp(&mut driver, "[::1]:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "[::1]:0", METADATA);
+    let to = receiver.local_addr();
+    // The datagram waits in the socket, so the receive takes it in its first kernel entry.
+    let datagram = Datagram {
+        ecn: Some(Ecn::Ect0),
+        ..Datagram::new(Lease::from(numbered(0, 150)), to)
+    };
+    let send = driver.send_to(&mut sender, datagram).unwrap();
+    drive(&mut driver, send).unwrap().0.unwrap();
+    let receive = driver
+        .recv_from(&mut receiver, Backing::from(Vec::with_capacity(100)))
+        .unwrap();
+    assert_eq!(posted(&mut driver, 1)[0].res, 100);
+    drop(receive);
+    driver.turn().unwrap();
+
+    let next = driver
+        .recv_from(&mut receiver, Backing::from(Vec::with_capacity(200)))
+        .unwrap();
+    assert_eq!(driver.ring.unsubmitted(), 0, "the receive submitted");
+    let (received, buffer) = drive(&mut driver, next).unwrap();
+    let received = received.unwrap();
+    assert!(buffer.bytes() == numbered(0, 100), "the kept bytes differ");
+    assert_eq!(
+        (received.len, received.truncated, received.source, received.metadata.ecn),
+        (100, true, sender.local_addr(), Some(Ecn::Ect0))
+    );
+    assert_eq!(driver.copied(), 100);
+
+    // Another datagram stays with the socket, and the close releases it.
+    let send = driver
+        .send_to(&mut sender, Datagram::new(Lease::from(b"kept".to_vec()), to))
+        .unwrap();
+    drive(&mut driver, send).unwrap().0.unwrap();
+    let receive = driver
+        .recv_from(&mut receiver, Backing::from(Vec::with_capacity(100)))
+        .unwrap();
+    assert_eq!(posted(&mut driver, 1)[0].res, 4);
+    drop(receive);
+    driver.turn().unwrap();
+    let close = driver.close_udp(receiver).unwrap();
+    drive(&mut driver, close).unwrap();
+}
+
+/// A batch of datagrams of different sizes goes in one kernel entry, one linked send for each, and
+/// arrives as those datagrams, each with its own size. Its report counts them.
+#[test]
+fn a_batch_of_datagrams_arrives_as_each_datagram_after_one_kernel_entry() {
+    let mut driver = driver(Config::new());
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let sizes = [100, 2000, 300];
+    let mut batch = Datagrams::with_capacity(sizes.len());
+    let mut at = 0;
+    for size in sizes {
+        batch.push(Datagram::new(Lease::from(numbered(at, size)), receiver.local_addr()));
+        at += size;
+    }
+    let mut send = driver.send_batch(&mut sender, batch).unwrap();
+    assert_eq!(
+        driver.ring.unsubmitted(),
+        3,
+        "the batch did not push one entry for each datagram"
+    );
+    driver.turn().unwrap();
+    let Poll::Ready(sent) = Pin::new(&mut send).poll(&mut Context::from_waker(Waker::noop())) else {
+        panic!("the batch needs more than one kernel entry");
+    };
+    assert_eq!(sent.unwrap().0.unwrap(), 3);
+    let mut at = 0;
+    for size in sizes {
+        let (received, bytes) = receive(&mut driver, &mut receiver, 4000);
+        assert_eq!(received.len, size);
+        assert!(bytes == numbered(at, size), "a datagram arrived with other bytes");
+        at += size;
+    }
+}
+
+/// A datagram of a batch that the kernel refuses ends the batch: the report counts the datagrams
+/// before it, and the datagrams after it do not go, so no rest becomes a new datagram. The
+/// receiver gets exactly the counted datagrams.
+#[test]
+fn a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it() {
+    let mut driver = driver(Config::new());
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut batch = Datagrams::with_capacity(3);
+    // A UDP datagram over IPv4 holds at most 65507 bytes, so the second one is refused.
+    for (start, size) in [(0, 100), (100, 70_000), (70_100, 300)] {
+        batch.push(Datagram::new(Lease::from(numbered(start, size)), receiver.local_addr()));
+    }
+    let send = driver.send_batch(&mut sender, batch).unwrap();
+    let (sent, mut rest) = drive(&mut driver, send).unwrap();
+    assert_eq!(sent.unwrap(), 1);
+    rest.advance(1);
+    assert_eq!(rest.len(), 2);
+
+    let (received, bytes) = receive(&mut driver, &mut receiver, 4000);
+    assert!(
+        received.len == 100 && bytes == numbered(0, 100),
+        "the first datagram differs"
+    );
+    let receive = driver
+        .recv_from(&mut receiver, Backing::from(Vec::with_capacity(4000)))
+        .unwrap();
+    driver.turn().unwrap();
+    receive.cancel();
+    let (more, _) = drive(&mut driver, receive).unwrap();
+    assert_eq!(
+        more.unwrap_err().raw_os_error(),
+        Some(ECANCELED),
+        "another datagram arrived"
+    );
+}
+
+/// A batch with more datagrams than the submission queue has entries can never start, so it
+/// refuses with `Reason::Queue` and gives its datagrams back. The socket then sends a datagram.
+#[test]
+fn a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back() {
+    let mut driver = driver(Config::new().submissions(8));
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut batch = Datagrams::with_capacity(9);
+    for start in 0..9 {
+        batch.push(Datagram::new(
+            Lease::from(numbered(start * 10, 10)),
+            receiver.local_addr(),
+        ));
+    }
+    let refused = driver.send_batch(&mut sender, batch).unwrap_err();
+    assert_eq!(refused.reason(), Reason::Queue);
+    assert_eq!(refused.into_inner().len(), 9);
+    let send = driver
+        .send_to(
+            &mut sender,
+            Datagram::new(Lease::from(numbered(0, 100)), receiver.local_addr()),
+        )
+        .unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 1);
+    let (received, bytes) = receive(&mut driver, &mut receiver, 200);
+    assert!(
+        received.len == 100 && bytes == numbered(0, 100),
+        "the datagram after the refusal differs"
+    );
+}
+
+/// A batch receive takes the datagrams that wait in one kernel entry, each into a buffer that the
+/// kernel selects, with its own metadata. Its report counts them.
+#[test]
+fn a_batch_receive_returns_several_datagrams_each_with_its_metadata() {
+    let budget = Budget::new(NonZeroU64::new(4096).unwrap());
+    let mut driver = driver(Config::new());
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    driver
+        .provide(Pool::new(&budget, NonZeroU32::new(1).unwrap().saturating_add(3), slot).unwrap())
+        .unwrap();
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", METADATA);
+    let codepoints = [Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
+    for (index, ecn) in codepoints.into_iter().enumerate() {
+        let datagram = Datagram {
+            ecn: Some(ecn),
+            ..Datagram::new(Lease::from(numbered(index, 10)), receiver.local_addr())
+        };
+        let send = driver.send_to(&mut sender, datagram).unwrap();
+        drive(&mut driver, send).unwrap().0.unwrap();
+    }
+    let receive = driver.recv_batch(&mut receiver, Arrivals::with_capacity(4)).unwrap();
+    let (count, mut arrivals) = drive(&mut driver, receive).unwrap();
+    assert_eq!(count.unwrap(), 3);
+    for (index, (buffer, received)) in arrivals.drain().enumerate() {
+        assert!(
+            buffer.bytes() == numbered(index, 10),
+            "a datagram arrived with other bytes"
+        );
+        assert_eq!(received.metadata.ecn, Some(codepoints[index]));
+        assert_eq!(received.source, sender.local_addr());
     }
 }

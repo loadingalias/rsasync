@@ -31,22 +31,27 @@ Each command runs the tests of the whole workspace. Only the glibc run includes 
 Today, the tests check the repository tools, the shared types, and the io_uring ring of the Linux
 driver: ring creation, a message from one ring to another, the probes of kernel features, the
 operation table with the completions of the kernel, the driver-only surface (turns, waits, wakes,
-and teardown), and TCP on the driver. The TCP tests bind, listen, and accept; receive into an
-owned buffer and into a buffer that the kernel selects; send from a lease and from several regions;
-connect; half-close; set and read the socket options; and close. Bind and listen run on the ring
-where the kernel has them (Ubuntu 26.04), and as system calls elsewhere (Debian 12). They also
+and teardown), and TCP and UDP on the driver. The TCP tests bind, listen, and accept; receive into
+an owned buffer and into a buffer that the kernel selects; send from a lease and from several
+regions; connect; half-close; set and read the socket options; and close. Bind and listen run on the
+ring where the kernel has them (Ubuntu 26.04), and as system calls elsewhere (Debian 12). They also
 check that a dropped, forgotten, or cancelled receive, send, or accept loses no byte and no
-connection, on IPv4 and IPv6. The receive into an owned buffer and the send from a lease keep the
-addresses of their buffers and allocate nothing for each operation. The tests also check the
+connection, on IPv4 and IPv6. The UDP tests send and receive datagrams with their metadata,
+segmented sends and coalesced receives, batches in one kernel entry, and truncation. They also
+check that a dropped receive keeps its datagram.
+
+The receive into an owned buffer and the send from a lease keep the addresses of their buffers and
+allocate nothing for each operation. The tests also check the
 [blocking service](blocking-service.md): its bound of jobs, its refusals, its teardown, and the
-charges of its threads. Only the driver, the blocking service, and `rsnetwork-udp` make system
-calls: the io_uring ring and its waits in the kernel, its two event descriptors, the socket,
-option, bind, and listen calls of a TCP socket, the threads that the blocking service starts
-through `std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
-on musl, and that these calls work through the system calls of musl. It does not show that a
-runtime with a scheduler works on musl: the library has no scheduler yet. From the Linux driver
-stage on, each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C
-libraries. This page then names each operation that has that evidence.
+charges of its threads. Only the driver, the blocking service, and `rsnetwork-udp` make system calls: the io_uring
+ring and its waits in the kernel, its two event descriptors, the socket, option, and bind calls of a
+socket, the listen call of a TCP socket, the threads that the blocking service starts through `std`,
+and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs on musl,
+and that these calls work through the system calls of musl. It does not show that a runtime with a
+scheduler works on musl: the library has no scheduler yet.
+
+From the Linux driver stage on, each stage exit also runs the tests on x86_64 and aarch64 Linux
+hosts with both C libraries. This page then names each operation that has that evidence.
 
 ## macOS
 

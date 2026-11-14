@@ -93,3 +93,8 @@ mod uring;
 // compile error, not a module that hides the shared one.
 #[doc(inline)]
 pub use rstypes::{buffer, capacity, time};
+
+/// The datagram types of the UDP operations of the driver, and datagram I/O on any socket, with
+/// no driver: the `rsnetwork-udp` crate, so that its users add no dependency.
+#[cfg(feature = "std")]
+pub use rsnetwork_udp as datagram;

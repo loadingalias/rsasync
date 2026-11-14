@@ -93,6 +93,8 @@ const _: () = {
 
 /// `SOCK_STREAM` (`include/linux/net.h`): a byte stream, such as TCP.
 pub const SOCK_STREAM: c_int = 1;
+/// `SOCK_DGRAM` (`include/linux/net.h`): datagrams, such as UDP.
+pub const SOCK_DGRAM: c_int = 2;
 /// `SOCK_NONBLOCK` (`include/linux/net.h`, `O_NONBLOCK`): the new descriptor does not block.
 pub const SOCK_NONBLOCK: c_int = 0o4_000;
 /// `SOCK_CLOEXEC` (`include/linux/net.h`, `O_CLOEXEC`): the new descriptor closes at an exec.

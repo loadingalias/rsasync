@@ -150,7 +150,7 @@ pub fn send(socket: BorrowedFd<'_>, transmit: &Transmit<'_>) -> io::Result<usize
         }
         match io::Error::last_os_error() {
             error if error.raw_os_error() == Some(EINTR) => {}
-            error => return Err(refusal(error, transmit.segment_size.is_some())),
+            error => return Err(Refused::of_send(error, transmit.segment_size.is_some())),
         }
     }
 }
@@ -178,7 +178,7 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<Received> {
             let control_len = header.msg_controllen;
             #[cfg(target_os = "macos")]
             let control_len = usize::try_from(header.msg_controllen).unwrap_or(usize::MAX);
-            return finish(&name, header.msg_namelen, header.msg_flags, &control, control_len, len);
+            return Received::from_message(&name, header.msg_namelen, header.msg_flags, &control, control_len, len);
         }
         match io::Error::last_os_error() {
             error if error.raw_os_error() == Some(EINTR) => {}
@@ -234,38 +234,51 @@ fn header(
     }
 }
 
-/// The datagram that a receive wrote: `len` bytes, the peer address of `name_len` bytes in `name`,
-/// the received `flags`, and `control_len` bytes of control messages in `control`.
-fn finish(
-    name: &SockAddrStorage,
-    name_len: u32,
-    flags: c_int,
-    control: &Control,
-    control_len: usize,
-    len: usize,
-) -> io::Result<Received> {
-    let source = name
-        .to_socket_addr(name_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the datagram has no IP peer address"))?;
-    Ok(Received {
-        len,
-        source,
-        truncated: flags & MSG_TRUNC != 0,
-        metadata: control.decode(control_len),
-    })
+impl Received {
+    /// The datagram that a receive wrote, from its message header: `len` bytes, the peer address
+    /// of `name_len` bytes in `name`, the received `flags`, and `control_len` bytes of control
+    /// messages in `control`. A completion backend that makes its own receive gives the same
+    /// result as [`recv`].
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` when the peer address is not an IP address.
+    pub fn from_message(
+        name: &SockAddrStorage,
+        name_len: u32,
+        flags: c_int,
+        control: &Control,
+        control_len: usize,
+        len: usize,
+    ) -> io::Result<Self> {
+        let source = name
+            .to_socket_addr(name_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the datagram has no IP peer address"))?;
+        Ok(Self {
+            len,
+            source,
+            truncated: flags & MSG_TRUNC != 0,
+            metadata: control.decode(control_len),
+        })
+    }
 }
 
-/// A send error with its [`Refused`] payload when it has one.
-#[cfg_attr(
-    target_os = "macos",
-    expect(unused_variables, reason = "macOS refuses a segment size before the call")
-)]
-fn refusal(error: io::Error, segmented: bool) -> io::Error {
-    match error.raw_os_error() {
-        Some(EMSGSIZE) => io::Error::new(io::ErrorKind::InvalidInput, Refused::TooLarge),
-        #[cfg(target_os = "linux")]
-        Some(sys::EIO) if segmented => io::Error::new(io::ErrorKind::Unsupported, Refused::NoSegmentation),
-        _ => error,
+impl Refused {
+    /// The error of a send, with its [`Refused`] payload when it has one. `segmented` is whether
+    /// the send had a segment size. A completion backend that makes its own send gives the same
+    /// error as [`send`].
+    #[cfg_attr(
+        target_os = "macos",
+        expect(unused_variables, reason = "macOS refuses a segment size before the call")
+    )]
+    #[must_use]
+    pub fn of_send(error: io::Error, segmented: bool) -> io::Error {
+        match error.raw_os_error() {
+            Some(EMSGSIZE) => io::Error::new(io::ErrorKind::InvalidInput, Self::TooLarge),
+            #[cfg(target_os = "linux")]
+            Some(sys::EIO) if segmented => io::Error::new(io::ErrorKind::Unsupported, Self::NoSegmentation),
+            _ => error,
+        }
     }
 }
 
