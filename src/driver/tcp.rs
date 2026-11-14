@@ -14,7 +14,7 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
 use rsnetwork_udp::sys::{self, IoVec, MsgHdr};
-use rsnetwork_udp::{AF_INET6, Received, SockAddrStorage};
+use rsnetwork_udp::{AF_INET6, Received, SaFamily, SockAddrStorage};
 
 use super::udp::{self, Arrivals, Batch};
 use super::{
@@ -845,7 +845,7 @@ impl Driver {
             set_int(socket, sys::SOL_SOCKET, sys::SO_REUSEADDR, 1)?;
             options.apply(socket)
         };
-        let completion = self.bind_socket(address, true, setup)?;
+        let completion = self.bind_socket(SockAddrStorage::new(address), true, setup)?;
         Ok(Operation::new(completion, |result, mut held| {
             Some(count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
@@ -859,14 +859,14 @@ impl Driver {
         }))
     }
 
-    /// Makes a socket for `address`, sets it up with `setup`, binds it, and with `listen` listens
-    /// on it: a TCP listener, or a UDP socket with no `listen`. The ring runs the bind, and the
-    /// listen linked to it, where the kernel has those operations; elsewhere the driver makes the
-    /// system calls, and the operation ends at once. Its resources then hold the socket and its
-    /// local address.
+    /// Makes a socket of the family of the address `storage` of `len` bytes, sets it up with
+    /// `setup`, binds it, and with `listen` listens on it: a TCP or local listener, or a UDP socket
+    /// with no `listen`. The ring runs the bind, and the listen linked to it, where the kernel has
+    /// those operations; elsewhere the driver makes the system calls, and the operation ends at
+    /// once. Its resources then hold the socket and its local address.
     pub(super) fn bind_socket(
         &mut self,
-        address: SocketAddr,
+        (storage, len): (SockAddrStorage, u32),
         listen: bool,
         setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
     ) -> Result<Completion, Refused<()>> {
@@ -878,7 +878,6 @@ impl Driver {
             (true, false) => 1,
             (true, true) => 2,
         };
-        let (storage, len) = SockAddrStorage::new(address);
         let tag = Tag {
             resource: None,
             kind: Kind::Bind,
@@ -896,7 +895,7 @@ impl Driver {
             .map_err(|(reason, value)| Refused { reason, value })?;
         let completion = Completion::new(Arc::clone(&self.shared), id, true);
         let kind = if listen { sys::SOCK_STREAM } else { sys::SOCK_DGRAM };
-        match self.socket(id, address, kind, setup) {
+        match self.socket(id, storage.ss_family, kind, setup) {
             Err(error) => self.complete_now(id, errno(&error)),
             Ok((_, fd)) if ring => {
                 // SAFETY: the bind names the address in the resources of `id`, which the home keeps
@@ -961,7 +960,19 @@ impl Driver {
         address: SocketAddr,
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<TcpStream>>, Refused<()>> {
-        let (storage, len) = SockAddrStorage::new(address);
+        let completion = self.connect_socket(SockAddrStorage::new(address), |socket| options.apply(socket))?;
+        Ok(Operation::new(completion, |result, held| {
+            Some(count(result).and_then(|_| Ok(TcpStream::new(held.accepted.ok_or(io::ErrorKind::OutOfMemory)?))))
+        }))
+    }
+
+    /// Makes a stream socket of the family of the address `storage` of `len` bytes, sets it up with
+    /// `setup`, and connects it to that address on the ring. Its resources then hold the socket.
+    pub(super) fn connect_socket(
+        &mut self,
+        (storage, len): (SockAddrStorage, u32),
+        setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
+    ) -> Result<Completion, Refused<()>> {
         let tag = Tag {
             resource: None,
             kind: Kind::Connect,
@@ -978,7 +989,7 @@ impl Driver {
             .open(tag, 1, (), held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         let completion = Completion::new(Arc::clone(&self.shared), id, true);
-        match self.socket(id, address, sys::SOCK_STREAM, |socket| options.apply(socket)) {
+        match self.socket(id, storage.ss_family, sys::SOCK_STREAM, setup) {
             Err(error) => self.complete_now(id, errno(&error)),
             Ok((_, fd)) => {
                 // SAFETY: the connect names the address in the resources of `id`, which the home
@@ -995,9 +1006,7 @@ impl Driver {
                 }
             }
         }
-        Ok(Operation::new(completion, |result, held| {
-            Some(count(result).and_then(|_| Ok(TcpStream::new(held.accepted.ok_or(io::ErrorKind::OutOfMemory)?))))
-        }))
+        Ok(completion)
     }
 
     /// Sends the bytes of `regions`, in order, in one operation, with no copy that joins them. The
@@ -1037,19 +1046,19 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation, and [`Reason::Unsupported`] for a
-    /// resource that is not a TCP stream: a [`PipeWriter`](super::PipeWriter), which you close
-    /// instead, or a [`UdpSocket`](super::UdpSocket). A refusal changes nothing.
+    /// resource that is not a TCP or local stream: a [`PipeWriter`](super::PipeWriter), which you
+    /// close instead, or a [`UdpSocket`](super::UdpSocket). A refusal changes nothing.
     pub fn shutdown_write<'a, W: AsMut<WriteHalf>>(
         &mut self,
         writer: &'a mut W,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let resource = writer.as_mut().resource;
-        // Only a TCP stream has a half-close. The close of a pipe is the end of its stream, and a
-        // datagram socket has no stream.
+        // Only a stream socket has a half-close. The close of a pipe is the end of its stream, and
+        // a datagram socket has no stream.
         if self
             .resources
             .get(resource)
-            .is_some_and(|owned| owned.medium != Medium::Tcp)
+            .is_some_and(|owned| owned.medium != Medium::Stream)
         {
             return Err(Refused {
                 reason: Reason::Unsupported,
@@ -1086,23 +1095,23 @@ impl Driver {
         TcpOptions::read(fd)
     }
 
-    /// Makes the socket of the connect or the bind `id`: a new nonblocking socket of `kind` for
-    /// `address`, which `setup` sets up before the bind or the connect, as a resource that `id`
+    /// Makes the socket of the connect or the bind `id`: a new nonblocking socket of `family` and
+    /// `kind`, which `setup` sets up before the bind or the connect, as a resource that `id`
     /// holds. Gives the resource and its descriptor.
     fn socket(
         &mut self,
         id: OpId,
-        address: SocketAddr,
+        family: SaFamily,
         kind: c_int,
         setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
     ) -> io::Result<(Resource, std::os::fd::RawFd)> {
-        let socket = new_socket(address, kind)?;
+        let socket = new_socket(family, kind)?;
         setup(socket.as_fd())?;
         let fd = socket.as_raw_fd();
         let medium = if kind == sys::SOCK_DGRAM {
             Medium::Udp
         } else {
-            Medium::Tcp
+            Medium::Stream
         };
         let resource = self
             .adopt(socket, medium)
@@ -1133,15 +1142,7 @@ impl Driver {
         &mut self,
         listener: &'a mut TcpListener,
     ) -> Result<Operation<'a, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
-        let held = |()| Held {
-            payload: Payload::Socket {
-                peer: SockAddrStorage::default(),
-                peer_len: SockAddrStorage::LEN,
-                connection: None,
-            },
-            ..Held::default()
-        };
-        let completion = self.begin(listener.resource, Kind::Accept, (), held)?;
+        let completion = self.begin_accept(listener.resource)?;
         Ok(Operation::new(completion, |result, mut held| {
             Some(count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
@@ -1153,6 +1154,20 @@ impl Driver {
                 Ok((TcpStream::new(resource), peer))
             }))
         }))
+    }
+
+    /// Starts an accept on the listener `resource`. Its resources hold the peer address that the
+    /// kernel writes, and then the stream.
+    pub(super) fn begin_accept(&mut self, resource: Resource) -> Result<Completion, Refused<()>> {
+        let held = |()| Held {
+            payload: Payload::Socket {
+                peer: SockAddrStorage::default(),
+                peer_len: SockAddrStorage::LEN,
+                connection: None,
+            },
+            ..Held::default()
+        };
+        self.begin(resource, Kind::Accept, (), held)
     }
 
     /// Receives into the capacity of `buffer` after its initialized bytes. The future gives the
@@ -1509,7 +1524,7 @@ impl Driver {
             }
             (Kind::Recv | Kind::Selected, Some(Kept::Error(error))) => Some(error),
             (Kind::Accept, Some(Kept::Connection { fd, peer, peer_len })) => {
-                match self.resources.adopt(fd, Medium::Tcp) {
+                match self.resources.adopt(fd, Medium::Stream) {
                     Ok(stream) => slot.update(id, |held| {
                         if let Some(held) = held {
                             held.accepted = Some(stream);
@@ -1904,14 +1919,9 @@ const INT_LEN: u32 = 4;
 
 const _: () = assert!(size_of::<c_int>() == 4);
 
-/// A new nonblocking socket of `kind`, `SOCK_STREAM` or `SOCK_DGRAM`, of the family of `address`.
+/// A new nonblocking socket of `family` and `kind`, `SOCK_STREAM` or `SOCK_DGRAM`.
 #[expect(unsafe_code, reason = "the C library gives a new descriptor")]
-fn new_socket(address: SocketAddr, kind: c_int) -> io::Result<OwnedFd> {
-    let family = if address.is_ipv4() {
-        rsnetwork_udp::AF_INET
-    } else {
-        AF_INET6
-    };
+pub(super) fn new_socket(family: SaFamily, kind: c_int) -> io::Result<OwnedFd> {
     let kind = kind | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC;
     // SAFETY: the call takes no pointer.
     let fd = unsafe { sys::socket(c_int::from(family), kind, 0) };

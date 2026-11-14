@@ -1199,7 +1199,7 @@ impl Driver {
     }
 
     /// Starts an operation that ends at once with the error `errno`, with no submission.
-    fn fail_now(&mut self, errno: i32) -> Result<Completion, Refused<()>> {
+    pub(super) fn fail_now(&mut self, errno: i32) -> Result<Completion, Refused<()>> {
         let tag = Tag {
             resource: None,
             kind: Kind::File(Op::Plain),

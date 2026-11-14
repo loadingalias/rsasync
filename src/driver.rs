@@ -49,6 +49,7 @@
 
 mod completion;
 mod file;
+mod local;
 mod pipe;
 mod probe;
 mod signal;
@@ -81,6 +82,7 @@ use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
 pub use file::{
     Alignment, BlockingWork, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode,
 };
+pub use local::{LocalListener, LocalStream, Peer, Stale};
 pub use pipe::{PipeReader, PipeWriter};
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
@@ -579,9 +581,9 @@ struct Owned {
 /// What a resource of the driver is.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum Medium {
-    /// A TCP stream or listener: its operations are receives and sends.
+    /// A stream socket or listener, TCP or Unix-domain: its operations are receives and sends.
     #[default]
-    Tcp,
+    Stream,
     /// A pipe end: its operations are reads and writes, because a receive and a send need a
     /// socket. It has no half-close.
     Pipe,
@@ -1584,7 +1586,7 @@ fn finish(
                 if abandoned {
                     *connection = Some(fd);
                 } else {
-                    match resources.adopt(fd, Medium::Tcp) {
+                    match resources.adopt(fd, Medium::Stream) {
                         Ok(stream) => held.accepted = Some(stream),
                         // With no free resource slot, the listener keeps the connection for the
                         // next accept, and this one gives `OutOfMemory`.

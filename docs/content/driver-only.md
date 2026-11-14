@@ -6,8 +6,9 @@ it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development
 releases are on crates.io.
 
 The driver has TCP bind, connect, accept, receive, send, half-close, and close. It also has UDP
-datagrams with their metadata, the receive, send, and close of pipe ends, and files. The other
-operations come in later changes. [TCP on the driver](tcp.md), [UDP on the driver](udp.md),
+datagrams with their metadata, local streams at a path, the receive, send, and close of pipe ends,
+and files. The other operations come in later changes. [TCP on the driver](tcp.md),
+[UDP on the driver](udp.md), [Local streams on the driver](local-streams.md),
 [Pipes on the driver](pipes.md), and [Files on the driver](files.md) are the references for each
 operation and its results.
 

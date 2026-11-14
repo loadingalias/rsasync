@@ -532,7 +532,7 @@ impl Driver {
         address: SocketAddr,
         options: UdpOptions,
     ) -> Result<Operation<'static, io::Result<UdpSocket>>, Refused<()>> {
-        let completion = self.bind_socket(address, false, |socket| options.apply(socket))?;
+        let completion = self.bind_socket(SockAddrStorage::new(address), false, |socket| options.apply(socket))?;
         Ok(Operation::new(completion, |result, mut held| {
             Some(super::tcp::count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;

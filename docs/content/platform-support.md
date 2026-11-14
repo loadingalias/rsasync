@@ -42,7 +42,12 @@ check that a dropped receive keeps its datagram. The [file](files.md) tests, on 
 at an offset, also vectored and with direct I/O, read exactly, inspect and change the length,
 preallocate, punch holes, sync, rename, unlink, and sync a directory. The length change runs on the
 ring on Ubuntu 26.04, and on the blocking service on Debian 12. They also check that a dropped write
-changes the file and keeps its lease until its completion.
+changes the file and keeps its lease until its completion. The [local stream](local-streams.md)
+tests bind at a path with a socket file of mode 0600, refuse the path of a live listener, replace
+only a stale socket file, refuse a path that does not fit a socket address, and carry a numbered
+stream with no gap through a dropped accept, send, and receive. Run as root on Debian 12 on x86_64,
+they also check that a second OS user cannot connect, that an accepted stream reports the user,
+group, and process of its peer, and that a bind does not replace the socket file of another user.
 
 The receive into an owned buffer and the send from a lease keep the addresses of their buffers and
 allocate nothing for each operation. The tests also check the
