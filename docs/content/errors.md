@@ -100,6 +100,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Error::Refused(io::Error)` | The kernel or its policy refuses io_uring (`EPERM` or `ENOSYS`) | Allow io_uring for the process, for example in the seccomp profile of the container or in `kernel.io_uring_disabled` |
 | `Error::Config` | A limit of `Config` is 0 or above what the kernel takes | Give each limit a value in its range |
 | `Error::System(io::Error)` | Another failure of the system | Read the `io::Error` |
+| `Error::Unsupported(Features)` | The kernel has no feature of these, which `Config::require` required | Run on a kernel with each feature, or remove the requirement and use the route that `Driver::report` gives |
 | `Refused` with `Reason::Operations` | Each operation slot is in use | Turn the driver until an operation ends, then submit again |
 | `Refused` with `Reason::Queue` | The submission queue is full | Turn the driver, then submit again |
 | `Refused` with `Reason::Resources` | Each resource slot is in use | Close a resource, then try again |
@@ -108,7 +109,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::NotPipe`, `Reason::Direction` | The descriptor is not a pipe, or its direction is wrong | Give a pipe end with the direction of the adoption |
 | `Refused` with `Reason::Unsupported` | The operation does not apply to the resource | Use an operation of that resource |
 | `Refused` with `Reason::Alignment` | A direct-I/O buffer, length, or offset is not aligned | Align each one to the `Alignment` of the file |
-| `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`. `Driver::blocking_work` names such operations |
+| `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`. `Driver::report` gives the route of each call |
 | `Ended` | The driver ended before the operation gave its result | Keep the driver driven until each future takes its result |
 | `SignalError::Fault`, `Uncatchable`, `Invalid` | No stream can take the signal | Use another signal |
 | `SignalError::Full` | Each of the 64 streams of the process is in use | Close a stream, then try again |

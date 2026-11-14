@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::super::tests::{Log, drive, driver, note, numbered, posted, recorded, taken};
-use super::super::{Config, Driver, Reason};
+use super::super::{Call, Config, Driver, Reason, Route};
 use super::{Buffers, Cache, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 use crate::blocking::{self, Service};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool, WriteLoan};
@@ -195,14 +195,15 @@ impl Drop for Hold {
 }
 
 /// A length change runs on the ring from Linux 6.9 (`IORING_OP_FTRUNCATE`), and on the blocking
-/// service before it, and `blocking_work` names the path before the first operation. On the
+/// service before it, and the report names the route before the first operation. On the
 /// blocking service, a driver with no service and a full service refuse.
 #[test]
 fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before() {
     let scratch = Scratch::new("length");
     let mut driver = driver(Config::new());
     let on_service = kernel() < (6, 9);
-    assert_eq!(driver.blocking_work().set_len(), on_service);
+    let route = driver.report().route(Call::SetFileLen);
+    assert_eq!(route == Route::BlockingService, on_service);
     let file = open(&mut driver, &scratch.join("data"), writable());
     let budget = Budget::new(NonZeroU64::new(8 << 20).unwrap());
     let config = blocking::Config::new().threads(1).jobs(1).stack(256 << 10);

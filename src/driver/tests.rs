@@ -21,8 +21,8 @@ use core::net::IpAddr;
 use rsnetwork_udp::{Ecn, Received};
 
 use super::{
-    Arrivals, Completion, Config, Datagram, Datagrams, Driver, ECANCELED, Held, Medium, Reason, Refused, TcpListener,
-    TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, sys,
+    Arrivals, Call, Completion, Config, Datagram, Datagrams, Driver, ECANCELED, Error, Feature, Features, Held, Medium,
+    Reason, Refused, Route, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, sys,
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
@@ -1288,13 +1288,13 @@ fn a_half_close_on_a_failed_write_direction_sends_no_end_of_stream() {
     );
 }
 
-/// The bind and the listen run as linked entries of the ring where the probe of the kernel finds
-/// both, and as system calls with a future that is ready at once elsewhere. On IPv4 and IPv6, the
+/// The bind and the listen run as linked entries of the ring where the report gives
+/// `Route::Ring`, and as system calls with a future that is ready at once elsewhere. On IPv4 and IPv6, the
 /// listener then accepts.
 #[test]
-fn bind_and_listen_run_on_the_ring_exactly_where_the_probe_finds_them() {
+fn bind_and_listen_run_on_the_ring_exactly_where_the_report_gives_the_ring() {
     let mut driver = driver(Config::new());
-    let ring = driver.features.bind && driver.features.listen;
+    let ring = driver.report().route(Call::Bind) == Route::Ring;
     for address in ["127.0.0.1:0", "[::1]:0"] {
         let mut bind = driver.bind(address.parse().unwrap(), TcpOptions::default()).unwrap();
         let unsubmitted = driver.ring.unsubmitted();
@@ -1632,4 +1632,39 @@ fn a_batch_receive_returns_several_datagrams_each_with_its_metadata() {
         assert_eq!(received.metadata.ecn, Some(codepoints[index]));
         assert_eq!(received.source, sender.local_addr());
     }
+}
+
+/// A strict requirement refuses before a driver exists: a kernel with no such feature gives
+/// `Error::Unsupported` with that feature. A kernel with it gives a driver whose report states the
+/// requirement. The test prints the report of the kernel.
+#[test]
+fn a_strict_requirement_refuses_before_the_driver_is_ready() {
+    let report = driver(Config::new()).report();
+    std::println!("capability report: {report:#?}");
+    let truncate = Features::NONE.with(Feature::Truncate);
+    match Driver::new(Config::new().require(Feature::Truncate)) {
+        Ok(strict) => {
+            assert!(report.probed().contains(Feature::Truncate));
+            assert_eq!(strict.report().required(), truncate);
+        }
+        Err(Error::Unsupported(missing)) => {
+            assert!(!report.probed().contains(Feature::Truncate));
+            assert_eq!(missing, truncate);
+        }
+        Err(error) => panic!("the driver did not start: {error}"),
+    }
+}
+
+/// A new driver registers no file and no buffer, and it starts no submission poller: the view of
+/// the kernel of its ring (`/proc/self/fdinfo`) shows none.
+#[test]
+fn a_new_driver_registers_no_file_or_buffer_and_starts_no_poller() {
+    let driver = driver(Config::new());
+    let info = std::fs::read_to_string(alloc::format!("/proc/self/fdinfo/{}", driver.ring.fd())).unwrap();
+    let field = |name: &str| info.lines().find_map(|line| line.strip_prefix(name)).map(str::trim);
+    assert_eq!(
+        (field("UserFiles:"), field("UserBufs:"), field("SqThread:")),
+        (Some("0"), Some("0"), Some("-1")),
+        "{info}"
+    );
 }

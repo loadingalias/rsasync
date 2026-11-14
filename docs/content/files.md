@@ -150,8 +150,10 @@ From Linux 6.9, `set_file_len` runs on the ring (`IORING_OP_FTRUNCATE`). Before 
 as a job of the [blocking service](blocking-service.md), because the kernel has no ring operation
 for it:
 
-- `Driver::blocking_work().set_len()` is `true` on such a kernel. The driver knows it when it
-  starts, before the first operation.
+- `Driver::report().route(Call::SetFileLen)` is `Route::BlockingService` on such a kernel. The
+  driver knows it when it starts, before the first operation (see the
+  [capability report](capability-report.md)). `Config::require(Feature::Truncate)` makes such a
+  kernel refuse the driver.
 - `Driver::use_blocking(submitter)` gives the driver a `Submitter` of your service. Until then, the
   change refuses with `Reason::Blocking`. A full or stopped service also refuses with
   `Reason::Blocking`.

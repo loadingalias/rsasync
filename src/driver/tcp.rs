@@ -18,7 +18,8 @@ use rsnetwork_udp::{AF_INET6, Received, SaFamily, SockAddrStorage};
 
 use super::udp::{self, Arrivals, Batch};
 use super::{
-    Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources, Tag,
+    Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
+    Route, Tag,
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
@@ -870,7 +871,8 @@ impl Driver {
         listen: bool,
         setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
     ) -> Result<Completion, Refused<()>> {
-        let ring = self.features.bind && (self.features.listen || !listen);
+        let call = if listen { Call::Bind } else { Call::BindUdp };
+        let ring = self.report.route(call) == Route::Ring;
         // On the ring, the bind and the listen are two linked entries, so the queue needs room for
         // both. A bind with system calls pushes no entry.
         let entries = match (ring, listen) {

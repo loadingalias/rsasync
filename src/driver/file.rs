@@ -21,8 +21,8 @@ use rsnetwork_udp::sys::IoVec;
 
 use super::tcp::{Regions, count};
 use super::{
-    Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources, Tag,
-    sys,
+    Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
+    Route, Tag, sys,
 };
 use crate::blocking::Submitter;
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
@@ -480,22 +480,6 @@ impl Buffers {
     }
 }
 
-/// The driver operations that run on the blocking service on this kernel, because the kernel has
-/// no ring operation for them. [`Driver::blocking_work`] gives them before the first operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockingWork {
-    set_len: bool,
-}
-
-impl BlockingWork {
-    /// [`Driver::set_file_len`] runs on the blocking service: the kernel has no
-    /// `IORING_OP_FTRUNCATE` (Linux 6.9).
-    #[must_use]
-    pub const fn set_len(self) -> bool {
-        self.set_len
-    }
-}
-
 /// The home finishes the file operation `op` of `held` at its terminal event, whose result is
 /// `result`: an open makes its descriptor a resource, and a read records the bytes that it put in.
 #[expect(
@@ -654,20 +638,11 @@ impl alloc::task::Wake for JobWaker {
 
 impl Driver {
     /// Gives the driver the blocking service of `submitter`, for the operations that the kernel
-    /// has no ring operation for ([`Driver::blocking_work`]). The driver keeps the submitter, and
+    /// has no ring operation for ([`Route::BlockingService`]). The driver keeps the submitter, and
     /// each such operation is one job of the service.
     pub fn use_blocking(&mut self, submitter: Submitter) {
         let waker = core::task::Waker::from(alloc::sync::Arc::new(JobWaker(self.wake_handle())));
         self.blocking = Some((submitter, waker));
-    }
-
-    /// The operations that run on the blocking service on this kernel. Each of them refuses with
-    /// [`Reason::Blocking`] until [`Driver::use_blocking`] gives the driver a service.
-    #[must_use]
-    pub const fn blocking_work(&self) -> BlockingWork {
-        BlockingWork {
-            set_len: !self.features.truncate,
-        }
     }
 
     /// Opens the file at `path` with `options` (`IORING_OP_OPENAT`). The descriptor closes on
@@ -926,7 +901,7 @@ impl Driver {
 
     /// Sets the length of `file` to `len` bytes: a longer file reads as zeros after its old end.
     /// It runs on the ring with `IORING_OP_FTRUNCATE` (Linux 6.9), and else as a job of the
-    /// blocking service ([`Driver::blocking_work`]). A drop of the future does not cancel it.
+    /// blocking service ([`Route::BlockingService`]). A drop of the future does not cancel it.
     ///
     /// # Errors
     ///
@@ -934,7 +909,7 @@ impl Driver {
     /// change runs on the blocking service and the driver has none, or the service refused the
     /// job. The future gives an error of the system.
     pub fn set_file_len<'a>(&mut self, file: &'a File, len: u64) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        let completion = if self.features.truncate {
+        let completion = if self.report.route(Call::SetFileLen) == Route::Ring {
             let entry = move |fd, _: &mut Held| Sqe::ftruncate(fd, len);
             self.begin_file(Some(file.resource), Op::Plain, (), |()| Held::default(), entry, false)?
         } else {

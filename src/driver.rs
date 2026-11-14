@@ -27,9 +27,11 @@
 //! vectored reads and writes, length, space, sync, rename, unlink, directories, and
 //! [`Driver::close_file`]. Several operations of one file run at one time: see [`File`].
 //!
-//! The io_uring driver needs no helper thread: [`Driver::helper_threads`] gives 0. A kernel with no
-//! ring operation for a file call runs that call on the blocking service of the caller:
-//! [`Driver::blocking_work`] names those calls, and [`Driver::use_blocking`] gives the service.
+//! [`Driver::report`] states what the driver found and applied when it started: the features of the
+//! kernel, and the [`Route`] of each [`Call`] that depends on them. The io_uring driver starts no
+//! helper thread. A kernel with no ring operation for a file call runs that call on the blocking
+//! service of the caller, which [`Driver::use_blocking`] gives. [`Config::require`] makes a missing
+//! feature refuse the driver.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +49,7 @@
 //! # }
 //! ```
 
+mod capability;
 mod completion;
 mod file;
 mod local;
@@ -77,11 +80,10 @@ use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
 use crate::capacity::Permit;
 use crate::sync::Arc;
 use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
-use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
+use crate::uring::{BufferRing, Cqe, Ring, SetupError, Sqe};
 
-pub use file::{
-    Alignment, BlockingWork, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode,
-};
+pub use capability::{Call, Feature, Features, Report, Route};
+pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 pub use local::{LocalListener, LocalStream, Peer, Stale};
 pub use pipe::{PipeReader, PipeWriter};
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
@@ -91,17 +93,20 @@ pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
 
-/// The limits of a driver. Each one bounds memory that the driver allocates when it starts.
+/// The limits of a driver, each of which bounds memory that the driver allocates when it starts,
+/// and the features that it requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     submissions: u32,
     operations: u32,
     resources: u32,
     completions_per_turn: u32,
+    required: Features,
 }
 
 impl Config {
-    /// 64 submission entries, 256 operations, 256 resources, and 64 completions per turn.
+    /// 64 submission entries, 256 operations, 256 resources, 64 completions per turn, and no
+    /// required feature.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -109,6 +114,18 @@ impl Config {
             operations: 256,
             resources: 256,
             completions_per_turn: 64,
+            required: Features::NONE,
+        }
+    }
+
+    /// Requires `feature`: on a kernel with no such feature, [`Driver::new`] refuses with
+    /// [`Error::Unsupported`], before a driver exists. With no requirement, the driver uses the
+    /// route of each call that the kernel has, and [`Driver::report`] states it.
+    #[must_use]
+    pub const fn require(self, feature: Feature) -> Self {
+        Self {
+            required: self.required.with(feature),
+            ..self
         }
     }
 
@@ -157,6 +174,8 @@ pub enum Error {
     Config,
     /// Another failure of the system, for example no memory.
     System(io::Error),
+    /// The kernel has no feature of these, which [`Config::require`] required.
+    Unsupported(Features),
 }
 
 impl fmt::Display for Error {
@@ -165,6 +184,7 @@ impl fmt::Display for Error {
             Self::Refused(error) => write!(f, "the kernel refuses io_uring: {error}"),
             Self::Config => f.write_str("a limit of the driver configuration is 0 or too large"),
             Self::System(error) => write!(f, "the driver did not start: {error}"),
+            Self::Unsupported(missing) => write!(f, "the kernel has no required feature of {missing:?}"),
         }
     }
 }
@@ -173,7 +193,7 @@ impl core::error::Error for Error {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Refused(error) | Self::System(error) => Some(error),
-            Self::Config => None,
+            Self::Config | Self::Unsupported(_) => None,
         }
     }
 }
@@ -422,7 +442,7 @@ pub enum Reason {
     /// The buffer, the length, or the offset of a direct-I/O operation does not have the
     /// [`Alignment`] of its file.
     Alignment,
-    /// The operation runs on the blocking service on this kernel ([`Driver::blocking_work`]),
+    /// The operation runs on the blocking service on this kernel ([`Route::BlockingService`]),
     /// and the driver has no service ([`Driver::use_blocking`]), or the service refused the job.
     Blocking,
 }
@@ -808,8 +828,8 @@ pub struct Driver {
     /// The bytes that receives copied from the data that an abandoned receive left.
     copied: u64,
     selected: Option<Selected>,
-    /// The later operations of the kernel, from the probe of the ring.
-    features: Features,
+    /// What the driver found and applied when it started.
+    report: Report,
     completions_per_turn: u32,
     /// The ring polls the interrupt descriptor, so that a request or wake from another thread
     /// ends a wait.
@@ -867,7 +887,12 @@ impl Driver {
             SetupError::Failed(error) => Error::System(error),
         })?;
         // The probe needs a new ring, with no entry, completion, or buffer group.
-        let features = ring.probe().map_err(Error::System)?;
+        let probed = Features::probed(ring.probe().map_err(Error::System)?);
+        // A strict requirement refuses before the driver exists.
+        let missing = config.required.without(probed);
+        if !missing.is_empty() {
+            return Err(Error::Unsupported(missing));
+        }
         let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
         let wake = fs::File::from(wake);
         ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
@@ -892,7 +917,7 @@ impl Driver {
             pending: Vec::with_capacity(config.resources as usize),
             copied: 0,
             selected: None,
-            features,
+            report: Report::new(config.required, probed, rearm_wake),
             completions_per_turn: config.completions_per_turn,
             waking: false,
             rearm_wake,
@@ -904,10 +929,10 @@ impl Driver {
         })
     }
 
-    /// The helper threads of the driver. The io_uring driver has none.
+    /// What the driver found and applied when it started.
     #[must_use]
-    pub const fn helper_threads(&self) -> u32 {
-        0
+    pub const fn report(&self) -> Report {
+        self.report
     }
 
     /// The bytes that receives copied, in total, from the data that a dropped or forgotten receive
@@ -1106,7 +1131,7 @@ impl Driver {
 
     /// Cancels each running operation, drives until each terminal event, and closes each
     /// resource. Each future that has not taken its result then gives [`Ended`]. A job of the
-    /// blocking service ([`Driver::blocking_work`]) cannot be cancelled, so the teardown waits until
+    /// blocking service ([`Route::BlockingService`]) cannot be cancelled, so the teardown waits until
     /// it returns.
     ///
     /// # Errors

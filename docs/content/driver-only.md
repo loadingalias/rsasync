@@ -12,10 +12,11 @@ and files. The other operations come in later changes. [TCP on the driver](tcp.m
 [Pipes on the driver](pipes.md), and [Files on the driver](files.md) are the references for each
 operation and its results.
 
-The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It needs no helper
-thread: `Driver::helper_threads` gives 0. Before Linux 6.9, a change of the length of a file runs on
-your [blocking service](blocking-service.md): `Driver::blocking_work` tells it before the first
-operation. See [Length and space](files.md#length-and-space).
+The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It starts no helper
+thread. Before Linux 6.9, a change of the length of a file runs on your
+[blocking service](blocking-service.md). `Driver::report` gives the features of the kernel and the
+route of each such call before the first operation: see the [capability report](capability-report.md)
+and [Length and space](files.md#length-and-space).
 
 ## The contract
 
@@ -28,6 +29,7 @@ it.
 | Call | What it does |
 | --- | --- |
 | `Driver::new(Config)` | Starts the driver and allocates its bounded memory one time. It gives `Error::Refused` if the kernel or its policy refuses io_uring, for example in a container with the default seccomp profile |
+| `Driver::report()` | What the driver found and applied when it started: the [capability report](capability-report.md) |
 | `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and takes up to `Config::completions_per_turn` completions from the ring. It gives the completion of each operation to its future. The bound and `Turn::completed()` also count the completions of the driver itself, such as cancel results |
 | `Turn::more()` | Work remains. Turn again before you wait |
 | `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. The kernel runs its deferred work during the wait |
