@@ -1,7 +1,8 @@
 //! Dual async runtime. This crate is in development.
 //!
 //! The [`buffer`], [`capacity`], and [`time`] modules hold the types that the runtime shares with
-//! networking and applications. Use them through this crate:
+//! networking and applications. [`timer`] holds bounded timers, which work with no scheduler. Use
+//! the shared types through this crate:
 //!
 //! ```
 //! use rsasync::{buffer, capacity, time};
@@ -48,13 +49,15 @@ mod sync;
 )]
 mod table;
 #[cfg_attr(
-    not(test),
+    all(not(test), feature = "std"),
     expect(
         dead_code,
-        reason = "the channels, the one-shot, and the permit wait are its first users"
+        reason = "the blocking wait has no user yet: the channels, the one-shot, and the permit wait are its first users"
     )
 )]
 mod wait;
+
+pub mod timer;
 
 /// Driver-only use of the io_uring driver, on Linux.
 #[cfg(all(

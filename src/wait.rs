@@ -1,5 +1,5 @@
 //! The wait handshake: one waiter cell for each waiting endpoint or future of a channel, a permit
-//! wait, or a one-shot.
+//! wait, a one-shot, or a timer.
 //!
 //! A wait registers interest, rechecks its condition, and only then parks. A publisher first
 //! changes the condition and then wakes the waiter. Thus a publication can come before the
@@ -261,7 +261,7 @@ unsafe impl Send for Waiter {}
 unsafe impl Sync for Waiter {}
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(all(test, loom))]
 mod explore;

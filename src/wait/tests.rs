@@ -6,10 +6,10 @@ use core::task::{Context, Waker};
 use super::Waiter;
 
 /// A waker that counts its wakes. It drives the code under test, so it uses the native atomics.
-pub(super) struct Count(AtomicUsize);
+pub(crate) struct Count(AtomicUsize);
 
 impl Count {
-    pub(super) fn get(&self) -> usize {
+    pub(crate) fn get(&self) -> usize {
         self.0.load(Ordering::Relaxed)
     }
 }
@@ -24,7 +24,7 @@ impl Wake for Count {
     }
 }
 
-pub(super) fn counter() -> (Arc<Count>, Waker) {
+pub(crate) fn counter() -> (Arc<Count>, Waker) {
     let count = Arc::new(Count(AtomicUsize::new(0)));
     (Arc::clone(&count), Waker::from(count))
 }
