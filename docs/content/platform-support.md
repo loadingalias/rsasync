@@ -1,8 +1,9 @@
 # Platform support
 
 rsasync is in development, and its alpha releases are on crates.io. This page gives the Linux C
-libraries that rsasync supports, the macOS part of `rsnetwork-udp`, the WebAssembly targets of its
-portable subset, and the evidence that its tests give today.
+libraries that rsasync supports, the hosts of the io_uring driver, the macOS part of
+`rsnetwork-udp`, the WebAssembly targets of its portable subset, and the evidence that its tests
+give today.
 
 ## Linux C libraries
 
@@ -15,6 +16,35 @@ Linux support includes two C libraries, glibc and musl, on x86_64 and aarch64:
 
 The pinned toolchain in `rust-toolchain.toml` includes the two musl targets. The datagram calls of
 `rsnetwork-udp` support the same four targets: see [Datagram I/O on any socket](datagram-io.md).
+
+## The io_uring driver on Linux
+
+The driver-only surface, `rsasync::driver` on io_uring, is supported on these four hosts, each
+with glibc and musl:
+
+| Distribution | Architecture | Kernel |
+| --- | --- | --- |
+| Debian 12 | x86_64 | `6.1.0-54-cloud-amd64` |
+| Debian 12 | aarch64 | `6.1.0-54-cloud-arm64` |
+| Ubuntu 26.04 | x86_64 | `7.0.0-1016-aws` |
+| Ubuntu 26.04 | aarch64 | `7.0.0-1016-aws` |
+
+On 2026-11-14, at revision `10f7987`, one run on each host passed these commands. Each host was an
+AWS EC2 instance:
+
+```sh
+cargo xtask test
+cargo xtask test --target <arch>-unknown-linux-musl   # x86_64 or aarch64
+cargo run -p driver_only
+```
+
+Each test command ran 276 tests of the whole workspace, and the glibc command also ran the doctests.
+Six tests need root or `CAP_SYS_TIME`, so they did not run. The last command runs the example of
+[Drive the I/O driver yourself](driver-only.md#run-the-example), and it printed the documented
+output on each host. The tests cover file, TCP, UDP, local stream, and pipe operations on owned
+buffers, child processes, signal streams, cancellation, close, teardown, and the capability report.
+The negative-path cases also run under injected completions. Debian 12 and Ubuntu 26.04 take
+different routes for some calls: see the [capability report](capability-report.md).
 
 ## Evidence today
 
@@ -55,17 +85,17 @@ that the driver installs no `SIGCHLD` handler and never reaps a child that the t
 The receive into an owned buffer and the send from a lease keep the addresses of their buffers and
 allocate nothing for each operation. The tests also check the
 [blocking service](blocking-service.md): its bound of jobs, its refusals, its teardown, and the
-charges of its threads. Only the driver, the blocking service, and `rsnetwork-udp` make system calls: the io_uring
-ring and its waits in the kernel, its two event descriptors, the socket, option, and bind calls of a
-socket, the listen call of a TCP socket, the `statx` call of a direct-I/O open, the threads that the
-blocking service starts through `std` and their length changes of a file and spawns of a child, the
-process descriptor, `waitid`, and `kill` calls of a child, and the datagram calls of
-`rsnetwork-udp`. Thus a pass shows that the build links and runs on musl,
-and that these calls work through the system calls of musl. It does not show that a runtime with a
-scheduler works on musl: the library has no scheduler yet.
+charges of its threads. Only the driver, the blocking service, the local tasks, and `rsnetwork-udp`
+make system calls: the io_uring ring and its waits in the kernel, its two event descriptors, the
+socket, option, and bind calls of a socket, the listen call of a TCP socket, the `statx` call of a
+direct-I/O open, the threads that the blocking service starts through `std` and their length changes
+of a file and spawns of a child, the process descriptor, `waitid`, and `kill` calls of a child, the
+park and unpark of the thread of a local owner through `std`, and the datagram calls of
+`rsnetwork-udp`. Thus a pass shows that the build links and runs on musl, and that these calls work
+through the system calls of musl.
 
-From the Linux driver stage on, each stage exit also runs the tests on x86_64 and aarch64 Linux
-hosts with both C libraries. This page then names each operation that has that evidence.
+Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C libraries, as
+[The io_uring driver on Linux](#the-io_uring-driver-on-linux) shows for the driver.
 
 ## macOS
 
