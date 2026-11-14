@@ -32,6 +32,7 @@ it.
 
 Turn while work remains, and wait when no work remains:
 
+<!-- The same text as the doctest of `rsasync::driver`. Edit both. -->
 ```rust
 use rsasync::driver::{Config, Driver};
 
@@ -77,6 +78,7 @@ it, and `Driver::connect` connects one. `Driver::accept` gives the future of a c
 Each operation gives an `Operation` future. You poll it, and you turn the driver until it is ready.
 This helper does both:
 
+<!-- The same text as the doctest of `rsasync::driver::Operation`. Edit both. -->
 ```rust
 use std::future::Future;
 use std::pin::pin;
@@ -107,6 +109,7 @@ initialized bytes. The future gives the buffer back with the received bytes init
 after a failure. A send takes a lease, and the kernel reads its bytes. The future gives the lease
 back. Neither operation copies the bytes:
 
+<!-- The same text as the doctest of `rsasync::driver::TcpStream`. Edit both. -->
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};
 use rsasync::driver::{Config, Driver, TcpOptions};
@@ -148,6 +151,7 @@ change them in place, for example to decrypt them. `Lease::from` then freezes th
 address, with no allocation. When the backing, or the last lease or view of the slot, drops, on any
 thread, the slot goes back to the pool, and the next turn gives it to the kernel again:
 
+<!-- The same text as the doctest of `rsasync::driver::Driver::provide`. Edit both. -->
 ```rust
 use core::alloc::Layout;
 use core::num::{NonZeroU32, NonZeroU64};

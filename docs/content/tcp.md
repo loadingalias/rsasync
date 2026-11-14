@@ -79,6 +79,7 @@ The count can end inside a region. `Regions::advance` then drops each region tha
 the region that went in part a view of its rest, with no copy, so the next send continues the
 stream:
 
+<!-- The same text as the doctest of `rsasync::driver::WriteFailed`. Edit both. -->
 ```rust
 use rsasync::buffer::Lease;
 use rsasync::driver::Regions;
@@ -149,6 +150,7 @@ stream.
 
 A next send that succeeds shows that each earlier dropped send sent all its bytes.
 
+<!-- The same text as the doctest of `rsasync::driver::Regions`. Edit both. -->
 ```rust
 use rsasync::buffer::Lease;
 use rsasync::driver::WriteFailed;
