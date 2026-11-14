@@ -181,5 +181,7 @@ pub(super) fn blocks(fd: &OwnedFd) -> bool {
         && (flags & sys::O_NONBLOCK == 0 || unsafe { sys::fcntl(raw, sys::F_SETFL, flags & !sys::O_NONBLOCK) } >= 0)
 }
 
-#[cfg(all(test, not(loom)))]
-mod tests;
+// Two attributes, so that Clippy sees the test module (`allow-unwrap-in-tests`).
+#[cfg(test)]
+#[cfg(not(loom))]
+pub(super) mod tests;

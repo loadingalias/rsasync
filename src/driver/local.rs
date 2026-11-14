@@ -406,5 +406,7 @@ fn remove_stale(path: &Path, (storage, len): (SockAddrStorage, u32)) -> Result<(
     }
 }
 
-#[cfg(all(test, not(loom)))]
-mod tests;
+// Two attributes, so that Clippy sees the test module (`allow-unwrap-in-tests`).
+#[cfg(test)]
+#[cfg(not(loom))]
+pub(super) mod tests;

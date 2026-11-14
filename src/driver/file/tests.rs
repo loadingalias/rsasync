@@ -7,6 +7,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
+use super::super::suite::{self, Backend};
 use super::super::tests::{Log, drive, driver, note, numbered, posted, recorded, taken};
 use super::super::{Call, Config, Driver, Reason, Route};
 use super::{Buffers, Cache, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
@@ -80,11 +81,12 @@ fn sync(driver: &mut Driver, file: &File) {
 
 /// A read gives the exact count of the bytes that it put in, fewer at the end of the file and 0
 /// after it. The exact read of the same range reports that it is incomplete, with that count.
-#[test]
-fn a_short_read_gives_its_exact_extent_and_the_exact_read_reports_incomplete_progress() {
+pub(in crate::driver) fn a_short_read_gives_its_exact_extent_and_the_exact_read_reports_incomplete_progress(
+    backend: Backend,
+) {
     let scratch = Scratch::new("short");
     fs::write(scratch.join("data"), numbered(0, 10)).unwrap();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("data"), OpenOptions::new());
 
     let read = driver.read_at(&file, Backing::from(Vec::with_capacity(64)), 4).unwrap();

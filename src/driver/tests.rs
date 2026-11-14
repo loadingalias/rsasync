@@ -20,6 +20,7 @@ use core::net::IpAddr;
 
 use rsnetwork_udp::{Ecn, Received};
 
+use super::suite::{self, Backend};
 use super::{
     Arrivals, Call, Completion, Config, Datagram, Datagrams, Driver, ECANCELED, Error, Feature, Features, Held, Medium,
     Reason, Refused, Route, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, sys,
@@ -217,11 +218,12 @@ fn a_completion_wakes_only_the_waker_of_its_latest_poll() {
 
 /// A forgotten future ends no operation: the buffer and the charge stay until the terminal
 /// completion, and teardown releases them after it.
-#[test]
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
-fn a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion() {
+pub(in crate::driver) fn a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion(
+    backend: Backend,
+) {
     let (log, budget) = (Log::default(), budget());
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let (reader, mut writer) = pipe();
     mem::forget(read(&mut driver, reader, held(&log, &budget)));
     driver.turn().unwrap();
@@ -326,10 +328,9 @@ fn a_completion_during_a_wait_adds_no_other_completion() {
 
 /// Teardown cancels a read that gets no data, returns after the completion of the read, closes
 /// the pipe, and reports the cancelled read. Its future then gets `Gone`.
-#[test]
-fn teardown_cancels_a_read_with_no_data_closes_its_pipe_and_reports_it() {
+pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_and_reports_it(backend: Backend) {
     let (log, budget) = (Log::default(), budget());
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let (reader, mut writer) = pipe();
     let future = read(&mut driver, reader, held(&log, &budget));
     driver.turn().unwrap();
@@ -358,9 +359,8 @@ fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers_of_running_operations
 
 /// A driver with each operation slot in use refuses the next submission with a typed reason, and
 /// it gives back the buffer and the charge.
-#[test]
 #[expect(unsafe_code, reason = "a no-op names no memory")]
-fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
+pub(in crate::driver) fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new().operations(1));
     // SAFETY: a no-op names no memory.
@@ -469,9 +469,10 @@ fn written_in_place(driver: &mut Driver, address: *const u8, len: usize) -> Vec<
 /// response from a lease. Each buffer comes back with its exact extent and at its own address. The
 /// request is at the address of the buffer when the kernel completes, before the driver takes the
 /// completion: the kernel wrote it in place, with no staging buffer.
-#[test]
-fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
     let client = thread::spawn(move || {
@@ -569,11 +570,10 @@ const ENOBUFS: i32 = 105;
 /// A selecting receive that finds no free buffer ends with `ENOBUFS`, which its future gives: the
 /// driver does not retry it. The data stays in the socket, and a receive after the buffer comes
 /// back gets it.
-#[test]
-fn a_selecting_receive_with_no_free_buffer_gives_enobufs() {
+pub(in crate::driver) fn a_selecting_receive_with_no_free_buffer_gives_enobufs(backend: Backend) {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
@@ -749,9 +749,8 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
 /// A receive whose future drops after its bytes came leaves them with the stream. The next
 /// receives give them before they submit, as many as fit each buffer, with one counted copy, and
 /// the stream keeps the rest. Each byte comes once and in order with the bytes after it.
-#[test]
-fn a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     peer.write_all(&numbered(0, 1000)).unwrap();
     let receive = driver
@@ -778,11 +777,31 @@ fn a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order() {
     assert_eq!(driver.copied(), u64::try_from(kept).unwrap());
 }
 
+/// `ECONNRESET` (`include/uapi/asm-generic/errno.h`).
+const ECONNRESET: i32 = 104;
+
+/// A receive whose future drops after it failed leaves its error with the stream, and the next
+/// receive gives it. The peer resets the connection: it closes with bytes that it did not read.
+pub(in crate::driver) fn a_dropped_receive_that_failed_leaves_its_error_to_the_next_receive(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, peer) = connected(&mut driver, "127.0.0.1:0");
+    let send = driver.send(&mut stream, Lease::from(b"unread".to_vec())).unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 6);
+    assert_eq!(peer.peek(&mut [0; 6]).unwrap(), 6, "the bytes wait in the peer");
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(64))).unwrap();
+    drop(peer);
+    assert_eq!(posted(&mut driver, 1)[0].res, -ECONNRESET);
+    drop(receive);
+
+    let next = driver.recv(&mut stream, Backing::from(Vec::with_capacity(64))).unwrap();
+    let error = drive(&mut driver, next).unwrap().0.unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ConnectionReset);
+}
+
 /// An explicit cancel of a receive whose bytes came gives the original buffer with the bytes,
 /// with no copy.
-#[test]
-fn an_explicit_cancel_of_a_receive_gives_its_buffer_and_bytes_with_no_copy() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn an_explicit_cancel_of_a_receive_gives_its_buffer_and_bytes_with_no_copy(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     peer.write_all(b"hello").unwrap();
     let buffer = Backing::from(Vec::with_capacity(64));
@@ -800,10 +819,11 @@ fn an_explicit_cancel_of_a_receive_gives_its_buffer_and_bytes_with_no_copy() {
 
 /// A receive whose future is forgotten after its bytes came leaves them to the next receive on
 /// its half, which gives them before it submits.
-#[test]
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
-fn a_forgotten_receive_leaves_its_bytes_to_the_next_receive_which_gives_them_before_it_submits() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_forgotten_receive_leaves_its_bytes_to_the_next_receive_which_gives_them_before_it_submits(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "[::1]:0");
     let (reader, _) = stream.split();
     let receive = driver.recv(reader, Backing::from(Vec::with_capacity(64))).unwrap();
@@ -821,9 +841,8 @@ fn a_forgotten_receive_leaves_its_bytes_to_the_next_receive_which_gives_them_bef
 /// A send whose future drops sends only part of its bytes, so the write direction fails. The next
 /// send gives the count of the bytes that went, each later send gives no count, and the close
 /// reports none: the count is reported once. The peer reads exactly those bytes.
-#[test]
-fn a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     drop(driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap());
     let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
@@ -846,9 +865,10 @@ fn a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once()
 
 /// A send whose future drops and that sends all its bytes reports nothing, and the next send
 /// succeeds after it.
-#[test]
-fn a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     drop(driver.send(&mut stream, Lease::from(numbered(0, 1000))).unwrap());
     let next = driver.send(&mut stream, Lease::from(numbered(1000, 1000))).unwrap();
@@ -864,9 +884,8 @@ fn a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_suc
 /// Two sends whose futures drop, one in the kernel and one that waits for it, still run, and a
 /// third send waits behind them and completes after both. Each submits after the end of the one
 /// before it: the peer reads one numbered stream in order.
-#[test]
-fn two_dropped_sends_and_a_third_send_run_in_start_order() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn two_dropped_sends_and_a_third_send_run_in_start_order(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     let filled = fill(&mut driver, &mut stream);
     let first = driver.send(&mut stream, Lease::from(numbered(filled, 4096))).unwrap();
@@ -902,9 +921,10 @@ fn two_dropped_sends_and_a_third_send_run_in_start_order() {
 
 /// An explicit cancel of a send that waits for room gives its lease and its progress, and the
 /// next send in the direction succeeds.
-#[test]
-fn an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usable() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usable(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     let filled = fill(&mut driver, &mut stream);
     let send = driver.send(&mut stream, Lease::from(numbered(filled, 4096))).unwrap();
@@ -932,10 +952,9 @@ fn an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usabl
 /// An accept whose future drops after the kernel accepted a connection leaves it with the
 /// listener, and the next accept gives it, with its peer address, before it submits. On IPv4 and
 /// on IPv6.
-#[test]
-fn a_dropped_accept_leaves_its_connection_to_the_next_accept() {
+pub(in crate::driver) fn a_dropped_accept_leaves_its_connection_to_the_next_accept(backend: Backend) {
     for address in ["127.0.0.1:0", "[::1]:0"] {
-        let mut driver = driver(Config::new());
+        let mut driver = suite::driver(Config::new(), backend);
         let mut listener = listen(&mut driver, address);
         let address = listener.local_addr();
         let accept = driver.accept(&mut listener).unwrap();
@@ -957,10 +976,9 @@ fn a_dropped_accept_leaves_its_connection_to_the_next_accept() {
 /// A close releases the bytes that no receive took, through the release hook of their buffer,
 /// and a close of a listener closes the connection that no accept took: its client reads the end
 /// of the stream.
-#[test]
-fn close_releases_the_bytes_and_the_connection_that_no_operation_took() {
+pub(in crate::driver) fn close_releases_the_bytes_and_the_connection_that_no_operation_took(backend: Backend) {
     let log = Log::default();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     peer.write_all(b"unread").unwrap();
     let receive = driver.recv(&mut stream, recorded(&log, 64)).unwrap();
@@ -989,9 +1007,10 @@ fn close_releases_the_bytes_and_the_connection_that_no_operation_took() {
 /// send in the kernel, sends one cancel for each of them, by its own user data. Each cancel finds
 /// its operation in flight, each operation gets its own result, and the close returns and reports
 /// the count of the send.
-#[test]
-fn close_cancels_each_dropped_operation_by_its_own_request_and_reports_the_send() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request_and_reports_the_send(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, _peer) = connected(&mut driver, "127.0.0.1:0");
     let filled = fill(&mut driver, &mut stream);
     let (reader, writer) = stream.split();
@@ -1077,9 +1096,8 @@ fn descriptors() -> usize {
 }
 
 /// A connect to a port with no listener gives the typed refusal of the system, on IPv4 and IPv6.
-#[test]
-fn a_connect_to_a_port_with_no_listener_is_refused() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_connect_to_a_port_with_no_listener_is_refused(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     for address in ["127.0.0.1:0", "[::1]:0"] {
         // A port that was free and has no listener now.
         let free = std::net::TcpListener::bind(address).unwrap().local_addr().unwrap();
@@ -1091,9 +1109,8 @@ fn a_connect_to_a_port_with_no_listener_is_refused() {
 
 /// A connect whose future drops after the kernel connected leaves no descriptor open after its
 /// terminal event: the driver closes the connection, and the peer reads the end of the stream.
-#[test]
-fn a_dropped_connect_that_completes_closes_its_connection() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_dropped_connect_that_completes_closes_its_connection(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let open = descriptors();
     let connect = driver
@@ -1132,9 +1149,8 @@ fn regions(start: usize, lens: &[usize]) -> super::Regions {
 /// A vectored send that the socket buffers stop gives the exact count across its regions: it
 /// ends in the third region, and the peer reads exactly those bytes. After `Regions::advance`, a
 /// second vectored send sends the rest, and the peer reads one numbered stream.
-#[test]
-fn a_vectored_send_gives_its_exact_progress_across_regions() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_vectored_send_gives_its_exact_progress_across_regions(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "[::1]:0");
     let lens = [1000, 2000, 64 << 20];
     let send = driver.send_vectored(&mut stream, regions(0, &lens)).unwrap();
@@ -1571,8 +1587,7 @@ fn a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_
 
 /// A batch with more datagrams than the submission queue has entries can never start, so it
 /// refuses with `Reason::Queue` and gives its datagrams back. The socket then sends a datagram.
-#[test]
-fn a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back() {
+pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back() {
     let mut driver = driver(Config::new().submissions(8));
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());

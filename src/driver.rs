@@ -57,9 +57,14 @@ mod pipe;
 mod probe;
 mod process;
 mod signal;
+// Two attributes each, so that Clippy sees the test modules (`allow-unwrap-in-tests`).
+#[cfg(test)]
+#[cfg(not(loom))]
+mod suite;
 mod sys;
 mod tcp;
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
+#[cfg(not(loom))]
 mod tests;
 mod udp;
 

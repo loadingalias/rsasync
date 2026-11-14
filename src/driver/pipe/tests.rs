@@ -7,6 +7,7 @@ use core::task::{Context, Waker};
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
+use super::super::suite::{self, Backend};
 use super::super::tests::{budget, drive, driver, numbered, posted};
 use super::super::{Config, Driver, Reason, sys};
 use super::{PipeReader, PipeWriter};
@@ -42,9 +43,10 @@ fn receive_all(driver: &mut Driver, reader: &mut PipeReader, capacity: usize) ->
 /// A dropped send that sends all its bytes and a dropped receive whose bytes came lose no byte:
 /// the next send goes after them, and the next receives give them first. The close of the writer
 /// ends the reader at the sent count.
-#[test]
-fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut reader, mut writer) = adopted(&mut driver);
     drop(driver.send(&mut writer, Lease::from(numbered(0, 1000))).unwrap());
     let next = driver.send(&mut writer, Lease::from(numbered(1000, 1000))).unwrap();
@@ -64,9 +66,8 @@ fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_wri
 
 /// A send after the read end closed gives `EPIPE`, and the process lives: a Rust program
 /// ignores `SIGPIPE`.
-#[test]
-fn a_send_after_the_reader_closed_gives_broken_pipe() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_send_after_the_reader_closed_gives_broken_pipe(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (reader, mut writer) = adopted(&mut driver);
     let close = driver.close_reader(reader).unwrap();
     drive(&mut driver, close).unwrap();
@@ -95,10 +96,9 @@ fn queued(fd: &impl std::os::fd::AsRawFd) -> usize {
 /// more than the pipe holds writes what fits and waits for room, or ends with that count, by the
 /// kernel. The close of the writer then reports that count, and the reader reads exactly those
 /// bytes.
-#[test]
 #[expect(unsafe_code, reason = "fcntl names no memory with this command")]
-fn a_close_returns_while_the_other_end_is_idle_and_reports_the_cancelled_send() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_close_returns_while_the_other_end_is_idle_and_reports_the_cancelled_send(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut read, write) = io::pipe().unwrap();
     // SAFETY: the command names no memory.
     let capacity = usize::try_from(unsafe { sys::fcntl(read.as_raw_fd(), sys::F_GETPIPE_SZ) }).unwrap();

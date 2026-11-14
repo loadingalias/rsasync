@@ -10,6 +10,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::super::suite::{self, Backend};
 use super::super::tests::{drive, driver, numbered, posted};
 use super::super::{Config, Driver, Regions};
 use super::{LocalListener, LocalStream, Stale};
@@ -69,12 +70,13 @@ fn receive_all(driver: &mut Driver, stream: &mut LocalStream, capacity: usize) -
 /// the next accept, a dropped send that sends all its bytes reports nothing, and a dropped or a
 /// forgotten receive leaves its bytes to the next receive. A half-close ends the receive of the
 /// peer at the sent count.
-#[test]
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
-fn a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations() {
+pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations(
+    backend: Backend,
+) {
     let scratch = Scratch::new("stream");
     let path = scratch.join("socket");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let accept = driver.accept_local(&mut listener).unwrap();
     let mut peer = UnixStream::connect(&path).unwrap();

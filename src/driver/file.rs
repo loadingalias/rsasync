@@ -1306,5 +1306,7 @@ impl Driver {
     }
 }
 
-#[cfg(all(test, not(loom)))]
-mod tests;
+// Two attributes, so that Clippy sees the test module (`allow-unwrap-in-tests`).
+#[cfg(test)]
+#[cfg(not(loom))]
+pub(super) mod tests;
