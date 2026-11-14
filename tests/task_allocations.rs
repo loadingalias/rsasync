@@ -5,7 +5,7 @@
 //! A refusal and its report complete under an allocator that refuses each request.
 //! It is a test binary of its own, because a binary has one global allocator, and the unit tests
 //! of the crate have theirs.
-#![cfg(feature = "std")]
+#![cfg(feature = "local")]
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::Cell;

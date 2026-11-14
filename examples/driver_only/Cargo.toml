@@ -1,0 +1,15 @@
+[package]
+name = "driver_only"
+version = "0.0.0"
+description = "The driver-only example of rsasync: I/O on owned buffers under a loop of the caller, with no scheduler."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Driver-only use: the driver and the blocking service, with no scheduler. The `local` feature,
+# which holds the local tasks, stays off. The driver needs Linux on x86_64 or aarch64.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../..", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

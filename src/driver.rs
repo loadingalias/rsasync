@@ -52,6 +52,8 @@
 mod capability;
 mod completion;
 mod file;
+#[cfg(feature = "local")]
+mod home;
 mod local;
 mod pipe;
 mod probe;
@@ -99,6 +101,8 @@ pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
+#[cfg(feature = "local")]
+pub(crate) use home::{Home, MESSAGES};
 
 /// The limits of a driver, each of which bounds memory that the driver allocates when it starts,
 /// and the features that it requires.
@@ -745,47 +749,6 @@ const GROUP: u16 = 0;
 /// The user data of the poll of the interrupt descriptor that a wait keeps in the ring.
 const WAKE: u64 = CONTROL;
 
-/// The user data of the completion that a wake message posts at its home. It only ends a wait.
-const ARRIVED: u64 = 1 << 62;
-
-/// The user data of the completion of a wake message at its sender, with the index of its entry
-/// in `Driver::messages` in the low bits.
-const MESSAGE: u64 = (1 << 62) | (1 << 61);
-
-/// The wake messages that a driver keeps at one time, until their completions. A power of two,
-/// so the index of a message is the low bits of its user data.
-pub(crate) const MESSAGES: usize = 64;
-
-/// The bits of the index of a message in its user data.
-const MESSAGE_INDEX: u64 = MESSAGES as u64 - 1;
-
-/// The home of a local owner whose ring is a driver: the target of a wake from another thread.
-pub(crate) struct Home {
-    /// A duplicate of the ring descriptor. A message never names a closed descriptor, whose number
-    /// another file could take.
-    ring: OwnedFd,
-    shared: Arc<Shared>,
-}
-
-impl Home {
-    /// Ends a wait of the home from a thread with no ring: it writes the interrupt descriptor,
-    /// which the wait polls in the ring.
-    pub(crate) fn interrupt(&self) {
-        // A full counter is a pending wake already, and nothing else can fail here.
-        drop((&self.shared.interrupt).write(&1_u64.to_ne_bytes()));
-    }
-
-    /// Takes the writes of the interrupt descriptor since the last take, or since the last turn of
-    /// the driver.
-    #[cfg(test)]
-    pub(crate) fn take_interrupts(&self) -> u64 {
-        let mut count = [0; 8];
-        (&self.shared.interrupt)
-            .read(&mut count)
-            .map_or(0, |_| u64::from_ne_bytes(count))
-    }
-}
-
 /// The provided buffers: the slots of a pool, which the kernel selects for a receive. Each one is
 /// in the kernel ring, or in a lease of a consumer, or back in the pool.
 #[derive(Debug)]
@@ -928,11 +891,9 @@ pub struct Driver {
     blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
     /// The operations that run on the blocking service, which each turn polls.
     jobs: Vec<OpId>,
-    /// The home of a local owner on this driver.
-    home: Arc<Home>,
-    /// The wake messages that this driver sent and that have not completed: the home of each.
-    /// Each one keeps the descriptor of its target open until its completion.
-    messages: [Option<Arc<Home>>; MESSAGES],
+    /// The home of a local owner on this driver, and the wake messages that it sent.
+    #[cfg(feature = "local")]
+    wakes: home::Wakes,
 }
 
 impl fmt::Debug for Driver {
@@ -948,9 +909,10 @@ impl fmt::Debug for Driver {
 }
 
 impl Driver {
-    /// Starts a driver with the limits of `config`. It allocates here, one time. It opens four
-    /// descriptors: the ring, a duplicate of the ring that is the target of wake messages, the
-    /// wake descriptor, and the interrupt descriptor.
+    /// Starts a driver with the limits of `config`. It allocates here, one time. It opens three
+    /// descriptors: the ring, the wake descriptor, and the interrupt descriptor. With the `local`
+    /// feature, it also opens a duplicate of the ring, the target of the wake messages of local
+    /// tasks.
     ///
     /// # Errors
     ///
@@ -988,10 +950,8 @@ impl Driver {
             wake,
             interrupt: fs::File::from(interrupt),
         });
-        let home = Arc::new(Home {
-            ring: ring.duplicate().map_err(Error::System)?,
-            shared: Arc::clone(&shared),
-        });
+        #[cfg(feature = "local")]
+        let wakes = home::Wakes::new(&ring, &shared).map_err(Error::System)?;
         Ok(Self {
             ring,
             table,
@@ -1012,8 +972,8 @@ impl Driver {
             signals: Vec::new(),
             blocking: None,
             jobs: Vec::with_capacity(config.operations as usize),
-            home,
-            messages: [const { None }; MESSAGES],
+            #[cfg(feature = "local")]
+            wakes,
         })
     }
 
@@ -1034,42 +994,6 @@ impl Driver {
     #[must_use]
     pub fn wake_handle(&self) -> WakeHandle {
         WakeHandle(Arc::clone(&self.shared))
-    }
-
-    /// The home of a local owner whose ring is this driver.
-    pub(crate) fn home(&self) -> Arc<Home> {
-        Arc::clone(&self.home)
-    }
-
-    /// Sends a wake message from this ring to `home`: the next submit sends it, and its completion
-    /// at `home` ends a wait there. The driver keeps `home` until the completion of the message at
-    /// this ring, and a failed message writes the interrupt descriptor of `home` instead. Gives
-    /// `home` back when no entry or no room in the queue is free.
-    #[expect(unsafe_code, reason = "a message names no memory")]
-    pub(crate) fn message(&mut self, home: Arc<Home>) -> Result<(), Arc<Home>> {
-        let Some(index) = self.messages.iter().position(Option::is_none) else {
-            return Err(home);
-        };
-        let user_data = MESSAGE | index as u64;
-        let entry = Sqe::message(home.ring.as_raw_fd(), ARRIVED, 0, user_data);
-        // SAFETY: a message names no memory. The entry of `index` keeps the descriptor of the
-        // target open until the completion of the message.
-        if unsafe { self.ring.push(&entry) }.is_err() {
-            return Err(home);
-        }
-        self.messages[index] = Some(home);
-        Ok(())
-    }
-
-    /// Writes the interrupt descriptor of the home of each message whose completion this driver
-    /// has not taken, before a time with no turn: such a message can still be in the queue, or it
-    /// can fail with no turn that sees it. A message that arrives then wakes its home one more time.
-    /// Each entry stays until the completion of its message, so a later message never takes the
-    /// index of a message that the kernel can still complete.
-    pub(crate) fn settle_messages(&self) {
-        for home in self.messages.iter().flatten() {
-            home.interrupt();
-        }
     }
 
     /// A stream of `signal`, whose home is this driver: a turn wakes it when the signal arrived.
@@ -1559,7 +1483,8 @@ impl Driver {
         let mut completed = 0;
         let (shared, table, pending) = (&self.shared, &mut self.table, &mut self.pending);
         let (resources, selected, waking) = (&mut self.resources, &mut self.selected, &mut self.waking);
-        let messages = &mut self.messages;
+        #[cfg(feature = "local")]
+        let wakes = &mut self.wakes;
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
         for cqe in self.ring.completions().take(limit as usize) {
             completed += 1;
@@ -1614,13 +1539,9 @@ impl Driver {
                 }
                 // A wake message of this driver completed. If it failed, it did not reach its
                 // home, and the interrupt descriptor wakes the home instead.
-                (Outcome::Control(data), _) if data & !MESSAGE_INDEX == MESSAGE => {
-                    let index = usize::try_from(data & MESSAGE_INDEX).ok();
-                    if let Some(home) = index.and_then(|index| messages.get_mut(index)?.take())
-                        && cqe.res < 0
-                    {
-                        home.interrupt();
-                    }
+                #[cfg(feature = "local")]
+                (Outcome::Control(data), _) if home::Wakes::is_message(data) => {
+                    wakes.complete(data, cqe.res);
                     continue;
                 }
                 (Outcome::Ready, Some(id)) => match table.resources(id) {
@@ -1809,6 +1730,7 @@ impl Drop for Driver {
     /// kernel can still use them, and so do the provided buffers then; [`Driver::teardown`] ends
     /// the operations first.
     fn drop(&mut self) {
+        #[cfg(feature = "local")]
         self.settle_messages();
         let busy = self.table.busy();
         for entry in &self.shared.entries {

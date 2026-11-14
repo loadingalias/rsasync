@@ -42,7 +42,8 @@ fix, check, test, and explore select the whole workspace unless their
 arguments select packages with -p or --package. With the whole workspace, fix
 and check also lint each crate that builds without `std` with no default
 feature: its library on wasm32v1-none, a target with no `std`, and all of its
-targets, the tests too, on the host.
+targets, the tests too, on the host. They also lint the driver-only example
+alone on the host, so its build of rsasync has no scheduler.
 
 An exploration test is a unit test in a module named `explore`. The explore
 command builds the unit tests with `--cfg loom`, in target/loom/, and runs only
@@ -206,7 +207,8 @@ impl Repo {
             self.cargo(&["clippy", "--locked", "--all-targets", "--quiet"])
                 .args(&scope),
         )?;
-        self.clippy_no_std(&scope)
+        self.clippy_no_std(&scope)?;
+        self.clippy_driver_only(&scope)
     }
 
     /// Lints each package in `NO_STD_PACKAGES` with no default feature: its
@@ -244,6 +246,28 @@ impl Repo {
         step("clippy tests without std", &mut tests)
     }
 
+    /// Lints the driver-only example alone, on the host. Its build of rsasync has `std` and not
+    /// `local`, so a driver that needs the scheduler, or code that only the scheduler uses, fails
+    /// it. In a build of the workspace, the features of the other packages hide both. It runs only
+    /// when `scope` is the whole workspace, and it takes no argument of the caller.
+    fn clippy_driver_only(&self, scope: &[&str]) -> Result<(), Failure> {
+        if !scope.contains(&"--workspace") {
+            eprintln!("── clippy driver only\n   not run: the arguments select packages; run with no -p or --package");
+            return Ok(());
+        }
+        step(
+            "clippy driver only",
+            &mut self.cargo(&[
+                "clippy",
+                "--locked",
+                "--quiet",
+                "--all-targets",
+                "--package",
+                "driver_only",
+            ]),
+        )
+    }
+
     /// Checks formatting, lints, and rustdoc. It changes no file.
     fn check(&self, args: &[String]) -> Result<(), Failure> {
         let scope = scope(args);
@@ -254,6 +278,7 @@ impl Repo {
                 .args(&scope),
         )?;
         self.clippy_no_std(&scope)?;
+        self.clippy_driver_only(&scope)?;
         step(
             "rustdoc",
             self.cargo(&["doc", "--locked", "--no-deps", "--quiet"]).args(&scope),

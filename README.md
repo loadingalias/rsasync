@@ -36,7 +36,8 @@ this evidence.
   the event loop of a host, terminal teardown, and TCP accept, receive (into an owned buffer or into
   a buffer that the kernel selects), and send.
 
-There is no scheduler yet, and the driver has no other backend and no other platform yet. Each
+`rsasync::task` runs local tasks on one thread, behind the `local` feature, which is on by default.
+The work-stealing pool, the other backends of the driver, and the other platforms come later. Each
 alpha can change the API.
 
 Part of one family on [rscrypto](https://github.com/loadingalias/rscrypto): rsasync (runtime),

@@ -13,11 +13,84 @@ files, and child processes. The other operations come in later changes. [TCP on 
 [Child processes on the driver](processes.md) are the references for each operation and its
 results.
 
-The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It starts no helper
+The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It does not need
+the `local` feature, which holds the local tasks of `rsasync::task`, a scheduler. It starts no helper
 thread. Before Linux 6.9, a change of the length of a file runs on your
 [blocking service](blocking-service.md). `Driver::report` gives the features of the kernel and the
 route of each such call before the first operation: see the [capability report](capability-report.md)
 and [Length and space](files.md#length-and-space).
+
+## Run the example
+
+The program in `examples/driver_only` of the repository uses only the public API of the driver. Its
+loop polls a future again only after the future woke its waker. It prints one line for each of
+these outcomes:
+
+- The capability report: 0 helper threads, and the route of `set_file_len`. The program gives the
+  driver a [blocking service](blocking-service.md). The driver uses it only for a call whose route is
+  `Route::BlockingService`.
+- File, TCP, and UDP I/O on owned buffers. Each operation takes its buffer, and its future gives the
+  buffer back, also after a failure.
+- A receive gives its completion to the waker of its latest poll, not to an earlier waker.
+- Partial progress: an exact read that ends at the end of the file, a TCP receive into a buffer that
+  is smaller than the data, and a datagram that a small buffer truncates. The same buffer then takes
+  the next bytes.
+- `Operation::cancel` on a waiting receive: the future gives `ECANCELED` and the buffer, and the next
+  receive uses that buffer.
+- A dropped receive and a dropped accept. A drop ends the interest, and the driver keeps the buffer
+  until the kernel ends the operation. The next receive gets the bytes.
+- Close of each resource. Then teardown cancels 0 operations, because no operation of the driver
+  still runs.
+
+Its manifest takes rsasync with no scheduler:
+
+```toml
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../..", default-features = false, features = ["std"] }
+```
+
+Run it on Linux, from the root of the repository:
+
+```sh
+cargo run -p driver_only
+```
+
+On Linux 7.0, it prints this text:
+
+<!-- The same text as `EXPECTED` in examples/driver_only/src/main.rs. Edit both. -->
+```text
+report: 0 helper threads; set_file_len route: Ring
+file: wrote 11 bytes and made them durable
+file: an exact read of 16 bytes stopped at the end of the file after 11 bytes: "hello world"
+file: set the length to 5, and the length is 5
+file: the same buffer then read 5 bytes: "hello"
+file: closed and removed the file
+tcp: the receive woke its current waiter 1 time and its earlier waiter 0 times
+tcp: the receive gave 8 of the 11 sent bytes: "hello wo"
+tcp: the same buffer then received the rest: "rld"
+tcp: the cancelled receive gave ECANCELED and its buffer back
+tcp: the same buffer then received "again"
+tcp: after a dropped receive, the next receive gave "late"
+tcp: closed the listener after a dropped accept
+tcp: closed both streams; Closed::sent() gives [None, None]
+udp: a receive into 4 bytes gave "ping", truncated: true
+udp: the same buffer then received "pong", truncated: false
+udp: after a dropped receive, the next receive gave "late"
+udp: closed both sockets
+driver: teardown cancelled 0 operations and kept 0 children
+blocking service: teardown found 0 running jobs and dropped 0 jobs
+```
+
+Before Linux 6.9, the first line ends with `set_file_len route: BlockingService`, because the kernel
+has no ring operation for the change of the length. The service then runs it, and each other line
+is the same. On another target, the program ends with an error, because the driver needs Linux on
+x86_64 or aarch64. On Linux, `cargo xtask test` runs the steps of the program and compares their
+output with this text.
+
+`cargo tree -p driver_only -e features` shows `rsasync feature "std"` and no `local` feature.
+A build of the whole workspace unifies the features of its packages, so the build with no scheduler
+is the build of the package alone: `cargo build -p driver_only` or `cargo run -p driver_only`.
+`cargo xtask check` lints that build alone, on the host.
 
 ## The contract
 

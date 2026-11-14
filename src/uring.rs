@@ -624,6 +624,7 @@ impl Ring {
 
     /// A new descriptor of the ring. It keeps the ring open after this ring closes, so a message
     /// to it never names a descriptor number that another file took.
+    #[cfg(feature = "local")]
     pub(crate) fn duplicate(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
     }

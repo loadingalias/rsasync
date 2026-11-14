@@ -16,16 +16,20 @@
 //!   permits, and finds data races on the cells. Its spin hint lets another thread run.
 //!   `cargo xtask explore` runs these tests.
 
+#[cfg(all(test, loom, feature = "std"))]
+pub(crate) use loom::thread;
+#[cfg(all(test, loom, feature = "local"))]
+pub(crate) use loom::thread_local;
 #[cfg(all(test, loom))]
 pub(crate) use loom::{
     cell::UnsafeCell,
     hint,
     sync::{Arc, atomic},
 };
-#[cfg(all(test, loom, feature = "std"))]
-pub(crate) use loom::{thread, thread_local};
 #[cfg(all(not(all(test, loom)), feature = "std"))]
-pub(crate) use std::{thread, thread_local};
+pub(crate) use std::thread;
+#[cfg(all(not(all(test, loom)), feature = "local"))]
+pub(crate) use std::thread_local;
 #[cfg(not(all(test, loom)))]
 pub(crate) use {alloc::sync::Arc, core::hint, core::sync::atomic, native::UnsafeCell};
 

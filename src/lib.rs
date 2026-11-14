@@ -9,12 +9,13 @@
 //!
 //! The [`channel`] module holds the bounded channels, [`clock`] holds the native and the injected
 //! clocks, and [`timer`] holds bounded timers. None of them needs a scheduler or driver. With the
-//! `std` feature, the [`task`] module runs local tasks on a local owner.
+//! `local` feature, which turns on `std`, the [`task`] module runs local tasks on a local owner.
 //!
 //! With the `std` feature, the `blocking` module holds the bounded blocking service, which runs
 //! blocking host work on a fixed number of threads.
 //!
-//! Without the `std` feature, which is on by default, the crate needs only `core` and `alloc`.
+//! The features `std` and `local` are on by default. Without `std`, the crate needs only `core`
+//! and `alloc`. With `std` and not `local`, the driver builds with no scheduler.
 
 #![no_std]
 
@@ -61,7 +62,7 @@ mod table;
 mod wait;
 
 pub mod clock;
-#[cfg(feature = "std")]
+#[cfg(feature = "local")]
 pub mod task;
 pub mod timer;
 

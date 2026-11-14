@@ -10,9 +10,11 @@ license.workspace = true
 include = ["/src", "/LICENSE", "/README.md"]
 
 [features]
-default = ["std"]
+default = ["std", "local"]
 # Without `std`, the crate needs only `core` and `alloc`.
 std = ["rstypes/std", "dep:rsnetwork-udp"]
+# The local tasks of `rsasync::task`: a scheduler. Without it, the driver builds with no scheduler.
+local = ["std"]
 
 [dependencies]
 # The shared types. Users reach them through this crate and never name it.
@@ -31,7 +33,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = [".", "rsnetwork-udp", "rstypes", "xtask"]
+members = [".", "examples/driver_only", "rsnetwork-udp", "rstypes", "xtask"]
 
 # No `rust-version`: development requires the nightly pinned in
 # rust-toolchain.toml, which a release number cannot express.

@@ -2,7 +2,8 @@
 
 `rsasync::task` runs local tasks: futures that one thread polls, and drops, only on itself. A task
 can hold `!Send` state, such as an `Rc`. rsasync is in development, and the tasks on this page are
-not in a published release yet. They need the `std` feature, which is on by default.
+not in a published release yet. They need the `local` feature, which is on by default and turns on
+the `std` feature.
 
 ## Run tasks on a local owner
 
