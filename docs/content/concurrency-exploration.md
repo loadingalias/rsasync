@@ -35,7 +35,7 @@ The search also finds each import with braces, such as `use core::{...}`, becaus
 can name `sync` on a later line. It also finds the test modules that are not in a `tests.rs`
 file, and the doc examples. Examine each line that it finds.
 
-The search finds five exceptions:
+The search finds six exceptions:
 
 - The `alloc::sync::Arc` of a trait object in `rstypes/src/buffer.rs`, which holds the owner of
   `Lease::from_owner`. The loom `Arc` cannot hold a trait object. That count only drops the owner,
@@ -55,6 +55,8 @@ The search finds five exceptions:
 - The `alloc::sync::Arc` of the waker of a task and of the root future in `src/task`, and of a
   `CancelHandle`. `Waker::from` takes only that `Arc`. Its count only drops the identity of the
   task: the slot word and the remote-ready list, which loom explores, use the items of the module.
+- The `alloc::sync::Arc` of the waker of the blocking jobs of the driver in `src/driver/file.rs`.
+  `Waker::from` takes only that `Arc`, and its count only drops a wake handle of the driver.
 
 ## Write an exploration test
 

@@ -79,7 +79,14 @@ pub(super) const IORING_OP_NOP: u8 = 0;
 pub(super) const IORING_OP_POLL_ADD: u8 = 6;
 pub(super) const IORING_OP_ACCEPT: u8 = 13;
 pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
+pub(super) const IORING_OP_READV: u8 = 1;
 pub(super) const IORING_OP_WRITEV: u8 = 2;
+pub(super) const IORING_OP_FSYNC: u8 = 3;
+pub(super) const IORING_OP_FALLOCATE: u8 = 17;
+pub(super) const IORING_OP_OPENAT: u8 = 18;
+pub(super) const IORING_OP_STATX: u8 = 21;
+pub(super) const IORING_OP_RENAMEAT: u8 = 35;
+pub(super) const IORING_OP_UNLINKAT: u8 = 36;
 pub(super) const IORING_OP_READ: u8 = 22;
 pub(super) const IORING_OP_WRITE: u8 = 23;
 pub(super) const IORING_OP_SENDMSG: u8 = 9;
@@ -121,6 +128,9 @@ pub(super) const MSG_NOSIGNAL: u32 = 0x4000;
 /// flags of an entry.
 pub(super) const SOCK_NONBLOCK: u32 = rsnetwork_udp::sys::SOCK_NONBLOCK.cast_unsigned();
 pub(super) const SOCK_CLOEXEC: u32 = rsnetwork_udp::sys::SOCK_CLOEXEC.cast_unsigned();
+
+/// `IORING_FSYNC_DATASYNC`: the sync of `IORING_OP_FSYNC` is `fdatasync`, not `fsync`.
+pub(super) const IORING_FSYNC_DATASYNC: u32 = 1 << 0;
 
 /// The command of `IORING_OP_MSG_RING` that posts `len` and `off` as a completion of the target.
 pub(super) const IORING_MSG_DATA: u64 = 0;

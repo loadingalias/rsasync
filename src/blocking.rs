@@ -615,6 +615,13 @@ impl<R> Waiter<R> {
     pub fn wait_blocking(&mut self) -> Result<R, Failed> {
         result(self.reply.recv_blocking())
     }
+
+    /// One poll of the wait, for the driver, which keeps the waiter of a job and no future. The
+    /// waker of `cx` stays registered after a `Pending`, so the end of the job wakes it.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"),))]
+    pub(crate) fn poll(&mut self, cx: &Context<'_>) -> Poll<Result<R, Failed>> {
+        self.reply.poll_recv(cx).map(result)
+    }
 }
 
 impl<R> fmt::Debug for Waiter<R> {

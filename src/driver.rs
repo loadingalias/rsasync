@@ -23,7 +23,13 @@
 //! a stream runs one operation at a time, and the rules for a dropped or forgotten future keep each
 //! byte and each connection: see [`TcpStream`].
 //!
-//! The io_uring driver needs no helper thread: [`Driver::helper_threads`] gives 0.
+//! Files run on the driver too: [`Driver::open_file`] with an explicit cache mode, positional and
+//! vectored reads and writes, length, space, sync, rename, unlink, directories, and
+//! [`Driver::close_file`]. Several operations of one file run at one time: see [`File`].
+//!
+//! The io_uring driver needs no helper thread: [`Driver::helper_threads`] gives 0. A kernel with no
+//! ring operation for a file call runs that call on the blocking service of the caller:
+//! [`Driver::blocking_work`] names those calls, and [`Driver::use_blocking`] gives the service.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,6 +48,7 @@
 //! ```
 
 mod completion;
+mod file;
 mod pipe;
 mod probe;
 mod signal;
@@ -59,7 +66,7 @@ use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop};
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use std::fs::File;
+use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
@@ -71,6 +78,9 @@ use crate::sync::Arc;
 use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
 
+pub use file::{
+    Alignment, BlockingWork, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode,
+};
 pub use pipe::{PipeReader, PipeWriter};
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
@@ -256,6 +266,19 @@ pub(crate) struct Held {
     pub(crate) progress: udp::Progress,
     /// The next operation that waits in the same direction, in start order.
     pub(crate) next: Option<OpId>,
+    /// The C strings of the paths of a file operation, which the kernel reads.
+    pub(crate) path: Option<std::ffi::CString>,
+    pub(crate) target: Option<std::ffi::CString>,
+    /// The structure that a `statx` of a file writes.
+    pub(crate) stat: sys::Statx,
+    /// The buffers of a vectored read of a file.
+    pub(crate) buffers: Option<Buffers>,
+    /// The alignment of direct I/O of a file that an open gave.
+    pub(crate) alignment: Option<Alignment>,
+    /// The waiter of the job of an operation that runs on the blocking service.
+    pub(crate) job: Option<crate::blocking::Waiter<i32>>,
+    /// An error of the home that the future gives in place of the result of the kernel.
+    pub(crate) error: Option<io::ErrorKind>,
 }
 
 /// What an operation is: the direction that it uses, and what the home does at its terminal
@@ -294,6 +317,9 @@ pub(crate) enum Kind {
     SendBatch,
     /// A close, which ends after each operation of its resource ends.
     Close,
+    /// An operation of a file or a directory, which runs at the same time as the others of its
+    /// file.
+    File(file::Op),
 }
 
 impl Kind {
@@ -341,6 +367,12 @@ pub enum Reason {
     Direction,
     /// The operation does not apply to this resource, for example a half-close of a pipe.
     Unsupported,
+    /// The buffer, the length, or the offset of a direct-I/O operation does not have the
+    /// [`Alignment`] of its file.
+    Alignment,
+    /// The operation runs on the blocking service on this kernel ([`Driver::blocking_work`]),
+    /// and the driver has no service ([`Driver::use_blocking`]), or the service refused the job.
+    Blocking,
 }
 
 /// A refused operation: the reason, and the value that the caller gave, which it keeps.
@@ -481,6 +513,8 @@ struct Owned {
     directions: tcp::Directions,
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
+    /// The operations of a file that run, which its close waits for.
+    running: u32,
 }
 
 /// What a resource of the driver is.
@@ -494,6 +528,8 @@ enum Medium {
     Pipe,
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
     Udp,
+    /// A file or a directory: its operations are positional, and several run at one time.
+    File,
 }
 
 /// The descriptors that the driver owns, in a slice that it allocates once.
@@ -535,6 +571,7 @@ impl Resources {
         let slot = self.get(resource)?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
+        slot.running = 0;
         slot.fd.take()
     }
 }
@@ -624,10 +661,10 @@ struct Shared {
     requests: Requests,
     /// The wake descriptor: an `eventfd` that the kernel also signals at each completion and for
     /// its deferred work.
-    wake: File,
+    wake: fs::File,
     /// An `eventfd` that only the other threads signal. A wait polls it in the ring. A signal of
     /// the kernel would also complete that poll, so the wait does not poll `wake`.
-    interrupt: File,
+    interrupt: fs::File,
 }
 
 impl Shared {
@@ -680,6 +717,11 @@ pub struct Driver {
     rearm_wake: bool,
     /// The signal streams whose home is this driver.
     signals: Vec<Arc<signal::Home>>,
+    /// The blocking service of the operations that the kernel cannot run
+    /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
+    blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
+    /// The operations that run on the blocking service, which each turn polls.
+    jobs: Vec<OpId>,
 }
 
 impl fmt::Debug for Driver {
@@ -718,7 +760,7 @@ impl Driver {
         // The probe needs a new ring, with no entry, completion, or buffer group.
         let features = ring.probe().map_err(Error::System)?;
         let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
-        let wake = File::from(wake);
+        let wake = fs::File::from(wake);
         ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
         let rearm_wake = probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?;
         let table = Table::new(config.operations);
@@ -726,7 +768,7 @@ impl Driver {
             entries: (0..config.operations).map(|_| Entry::new()).collect(),
             requests: table.requests(),
             wake,
-            interrupt: File::from(interrupt),
+            interrupt: fs::File::from(interrupt),
         });
         Ok(Self {
             ring,
@@ -742,6 +784,8 @@ impl Driver {
             waking: false,
             rearm_wake,
             signals: Vec::new(),
+            blocking: None,
+            jobs: Vec::with_capacity(config.operations as usize),
         })
     }
 
@@ -845,6 +889,7 @@ impl Driver {
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
         self.take_requests();
+        self.poll_jobs();
         if let Some(selected) = &mut self.selected {
             selected.refill();
         }
@@ -909,7 +954,9 @@ impl Driver {
     }
 
     /// Cancels each running operation, drives until each terminal event, and closes each
-    /// resource. Each future that has not taken its result then gives [`Ended`].
+    /// resource. Each future that has not taken its result then gives [`Ended`]. A job of the
+    /// blocking service ([`Driver::blocking_work`]) cannot be cancelled, so the teardown waits until
+    /// it returns.
     ///
     /// # Errors
     ///
@@ -940,11 +987,13 @@ impl Driver {
         }
         while self.table.busy() {
             self.take_requests();
-            match self.ring.submit(1) {
-                Ok(_) => {}
-                Err(error) if retryable(&error) => {}
-                Err(error) => return Err(error),
+            self.poll_jobs();
+            if !self.table.busy() {
+                break;
             }
+            // The wait also ends when a job of the blocking service ends, because the job wakes
+            // the interrupt descriptor.
+            self.wait()?;
             self.harvest(u32::MAX);
             self.attend();
         }
@@ -1017,6 +1066,18 @@ impl Driver {
         value: P,
         held: impl FnOnce(P) -> Held,
     ) -> Result<OpId, (Reason, P)> {
+        self.open_with(tag, entries, value, |value| Ok(held(value)))
+    }
+
+    /// [`Driver::open`] with resources that `held` can refuse to make, for example when a job of
+    /// the operation does not start. The refusal changes nothing.
+    pub(crate) fn open_with<P>(
+        &mut self,
+        tag: Tag,
+        entries: u32,
+        value: P,
+        held: impl FnOnce(P) -> Result<Held, (Reason, P)>,
+    ) -> Result<OpId, (Reason, P)> {
         // The table counts the completions of a batch until its last one.
         let shape = if tag.kind.batch() {
             Shape::Multishot
@@ -1044,8 +1105,16 @@ impl Driver {
             self.table.withdraw(id);
             return Err((Reason::Operations, value));
         };
-        slot.start(id, held(value), |_| ());
-        Ok(id)
+        match held(value) {
+            Ok(held) => {
+                slot.start(id, held, |_| ());
+                Ok(id)
+            }
+            Err(refused) => {
+                self.table.withdraw(id);
+                Err(refused)
+            }
+        }
     }
 
     /// Submits the operation `id`: `entry` makes its submission from its resources at the home.
@@ -1087,6 +1156,14 @@ impl Driver {
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return;
         };
+        let tag = match &outcome {
+            Outcome::Ready => self.table.resources(id).copied(),
+            Outcome::Abandoned(Done { resources, .. }) => *resources,
+            _ => None,
+        };
+        if let Some(tag) = tag {
+            file::ended(&mut self.resources, &mut self.pending, tag);
+        }
         match outcome {
             Outcome::Ready => slot.publish(id, result),
             Outcome::Abandoned(Done {
@@ -1221,6 +1298,7 @@ impl Driver {
                     finish(held, tag, &cqe, abandoned, resources, selected.as_mut());
                 }
             });
+            file::ended(resources, pending, tag);
             if abandoned {
                 if let Some(held) = slot.reclaim(id) {
                     tcp::abandon(resources, tag, event.result, held);
@@ -1250,6 +1328,7 @@ fn finish(
 ) {
     let count = usize::try_from(cqe.res);
     match tag.kind {
+        Kind::File(op) => file::finish(held, op, cqe.res, abandoned, resources),
         Kind::Other
         | Kind::Send
         | Kind::Vectored
@@ -1407,7 +1486,7 @@ unsafe fn push_now(ring: &mut Ring, entry: &Sqe) -> io::Result<()> {
 
 /// Ends the registration of the wake descriptor and makes a new one, which starts with no
 /// deferred signal (`probe`).
-fn rearm(ring: &Ring, wake: &File) -> io::Result<()> {
+fn rearm(ring: &Ring, wake: &fs::File) -> io::Result<()> {
     ring.unregister_eventfd()?;
     ring.register_eventfd(wake.as_raw_fd())
 }

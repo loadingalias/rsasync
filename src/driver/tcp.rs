@@ -458,7 +458,7 @@ impl Regions {
 
     /// The iovec array of each region, and its length, for a submission. Its capacity holds the
     /// array, so it allocates nothing.
-    fn vectors(&mut self) -> (*const IoVec, u32) {
+    pub(super) fn vectors(&mut self) -> (*const IoVec, u32) {
         self.vectors.clear();
         self.vectors.extend(self.leases.iter().map(|lease| IoVec {
             iov_base: lease.as_ptr().cast_mut().cast::<c_void>(),
@@ -642,7 +642,7 @@ impl Directions {
                 Some(&mut self.read)
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::File(_) => None,
         }
     }
 
@@ -661,7 +661,9 @@ impl Directions {
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch | Kind::File(_) => {
+                false
+            }
         }
     }
 }
@@ -676,9 +678,9 @@ pub(super) fn count(result: i32) -> io::Result<usize> {
 /// for the next operation of the direction. A send that failed, sent only part of its bytes, or
 /// was cancelled makes the write direction fail.
 pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: Held) {
-    if matches!(tag.kind, Kind::Connect | Kind::Bind) {
-        // No caller holds the socket, so the home closes it: the peer of a connection reads the end
-        // of the stream.
+    if matches!(tag.kind, Kind::Connect | Kind::Bind | Kind::File(_)) {
+        // No caller holds the socket or the file, so the home closes it: the peer of a connection
+        // reads the end of the stream.
         if let Some(socket) = held.accepted {
             drop(resources.release(socket));
         }
@@ -764,7 +766,14 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
             _ => {}
         },
         // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
-        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
+        Kind::Accept
+        | Kind::Other
+        | Kind::Close
+        | Kind::Connect
+        | Kind::Bind
+        | Kind::SendTo
+        | Kind::SendBatch
+        | Kind::File(_) => {}
     }
 }
 
@@ -1624,7 +1633,7 @@ impl Driver {
             },
             // A batch submits in `start_batch`.
             Kind::SendBatch | Kind::RecvBatch => Sqe::nop(),
-            Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => {
+            Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::File(_) => {
                 Sqe::accept(fd, (&raw mut held.peer).cast(), &raw mut held.peer_len)
             }
         };
@@ -1810,7 +1819,8 @@ impl Driver {
             .flatten()
             .any(|operation| table.runs(operation))
             || directions.read.first.is_some()
-            || directions.write.first.is_some();
+            || directions.write.first.is_some()
+            || owned.running > 0;
         if runs {
             return;
         }

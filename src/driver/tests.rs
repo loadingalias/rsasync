@@ -65,13 +65,13 @@ fn pipe() -> (OwnedFd, File) {
 }
 
 /// The order of the events of a test, from any thread.
-type Log = Arc<Mutex<Vec<&'static str>>>;
+pub(super) type Log = Arc<Mutex<Vec<&'static str>>>;
 
-fn note(log: &Log, what: &'static str) {
+pub(super) fn note(log: &Log, what: &'static str) {
     log.lock().expect("no test thread panics with the log").push(what);
 }
 
-fn taken(log: &Log) -> Vec<&'static str> {
+pub(super) fn taken(log: &Log) -> Vec<&'static str> {
     mem::take(&mut *log.lock().expect("no test thread panics with the log"))
 }
 
@@ -80,7 +80,7 @@ fn taken(log: &Log) -> Vec<&'static str> {
     unsafe_code,
     reason = "the test maps its own block into a backing, as a library does"
 )]
-fn recorded(log: &Log, capacity: usize) -> Backing {
+pub(super) fn recorded(log: &Log, capacity: usize) -> Backing {
     let mut block = ManuallyDrop::new(Vec::<u8>::with_capacity(capacity));
     let ptr = NonNull::new(block.as_mut_ptr()).expect("a vector gives a pointer that is not null");
     let data = Arc::into_raw(Arc::clone(log)).cast::<()>();

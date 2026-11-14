@@ -6,12 +6,15 @@ it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development
 releases are on crates.io.
 
 The driver has TCP bind, connect, accept, receive, send, half-close, and close. It also has UDP
-datagrams with their metadata, and the receive, send, and close of pipe ends. The other operations
-come in later changes. [TCP on the driver](tcp.md), [UDP on the driver](udp.md), and
-[Pipes on the driver](pipes.md) are the references for each operation and its results.
+datagrams with their metadata, the receive, send, and close of pipe ends, and files. The other
+operations come in later changes. [TCP on the driver](tcp.md), [UDP on the driver](udp.md),
+[Pipes on the driver](pipes.md), and [Files on the driver](files.md) are the references for each
+operation and its results.
 
 The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It needs no helper
-thread: `Driver::helper_threads` gives 0.
+thread: `Driver::helper_threads` gives 0. Before Linux 6.9, a change of the length of a file runs on
+your [blocking service](blocking-service.md): `Driver::blocking_work` tells it before the first
+operation. See [Length and space](files.md#length-and-space).
 
 ## The contract
 

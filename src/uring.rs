@@ -138,6 +138,127 @@ impl Sqe {
         }
     }
 
+    /// A read of the `count` regions of the iovec array `vectors` from `fd`, in order
+    /// (`IORING_OP_READV`), at the position of the file.
+    pub(crate) fn readv(fd: RawFd, vectors: *const rsnetwork_udp::sys::IoVec, count: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_READV,
+            fd,
+            off: u64::MAX,
+            addr: vectors.addr() as u64,
+            len: count,
+            ..Self::default()
+        }
+    }
+
+    /// The read or the write at the file offset `offset`, not at the position of the file.
+    pub(crate) fn at(self, offset: u64) -> Self {
+        Self { off: offset, ..self }
+    }
+
+    /// The read or the write with the `RWF_*` flags `flags`, for example `RWF_DSYNC`.
+    pub(crate) fn with_rw_flags(self, flags: u32) -> Self {
+        Self {
+            rw_flags: flags,
+            ..self
+        }
+    }
+
+    /// A sync of the file `fd` (`IORING_OP_FSYNC`): `fdatasync` when `data` holds, else `fsync`.
+    pub(crate) fn fsync(fd: RawFd, data: bool) -> Self {
+        Self {
+            opcode: sys::IORING_OP_FSYNC,
+            fd,
+            rw_flags: if data { sys::IORING_FSYNC_DATASYNC } else { 0 },
+            ..Self::default()
+        }
+    }
+
+    /// A `fallocate` of `len` bytes from `offset` of the file `fd` with `mode`
+    /// (`IORING_OP_FALLOCATE`). The entry holds the length in `addr` and the mode in `len`.
+    pub(crate) fn fallocate(fd: RawFd, mode: u32, offset: u64, len: u64) -> Self {
+        Self {
+            opcode: sys::IORING_OP_FALLOCATE,
+            fd,
+            off: offset,
+            addr: len,
+            len: mode,
+            ..Self::default()
+        }
+    }
+
+    /// An `openat` of the C string `path` relative to `directory` with `flags` and `mode`
+    /// (`IORING_OP_OPENAT`). The kernel adds `O_LARGEFILE`.
+    pub(crate) fn openat(directory: RawFd, path: *const u8, flags: u32, mode: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_OPENAT,
+            fd: directory,
+            addr: path.addr() as u64,
+            len: mode,
+            rw_flags: flags,
+            ..Self::default()
+        }
+    }
+
+    /// A `statx` of the C string `path` relative to `directory`, with `flags` and the fields of
+    /// `mask`, into the structure at `buffer` (`IORING_OP_STATX`). The entry holds the structure
+    /// in `off`.
+    pub(crate) fn statx(directory: RawFd, path: *const u8, flags: u32, mask: u32, buffer: *mut u8) -> Self {
+        Self {
+            opcode: sys::IORING_OP_STATX,
+            fd: directory,
+            addr: path.addr() as u64,
+            len: mask,
+            off: buffer.addr() as u64,
+            rw_flags: flags,
+            ..Self::default()
+        }
+    }
+
+    /// A `renameat2` of the C string `from` relative to `from_directory` to the C string `to`
+    /// relative to `to_directory`, with `flags` (`IORING_OP_RENAMEAT`). The entry holds the second
+    /// directory in `len` and the second path in `off`.
+    pub(crate) fn renameat(
+        from_directory: RawFd,
+        from: *const u8,
+        to_directory: RawFd,
+        to: *const u8,
+        flags: u32,
+    ) -> Self {
+        Self {
+            opcode: sys::IORING_OP_RENAMEAT,
+            fd: from_directory,
+            addr: from.addr() as u64,
+            len: to_directory.cast_unsigned(),
+            off: to.addr() as u64,
+            rw_flags: flags,
+            ..Self::default()
+        }
+    }
+
+    /// An `unlinkat` of the C string `path` relative to `directory`, with `flags`, for example
+    /// `AT_REMOVEDIR` (`IORING_OP_UNLINKAT`).
+    pub(crate) fn unlinkat(directory: RawFd, path: *const u8, flags: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_UNLINKAT,
+            fd: directory,
+            addr: path.addr() as u64,
+            rw_flags: flags,
+            ..Self::default()
+        }
+    }
+
+    /// An `ftruncate` of the file `fd` to `len` bytes (`IORING_OP_FTRUNCATE`, Linux 6.9). The entry
+    /// holds the length in `off`.
+    pub(crate) fn ftruncate(fd: RawFd, len: u64) -> Self {
+        Self {
+            opcode: sys::IORING_OP_FTRUNCATE,
+            fd,
+            off: len,
+            ..Self::default()
+        }
+    }
+
     /// The entry with the user data `user_data`, which its completion gives back.
     pub(crate) fn with_user_data(self, user_data: u64) -> Self {
         Self { user_data, ..self }
