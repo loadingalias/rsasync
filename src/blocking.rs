@@ -74,10 +74,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
 use std::panic;
-use std::thread::{self, JoinHandle};
 
 use crate::capacity::{Budget, Exhausted, Permit};
 use crate::channel::{self, Closed, TooManyReceivers, mpmc, oneshot};
+use crate::sync::thread::{self, JoinHandle};
 use crate::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -335,11 +335,12 @@ struct Task<J: Job> {
 /// A task of any job type, for the queue.
 trait Run: Send {
     /// Runs the job, and gives its result to the waiter, or drops it when the waiter is gone.
-    fn run(self: Box<Self>);
+    /// Gives whether the job returned after the stop of the service in `stopped`.
+    fn run(self: Box<Self>, stopped: &AtomicBool) -> bool;
 }
 
 impl<J: Job> Run for Task<J> {
-    fn run(self: Box<Self>) {
+    fn run(self: Box<Self>, stopped: &AtomicBool) -> bool {
         let Self {
             job,
             reply,
@@ -348,10 +349,14 @@ impl<J: Job> Run for Task<J> {
         } = *self;
         // The payload of a panic drops here: the panic hook reported it.
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| job.run())).map_err(|_| Failed::Panicked);
+        // The check comes before the send: a waiter that took the result before the stop makes
+        // the teardown count no running job. Ordering: `Acquire` reads the release of the stop.
+        let late = stopped.load(Ordering::Acquire);
         // A waiter that is gone gives the result back, and it drops here.
         drop(reply.send(outcome));
         // The job slot ends only now, after the job returned and its result left this thread.
         drop(slot);
+        late
     }
 }
 
@@ -520,9 +525,11 @@ fn serve(shared: &Shared, mut queue: mpmc::Receiver<Box<dyn Run>>, _stack: Permi
             counts.dropped += 1;
             continue;
         }
-        drop(panic::catch_unwind(AssertUnwindSafe(|| task.run())));
-        // Ordering: `Acquire`, as above.
-        if shared.stopped.load(Ordering::Acquire) {
+        let late = panic::catch_unwind(AssertUnwindSafe(|| task.run(&shared.stopped)))
+            // A drop of the result panicked after the check, so check again. Ordering: `Acquire`,
+            // as above.
+            .unwrap_or_else(|_| shared.stopped.load(Ordering::Acquire));
+        if late {
             counts.running += 1;
         }
     }
