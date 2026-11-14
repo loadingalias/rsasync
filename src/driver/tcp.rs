@@ -16,7 +16,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use rsnetwork_udp::sys::{self, IoVec, MsgHdr};
 use rsnetwork_udp::{AF_INET6, SockAddrStorage};
 
-use super::{Completion, Driver, ECANCELED, Held, Kind, Operation, Reason, Refused, Resource, Resources, Tag};
+use super::{Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Reason, Refused, Resource, Resources, Tag};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
 use crate::table::OpId;
@@ -147,13 +147,13 @@ impl TcpStream {
 /// The read half of a [`TcpStream`]: [`Driver::recv`] and [`Driver::recv_selected`] borrow it.
 #[derive(Debug)]
 pub struct ReadHalf {
-    resource: Resource,
+    pub(super) resource: Resource,
 }
 
 /// The write half of a [`TcpStream`]: [`Driver::send`] borrows it.
 #[derive(Debug)]
 pub struct WriteHalf {
-    resource: Resource,
+    pub(super) resource: Resource,
 }
 
 impl AsMut<ReadHalf> for TcpStream {
@@ -442,17 +442,27 @@ impl Regions {
     /// The header of a message of each region, for a submission. Its capacity holds the array, so
     /// it allocates nothing.
     fn message(&mut self) -> *const MsgHdr {
-        self.vectors.clear();
-        self.vectors.extend(self.leases.iter().map(|lease| IoVec {
-            iov_base: lease.as_ptr().cast_mut().cast::<c_void>(),
-            iov_len: lease.initialized(),
-        }));
+        self.vectors();
         self.header = MsgHdr {
             msg_iov: self.vectors.as_mut_ptr(),
             msg_iovlen: self.vectors.len(),
             ..EMPTY_HEADER
         };
         &raw const self.header
+    }
+
+    /// The iovec array of each region, and its length, for a submission. Its capacity holds the
+    /// array, so it allocates nothing.
+    fn vectors(&mut self) -> (*const IoVec, u32) {
+        self.vectors.clear();
+        self.vectors.extend(self.leases.iter().map(|lease| IoVec {
+            iov_base: lease.as_ptr().cast_mut().cast::<c_void>(),
+            iov_len: lease.initialized(),
+        }));
+        (
+            self.vectors.as_ptr(),
+            u32::try_from(self.vectors.len()).unwrap_or(u32::MAX),
+        )
     }
 }
 
@@ -924,12 +934,26 @@ impl Driver {
     ///
     /// # Errors
     ///
-    /// A refusal when the driver has no room for the operation.
+    /// A refusal when the driver has no room for the operation, and [`Reason::Unsupported`] for a
+    /// resource that is not a TCP stream, such as a [`PipeWriter`](super::PipeWriter): close a
+    /// pipe writer instead. A refusal changes nothing.
     pub fn shutdown_write<'a, W: AsMut<WriteHalf>>(
         &mut self,
         writer: &'a mut W,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        let completion = self.begin(writer.as_mut().resource, Kind::Shutdown, (), |()| Held::default())?;
+        let resource = writer.as_mut().resource;
+        // Only a TCP stream has a half-close. The close of a pipe is the end of its stream.
+        if self
+            .resources
+            .get(resource)
+            .is_some_and(|owned| owned.medium != Medium::Tcp)
+        {
+            return Err(Refused {
+                reason: Reason::Unsupported,
+                value: (),
+            });
+        }
+        let completion = self.begin(resource, Kind::Shutdown, (), |()| Held::default())?;
         Ok(Operation::new(completion, |result, held| {
             Some(match held.failed {
                 Some(failed) => Err(io::Error::other(failed)),
@@ -1310,6 +1334,7 @@ impl Driver {
         let Some(fd) = owned.fd.as_ref().map(OwnedFd::as_raw_fd) else {
             return true;
         };
+        let pipe = owned.medium == Medium::Pipe;
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return true;
         };
@@ -1404,25 +1429,36 @@ impl Driver {
         let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
         let entry = move |held: &mut Held| match kind {
             Kind::Recv => match held.loan.as_mut() {
-                Some(loan) => Sqe::recv(
-                    fd,
-                    loan.as_mut_ptr(),
-                    u32::try_from(loan.capacity()).unwrap_or(u32::MAX),
-                ),
+                Some(loan) => {
+                    let (buffer, len) = (loan.as_mut_ptr(), u32::try_from(loan.capacity()).unwrap_or(u32::MAX));
+                    if pipe {
+                        Sqe::read(fd, buffer, len)
+                    } else {
+                        Sqe::recv(fd, buffer, len)
+                    }
+                }
                 // A receive always has its loan.
                 None => Sqe::nop(),
             },
+            Kind::Selected if pipe => Sqe::read_selected(fd, group),
             Kind::Selected => Sqe::recv_selected(fd, group),
             Kind::Send => match held.lease.as_ref() {
-                Some(lease) => Sqe::send(
-                    fd,
-                    lease.as_ptr(),
-                    u32::try_from(lease.initialized()).unwrap_or(u32::MAX),
-                ),
+                Some(lease) => {
+                    let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
+                    if pipe {
+                        Sqe::write(fd, bytes, len)
+                    } else {
+                        Sqe::send(fd, bytes, len)
+                    }
+                }
                 // A send always has its lease.
                 None => Sqe::nop(),
             },
             Kind::Vectored => match held.regions.as_mut() {
+                Some(regions) if pipe => {
+                    let (vectors, count) = regions.vectors();
+                    Sqe::writev(fd, vectors, count)
+                }
                 Some(regions) => Sqe::send_message(fd, regions.message()),
                 // A vectored send always has its regions.
                 None => Sqe::nop(),
@@ -1495,7 +1531,7 @@ impl Driver {
     }
 
     /// Cancels each operation of `resource`, and closes it after each one ends.
-    fn close_resource<P>(&mut self, resource: Resource, value: P) -> Result<Completion, Refused<P>> {
+    pub(super) fn close_resource<P>(&mut self, resource: Resource, value: P) -> Result<Completion, Refused<P>> {
         if self.resources.get(resource).is_none() {
             return Err(Refused {
                 reason: Reason::Resource,

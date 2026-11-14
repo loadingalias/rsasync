@@ -42,6 +42,7 @@
 //! ```
 
 mod completion;
+mod pipe;
 mod probe;
 mod signal;
 mod sys;
@@ -69,6 +70,7 @@ use crate::sync::Arc;
 use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Features, Ring, SetupError, Sqe};
 
+pub use pipe::{PipeReader, PipeWriter};
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
 
@@ -300,6 +302,15 @@ pub enum Reason {
     Resource,
     /// The driver has no provided buffers ([`Driver::provide`]).
     Buffers,
+    /// Each resource slot of the driver is in use.
+    Resources,
+    /// The descriptor is not a pipe or a FIFO.
+    NotPipe,
+    /// The pipe end does not have the direction of the adoption: a read end for a writer, or a
+    /// write end for a reader.
+    Direction,
+    /// The operation does not apply to this resource, for example a half-close of a pipe.
+    Unsupported,
 }
 
 /// A refused operation: the reason, and the value that the caller gave, which it keeps.
@@ -438,6 +449,19 @@ struct Owned {
     fd: Option<OwnedFd>,
     /// The directions of a stream or a listener, and what they keep.
     directions: tcp::Directions,
+    /// What the descriptor is, which selects the calls of its operations.
+    medium: Medium,
+}
+
+/// What a resource of the driver is.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Medium {
+    /// A TCP stream or listener: its operations are receives and sends.
+    #[default]
+    Tcp,
+    /// A pipe end: its operations are reads and writes, because a receive and a send need a
+    /// socket. It has no half-close.
+    Pipe,
 }
 
 /// The descriptors that the driver owns, in a slice that it allocates once.
@@ -478,6 +502,7 @@ impl Resources {
         let slot = self.get(resource)?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
+        slot.medium = Medium::Tcp;
         slot.fd.take()
     }
 }

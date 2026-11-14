@@ -4,8 +4,9 @@ An rsasync I/O driver can run with no scheduler: your code owns it and drives it
 how to start a driver, drive it from your own loop or from the reactor of another host, use TCP on
 it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development, and its alpha
 releases are on crates.io. The driver has TCP bind, connect, accept, receive, send, half-close, and
-close; the other operations come in later changes. [TCP on the driver](tcp.md) is the reference for each TCP operation and its
-results.
+close, and the receive, send, and close of pipe ends; the other operations come in later changes.
+[TCP on the driver](tcp.md) is the reference for each TCP operation and its results, and
+[Pipes on the driver](pipes.md) for each pipe operation.
 
 The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It needs no helper
 thread: `Driver::helper_threads` gives 0.

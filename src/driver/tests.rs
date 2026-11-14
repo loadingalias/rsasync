@@ -110,11 +110,11 @@ unsafe fn release_recorded(data: *const (), ptr: NonNull<u8>, capacity: usize) {
     drop(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, capacity) });
 }
 
-fn budget() -> Budget {
+pub(super) fn budget() -> Budget {
     Budget::new(NonZeroU64::MIN.saturating_add(99))
 }
 
-fn driver(config: Config) -> Driver {
+pub(super) fn driver(config: Config) -> Driver {
     Driver::new(config).expect("the test host allows io_uring")
 }
 
@@ -389,7 +389,7 @@ fn a_poll_after_ready_panics() {
 
 /// Turns the driver and polls `future` on the home thread, until it gives its output. It polls
 /// once after each turn, so it never polls a future that gave its output.
-fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
+pub(super) fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
     loop {
         let more = driver.turn().expect("a turn of the test driver works").more();
@@ -643,7 +643,7 @@ fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
 
 /// The bytes of a numbered stream from `start`: each byte is its position modulo 251, so a lost
 /// or a repeated run of bytes changes the bytes after it.
-fn numbered(start: usize, len: usize) -> Vec<u8> {
+pub(super) fn numbered(start: usize, len: usize) -> Vec<u8> {
     (start..start + len)
         .map(|position| u8::try_from(position % 251).expect("a remainder of 251 fits a byte"))
         .collect()
@@ -676,7 +676,7 @@ fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStr
 
 /// Submits and enters the kernel until it posted at least `count` completions, and gives them.
 /// They stay in the ring for the driver.
-fn posted(driver: &mut Driver, count: usize) -> Vec<Cqe> {
+pub(super) fn posted(driver: &mut Driver, count: usize) -> Vec<Cqe> {
     loop {
         let ready = driver.ring.peek();
         if ready.len() >= count {

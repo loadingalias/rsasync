@@ -1,7 +1,8 @@
-//! The declarations of the wake descriptor, `eventfd`, and of `poll`, which the probe of the
-//! descriptor uses, from the C library, glibc or musl.
+//! The declarations of the wake descriptor, `eventfd`, of `poll`, which the probe of the
+//! descriptor uses, and of `fcntl`, which the adoption of a pipe end uses, from the C library,
+//! glibc or musl.
 //!
-//! Each item agrees with `sys/eventfd.h` and `poll.h` of glibc and musl, and with
+//! Each item agrees with `sys/eventfd.h`, `poll.h`, and `fcntl.h` of glibc and musl, and with
 //! `include/uapi/asm-generic/fcntl.h` and `include/uapi/asm-generic/poll.h` of Linux 6.1, which
 //! x86_64 and aarch64 both use.
 
@@ -35,3 +36,21 @@ const _: () = {
 /// `EFD_CLOEXEC` is `O_CLOEXEC`, and `EFD_NONBLOCK` is `O_NONBLOCK`.
 pub(super) const EFD_CLOEXEC: c_int = 0o2_000_000;
 pub(super) const EFD_NONBLOCK: c_int = 0o4_000;
+
+#[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
+unsafe extern "C" {
+    /// `int fcntl(int fd, int cmd, ...)`.
+    pub(super) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+}
+
+/// The commands of `fcntl` (`include/uapi/asm-generic/fcntl.h` and `include/uapi/linux/fcntl.h`):
+/// the file status flags, and the capacity of a pipe, which only a pipe or a FIFO has.
+pub(super) const F_GETFL: c_int = 3;
+pub(super) const F_SETFL: c_int = 4;
+pub(super) const F_GETPIPE_SZ: c_int = 1032;
+/// The access mode of the file status flags, and its values.
+pub(super) const O_ACCMODE: c_int = 0o3;
+pub(super) const O_RDONLY: c_int = 0o0;
+pub(super) const O_WRONLY: c_int = 0o1;
+pub(super) const O_RDWR: c_int = 0o2;
+pub(super) const O_NONBLOCK: c_int = 0o4_000;

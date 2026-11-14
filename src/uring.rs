@@ -99,6 +99,45 @@ impl Sqe {
         }
     }
 
+    /// A read from the pipe `fd` into a buffer that the kernel selects from the provided buffer
+    /// ring of `group` when data comes (`IORING_OP_READ` with `IOSQE_BUFFER_SELECT`).
+    pub(crate) fn read_selected(fd: RawFd, group: u16) -> Self {
+        Self {
+            opcode: sys::IORING_OP_READ,
+            flags: sys::IOSQE_BUFFER_SELECT,
+            fd,
+            off: u64::MAX,
+            buf_index: group,
+            ..Self::default()
+        }
+    }
+
+    /// A write of `len` bytes from `buffer` to the pipe `fd` (`IORING_OP_WRITE`). A pipe whose
+    /// reader closed gives `EPIPE`, and also `SIGPIPE` where the process does not ignore it.
+    pub(crate) fn write(fd: RawFd, buffer: *const u8, len: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_WRITE,
+            fd,
+            off: u64::MAX,
+            addr: buffer.addr() as u64,
+            len,
+            ..Self::default()
+        }
+    }
+
+    /// A write of the `count` regions of the iovec array `vectors` to the pipe `fd`, in order
+    /// (`IORING_OP_WRITEV`).
+    pub(crate) fn writev(fd: RawFd, vectors: *const rsnetwork_udp::sys::IoVec, count: u32) -> Self {
+        Self {
+            opcode: sys::IORING_OP_WRITEV,
+            fd,
+            off: u64::MAX,
+            addr: vectors.addr() as u64,
+            len: count,
+            ..Self::default()
+        }
+    }
+
     /// The entry with the user data `user_data`, which its completion gives back.
     pub(crate) fn with_user_data(self, user_data: u64) -> Self {
         Self { user_data, ..self }
