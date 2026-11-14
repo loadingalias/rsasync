@@ -1,7 +1,8 @@
 //! Bounded channels, which move values from producers to consumers with no scheduler or driver.
 //!
-//! [`spsc`] has one sender and one receiver. [`mpsc`] has many senders and one receiver.
-//! [`oneshot`] moves one value, such as a reply or a startup outcome. Each send, receive, and
+//! [`spsc`] has one sender and one receiver. [`mpsc`] has many senders and one receiver. [`mpmc`]
+//! has many senders and many receivers that compete for the values. [`oneshot`] moves one value,
+//! such as a reply or a startup outcome. Each send, receive, and
 //! reservation has a nonblocking form, which is the kernel. The asynchronous waits, and with the
 //! `std` feature the blocking waits, use the same publication and close rules. The outcome types in
 //! this module state who owns the value after each result.
@@ -14,8 +15,10 @@ use core::fmt;
 
 use crate::capacity::Exhausted;
 
+pub mod mpmc;
 pub mod mpsc;
 pub mod oneshot;
+mod ring;
 pub mod spsc;
 #[cfg(test)]
 mod tests;
@@ -179,3 +182,16 @@ impl fmt::Display for TooManySenders {
 }
 
 impl core::error::Error for TooManySenders {}
+
+/// A refusal to clone a receiver: each receiver place of the channel is in use. A later clone can
+/// succeed after a receiver drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TooManyReceivers;
+
+impl fmt::Display for TooManyReceivers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("each receiver place of the channel is in use")
+    }
+}
+
+impl core::error::Error for TooManyReceivers {}

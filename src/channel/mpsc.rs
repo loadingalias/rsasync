@@ -106,11 +106,11 @@
 //!   then sets the bit of a waiting receiver with an `AcqRel` change, which also rechecks the
 //!   state. The publication that swaps the state reads the bit, and wakes the receiver.
 //! - A waiting sender registers its waker in its place, sets its waiting bit, and then changes
-//!   `head` with an `AcqRel` read-modify-write. The receiver swaps `head` after each take, and then
-//!   reads the waiting bits. The two changes of `head` have one order: the receiver reads the
-//!   waiting bit, or the sender reads the new read position.
-//! - A close changes `tail` and then wakes the waiting senders. The change of each waiting word
-//!   orders the close before the recheck of a sender that sets its bit after that change.
+//!   `head` with an `AcqRel` read-modify-write that also sets the bit of a waiting sender. The
+//!   receiver swaps `head` after each take. The two changes of `head` have one order: the receiver
+//!   reads the bit and wakes a waiting sender, or the sender reads the new read position. The
+//!   places of the senders are the shared ones of `super::ring`.
+//! - A close changes `tail` and then wakes the waiting senders (`super::ring`).
 
 use core::alloc::Layout;
 use core::fmt;
@@ -120,8 +120,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
+use super::ring::{ABORTED, CLOSED, Line, MAX_CAPACITY, MAX_PLACES, POSITION, Places, Ring, items};
 use super::{Aborted, Closed, Refused, ReserveError, SendError, TooManySenders, TryRecvError, TrySendError};
 use crate::capacity::{Budget, Permit};
 #[cfg(feature = "std")]
@@ -132,18 +132,8 @@ use crate::sync::{
 };
 use crate::wait::Waiter;
 
-/// The bits of a position in the `tail` and `head` words.
-const POSITION: u64 = (1 << 62) - 1;
-/// In the `tail` word: the channel accepts no new claim.
-const CLOSED: u64 = 1 << 62;
-/// In the `tail` word: the receiver is gone, so no value can be published.
-const ABORTED: u64 = 1 << 63;
 /// In the `head` word: a sender waits for a free slot.
 const SENDERS_WAIT: u64 = 1 << 62;
-/// The largest capacity, as in the SPSC channel.
-const MAX_CAPACITY: u32 = 1 << 27;
-/// The largest number of sender places.
-const MAX_SENDERS: u32 = 1 << 16;
 
 /// The state of a slot: free, or claimed and not published yet.
 const EMPTY: u32 = 0;
@@ -158,69 +148,10 @@ const STATE: u32 = 0b11;
 /// In the state of a slot: the receiver waits for the publication of this slot.
 const RECEIVER_WAITS: u32 = 0b100;
 
-/// The sender places in each word of a bitset.
-const BITS: u32 = u32::BITS;
-
-/// The positions of a ring of `capacity` slots. One lap is the next power of two of the
-/// capacity: the bits below `shift` are the index of a slot, and the bits above are the lap.
-#[derive(Clone, Copy)]
-struct Ring {
-    capacity: u64,
-    shift: u32,
-}
-
-impl Ring {
-    fn new(capacity: u32) -> Self {
-        Self {
-            capacity: u64::from(capacity),
-            shift: capacity.next_power_of_two().trailing_zeros(),
-        }
-    }
-
-    fn index_bits(self) -> u64 {
-        (1 << self.shift) - 1
-    }
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the index is below the capacity, which is at most 2^27"
-    )]
-    fn index(self, position: u64) -> usize {
-        (position & self.index_bits()) as usize
-    }
-
-    /// The position `count` slots after `position`. The count is at most the capacity.
-    fn advance(self, position: u64, count: u64) -> u64 {
-        // No overflow: the index is below 2^27, and so is the count.
-        let index = (position & self.index_bits()) + count;
-        if index < self.capacity {
-            position + count
-        } else {
-            let lap = (position & !self.index_bits()).wrapping_add(1 << self.shift);
-            (lap + (index - self.capacity)) & POSITION
-        }
-    }
-
-    /// The number of free slots when the receiver is at `head` and the claims end at `tail`. A
-    /// `head` that is older than the true one gives fewer free slots, never more.
-    fn free(self, head: u64, tail: u64) -> u64 {
-        let laps = ((tail & !self.index_bits()).wrapping_sub(head & !self.index_bits()) & POSITION) >> self.shift;
-        let used = laps
-            .saturating_mul(self.capacity)
-            .saturating_add(tail & self.index_bits())
-            .saturating_sub(head & self.index_bits());
-        self.capacity.saturating_sub(used)
-    }
-}
-
 struct Slot<T> {
     state: AtomicU32,
     value: UnsafeCell<MaybeUninit<T>>,
 }
-
-/// A word on its own cache line, also on targets with lines of 128 bytes.
-#[repr(align(128))]
-struct Line<T>(T);
 
 struct Shared<T> {
     /// The claimed position and the flags `CLOSED` and `ABORTED`.
@@ -230,29 +161,8 @@ struct Shared<T> {
     receiver: Waiter,
     slots: Box<[Slot<T>]>,
     ring: Ring,
-    /// The waiter of each sender place.
-    places: Box<[Waiter]>,
-    /// One bit for each sender place in use. The bits after the last place are set.
-    used: Box<[AtomicU32]>,
-    /// One bit for each sender place that waits for a free slot.
-    waiting: Box<[AtomicU32]>,
-    /// The number of senders.
-    senders: AtomicU32,
+    senders: Places,
     _charge: Permit,
-}
-
-/// The word and the bit of a sender place in a bitset.
-fn place_bit(place: u32) -> (usize, u32) {
-    ((place / BITS) as usize, 1 << (place % BITS))
-}
-
-/// The first place of a word of a bitset.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "a bitset has at most `MAX_SENDERS / BITS` words"
-)]
-fn place_index(word: usize) -> u32 {
-    word as u32
 }
 
 impl<T> Shared<T> {
@@ -298,76 +208,6 @@ impl<T> Shared<T> {
         }
         old & STATE
     }
-
-    /// Takes a free sender place.
-    fn take_place(&self) -> Option<u32> {
-        for (index, word) in (0_u32..).zip(self.used.iter()) {
-            let mut bits = word.load(Ordering::Relaxed);
-            while bits != u32::MAX {
-                let bit = !bits & bits.wrapping_add(1);
-                // Ordering: `Acquire` reads the release of the last sender of the place, so its
-                // use of the waiter of the place happens before the use of the new sender.
-                match word.compare_exchange_weak(bits, bits | bit, Ordering::Acquire, Ordering::Relaxed) {
-                    Ok(_) => return Some(index * BITS + bit.trailing_zeros()),
-                    Err(actual) => bits = actual,
-                }
-            }
-        }
-        None
-    }
-
-    /// Wakes one waiting sender: the first that has a registered waker, from place `from` on, in
-    /// rotating order. Gives the place that it woke.
-    fn wake_sender(&self, from: u32) -> Option<u32> {
-        let words = self.waiting.len();
-        let first = place_bit(from).0 % words;
-        let from_bit = from % BITS;
-        // The first word two times: its bits from `from` on, and at the end its bits before.
-        for step in 0..=words {
-            let slot = (first + step) % words;
-            let word = &self.waiting[slot];
-            let index = place_index(slot);
-            let mut bits = word.load(Ordering::Relaxed);
-            if step == 0 {
-                bits &= u32::MAX << from_bit;
-            } else if step == words {
-                bits &= !(u32::MAX << from_bit);
-            }
-            while bits != 0 {
-                let bit = bits.isolate_lowest_one();
-                bits &= !bit;
-                // Ordering: `Acquire` reads the release of the waiting sender, so its waker is
-                // registered. The clear of the bit decides which waker owns the wake.
-                if word.fetch_and(!bit, Ordering::Acquire) & bit != 0 {
-                    let place = index * BITS + bit.trailing_zeros();
-                    if self.places[place as usize].wake() {
-                        return Some(place);
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Wakes each waiting sender, after a close.
-    fn wake_senders(&self) {
-        for (index, word) in (0_u32..).zip(self.waiting.iter()) {
-            // Ordering: `Acquire` reads the release of each waiting sender, so its waker is
-            // registered. `Release` orders the close before the recheck of a sender that sets its
-            // bit after this change.
-            let mut bits = word.swap(0, Ordering::AcqRel);
-            while bits != 0 {
-                let bit = bits.isolate_lowest_one();
-                bits &= !bit;
-                let place = index * BITS + bit.trailing_zeros();
-                self.places[place as usize].wake();
-            }
-        }
-    }
-
-    fn any_waiting(&self) -> bool {
-        self.waiting.iter().any(|word| word.load(Ordering::Relaxed) != 0)
-    }
 }
 
 #[expect(
@@ -378,16 +218,6 @@ impl<T> Shared<T> {
 // publication to the next claim. The changes of `tail`, of `head`, and of the state of the slot
 // order each handover (module docs). The values move between threads, so `T` is `Send`.
 unsafe impl<T: Send> Sync for Shared<T> {}
-
-/// Makes `count` items with `make`, or refuses if the allocator does not give the memory.
-fn items<X>(count: u32, make: impl Fn(u32) -> X) -> Result<Box<[X]>, Refused> {
-    let mut items = Vec::new();
-    items
-        .try_reserve_exact(count as usize)
-        .map_err(|_| Refused::Allocation)?;
-    items.extend((0..count).map(make));
-    Ok(items.into_boxed_slice())
-}
 
 /// Makes a channel of `capacity` slots and `senders` sender places. It charges the slots, the
 /// places, and the shared state to `budget`, at their size in memory, before it allocates. The
@@ -422,61 +252,37 @@ pub fn channel<T>(budget: &Budget, capacity: u32, senders: u32) -> Result<(Sende
     if capacity == 0 || senders == 0 {
         return Err(Refused::Zero);
     }
-    if capacity > MAX_CAPACITY || senders > MAX_SENDERS {
+    if capacity > MAX_CAPACITY || senders > MAX_PLACES {
         return Err(Refused::TooLarge);
     }
-    let words = senders.div_ceil(BITS);
-    let size = [
-        Layout::array::<Slot<T>>(capacity as usize),
-        Layout::array::<Waiter>(senders as usize),
-        Layout::array::<AtomicU32>(2 * words as usize),
-        Ok(Layout::new::<Shared<T>>()),
-    ]
-    .into_iter()
-    .try_fold(0_usize, |total, layout| {
-        layout.ok().and_then(|layout| total.checked_add(layout.size()))
-    })
-    .and_then(|size| u64::try_from(size).ok())
-    .ok_or(Refused::TooLarge)?;
+    let size = Layout::array::<Slot<T>>(capacity as usize)
+        .ok()
+        .and_then(|slots| slots.size().checked_add(Places::size(senders)?))
+        .and_then(|size| size.checked_add(size_of::<Shared<T>>()))
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or(Refused::TooLarge)?;
     let charge = budget.reserve(size).map_err(Refused::Budget)?;
 
     let slots = items(capacity, |_| Slot {
         state: AtomicU32::new(EMPTY),
         value: UnsafeCell::new(MaybeUninit::uninit()),
     })?;
-    let places = items(senders, |_| Waiter::new())?;
-    // The first sender has place 0. The bits after the last place are set, so no clone takes them.
-    let used = items(words, |index| {
-        let first = index * BITS;
-        let unused = if first + BITS > senders {
-            u32::MAX << (senders - first)
-        } else {
-            0
-        };
-        AtomicU32::new(unused | u32::from(index == 0))
-    })?;
-    let waiting = items(words, |_| AtomicU32::new(0))?;
+    // The first sender has place 0.
+    let senders = Places::new(senders)?;
     let shared = Arc::new(Shared {
         tail: Line(AtomicU64::new(0)),
         head: Line(AtomicU64::new(0)),
         receiver: Waiter::new(),
         slots,
         ring: Ring::new(capacity),
-        places,
-        used,
-        waiting,
-        senders: AtomicU32::new(1),
+        senders,
         _charge: charge,
     });
     let sender = Sender {
         shared: Arc::clone(&shared),
         place: 0,
     };
-    let receiver = Receiver {
-        shared,
-        head: 0,
-        next: 0,
-    };
+    let receiver = Receiver { shared, head: 0 };
     Ok((sender, receiver))
 }
 
@@ -497,10 +303,7 @@ impl<T> Sender<T> {
     /// Makes another sender of the channel, which takes a free sender place. A clone adds no slot
     /// to the channel.
     pub fn try_clone(&self) -> Result<Self, TooManySenders> {
-        let place = self.shared.take_place().ok_or(TooManySenders)?;
-        // Ordering: `Relaxed`, as for the count of an `Arc`: this sender is alive, so the count is
-        // not zero. The drop of the last sender reads each change.
-        self.shared.senders.fetch_add(1, Ordering::Relaxed);
+        let place = self.shared.senders.take().ok_or(TooManySenders)?;
         Ok(Self {
             shared: Arc::clone(&self.shared),
             place,
@@ -640,12 +443,9 @@ impl<T> Sender<T> {
         let result = match self.send_now(value) {
             Err((Refusal::Full, value)) => {
                 let shared = &*self.shared;
-                register(&shared.places[self.place as usize]);
+                register(shared.senders.waiter(self.place));
                 *waits = true;
-                let (word, bit) = place_bit(self.place);
-                // Ordering: `Release` orders the registration before the wake that clears the
-                // bit. `Acquire` reads the release of a close that cleared the word before.
-                shared.waiting[word].fetch_or(bit, Ordering::AcqRel);
+                shared.senders.wait(self.place);
                 // Ordering: `AcqRel`: the next receive reads this change, and then sees the bit, or
                 // this change reads that receive, and the retry sees the free slot (module docs).
                 shared.head.0.fetch_or(SENDERS_WAIT, Ordering::AcqRel);
@@ -657,36 +457,17 @@ impl<T> Sender<T> {
             result => result,
         };
         if *waits {
-            self.unwait(false);
+            self.shared.senders.unwait(self.place, false);
             *waits = false;
         }
         Ok(result.map_err(|(_, value)| SendError(value)))
-    }
-
-    /// Ends the interest of a wait. A wait that ends with no send, after a wake cleared its bit,
-    /// wakes another waiting sender: that wake was for a free slot that it does not use.
-    fn unwait(&self, cancelled: bool) {
-        let shared = &*self.shared;
-        let (word, bit) = place_bit(self.place);
-        let waiter = &shared.places[self.place as usize];
-        // Ordering: `Relaxed`: only this sender sets the bit, and the change publishes no data.
-        if shared.waiting[word].fetch_and(!bit, Ordering::Relaxed) & bit != 0 {
-            waiter.cancel();
-        } else if !waiter.cancel() && cancelled {
-            shared.wake_sender(self.place + 1);
-        }
     }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let shared = &*self.shared;
-        let (word, bit) = place_bit(self.place);
-        // Ordering: `Release` orders the use of the waiter of the place before the next sender of
-        // the place.
-        shared.used[word].fetch_and(!bit, Ordering::Release);
-        // Ordering: `AcqRel`, as for the count of an `Arc`.
-        if shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if shared.senders.release(self.place) {
             // Ordering: `Relaxed`: the close publishes no data. The waiter of the receiver orders
             // it before the recheck of a waiting receiver.
             shared.tail.0.fetch_or(CLOSED, Ordering::Relaxed);
@@ -746,7 +527,7 @@ impl<T> Future for SendFuture<'_, T> {
 impl<T> Drop for SendFuture<'_, T> {
     fn drop(&mut self) {
         if self.waits {
-            self.sender.unwait(true);
+            self.sender.shared.senders.unwait(self.sender.place, true);
         }
     }
 }
@@ -855,8 +636,6 @@ pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
     /// The read position. Only the receiver changes it.
     head: u64,
-    /// The sender place from which the next wake of a sender starts.
-    next: u32,
 }
 
 impl<T> Receiver<T> {
@@ -922,7 +701,7 @@ impl<T> Receiver<T> {
         // claim before or after it, and the waiting words order it before the recheck of each
         // waiting sender.
         if shared.tail.0.fetch_or(CLOSED, Ordering::Relaxed) & CLOSED == 0 {
-            shared.wake_senders();
+            shared.senders.wake_all();
         }
     }
 
@@ -935,10 +714,8 @@ impl<T> Receiver<T> {
         // Ordering: `Release` orders the take of the slot before the next claim, which loads
         // `head` with `Acquire`. `Acquire` reads the release of a waiting sender (module docs).
         if shared.head.0.swap(self.head, Ordering::AcqRel) & SENDERS_WAIT != 0 {
-            if let Some(place) = shared.wake_sender(self.next) {
-                self.next = place + 1;
-            }
-            if shared.any_waiting() {
+            shared.senders.wake_one();
+            if shared.senders.waiting() {
                 // Ordering: `Relaxed`: the receiver reads this bit at its next swap, in this
                 // thread.
                 shared.head.0.fetch_or(SENDERS_WAIT, Ordering::Relaxed);
@@ -1010,7 +787,7 @@ impl<T> Drop for Receiver<T> {
         // against the publication of the slot.
         let tail = shared.tail.0.fetch_or(CLOSED | ABORTED, Ordering::Relaxed);
         if tail & CLOSED == 0 {
-            shared.wake_senders();
+            shared.senders.wake_all();
         }
         let mut position = self.head;
         while position != tail & POSITION {

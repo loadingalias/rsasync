@@ -9,20 +9,22 @@ yet. Select the topology from the transfer that you have:
 | --- | --- | --- |
 | One sender and one receiver | `rsasync::channel::spsc` | `spsc::channel(&budget, capacity)` |
 | Many senders and one receiver | `rsasync::channel::mpsc` | `mpsc::channel(&budget, capacity, senders)` |
+| Many receivers that compete for the same jobs (see [Competing receivers](#competing-receivers)) | `rsasync::channel::mpmc` | `mpmc::channel(&budget, capacity, senders, receivers)` |
 | One value, such as a reply (see [One-shot](#one-shot)) | `rsasync::channel::oneshot` | `oneshot::channel(&budget)` |
 
-The SPSC channel costs less for each value, so use it when one owner sends.
+The SPSC channel costs less for each value, so use it when one owner sends. Use MPMC only when the
+receivers compete for the same values: with one receiver, SPSC and MPSC cost less.
 
 ## Make a channel
 
-The SPSC and MPSC constructors give a `Sender` and a `Receiver`, or a refusal:
+The SPSC, MPSC, and MPMC constructors give a `Sender` and a `Receiver`, or a refusal:
 
 - The channel charges its slots and its shared state to the `Budget` (see [Capacity](capacity.md))
   before it allocates. The charge ends when each endpoint has dropped.
 - The capacity is the number of slots, from 1 to 2^27. A capacity of zero is a refusal,
   `Refused::Zero`. It does not make a rendezvous channel or an unbounded channel.
-- For MPSC, `senders` is the number of sender places, from 1 to 2^16. Zero is also
-  `Refused::Zero`.
+- For MPSC and MPMC, `senders` is the number of sender places. For MPMC, `receivers` is the
+  number of receiver places. Each is from 1 to 2^16, and zero is also `Refused::Zero`.
 - Other refusals are `Refused::TooLarge`, `Refused::Budget` with the `Exhausted` value of the
   budget, and `Refused::Allocation`. A refusal keeps no charge and no memory.
 
@@ -32,8 +34,10 @@ for that memory in the value, so that the charge moves with the value.
 ## Send and receive
 
 Each operation borrows its endpoint mutably, so each endpoint has at most one operation at a
-time. No endpoint can be cloned, except an MPSC `Sender` (see [Many senders](#many-senders)). The
-receiver gets the values of each sender in the order that the sender published them.
+time. Only an endpoint with places can be cloned: an MPSC `Sender` (see
+[Many senders](#many-senders)), and an MPMC `Sender` or `Receiver` (see
+[Competing receivers](#competing-receivers)). The values of each sender are taken in the order
+that the sender published them.
 
 Each operation has a nonblocking form, which never waits, an asynchronous form, which gives a
 future, and a blocking form, which needs the `std` feature (on by default). The three forms obey
@@ -149,6 +153,74 @@ for producer in producers {
 }
 ```
 
+## Competing receivers
+
+An MPMC channel is a job queue: many receivers compete for the same values, and each value goes to
+exactly one receiver. Choose it only when the receivers compete. With one receiver, choose SPSC or
+MPSC: their receive costs less, and their receiver gets the values in order. To give each consumer
+its own stream of values, give each consumer its own channel.
+
+- `Sender::try_clone` and `Receiver::try_clone` make another endpoint in a free place of its kind.
+  When each place is in use, they give `TooManySenders` or `TooManyReceivers`. A place is free
+  again when its endpoint drops.
+- The senders share one ring of exactly `capacity` slots, as in MPSC. A clone adds no slot.
+- Order: the receivers take the values of one sender in the order of its sends. Each receiver works
+  on its own, so the channel states no order in which the receivers handle the values.
+- Fairness: each value wakes one waiting receiver, and each free slot wakes one waiting sender, in
+  rotating order of the places. An endpoint that does not wait can take the value or the slot
+  first, so a woken endpoint can find nothing and wait again.
+- Close: any receiver can call `Receiver::close`, the drain. The drop of the last sender also
+  closes the channel. Each close wakes each waiting receiver and each waiting sender. A receive
+  that took a value gives it to its caller, also when a close comes after the take. The drop of the
+  last receiver is the abort.
+
+A `Reservation` holds its place in the order of the channel, as in MPSC: one slow reservation stops
+each receiver.
+
+This example gives 100 jobs to 3 workers:
+
+```rust
+use core::num::NonZeroU64;
+use std::thread;
+
+use rsasync::capacity::Budget;
+use rsasync::channel::mpmc;
+
+type Error = Box<dyn core::error::Error + Send + Sync>;
+
+let budget = Budget::new(NonZeroU64::new(64 * 1024).unwrap());
+// 8 slots, 1 sender place, and 3 receiver places: one for each worker.
+let (mut jobs, receiver) = mpmc::channel::<u32>(&budget, 8, 1, 3)?;
+
+let receivers = [receiver.try_clone()?, receiver.try_clone()?, receiver];
+let workers: Vec<_> = receivers
+    .into_iter()
+    .map(|mut receiver| {
+        thread::spawn(move || {
+            // Each worker takes the next job, until the channel is closed and empty.
+            let mut total = 0;
+            while let Ok(job) = receiver.recv_blocking() {
+                total += job;
+            }
+            total
+        })
+    })
+    .collect();
+
+for job in 1..=100 {
+    jobs.send_blocking(job)?;
+}
+// The drop of the last sender closes the channel. The workers take the rest, and then end.
+drop(jobs);
+
+let total: u32 = workers
+    .into_iter()
+    .map(|worker| worker.join().expect("a worker does not panic"))
+    .sum();
+// Each job went to exactly one worker.
+assert_eq!(total, (1..=100).sum());
+```
+
 ## Who owns the value
 
 Each send that fails gives the value back to the caller, or this table names the party that drops
@@ -163,7 +235,7 @@ it.
 | `SendFuture::cancel` | The caller: it gives `Some(value)` if the send did not move the value into the channel, and `None` if it did |
 | A value is written into a `Reservation` | The reservation, until `Reservation::publish` |
 | A reservation drops with no publication | The reservation drops its values. They were never sent |
-| The receiver drops | The receiver drops each value that is still in the channel |
+| The receiver drops (for MPMC, the last receiver) | The receiver drops each value that is still in the channel |
 | A failed send: the publication of an accepted reservation comes after the abort | The channel drops the written values, as the abort drops the values in the channel. `Reservation::publish` gives `Aborted` |
 
 A success means that the channel accepted the value. It does not mean that the receiver took the
@@ -182,8 +254,8 @@ which drops them.
 | Event | Later sends and reservations | Values in the channel | A pending send |
 | --- | --- | --- | --- |
 | The last sender drops | None can start | The receiver gets them, then `Closed` | None can exist |
-| `Receiver::close` (the drain) | Fail. A send gives its value back | The receiver gets them, then `Closed` | Ends with `SendError` and its value |
-| The receiver drops (the abort) | Fail. A send gives its value back | The receiver drops them | Ends with `SendError` and its value |
+| `Receiver::close` (the drain), from any receiver | Fail. A send gives its value back | The receivers get them, then `Closed` | Ends with `SendError` and its value |
+| The last receiver drops (the abort) | Fail. A send gives its value back | The receiver drops them | Ends with `SendError` and its value |
 
 A `Reservation` that the channel accepted before `Receiver::close` can still publish its values.
 The receiver gets `TryRecvError::Empty`, not `TryRecvError::Closed`, while that reservation can
@@ -207,7 +279,9 @@ store-load order on the publication path: the publisher stores the position and 
 waiting bit. One read-modify-write takes the place of the store, a fence, and the load.
 
 An MPSC send costs one compare-exchange of the claimed position, which all senders share, and
-one swap of the state of its slot. An MPSC receive costs one swap of the read position.
+one swap of the state of its slot. An MPSC receive costs one swap of the read position. An MPMC
+receive costs more: one compare-exchange of the read position, which all receivers share, and one
+swap of the stamp of its slot.
 
 ## One-shot
 
