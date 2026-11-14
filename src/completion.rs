@@ -95,8 +95,9 @@ impl<T> Entry<T> {
     }
 
     /// After the terminal event of `id` and the end of interest of its consumer, the home takes
-    /// back the resources and drops them. A consumer that took them first keeps them.
-    pub(crate) fn reclaim(&self, id: OpId) {
+    /// back the resources, for the abandoned rule. A consumer that took them first keeps them, and
+    /// then the home gets `None`.
+    pub(crate) fn reclaim(&self, id: OpId) -> Option<T> {
         let state = self.state.load(Ordering::Relaxed);
         let ready = word(id, READY);
         let home = state == word(id, RUNNING)
@@ -105,9 +106,7 @@ impl<T> Entry<T> {
                     .state
                     .compare_exchange(ready, word(id, EMPTY), Ordering::Acquire, Ordering::Relaxed)
                     .is_ok());
-        if home {
-            drop(self.take());
-        }
+        if home { self.take() } else { None }
     }
 
     /// The driver ends: no consumer takes anything from now on, and each waiting consumer wakes

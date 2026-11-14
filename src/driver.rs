@@ -19,7 +19,9 @@
 //!
 //! TCP runs on the driver: [`Driver::bind`], [`Driver::accept`], [`Driver::recv`] into an owned
 //! buffer, [`Driver::recv_selected`] into a buffer of [`Driver::provide`], [`Driver::send`] from a
-//! lease, and [`Driver::close`]. The kernel reads and writes each buffer in place.
+//! lease, and [`Driver::close`]. The kernel reads and writes each buffer in place. Each direction of
+//! a stream runs one operation at a time, and the rules for a dropped or forgotten future keep each
+//! byte and each connection: see [`TcpStream`].
 //!
 //! The io_uring driver needs no helper thread: [`Driver::helper_threads`] gives 0.
 //!
@@ -49,22 +51,23 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
-use core::mem::ManuallyDrop;
+use core::marker::PhantomData;
+use core::mem::{self, ManuallyDrop};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 
 use rsnetwork_udp::SockAddrStorage;
 
 use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
 use crate::capacity::Permit;
 use crate::sync::Arc;
-use crate::table::{CONTROL, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
+use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Ring, SetupError, Sqe};
 
-pub use tcp::{TcpListener, TcpStream};
+pub use tcp::{Closed, ReadHalf, TcpListener, TcpStream, WriteFailed, WriteHalf};
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
@@ -218,28 +221,50 @@ pub(crate) struct Held {
         expect(dead_code, reason = "no operation takes a charge yet; the tests do")
     )]
     pub(crate) charge: Option<Permit>,
-    /// The descriptor that the operation uses. It stays open while the operation runs.
-    pub(crate) resource: Option<Resource>,
-    /// What the home does with the result at the terminal event.
-    pub(crate) finish: Finish,
     /// The peer address that an accept writes, and its length.
     pub(crate) peer: SockAddrStorage,
     pub(crate) peer_len: u32,
     /// The stream that an accept gave.
     pub(crate) accepted: Option<Resource>,
+    /// The connection of an accept with no consumer, which the listener keeps.
+    pub(crate) connection: Option<OwnedFd>,
+    /// The home asked the kernel to cancel the operation.
+    pub(crate) cancelled: bool,
+    /// The bytes that a receive copied from the data that an abandoned receive left.
+    pub(crate) copied: usize,
+    /// A send on a failed direction gives this error, with no submission.
+    pub(crate) failed: Option<WriteFailed>,
+    /// The report of a close.
+    pub(crate) closed: Option<Closed>,
+    /// The next operation that waits in the same direction, in start order.
+    pub(crate) next: Option<OpId>,
 }
 
-/// What the home does with the result of an operation at its terminal event.
+/// What an operation is: the direction that it uses, and what the home does at its terminal
+/// event.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Finish {
+pub(crate) enum Kind {
+    /// An operation with no direction, for example a read of a pipe in a test.
     #[default]
-    Nothing,
-    /// The result counts the bytes that the kernel wrote into `loan`.
-    Received,
-    /// The kernel selected a buffer of the provided ring, which becomes `loan`.
+    Other,
+    /// A receive into the loan of the caller's buffer.
+    Recv,
+    /// A receive into a buffer that the kernel selects, which becomes the loan.
     Selected,
-    /// The result is a new descriptor, which becomes `accepted`.
-    Accepted,
+    /// A send of the lease.
+    Send,
+    /// An accept: the result is a new descriptor.
+    Accept,
+    /// A close, which ends after each operation of its resource ends.
+    Close,
+}
+
+/// The facts of an operation that the operation table keeps for the home: its resource and its
+/// kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Tag {
+    pub(crate) resource: Option<Resource>,
+    pub(crate) kind: Kind,
 }
 
 /// Why the driver refused an operation. The caller keeps what it gave.
@@ -252,8 +277,6 @@ pub enum Reason {
     Queue,
     /// The descriptor is not one that this driver owns, for example after its close.
     Resource,
-    /// An operation still runs on the descriptor.
-    Busy,
     /// The driver has no provided buffers ([`Driver::provide`]).
     Buffers,
 }
@@ -304,21 +327,37 @@ impl core::error::Error for Ended {}
 /// it wakes the waker of its latest poll. A drop ends the interest, not the operation: the driver
 /// keeps the buffer until the kernel releases it.
 ///
+/// The future borrows the direction of its stream, or its listener, for `'a`, so no other
+/// operation can start in that direction while it exists.
+///
 /// # Panics
 ///
 /// A poll after the future gave `Ready` panics, as for the futures of the standard library.
-pub struct Operation<T> {
+pub struct Operation<'a, T> {
     completion: Completion,
     output: fn(i32, Held) -> Option<T>,
+    direction: PhantomData<&'a mut ()>,
 }
 
-impl<T> Operation<T> {
+impl<T> Operation<'_, T> {
     fn new(completion: Completion, output: fn(i32, Held) -> Option<T>) -> Self {
-        Self { completion, output }
+        Self {
+            completion,
+            output,
+            direction: PhantomData,
+        }
+    }
+
+    /// Asks the driver to cancel the operation. The future keeps its interest: it later gives
+    /// the result, with the original buffer and its exact progress. A receive gives the bytes
+    /// that it received before the cancel took effect, with no copy, and a send leaves its
+    /// direction usable.
+    pub fn cancel(&self) {
+        self.completion.cancel();
     }
 }
 
-impl<T> Future for Operation<T> {
+impl<T> Future for Operation<'_, T> {
     type Output = Result<T, Ended>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -329,7 +368,7 @@ impl<T> Future for Operation<T> {
     }
 }
 
-impl<T> fmt::Debug for Operation<T> {
+impl<T> fmt::Debug for Operation<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Operation")
             .field("completion", &self.completion)
@@ -349,8 +388,8 @@ pub(crate) struct Resource {
 struct Owned {
     generation: u32,
     fd: Option<OwnedFd>,
-    /// The operations that run on the descriptor.
-    running: u32,
+    /// The directions of a stream or a listener, and what they keep.
+    directions: tcp::Directions,
 }
 
 /// The descriptors that the driver owns, in a slice that it allocates once.
@@ -376,15 +415,12 @@ impl Resources {
             .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())
     }
 
-    /// Closes `resource` when no operation runs on it.
-    fn close(&mut self, resource: Resource) -> Result<(), Reason> {
-        let slot = self.get(resource).ok_or(Reason::Resource)?;
-        if slot.running > 0 {
-            return Err(Reason::Busy);
-        }
-        slot.fd = None;
+    /// Ends `resource` and gives its descriptor. The identity is stale from now on.
+    fn release(&mut self, resource: Resource) -> Option<OwnedFd> {
+        let slot = self.get(resource)?;
         slot.generation = slot.generation.wrapping_add(1);
-        Ok(())
+        slot.directions = tcp::Directions::default();
+        slot.fd.take()
     }
 }
 
@@ -507,9 +543,16 @@ impl fmt::Debug for Shared {
 /// An io_uring driver that its caller owns and drives. It stays on the thread that created it.
 pub struct Driver {
     ring: Ring,
-    table: Table<()>,
+    table: Table<Tag>,
     shared: Arc<Shared>,
     resources: Resources,
+    /// The requests that a take gives, applied after the take: at most two for each slot.
+    taken: Vec<Taken<Tag>>,
+    /// The resources whose directions need the home after an operation ended: an operation waits
+    /// for that one, or a close waits for it. Each resource is in it at most one time.
+    pending: Vec<Resource>,
+    /// The bytes that receives copied from the data that an abandoned receive left.
+    copied: u64,
     selected: Option<Selected>,
     completions_per_turn: u32,
     /// The ring polls the interrupt descriptor, so that a request or wake from another thread
@@ -569,6 +612,9 @@ impl Driver {
             table,
             shared,
             resources: Resources((0..config.resources).map(|_| Owned::default()).collect()),
+            taken: Vec::with_capacity(config.operations as usize * 2),
+            pending: Vec::with_capacity(config.resources as usize),
+            copied: 0,
             selected: None,
             completions_per_turn: config.completions_per_turn,
             waking: false,
@@ -580,6 +626,13 @@ impl Driver {
     #[must_use]
     pub const fn helper_threads(&self) -> u32 {
         0
+    }
+
+    /// The bytes that receives copied, in total, from the data that a dropped or forgotten receive
+    /// left. Each other byte of a receive goes from the kernel to its buffer with no copy.
+    #[must_use]
+    pub const fn copied(&self) -> u64 {
+        self.copied
     }
 
     /// A handle that wakes the driver from any thread.
@@ -624,6 +677,8 @@ impl Driver {
             }
         }
         let completed = self.harvest(self.completions_per_turn);
+        // Start the operations that waited for an operation that ended, and end the closes.
+        self.attend();
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
         // the descriptor already, so this turn reports it, or a later wake comes.
         if self.shared.clear() && self.rearm_wake {
@@ -679,8 +734,26 @@ impl Driver {
     ///
     /// A failure of the kernel entry other than an interrupt.
     pub fn teardown(mut self) -> io::Result<Teardown> {
+        // An operation that waits for the one before it never ran, so it ends now.
+        for index in 0..self.resources.0.len() {
+            let Some(resource) = self.resources.0.get(index).map(|owned| Resource {
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                generation: owned.generation,
+            }) else {
+                continue;
+            };
+            for kind in [Kind::Recv, Kind::Send] {
+                while let Some(id) = self.dequeue(resource, kind) {
+                    self.complete_now(id, -ECANCELED);
+                }
+            }
+        }
         let mut cancelled = 0_u32;
         for id in self.table.running() {
+            // A close ends when the operations of its resource end.
+            if self.table.resources(id).is_some_and(|tag| tag.kind == Kind::Close) {
+                continue;
+            }
             push_cancel(&mut self.ring, id)?;
             cancelled = cancelled.saturating_add(1);
         }
@@ -692,6 +765,7 @@ impl Driver {
                 Err(error) => return Err(error),
             }
             self.harvest(u32::MAX);
+            self.attend();
         }
         self.take_requests();
         Ok(Teardown { cancelled })
@@ -703,19 +777,21 @@ impl Driver {
     }
 
     /// The descriptor of `resource`, while the driver owns it.
-    pub(crate) fn fd(&mut self, resource: Resource) -> Option<RawFd> {
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn fd(&mut self, resource: Resource) -> Option<std::os::fd::RawFd> {
         Some(self.resources.get(resource)?.fd.as_ref()?.as_raw_fd())
     }
 
-    /// Submits an operation on `resource` with the resources that `held` makes from `value`, and
-    /// gives its future. `entry` makes the submission from the resources in their final place. A
-    /// drop of the future asks for a cancel when `cancel_on_drop` holds. A refusal gives back
-    /// `value`.
+    /// Submits an operation of no direction on `resource` with the resources that `held` makes
+    /// from `value`, and gives its future. `entry` makes the submission from the resources in
+    /// their final place. A drop of the future asks for a cancel when `cancel_on_drop` holds. A
+    /// refusal gives back `value`.
     ///
     /// # Safety
     ///
     /// The memory that the entry names belongs to the resources, and each descriptor that it names
     /// is `resource`. The memory keeps its address while the resources move.
+    #[cfg(all(test, not(loom)))]
     #[expect(unsafe_code, reason = "the kernel uses the memory that the entry names")]
     pub(crate) unsafe fn submit<P>(
         &mut self,
@@ -731,83 +807,208 @@ impl Driver {
         {
             return refuse(Reason::Resource, value);
         }
-        if !self.ring.has_room() && (self.ring.submit(0).is_err() || !self.ring.has_room()) {
+        if !self.room() {
             return refuse(Reason::Queue, value);
         }
-        let id = match self.table.begin((), Shape::Single) {
+        let tag = Tag {
+            resource,
+            kind: Kind::Other,
+        };
+        let id = self
+            .open(tag, value, held)
+            .map_err(|(reason, value)| Refused { reason, value })?;
+        // SAFETY: the caller's contract, and the queue has room.
+        unsafe { self.push(id, entry) };
+        Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
+    }
+
+    /// Whether the submission queue has room for one entry, after one submit if it is full.
+    fn room(&mut self) -> bool {
+        self.ring.has_room() || (self.ring.submit(0).is_ok() && self.ring.has_room())
+    }
+
+    /// Records a new operation at the home, before its submission, with the resources that
+    /// `held` makes from `value`. Refuses with `value` when each operation slot is in use.
+    pub(crate) fn open<P>(&mut self, tag: Tag, value: P, held: impl FnOnce(P) -> Held) -> Result<OpId, (Reason, P)> {
+        let id = match self.table.begin(tag, Shape::Single) {
             Ok(id) => id,
             Err(_) => {
                 // Futures that ended give their slots back at the next take.
                 self.take_requests();
-                match self.table.begin((), Shape::Single) {
+                match self.table.begin(tag, Shape::Single) {
                     Ok(id) => id,
-                    Err(_) => return refuse(Reason::Operations, value),
+                    Err(_) => return Err((Reason::Operations, value)),
                 }
             }
         };
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             self.table.withdraw(id);
-            return refuse(Reason::Operations, value);
+            return Err((Reason::Operations, value));
         };
-        let mut held = held(value);
-        held.resource = resource;
-        let entry = slot.start(id, held, entry).with_user_data(id.user_data());
-        if let Some(owned) = resource.and_then(|resource| self.resources.get(resource)) {
-            owned.running += 1;
+        slot.start(id, held(value), |_| ());
+        Ok(id)
+    }
+
+    /// Submits the operation `id`: `entry` makes its submission from its resources at the home.
+    ///
+    /// # Safety
+    ///
+    /// The memory that the entry names belongs to the resources of `id`, and each descriptor that
+    /// it names stays open until the terminal event of `id`. The queue has room.
+    #[expect(unsafe_code, reason = "the kernel uses the memory that the entry names")]
+    pub(crate) unsafe fn push(&mut self, id: OpId, entry: impl FnOnce(&mut Held) -> Sqe) {
+        let Some(slot) = self.shared.entries.get(id.index() as usize) else {
+            return;
+        };
+        let mut sqe = None;
+        slot.update(id, |held| sqe = held.as_mut().map(entry));
+        if let Some(sqe) = sqe {
+            // SAFETY: the entry of the slot keeps the resources until the terminal event of `id`,
+            // and the caller keeps the descriptor open. The queue has room.
+            let pushed = unsafe { self.ring.push(&sqe.with_user_data(id.user_data())) }.is_ok();
+            debug_assert!(pushed, "the queue has room for the entry");
         }
-        // SAFETY: the entry of the slot keeps the resources until the terminal event of `id`, and
-        // the driver keeps the descriptor open while the operation runs. The queue has room.
-        let pushed = unsafe { self.ring.push(&entry) }.is_ok();
-        debug_assert!(pushed, "the queue has room for the entry");
-        Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
+    }
+
+    /// Ends the operation `id` at the home with `result`, with no kernel event, as its terminal
+    /// event.
+    pub(crate) fn complete_now(&mut self, id: OpId, result: i32) {
+        let event = Event {
+            result,
+            more: false,
+            notice: false,
+        };
+        let outcome = self.table.complete(id.user_data(), event);
+        self.ended(id, result, outcome);
+    }
+
+    /// Applies the outcome of a terminal event of `id`: wakes the consumer, or applies the
+    /// abandoned rule.
+    fn ended(&mut self, id: OpId, result: i32, outcome: Outcome<Tag>) {
+        let Some(slot) = self.shared.entries.get(id.index() as usize) else {
+            return;
+        };
+        match outcome {
+            Outcome::Ready => slot.publish(id, result),
+            Outcome::Abandoned(Done {
+                resources: Some(tag), ..
+            }) => {
+                if let Some(held) = slot.reclaim(id) {
+                    tcp::abandon(&mut self.resources, tag, result, held);
+                }
+                tcp::after(&mut self.resources, &mut self.pending, tag);
+            }
+            _ => {}
+        }
     }
 
     /// Applies the requests that other threads posted.
     fn take_requests(&mut self) {
-        let (ring, shared) = (&mut self.ring, &self.shared);
-        self.table.take_requests(|taken| match taken {
-            Taken::Cancel(id) => {
-                if push_cancel(ring, id).is_err() {
-                    // The queue stays full: the next turn takes the request again.
-                    shared.requests.post(id, Request::Cancel);
-                }
+        let mut taken = mem::take(&mut self.taken);
+        self.table.take_requests(|request| taken.push(request));
+        for request in taken.drain(..) {
+            match request {
+                Taken::Cancel(id) => self.cancel(id),
+                Taken::Abandoned(id, ended) => self.claimed(id, ended),
             }
-            Taken::Abandoned(id, _) => {
-                if let Some(slot) = shared.entries.get(id.index() as usize) {
-                    slot.reclaim(id);
-                }
+        }
+        self.taken = taken;
+        self.attend();
+    }
+
+    /// The consumer of `id` ended its interest after the operation ended. If it took the result,
+    /// the home only frees the slot. If it did not, the home applies the abandoned rule.
+    fn claimed(&mut self, id: OpId, ended: Done<Tag>) {
+        let held = self
+            .shared
+            .entries
+            .get(id.index() as usize)
+            .and_then(|slot| slot.reclaim(id));
+        if let Some(tag) = ended.resources {
+            match held {
+                Some(held) => tcp::abandon(&mut self.resources, tag, ended.result, held),
+                None => tcp::taken(&mut self.resources, tag),
             }
-        });
+            tcp::after(&mut self.resources, &mut self.pending, tag);
+        }
+    }
+
+    /// Asks the kernel to cancel the running operation `id`, once. An operation that waits for
+    /// the one before it never ran, so it ends now.
+    fn cancel(&mut self, id: OpId) {
+        let Some(&tag) = self.table.resources(id) else {
+            return;
+        };
+        if tag.kind == Kind::Close {
+            return;
+        }
+        if self.unqueue(tag, id) {
+            self.complete_now(id, -ECANCELED);
+            return;
+        }
+        let mut first = false;
+        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+            slot.update(id, |held| {
+                if let Some(held) = held {
+                    first = !held.cancelled;
+                    held.cancelled = true;
+                }
+            });
+        }
+        if first && push_cancel(&mut self.ring, id).is_err() {
+            // The queue stays full: the next turn takes the request again.
+            if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+                slot.update(id, |held| {
+                    if let Some(held) = held {
+                        held.cancelled = false;
+                    }
+                });
+            }
+            self.shared.requests.post(id, Request::Cancel);
+        }
     }
 
     /// Gives up to `limit` ready completions to their operations. Gives their number.
     fn harvest(&mut self, limit: u32) -> u32 {
         let mut completed = 0;
-        let (shared, table) = (&self.shared, &mut self.table);
+        let (shared, table, pending) = (&self.shared, &mut self.table, &mut self.pending);
         let (resources, selected, waking) = (&mut self.resources, &mut self.selected, &mut self.waking);
         for cqe in self.ring.completions().take(limit as usize) {
             completed += 1;
-            let target =
-                OpId::from_user_data(cqe.user_data).and_then(|id| Some((id, shared.entries.get(id.index() as usize)?)));
-            let (abandoned, (id, slot)) = match (table.complete(cqe.user_data, cqe.event()), target) {
-                (Outcome::Ready, Some(target)) => (false, target),
-                (Outcome::Abandoned(_), Some(target)) => (true, target),
+            let outcome = table.complete(cqe.user_data, cqe.event());
+            let (id, abandoned, tag) = match (outcome, OpId::from_user_data(cqe.user_data)) {
                 // The poll of the interrupt descriptor ended: the next wait polls it again.
                 (Outcome::Control(WAKE), _) => {
                     *waking = false;
                     continue;
                 }
+                (Outcome::Ready, Some(id)) => match table.resources(id) {
+                    Some(&tag) => (id, false, tag),
+                    None => continue,
+                },
+                (
+                    Outcome::Abandoned(Done {
+                        resources: Some(tag), ..
+                    }),
+                    Some(id),
+                ) => (id, true, tag),
                 // No driver operation is multishot or a zero-copy send yet; the other outcomes
                 // change nothing.
                 _ => continue,
             };
+            let Some(slot) = shared.entries.get(id.index() as usize) else {
+                continue;
+            };
             slot.update(id, |held| {
                 if let Some(held) = held {
-                    finish(held, &cqe, abandoned, resources, selected.as_mut());
+                    finish(held, tag, &cqe, abandoned, resources, selected.as_mut());
                 }
             });
             if abandoned {
-                slot.reclaim(id);
+                if let Some(held) = slot.reclaim(id) {
+                    tcp::abandon(resources, tag, cqe.res, held);
+                }
+                tcp::after(resources, pending, tag);
             } else {
                 slot.publish(id, cqe.res);
             }
@@ -816,24 +1017,31 @@ impl Driver {
     }
 }
 
+/// `ECANCELED` (`include/uapi/asm-generic/errno.h`).
+pub(crate) const ECANCELED: i32 = 125;
+
 /// The home finishes the operation of `held` at its terminal event `cqe`, before its consumer
-/// takes the result, or before the home drops the resources of an abandoned operation.
+/// takes the result, or before the home applies the abandoned rule.
 #[expect(unsafe_code, reason = "the kernel initialized the bytes that the result counts")]
-fn finish(held: &mut Held, cqe: &Cqe, abandoned: bool, resources: &mut Resources, selected: Option<&mut Selected>) {
-    if let Some(owned) = held.resource.and_then(|resource| resources.get(resource)) {
-        owned.running = owned.running.saturating_sub(1);
-    }
+fn finish(
+    held: &mut Held,
+    tag: Tag,
+    cqe: &Cqe,
+    abandoned: bool,
+    resources: &mut Resources,
+    selected: Option<&mut Selected>,
+) {
     let count = usize::try_from(cqe.res);
-    match held.finish {
-        Finish::Nothing => {}
-        Finish::Received => {
+    match tag.kind {
+        Kind::Other | Kind::Send | Kind::Close => {}
+        Kind::Recv => {
             if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
                 // SAFETY: the receive named the capacity of the loan, and the kernel wrote `count`
                 // bytes at its start, at most that capacity.
                 unsafe { loan.set_filled(count) };
             }
         }
-        Finish::Selected => {
+        Kind::Selected => {
             if let Some(buffer) = cqe
                 .buffer()
                 .zip(selected)
@@ -844,17 +1052,26 @@ fn finish(held: &mut Held, cqe: &Cqe, abandoned: bool, resources: &mut Resources
                 // start of the buffer. The kernel wrote the bytes that the result counts there, at
                 // most the slot capacity that the ring names.
                 unsafe { loan.set_filled(count.unwrap_or(0)) };
-                if !abandoned {
-                    held.loan = Some(loan);
-                }
+                held.loan = Some(loan);
             }
         }
-        Finish::Accepted => {
+        Kind::Accept => {
             if cqe.res >= 0 {
                 // SAFETY: the kernel gave a new descriptor that nothing else owns.
                 let fd = unsafe { OwnedFd::from_raw_fd(cqe.res) };
-                if !abandoned {
-                    held.accepted = resources.adopt(fd).ok();
+                if abandoned {
+                    held.connection = Some(fd);
+                } else {
+                    match resources.adopt(fd) {
+                        Ok(stream) => held.accepted = Some(stream),
+                        // With no free resource slot, the listener keeps the connection for the
+                        // next accept, and this one gives `OutOfMemory`.
+                        Err(fd) => {
+                            if let Some(listener) = tag.resource.and_then(|listener| resources.get(listener)) {
+                                listener.directions.keep_connection(fd, held.peer, held.peer_len);
+                            }
+                        }
+                    }
                 }
             }
         }

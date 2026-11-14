@@ -32,6 +32,15 @@ impl Completion {
         }
     }
 
+    /// Asks the home to cancel the operation. The consumer keeps its interest, and later takes
+    /// the result.
+    pub(super) fn cancel(&self) {
+        if !self.done {
+            self.shared.requests.post(self.id, Request::Cancel);
+            self.shared.wake();
+        }
+    }
+
     fn entry(&self) -> Option<&Entry<Held>> {
         self.shared.entries.get(self.id.index() as usize)
     }

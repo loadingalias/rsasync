@@ -32,9 +32,10 @@ Today, the tests check the repository tools, the shared types, and the io_uring 
 driver: ring creation, a message from one ring to another, the probes of kernel features, the
 operation table with the completions of the kernel, the driver-only surface (turns, waits, wakes,
 and teardown), and TCP on the driver. The TCP tests bind, listen, and accept; receive into an
-owned buffer and into a buffer that the kernel selects; and send from a lease. The receive into an
-owned buffer and the send from a lease keep the addresses of their buffers and allocate nothing
-for each operation. Only the driver and `rsnetwork-udp` make system calls: the io_uring ring and
+owned buffer and into a buffer that the kernel selects; send from a lease; and close. They also
+check that a dropped, forgotten, or cancelled receive, send, or accept loses no byte and no
+connection, on IPv4 and IPv6. The receive into an owned buffer and the send from a lease keep the
+addresses of their buffers and allocate nothing for each operation. Only the driver and `rsnetwork-udp` make system calls: the io_uring ring and
 its waits in the kernel, its two event descriptors, the bind and listen of a TCP socket through
 `std`, and the datagram calls of `rsnetwork-udp`. Thus a pass shows that the build links and runs
 on musl, and that these calls work through the system calls of musl. It does not show that a

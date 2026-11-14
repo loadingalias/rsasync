@@ -1,19 +1,35 @@
 //! TCP on the driver: bind and listen, accept, receive into an owned buffer or into a buffer that
 //! the kernel selects, send from a lease, and close. Each socket is nonblocking, and the driver
 //! owns its descriptor.
+//!
+//! Each direction of a stream, and the accepts of a listener, runs one operation at a time. The
+//! home keeps the state of each direction: the operation that runs, one operation that waits for
+//! it, what an abandoned receive or accept left, and the progress that dropped sends owe.
 
 use alloc::vec::Vec;
+use core::fmt;
 use core::net::SocketAddr;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use rsnetwork_udp::SockAddrStorage;
 
-use super::{Driver, Finish, Held, Operation, Reason, Refused, Resource};
-use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
+use super::{Completion, Driver, ECANCELED, Held, Kind, Operation, Reason, Refused, Resource, Resources, Tag};
+use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
+use crate::sync::Arc;
+use crate::table::OpId;
 use crate::uring::Sqe;
 
+/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`): a selecting receive found no free buffer, and
+/// the data stays in the socket.
+const ENOBUFS: i32 = 105;
+
 /// A listening TCP socket that a driver owns.
+///
+/// An accept borrows the listener exclusively, so one accept runs at a time. When an accept future
+/// drops, the driver asks the kernel to cancel the accept. A connection that the accept took before
+/// the cancel took effect stays with the listener, and the next accept gives it before it
+/// submits. A close of the listener closes it.
 #[derive(Debug)]
 pub struct TcpListener {
     resource: Resource,
@@ -28,15 +44,314 @@ impl TcpListener {
     }
 }
 
-/// A connected TCP socket that a driver owns.
+/// A connected TCP socket that a driver owns: its read half and its write half.
+///
+/// A receive borrows the read half exclusively, and a send borrows the write half exclusively,
+/// through the stream or through [`TcpStream::split`]. So each direction runs one operation at a
+/// time, and when an operation starts, no future of an earlier operation in its direction exists.
+/// A half has no `Clone`.
+///
+/// A dropped or forgotten future ends the interest, not the operation. Its direction stays busy
+/// until the operation ends: an operation that starts before then waits, and the driver starts it
+/// after that end. A receive or an accept that waited and whose future dropped never ran, so it
+/// ends with no effect. A send that waited and whose future dropped still runs, in start order.
+/// No byte is lost or reordered:
+///
+/// - A dropped or forgotten receive asks the driver to cancel. The bytes that it received before
+///   the cancel took effect stay with the stream, in its own buffer. The next receive gives them
+///   before it submits: a receive into a buffer copies as many as fit, and the stream keeps the
+///   rest; a selecting receive gives that buffer. [`Driver::copied`] counts these copies. An error
+///   of an abandoned receive also stays, and the next receive gives it.
+/// - A send is not cancelled. If a dropped send fails, sends only part of its bytes, or was
+///   cancelled, the write direction fails: the next send gives an error with [`WriteFailed`] and
+///   the count of the bytes that went, and each later send gives [`WriteFailed`] with no count. A
+///   dropped send that sends all its bytes reports nothing, so a next send that succeeds shows
+///   that each earlier dropped send sent all its bytes.
+/// - [`Operation::cancel`] keeps the interest: the future gives the original buffer with its exact
+///   progress, with no copy, and the direction stays usable.
+///
+/// [`Driver::close`] cancels each operation that runs, waits until each one ends, and reports the
+/// progress that dropped sends owe.
 #[derive(Debug)]
 pub struct TcpStream {
+    read: ReadHalf,
+    write: WriteHalf,
+}
+
+impl TcpStream {
+    fn new(resource: Resource) -> Self {
+        Self {
+            read: ReadHalf { resource },
+            write: WriteHalf { resource },
+        }
+    }
+
+    /// The read half and the write half, so that a receive and a send can run at one time.
+    pub fn split(&mut self) -> (&mut ReadHalf, &mut WriteHalf) {
+        (&mut self.read, &mut self.write)
+    }
+}
+
+/// The read half of a [`TcpStream`]: [`Driver::recv`] and [`Driver::recv_selected`] borrow it.
+#[derive(Debug)]
+pub struct ReadHalf {
     resource: Resource,
+}
+
+/// The write half of a [`TcpStream`]: [`Driver::send`] borrows it.
+#[derive(Debug)]
+pub struct WriteHalf {
+    resource: Resource,
+}
+
+impl AsMut<ReadHalf> for TcpStream {
+    fn as_mut(&mut self) -> &mut ReadHalf {
+        &mut self.read
+    }
+}
+
+impl AsMut<ReadHalf> for ReadHalf {
+    fn as_mut(&mut self) -> &mut ReadHalf {
+        self
+    }
+}
+
+impl AsMut<WriteHalf> for TcpStream {
+    fn as_mut(&mut self) -> &mut WriteHalf {
+        &mut self.write
+    }
+}
+
+impl AsMut<WriteHalf> for WriteHalf {
+    fn as_mut(&mut self) -> &mut WriteHalf {
+        self
+    }
+}
+
+/// The write direction of a stream failed, because a send whose future dropped failed, sent only
+/// part of its bytes, or was cancelled. The caller no longer knows the framing of its stream. It
+/// is the payload of the `io::Error` of a send: get it with [`WriteFailed::of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteFailed {
+    sent: Option<usize>,
+}
+
+impl WriteFailed {
+    /// The bytes that the dropped sends sent, from the first byte of the first send whose result
+    /// no future took. The first send after the failure gives the count, and each later send gives
+    /// `None`.
+    #[must_use]
+    pub const fn sent(self) -> Option<usize> {
+        self.sent
+    }
+
+    /// The failure that `error` carries, or `None` for each other error.
+    #[must_use]
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref().copied()
+    }
+}
+
+impl fmt::Display for WriteFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.sent {
+            Some(sent) => write!(
+                f,
+                "the write direction failed after a dropped send, which sent {sent} bytes"
+            ),
+            None => f.write_str("the write direction failed after a dropped send"),
+        }
+    }
+}
+
+impl core::error::Error for WriteFailed {}
+
+/// What a close did, after each operation of its socket ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Closed {
+    sent: Option<usize>,
+}
+
+impl Closed {
+    /// The bytes that the dropped sends sent, from the first byte of the first send whose result
+    /// no future took, when a send that the close cancelled, or a failed send, owes that count.
+    /// `None` when no send owes it, also when a send already gave it with [`WriteFailed`].
+    #[must_use]
+    pub const fn sent(self) -> Option<usize> {
+        self.sent
+    }
+}
+
+/// One direction of a stream, or the accepts of a listener: the operation that runs or ran last,
+/// and the operations that wait for it, in start order, linked through `Held::next`.
+#[derive(Debug, Default)]
+struct Direction {
+    current: Option<OpId>,
+    first: Option<OpId>,
+    last: Option<OpId>,
+}
+
+/// What an abandoned receive or accept left for the next one.
+#[derive(Debug)]
+enum Kept {
+    /// Received bytes: from `start` to the end of the initialized bytes of `buffer`.
+    Bytes { buffer: Backing, start: usize },
+    /// The error of a receive.
+    Error(i32),
+    /// An accepted connection, and the address of its peer.
+    Connection {
+        fd: OwnedFd,
+        peer: SockAddrStorage,
+        peer_len: u32,
+    },
+}
+
+/// The write direction after dropped sends.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// Each dropped send sent all its bytes.
+    #[default]
+    Ok,
+    /// The direction failed, and the next send or the close gives the count.
+    Owe,
+    /// The direction failed, and a send gave the count.
+    Reported,
+}
+
+/// The directions of a stream or a listener, at the home.
+#[derive(Debug, Default)]
+pub(super) struct Directions {
+    read: Direction,
+    write: Direction,
+    kept: Option<Kept>,
+    sent: Sent,
+    /// The bytes that dropped sends sent, since the end of the last send whose result a future
+    /// took, or since the last report.
+    unreported: usize,
+    /// The close that waits for the operations of the resource.
+    closing: Option<OpId>,
+    /// The resource is in the pending list of the driver.
+    pending: bool,
+}
+
+impl Directions {
+    /// The direction of an operation of `kind`.
+    fn direction(&mut self, kind: Kind) -> Option<&mut Direction> {
+        match kind {
+            Kind::Recv | Kind::Selected | Kind::Accept => Some(&mut self.read),
+            Kind::Send => Some(&mut self.write),
+            Kind::Other | Kind::Close => None,
+        }
+    }
+
+    /// The listener keeps a connection that no accept took.
+    pub(super) fn keep_connection(&mut self, fd: OwnedFd, peer: SockAddrStorage, peer_len: u32) {
+        self.kept = Some(Kept::Connection { fd, peer, peer_len });
+    }
+
+    /// Whether an operation of `kind` has its result here, with no submission.
+    fn has_result(&self, kind: Kind) -> bool {
+        match kind {
+            Kind::Recv | Kind::Selected => matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_))),
+            Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
+            Kind::Send => self.sent != Sent::Ok,
+            Kind::Other | Kind::Close => false,
+        }
+    }
 }
 
 /// The result of an operation as a count of bytes, or the error of the kernel.
 fn count(result: i32) -> io::Result<usize> {
     usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(result.saturating_neg()))
+}
+
+/// The abandoned rule: the home applies it to the result of an operation of `tag` whose consumer
+/// ended its interest. Received bytes, the error of a receive, and an accepted connection stay
+/// for the next operation of the direction. A send that failed, sent only part of its bytes, or
+/// was cancelled makes the write direction fail.
+pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: Held) {
+    let Some(resource) = tag.resource else {
+        return;
+    };
+    if tag.kind == Kind::Accept {
+        // A stream that the home gave to a future that dropped before it took it goes back to a
+        // descriptor.
+        let connection = held
+            .connection
+            .or_else(|| held.accepted.and_then(|stream| resources.release(stream)));
+        if let (Some(fd), Some(listener)) = (connection, resources.get(resource)) {
+            listener.directions.keep_connection(fd, held.peer, held.peer_len);
+        }
+        return;
+    }
+    let Some(owned) = resources.get(resource) else {
+        return;
+    };
+    let directions = &mut owned.directions;
+    match tag.kind {
+        Kind::Recv | Kind::Selected => {
+            let buffer = held.loan.map(WriteLoan::into_inner);
+            if held.copied > 0
+                && let Some(Kept::Bytes { start, .. }) = &mut directions.kept
+            {
+                // The receive copied its bytes from the kept buffer, which still holds them.
+                *start -= held.copied;
+            } else if let (Ok(received), Some(buffer)) = (usize::try_from(result), buffer)
+                && received > 0
+            {
+                let start = buffer.initialized() - received;
+                directions.kept = Some(Kept::Bytes { buffer, start });
+            } else if result < 0 && result != -ECANCELED && result != -ENOBUFS {
+                directions.kept = Some(Kept::Error(result));
+            }
+        }
+        Kind::Send => {
+            if let Some(failed) = held.failed {
+                // The future did not take the failure: the next send gives it.
+                if let Some(sent) = failed.sent {
+                    directions.unreported = directions.unreported.saturating_add(sent);
+                    directions.sent = Sent::Owe;
+                }
+                return;
+            }
+            let sent = usize::try_from(result).unwrap_or(0);
+            let len = held.lease.as_ref().map_or(0, |lease| lease.initialized());
+            directions.unreported = directions.unreported.saturating_add(sent);
+            if (result < 0 || sent < len || held.cancelled) && directions.sent == Sent::Ok {
+                directions.sent = Sent::Owe;
+            }
+        }
+        Kind::Accept | Kind::Other | Kind::Close => {}
+    }
+}
+
+/// The consumer of an operation of `tag` took its result. A send result that a future took
+/// reports each byte up to its end.
+pub(super) fn taken(resources: &mut Resources, tag: Tag) {
+    if tag.kind == Kind::Send
+        && let Some(owned) = tag.resource.and_then(|resource| resources.get(resource))
+        && owned.directions.sent == Sent::Ok
+    {
+        owned.directions.unreported = 0;
+    }
+}
+
+/// An operation of `tag` ended: its resource needs the home when an operation or a close waits
+/// there.
+pub(super) fn after(resources: &mut Resources, pending: &mut Vec<Resource>, tag: Tag) {
+    let Some(resource) = tag.resource else {
+        return;
+    };
+    let Some(owned) = resources.get(resource) else {
+        return;
+    };
+    let directions = &mut owned.directions;
+    let waits = directions.read.first.is_some() || directions.write.first.is_some() || directions.closing.is_some();
+    if waits && !directions.pending {
+        directions.pending = true;
+        // At most one entry for each resource, so the capacity of the list holds it.
+        pending.push(resource);
+    }
 }
 
 impl Driver {
@@ -56,28 +371,21 @@ impl Driver {
     }
 
     /// Accepts a connection on `listener`. The future gives the stream and the address of its
-    /// peer. A drop of the future asks for a cancel.
+    /// peer. A drop of the future asks for a cancel, and a connection that the accept took stays
+    /// with the listener for the next accept.
     ///
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation.
-    #[expect(unsafe_code, reason = "the accept names the address in its own resources")]
-    pub fn accept(
+    pub fn accept<'a>(
         &mut self,
-        listener: &TcpListener,
-    ) -> Result<Operation<io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
-        let fd = self.fd(listener.resource).ok_or(Refused {
-            reason: Reason::Resource,
-            value: (),
-        })?;
+        listener: &'a mut TcpListener,
+    ) -> Result<Operation<'a, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
         let held = |()| Held {
-            finish: Finish::Accepted,
             peer_len: SockAddrStorage::LEN,
             ..Held::default()
         };
-        let entry = |held: &mut Held| Sqe::accept(fd, (&raw mut held.peer).cast(), &raw mut held.peer_len);
-        // SAFETY: the entry names the peer address in the resources, and the listener.
-        let completion = unsafe { self.submit((), Some(listener.resource), held, entry, true) }?;
+        let completion = self.begin(listener.resource, Kind::Accept, (), held)?;
         Ok(Operation::new(completion, |result, held| {
             Some(count(result).and_then(|_| {
                 let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
@@ -85,48 +393,29 @@ impl Driver {
                     .peer
                     .to_socket_addr(held.peer_len)
                     .ok_or(io::ErrorKind::InvalidData)?;
-                Ok((TcpStream { resource }, peer))
+                Ok((TcpStream::new(resource), peer))
             }))
         }))
     }
 
     /// Receives into the capacity of `buffer` after its initialized bytes. The future gives the
     /// count of received bytes, and the buffer with them initialized after its earlier bytes. The
-    /// kernel writes into the buffer itself, with no copy. A drop of the future asks for a cancel.
+    /// kernel writes into the buffer itself, with no copy, except for the bytes that a dropped
+    /// receive left (see [`TcpStream`]). A drop of the future asks for a cancel.
     ///
     /// # Errors
     ///
     /// A refusal, with the buffer, when the driver has no room for the operation.
-    #[expect(unsafe_code, reason = "the receive names the capacity of its own buffer")]
-    pub fn recv(
+    pub fn recv<'a, R: AsMut<ReadHalf>>(
         &mut self,
-        stream: &TcpStream,
+        reader: &'a mut R,
         buffer: Backing,
-    ) -> Result<Operation<(io::Result<usize>, Backing)>, Refused<Backing>> {
-        let Some(fd) = self.fd(stream.resource) else {
-            return Err(Refused {
-                reason: Reason::Resource,
-                value: buffer,
-            });
-        };
-        // The kernel writes into the loan, and the terminal event records its extent.
-        let mut loan = WriteLoan::new(buffer);
-        let len = u32::try_from(loan.capacity()).unwrap_or(u32::MAX);
-        // The address of the loan stays the same when the loan moves into the resources.
-        let entry = Sqe::recv(fd, loan.as_mut_ptr(), len);
-        let held = |loan| Held {
-            loan: Some(loan),
-            finish: Finish::Received,
+    ) -> Result<Operation<'a, (io::Result<usize>, Backing)>, Refused<Backing>> {
+        let held = |buffer| Held {
+            loan: Some(WriteLoan::new(buffer)),
             ..Held::default()
         };
-        // SAFETY: the entry names the capacity of the loan, which the resources keep, and the
-        // stream.
-        let completion = unsafe { self.submit(loan, Some(stream.resource), held, |_| entry, true) }.map_err(
-            |refused: Refused<WriteLoan<Backing>>| Refused {
-                reason: refused.reason,
-                value: refused.value.into_inner(),
-            },
-        )?;
+        let completion = self.begin(reader.as_mut().resource, Kind::Recv, buffer, held)?;
         Ok(Operation::new(completion, |result, held| {
             Some((count(result), held.loan?.into_inner()))
         }))
@@ -142,29 +431,20 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no provided buffers or no room for the operation.
-    #[expect(unsafe_code, reason = "a selecting receive names no memory of its own")]
-    pub fn recv_selected(&mut self, stream: &TcpStream) -> Result<Operation<io::Result<Backing>>, Refused<()>> {
-        let Some(group) = self.selected.as_ref().map(|selected| selected.ring.group()) else {
+    pub fn recv_selected<'a, R: AsMut<ReadHalf>>(
+        &mut self,
+        reader: &'a mut R,
+    ) -> Result<Operation<'a, io::Result<Backing>>, Refused<()>> {
+        if self.selected.is_none() {
             return Err(Refused {
                 reason: Reason::Buffers,
                 value: (),
             });
-        };
-        let fd = self.fd(stream.resource).ok_or(Refused {
-            reason: Reason::Resource,
-            value: (),
-        })?;
-        let held = |()| Held {
-            finish: Finish::Selected,
-            ..Held::default()
-        };
-        // SAFETY: the entry names the stream, and the kernel takes a buffer of the provided ring,
-        // which the driver keeps until the completion gives it.
-        let completion =
-            unsafe { self.submit((), Some(stream.resource), held, |_| Sqe::recv_selected(fd, group), true) }?;
+        }
+        let completion = self.begin(reader.as_mut().resource, Kind::Selected, (), |()| Held::default())?;
         Ok(Operation::new(completion, |result, held| {
-            // With no selected buffer, for example at the end of the stream, the backing is empty, and an
-            // empty `Vec` allocates nothing.
+            // With no selected buffer, for example at the end of the stream, the backing is empty,
+            // and an empty `Vec` allocates nothing.
             Some(count(result).map(|_| {
                 held.loan
                     .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner)
@@ -173,58 +453,493 @@ impl Driver {
     }
 
     /// Sends the bytes of `lease`. The future gives the count of sent bytes, and the lease. The
-    /// kernel reads the lease itself, with no copy. A drop of the future does not cancel the send.
+    /// kernel reads the lease itself, with no copy. A drop of the future does not cancel the send
+    /// (see [`TcpStream`]).
     ///
     /// # Errors
     ///
     /// A refusal, with the lease, when the driver has no room for the operation.
-    #[expect(unsafe_code, reason = "the send names the bytes of its own lease")]
-    pub fn send(
+    pub fn send<'a, W: AsMut<WriteHalf>>(
         &mut self,
-        stream: &TcpStream,
+        writer: &'a mut W,
         lease: Lease,
-    ) -> Result<Operation<(io::Result<usize>, Lease)>, Refused<Lease>> {
-        let Some(fd) = self.fd(stream.resource) else {
-            return Err(Refused {
-                reason: Reason::Resource,
-                value: lease,
-            });
-        };
-        let len = u32::try_from(lease.initialized()).unwrap_or(u32::MAX);
-        // The address of the lease stays the same when the lease moves into the resources.
-        let entry = Sqe::send(fd, lease.as_ptr(), len);
+    ) -> Result<Operation<'a, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let held = |lease| Held {
             lease: Some(lease),
             ..Held::default()
         };
-        // SAFETY: the entry names the bytes of the lease, which the resources keep, and the
-        // stream.
-        let completion = unsafe { self.submit(lease, Some(stream.resource), held, |_| entry, false) }?;
+        let completion = self.begin(writer.as_mut().resource, Kind::Send, lease, held)?;
         Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.lease?))
+            let sent = held
+                .failed
+                .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
+            Some((sent, held.lease?))
         }))
     }
 
-    /// Closes `stream`. Refuses with the stream while an operation runs on it.
+    /// Closes `stream`. The close cancels each operation that runs on the stream, a dropped send
+    /// too, waits until each one ends, releases the bytes that no receive took, and closes the
+    /// socket. The future gives the progress that dropped sends owe.
     ///
     /// # Errors
     ///
-    /// A refusal, with the stream, while an operation runs on it.
-    pub fn close(&mut self, stream: TcpStream) -> Result<(), Refused<TcpStream>> {
-        self.resources
-            .close(stream.resource)
-            .map_err(|reason| Refused { reason, value: stream })
+    /// A refusal, with the stream, when the driver has no room for the operation.
+    pub fn close(&mut self, stream: TcpStream) -> Result<Operation<'static, Closed>, Refused<TcpStream>> {
+        let resource = stream.read.resource;
+        let completion = self.close_resource(resource, stream)?;
+        Ok(Operation::new(completion, |_, held| held.closed))
     }
 
-    /// Closes `listener`. Refuses with the listener while an accept runs on it.
+    /// Closes `listener`. The close cancels the accept that runs, waits until it ends, closes each
+    /// connection that no accept took, and closes the socket.
     ///
     /// # Errors
     ///
-    /// A refusal, with the listener, while an accept runs on it.
-    pub fn close_listener(&mut self, listener: TcpListener) -> Result<(), Refused<TcpListener>> {
-        self.resources.close(listener.resource).map_err(|reason| Refused {
-            reason,
-            value: listener,
-        })
+    /// A refusal, with the listener, when the driver has no room for the operation.
+    pub fn close_listener(
+        &mut self,
+        listener: TcpListener,
+    ) -> Result<Operation<'static, Closed>, Refused<TcpListener>> {
+        let resource = listener.resource;
+        let completion = self.close_resource(resource, listener)?;
+        Ok(Operation::new(completion, |_, held| held.closed))
+    }
+
+    /// Starts an operation of `kind` in its direction of `resource`, with the resources that
+    /// `held` makes from `value`. The caller holds the direction exclusively, so no future of an
+    /// earlier operation of the direction exists: their interest ends first. The operation waits
+    /// while the earlier one runs, and starts at its end.
+    fn begin<P>(
+        &mut self,
+        resource: Resource,
+        kind: Kind,
+        value: P,
+        held: impl FnOnce(P) -> Held,
+    ) -> Result<Completion, Refused<P>> {
+        let Some((current, first)) = self
+            .direction(resource, kind)
+            .map(|direction| (direction.current, direction.first))
+        else {
+            return Err(Refused {
+                reason: Reason::Resource,
+                value,
+            });
+        };
+        if let Some(current) = current {
+            self.forgo(current);
+        }
+        let mut next = first;
+        while let Some(id) = next {
+            // The link comes first: a receive or an accept leaves the queue in `forgo`.
+            next = self.next(id);
+            self.forgo(id);
+        }
+        let (table, resources) = (&self.table, &mut self.resources);
+        let Some(owned) = resources.get(resource) else {
+            return Err(Refused {
+                reason: Reason::Resource,
+                value,
+            });
+        };
+        let has_result = owned.directions.has_result(kind);
+        let Some(direction) = owned.directions.direction(kind) else {
+            return Err(Refused {
+                reason: Reason::Resource,
+                value,
+            });
+        };
+        direction.current = direction.current.filter(|&id| table.runs(id));
+        let now = direction.current.is_none() && direction.first.is_none();
+        if now && !has_result && !self.room() {
+            return Err(Refused {
+                reason: Reason::Queue,
+                value,
+            });
+        }
+        let tag = Tag {
+            resource: Some(resource),
+            kind,
+        };
+        let id = self
+            .open(tag, value, held)
+            .map_err(|(reason, value)| Refused { reason, value })?;
+        if now {
+            if let Some(direction) = self.direction(resource, kind) {
+                direction.current = Some(id);
+            }
+            // The queue has room, or the operation has its result here, so it starts.
+            self.start(id, resource, kind);
+        } else {
+            self.enqueue(resource, kind, id);
+        }
+        Ok(Completion::new(Arc::clone(&self.shared), id, kind != Kind::Send))
+    }
+
+    /// The direction of `kind` of `resource`.
+    fn direction(&mut self, resource: Resource, kind: Kind) -> Option<&mut Direction> {
+        self.resources.get(resource)?.directions.direction(kind)
+    }
+
+    /// The operation that waits after `id` in its direction.
+    fn next(&self, id: OpId) -> Option<OpId> {
+        let mut next = None;
+        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+            slot.update(id, |held| next = held.as_ref().and_then(|held| held.next));
+        }
+        next
+    }
+
+    /// Links `next` after the waiting operation `id`.
+    fn link(&self, id: OpId, next: Option<OpId>) {
+        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+            slot.update(id, |held| {
+                if let Some(held) = held {
+                    held.next = next;
+                }
+            });
+        }
+    }
+
+    /// Puts `id` at the end of the operations that wait in its direction.
+    fn enqueue(&mut self, resource: Resource, kind: Kind, id: OpId) {
+        let Some(last) = self.direction(resource, kind).map(|direction| direction.last) else {
+            return;
+        };
+        match last {
+            Some(last) => self.link(last, Some(id)),
+            None => {
+                if let Some(direction) = self.direction(resource, kind) {
+                    direction.first = Some(id);
+                }
+            }
+        }
+        if let Some(direction) = self.direction(resource, kind) {
+            direction.last = Some(id);
+        }
+    }
+
+    /// Takes the first operation that waits in the direction of `kind`.
+    pub(super) fn dequeue(&mut self, resource: Resource, kind: Kind) -> Option<OpId> {
+        let id = self.direction(resource, kind)?.first?;
+        let next = self.next(id);
+        let direction = self.direction(resource, kind)?;
+        direction.first = next;
+        if next.is_none() {
+            direction.last = None;
+        }
+        Some(id)
+    }
+
+    /// Takes `id` out of the operations that wait in its direction, if it waits there. It never
+    /// waits again. Gives whether it waited.
+    pub(super) fn unqueue(&mut self, tag: Tag, id: OpId) -> bool {
+        let Some(resource) = tag.resource else {
+            return false;
+        };
+        let Some(first) = self.direction(resource, tag.kind).map(|direction| direction.first) else {
+            return false;
+        };
+        let (mut before, mut at) = (None, first);
+        while let Some(op) = at {
+            let next = self.next(op);
+            if op == id {
+                match before {
+                    Some(before) => self.link(before, next),
+                    None => {
+                        if let Some(direction) = self.direction(resource, tag.kind) {
+                            direction.first = next;
+                        }
+                    }
+                }
+                if let Some(direction) = self.direction(resource, tag.kind)
+                    && direction.last == Some(id)
+                {
+                    direction.last = before;
+                }
+                return true;
+            }
+            (before, at) = (Some(op), next);
+        }
+        false
+    }
+
+    /// The operation `id` has no future any more: the caller started the next operation in its
+    /// direction. Its interest ends, as at a drop of its future.
+    fn forgo(&mut self, id: OpId) {
+        match self.table.end_interest(id) {
+            Some(ended) => self.claimed(id, ended),
+            // A receive and an accept that run or wait ask to cancel, as at a drop.
+            None => {
+                if let Some(&tag) = self.table.resources(id)
+                    && tag.kind != Kind::Send
+                {
+                    self.cancel(id);
+                }
+            }
+        }
+    }
+
+    /// Starts the operation `id`: it takes the result that its direction holds, or the home
+    /// submits it. Gives `false`, and changes nothing, when it needs a submission and the queue has
+    /// no room.
+    fn start(&mut self, id: OpId, resource: Resource, kind: Kind) -> bool {
+        let Some(owned) = self.resources.get(resource) else {
+            return true;
+        };
+        let Some(fd) = owned.fd.as_ref().map(OwnedFd::as_raw_fd) else {
+            return true;
+        };
+        let Some(slot) = self.shared.entries.get(id.index() as usize) else {
+            return true;
+        };
+        let directions = &mut owned.directions;
+        let result = match (kind, directions.kept.take()) {
+            (Kind::Recv, Some(Kept::Bytes { buffer, mut start })) => {
+                let mut copied = 0;
+                slot.update(id, |held| {
+                    if let Some(held) = held
+                        && let Some(loan) = held.loan.as_mut()
+                    {
+                        copied = loan.fill_from(buffer.bytes().get(start..).unwrap_or_default());
+                        held.copied = copied;
+                    }
+                });
+                start += copied;
+                if start < buffer.initialized() {
+                    directions.kept = Some(Kept::Bytes { buffer, start });
+                }
+                self.copied = self.copied.saturating_add(copied as u64);
+                // The kept bytes came from one kernel result, so their count fits an `i32`.
+                Some(i32::try_from(copied).unwrap_or(i32::MAX))
+            }
+            (Kind::Selected, Some(Kept::Bytes { mut buffer, start })) => {
+                let len = buffer.initialized() - start;
+                if start > 0 {
+                    buffer.bytes_mut().copy_within(start.., 0);
+                    buffer.truncate(len);
+                    self.copied = self.copied.saturating_add(len as u64);
+                }
+                slot.update(id, |held| {
+                    if let Some(held) = held {
+                        held.copied = if start > 0 { len } else { 0 };
+                        held.loan = Some(WriteLoan::new(buffer));
+                    }
+                });
+                Some(i32::try_from(len).unwrap_or(i32::MAX))
+            }
+            (Kind::Recv | Kind::Selected, Some(Kept::Error(error))) => Some(error),
+            (Kind::Accept, Some(Kept::Connection { fd, peer, peer_len })) => {
+                match self.resources.adopt(fd) {
+                    Ok(stream) => slot.update(id, |held| {
+                        if let Some(held) = held {
+                            held.accepted = Some(stream);
+                            held.peer = peer;
+                            held.peer_len = peer_len;
+                        }
+                    }),
+                    // With no free resource slot, the listener keeps the connection, and this
+                    // accept gives `OutOfMemory`.
+                    Err(fd) => {
+                        if let Some(listener) = self.resources.get(resource) {
+                            listener.directions.keep_connection(fd, peer, peer_len);
+                        }
+                    }
+                }
+                Some(0)
+            }
+            (Kind::Send, kept) => {
+                directions.kept = kept;
+                match directions.sent {
+                    Sent::Ok => None,
+                    // A dropped send that waited never ran, so it gives no report.
+                    Sent::Owe if !self.table.interest(id) => Some(-ECANCELED),
+                    sent => {
+                        let failed = WriteFailed {
+                            sent: (sent == Sent::Owe).then_some(directions.unreported),
+                        };
+                        directions.sent = Sent::Reported;
+                        directions.unreported = 0;
+                        slot.update(id, |held| {
+                            if let Some(held) = held {
+                                held.failed = Some(failed);
+                            }
+                        });
+                        Some(0)
+                    }
+                }
+            }
+            (_, kept) => {
+                directions.kept = kept;
+                None
+            }
+        };
+        if let Some(result) = result {
+            self.complete_now(id, result);
+            return true;
+        }
+        if !self.room() {
+            return false;
+        }
+        let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
+        let entry = move |held: &mut Held| match kind {
+            Kind::Recv => match held.loan.as_mut() {
+                Some(loan) => Sqe::recv(
+                    fd,
+                    loan.as_mut_ptr(),
+                    u32::try_from(loan.capacity()).unwrap_or(u32::MAX),
+                ),
+                // A receive always has its loan.
+                None => Sqe::nop(),
+            },
+            Kind::Selected => Sqe::recv_selected(fd, group),
+            Kind::Send => match held.lease.as_ref() {
+                Some(lease) => Sqe::send(
+                    fd,
+                    lease.as_ptr(),
+                    u32::try_from(lease.initialized()).unwrap_or(u32::MAX),
+                ),
+                // A send always has its lease.
+                None => Sqe::nop(),
+            },
+            Kind::Accept | Kind::Other | Kind::Close => {
+                Sqe::accept(fd, (&raw mut held.peer).cast(), &raw mut held.peer_len)
+            }
+        };
+        // SAFETY: the entry names the loan, the lease, or the peer address in the resources of
+        // `id`, which the home keeps until its terminal event, and the descriptor of `resource`,
+        // which stays open until its close, after each of its operations ends. The queue has room.
+        #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
+        unsafe {
+            self.push(id, entry);
+        }
+        true
+    }
+
+    /// Starts each operation that waits for an operation that ended, and ends each close whose
+    /// resource has no running operation.
+    pub(super) fn attend(&mut self) {
+        while let Some(resource) = self.pending.pop() {
+            let Some(owned) = self.resources.get(resource) else {
+                continue;
+            };
+            owned.directions.pending = false;
+            for kind in [Kind::Recv, Kind::Send] {
+                let table = &self.table;
+                let runs = self
+                    .resources
+                    .get(resource)
+                    .and_then(|owned| owned.directions.direction(kind))
+                    .and_then(|direction| direction.current)
+                    .is_some_and(|current| table.runs(current));
+                if runs {
+                    continue;
+                }
+                while let Some(id) = self.dequeue(resource, kind) {
+                    if !self.table.runs(id) {
+                        continue;
+                    }
+                    if let Some(direction) = self.direction(resource, kind) {
+                        direction.current = Some(id);
+                    }
+                    let kind = self.table.resources(id).map_or(kind, |tag| tag.kind);
+                    if self.start(id, resource, kind) {
+                        break;
+                    }
+                    // No room in the queue: the operation waits first again, and the next turn
+                    // starts it.
+                    let first = self.direction(resource, kind).and_then(|direction| direction.first);
+                    self.link(id, first);
+                    if let Some(direction) = self.direction(resource, kind) {
+                        direction.current = None;
+                        direction.first = Some(id);
+                        if direction.last.is_none() {
+                            direction.last = Some(id);
+                        }
+                    }
+                    if let Some(owned) = self.resources.get(resource) {
+                        owned.directions.pending = true;
+                    }
+                    self.pending.push(resource);
+                    return;
+                }
+            }
+            self.close_if_idle(resource);
+        }
+    }
+
+    /// Cancels each operation of `resource`, and closes it after each one ends.
+    fn close_resource<P>(&mut self, resource: Resource, value: P) -> Result<Completion, Refused<P>> {
+        if self.resources.get(resource).is_none() {
+            return Err(Refused {
+                reason: Reason::Resource,
+                value,
+            });
+        }
+        let tag = Tag {
+            resource: Some(resource),
+            kind: Kind::Close,
+        };
+        let id = self
+            .open(tag, value, |_| Held::default())
+            .map_err(|(reason, value)| Refused { reason, value })?;
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.closing = Some(id);
+        }
+        for kind in [Kind::Recv, Kind::Send] {
+            // An operation that waits never ran, so it ends now; a send that waits too.
+            while let Some(operation) = self.dequeue(resource, kind) {
+                if self.table.end_interest(operation).is_none() {
+                    self.complete_now(operation, -ECANCELED);
+                }
+            }
+            let current = self.direction(resource, kind).and_then(|direction| direction.current);
+            if let Some(operation) = current {
+                match self.table.end_interest(operation) {
+                    Some(ended) => self.claimed(operation, ended),
+                    // The close cancels each operation that runs, a dropped send too.
+                    None => self.cancel(operation),
+                }
+            }
+        }
+        self.close_if_idle(resource);
+        // A close can release a resource that the pending list holds, so the list is empty
+        // before a new resource takes that slot.
+        self.attend();
+        Ok(Completion::new(Arc::clone(&self.shared), id, false))
+    }
+
+    /// Ends the close of `resource` when no operation of it runs: releases what its directions
+    /// keep, closes its descriptor, and gives the report.
+    fn close_if_idle(&mut self, resource: Resource) {
+        let table = &self.table;
+        let Some(owned) = self.resources.get(resource) else {
+            return;
+        };
+        let directions = &owned.directions;
+        let Some(id) = directions.closing else {
+            return;
+        };
+        let runs = [directions.read.current, directions.write.current]
+            .into_iter()
+            .flatten()
+            .any(|operation| table.runs(operation))
+            || directions.read.first.is_some()
+            || directions.write.first.is_some();
+        if runs {
+            return;
+        }
+        let closed = Closed {
+            sent: (directions.sent == Sent::Owe).then_some(directions.unreported),
+        };
+        // The release drops the kept bytes and connections, and the descriptor.
+        drop(self.resources.release(resource));
+        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+            slot.update(id, |held| {
+                if let Some(held) = held {
+                    held.closed = Some(closed);
+                }
+            });
+        }
+        self.complete_now(id, 0);
     }
 }

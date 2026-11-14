@@ -503,6 +503,18 @@ impl Ring {
         Ok(self.completions().filter(|cqe| cqe.user_data == PROBE_MESSAGE).count() == 1)
     }
 
+    /// The ready completions, which stay in the ring for the next take: a test reads them before
+    /// the driver takes them.
+    #[cfg(test)]
+    pub(crate) fn peek(&self) -> alloc::vec::Vec<Cqe> {
+        // Only this thread writes the head.
+        let head = self.word(self.cq_head).load(Ordering::Relaxed);
+        let tail = self.word(self.cq_tail).load(Ordering::Acquire);
+        (0..tail.wrapping_sub(head))
+            .map(|index| self.cqe((head.wrapping_add(index) & self.cq_mask) as usize))
+            .collect()
+    }
+
     /// The shared word at byte `offset` of the ring mapping.
     #[expect(unsafe_code, reason = "the kernel shares the words of the ring mapping")]
     fn word(&self, offset: usize) -> &AtomicU32 {

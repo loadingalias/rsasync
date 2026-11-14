@@ -3,8 +3,9 @@
 An rsasync I/O driver can run with no scheduler: your code owns it and drives it. This page tells
 how to start a driver, drive it from your own loop or from the reactor of another host, use TCP on
 it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development, and its alpha
-releases are on crates.io. The driver has TCP accept, receive, and send; the other operations come
-in later changes.
+releases are on crates.io. The driver has TCP accept, receive, send, and close; the other operations
+come in later changes. [TCP on the driver](tcp.md) is the reference for each TCP operation and its
+results.
 
 The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It needs no helper
 thread: `Driver::helper_threads` gives 0.
@@ -110,25 +111,31 @@ use rsasync::buffer::{Backing, Buffer as _, Lease};
 use rsasync::driver::{Config, Driver};
 
 let mut driver = Driver::new(Config::new())?;
-let listener = driver.bind("127.0.0.1:8080".parse()?)?;
-let accept = driver.accept(&listener)?;
-let (stream, peer) = run(&mut driver, accept)???;
+let mut listener = driver.bind("127.0.0.1:8080".parse()?)?;
+let accept = driver.accept(&mut listener)?;
+let (mut stream, peer) = run(&mut driver, accept)???;
 
-let receive = driver.recv(&stream, Backing::from(Vec::with_capacity(4096)))?;
+let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(4096)))?;
 let (received, request) = run(&mut driver, receive)??;
 let count = received?;
 assert_eq!(request.bytes().len(), count);
 
-let send = driver.send(&stream, Lease::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()))?;
+let send = driver.send(&mut stream, Lease::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec()))?;
 let (sent, _response) = run(&mut driver, send)??;
 sent?;
-driver.close(stream)?;
+let close = driver.close(stream)?;
+run(&mut driver, close)??;
 ```
 
 The outer `Result` of each future is `Err(Ended)` only if the driver ended before the operation
 gave its result. A poll of a future after it gave its output panics, as for the futures of the
 standard library. A refused operation, for example when each operation slot is in use, gives its
 `Reason` and the buffer or lease back.
+
+Each future borrows the direction of its stream (`&mut`), so each direction runs one operation at
+a time. `TcpStream::split` gives a read half and a write half, so that a receive and a send can run
+at one time. A dropped or forgotten future loses no byte and no connection: [TCP on the
+driver](tcp.md#dropped-forgotten-and-cancelled-operations) gives the rules.
 
 ### Receive with no buffer while you wait
 
@@ -150,7 +157,7 @@ use rsasync::capacity::Budget;
 let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
 let slot = Layout::from_size_align(4096, 4096)?;
 driver.provide(Pool::new(&budget, NonZeroU32::new(64).unwrap(), slot)?)?;
-let receive = driver.recv_selected(&stream)?;
+let receive = driver.recv_selected(&mut stream)?;
 let request = run(&mut driver, receive)???;
 ```
 
@@ -158,9 +165,9 @@ If no slot is free when the kernel tries the receive, the receive ends with the 
 (`io::Error::raw_os_error`). The data stays in the socket, so receive again after a slot comes
 back.
 
-`Driver::close` closes a stream, and `Driver::close_listener` closes a listener. Each one refuses
-with `Reason::Busy` while an operation runs on the socket. An operation runs until the kernel
-ends it, also after you drop its future, so turn the driver until then.
+`Driver::close` closes a stream, and `Driver::close_listener` closes a listener. Each one cancels the
+operations that run on the socket, and its future is ready after the kernel ends each one: see
+[Close](tcp.md#close).
 
 ## Limits that you set
 

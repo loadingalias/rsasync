@@ -16,11 +16,11 @@ use std::thread::{self, Thread};
 use std::time::Instant;
 use std::vec::Vec;
 
-use super::{Completion, Config, Driver, Held, Reason, Refused, sys};
+use super::{Completion, Config, Driver, ECANCELED, Held, Reason, Refused, TcpStream, WriteFailed, sys};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
-use crate::uring::Sqe;
+use crate::uring::{Cqe, Sqe};
 
 #[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
 unsafe extern "C" {
@@ -421,7 +421,7 @@ fn written_in_place(driver: &mut Driver, address: *const u8, len: usize) -> Vec<
 #[test]
 fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses() {
     let mut driver = driver(Config::new());
-    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = listener.local_addr();
     let client = thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(address).unwrap();
@@ -430,8 +430,8 @@ fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_address
         stream.read_to_end(&mut response).unwrap();
         (stream.local_addr().unwrap(), response)
     });
-    let accept = driver.accept(&listener).unwrap();
-    let (stream, peer) = drive(&mut driver, accept).unwrap().unwrap();
+    let accept = driver.accept(&mut listener).unwrap();
+    let (mut stream, peer) = drive(&mut driver, accept).unwrap().unwrap();
 
     // Zero capacity, so that the check of the bytes in place reads initialized memory.
     let mut request = Vec::from([0; 64]);
@@ -439,7 +439,7 @@ fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_address
     request.extend_from_slice(b"seen:");
     let request = Backing::from(request);
     let request_address = request.as_ptr();
-    let receive = driver.recv(&stream, request).unwrap();
+    let receive = driver.recv(&mut stream, request).unwrap();
     assert_eq!(
         written_in_place(&mut driver, request_address, 23),
         b"seen:GET / HTTP/1.1\r\n\r\n"
@@ -451,11 +451,12 @@ fn a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_address
 
     let response = Lease::from(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
     let response_address = response.as_ptr();
-    let send = driver.send(&stream, response).unwrap();
+    let send = driver.send(&mut stream, response).unwrap();
     let (sent, response) = drive(&mut driver, send).unwrap();
     assert_eq!(sent.unwrap(), 19);
     assert_eq!(response.as_ptr(), response_address);
-    driver.close(stream).unwrap();
+    let close = driver.close(stream).unwrap();
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
     let (client_address, bytes) = client.join().unwrap();
     assert_eq!(peer, client_address);
     assert_eq!(bytes, b"HTTP/1.1 200 OK\r\n\r\n");
@@ -478,7 +479,7 @@ fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last
     let slot = zeroed.into_inner().as_ptr();
     let mut driver = driver(Config::new());
     driver.provide(pool).unwrap();
-    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<()>();
     // The "cipher" of the record: each byte XOR this key.
@@ -489,10 +490,10 @@ fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last
         wait.recv().unwrap();
         stream.write_all(b"second").unwrap();
     });
-    let accept = driver.accept(&listener).unwrap();
-    let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+    let accept = driver.accept(&mut listener).unwrap();
+    let (mut stream, _) = drive(&mut driver, accept).unwrap().unwrap();
 
-    let receive = driver.recv_selected(&stream).unwrap();
+    let receive = driver.recv_selected(&mut stream).unwrap();
     assert_eq!(written_in_place(&mut driver, slot, 5), b"first".map(|byte| byte ^ KEY));
     let mut first = drive(&mut driver, receive).unwrap().unwrap();
     for byte in first.bytes_mut() {
@@ -505,7 +506,7 @@ fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last
     thread::spawn(move || assert_eq!(view.bytes(), b"irst")).join().unwrap();
 
     next.send(()).unwrap();
-    let receive = driver.recv_selected(&stream).unwrap();
+    let receive = driver.recv_selected(&mut stream).unwrap();
     let second = drive(&mut driver, receive).unwrap().unwrap();
     assert_eq!((second.bytes(), second.as_ptr()), (&b"second"[..], slot));
     client.join().unwrap();
@@ -525,7 +526,7 @@ fn a_selecting_receive_with_no_free_buffer_gives_enobufs() {
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
-    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<()>();
     let client = thread::spawn(move || {
@@ -535,18 +536,18 @@ fn a_selecting_receive_with_no_free_buffer_gives_enobufs() {
         stream.write_all(b"second").unwrap();
         wait.recv().unwrap();
     });
-    let accept = driver.accept(&listener).unwrap();
-    let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
-    let receive = driver.recv_selected(&stream).unwrap();
+    let accept = driver.accept(&mut listener).unwrap();
+    let (mut stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+    let receive = driver.recv_selected(&mut stream).unwrap();
     let held = drive(&mut driver, receive).unwrap().unwrap();
 
     next.send(()).unwrap();
-    let receive = driver.recv_selected(&stream).unwrap();
+    let receive = driver.recv_selected(&mut stream).unwrap();
     let refused = drive(&mut driver, receive).unwrap().unwrap_err();
     assert_eq!(refused.raw_os_error(), Some(ENOBUFS));
 
     drop(held);
-    let receive = driver.recv_selected(&stream).unwrap();
+    let receive = driver.recv_selected(&mut stream).unwrap();
     assert_eq!(drive(&mut driver, receive).unwrap().unwrap().bytes(), b"second");
     next.send(()).unwrap();
     client.join().unwrap();
@@ -578,7 +579,7 @@ fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
-    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = listener.local_addr();
     let (next, wait) = std::sync::mpsc::channel::<&'static [u8]>();
     let client = thread::spawn(move || {
@@ -587,10 +588,10 @@ fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
             stream.write_all(bytes).unwrap();
         }
     });
-    let accept = driver.accept(&listener).unwrap();
-    let (stream, _) = drive_from_reactor(&mut driver, accept).unwrap().unwrap();
+    let accept = driver.accept(&mut listener).unwrap();
+    let (mut stream, _) = drive_from_reactor(&mut driver, accept).unwrap().unwrap();
     for bytes in [&b"first"[..], b"second"] {
-        let receive = driver.recv_selected(&stream).unwrap();
+        let receive = driver.recv_selected(&mut stream).unwrap();
         // The turn submits the receive, which finds no data and waits for it.
         driver.turn().unwrap();
         next.send(bytes).unwrap();
@@ -636,4 +637,358 @@ fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
     if let Some(expected) = expected {
         assert_eq!(driver.rearm_wake, expected, "the kernel {release}");
     }
+}
+
+/// The bytes of a numbered stream from `start`: each byte is its position modulo 251, so a lost
+/// or a repeated run of bytes changes the bytes after it.
+fn numbered(start: usize, len: usize) -> Vec<u8> {
+    (start..start + len)
+        .map(|position| u8::try_from(position % 251).expect("a remainder of 251 fits a byte"))
+        .collect()
+}
+
+/// A stream of the driver that a listener at `address` accepted, and its peer. The listener is
+/// closed.
+fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStream) {
+    let address = address.parse().expect("the test gives a socket address");
+    let mut listener = driver.bind(address).expect("the test host binds loopback");
+    let peer = std::net::TcpStream::connect(listener.local_addr()).expect("the peer connects");
+    let accept = driver.accept(&mut listener).expect("the test driver has room");
+    let (stream, _) = drive(driver, accept)
+        .expect("the driver runs")
+        .expect("the listener accepts");
+    let close = driver.close_listener(listener).expect("the test driver has room");
+    drive(driver, close).expect("the driver runs");
+    (stream, peer)
+}
+
+/// Submits and enters the kernel until it posted at least `count` completions, and gives them.
+/// They stay in the ring for the driver.
+fn posted(driver: &mut Driver, count: usize) -> Vec<Cqe> {
+    loop {
+        let ready = driver.ring.peek();
+        if ready.len() >= count {
+            return ready;
+        }
+        driver.ring.submit(1).expect("the test ring enters the kernel");
+    }
+}
+
+/// A send of 64 MiB, more than the socket buffers hold while the peer does not read, so the
+/// kernel sends only part of it. Gives the count that it sent, from the numbered stream.
+fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
+    let send = driver
+        .send(stream, Lease::from(numbered(0, 64 << 20)))
+        .expect("the test driver has room");
+    let sent = drive(driver, send).expect("the driver runs").0.expect("the send works");
+    assert!(sent < 64 << 20, "the socket buffers held the whole send");
+    sent
+}
+
+/// A receive whose future drops after its bytes came leaves them with the stream. The next
+/// receives give them before they submit, as many as fit each buffer, with one counted copy, and
+/// the stream keeps the rest. Each byte comes once and in order with the bytes after it.
+#[test]
+fn a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    peer.write_all(&numbered(0, 1000)).unwrap();
+    let receive = driver
+        .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
+        .unwrap();
+    let kept = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
+    drop(receive);
+    peer.write_all(&numbered(1000, 500)).unwrap();
+    peer.shutdown(std::net::Shutdown::Write).unwrap();
+
+    // Receive until the end of the stream, so that a lost run of bytes shows as a short stream.
+    let mut received = Vec::new();
+    loop {
+        let receive = driver
+            .recv(&mut stream, Backing::from(Vec::with_capacity(300)))
+            .unwrap();
+        let (count, buffer) = drive(&mut driver, receive).unwrap();
+        if count.unwrap() == 0 {
+            break;
+        }
+        received.extend_from_slice(buffer.bytes());
+    }
+    assert_eq!(received, numbered(0, 1500));
+    assert_eq!(driver.copied(), u64::try_from(kept).unwrap());
+}
+
+/// An explicit cancel of a receive whose bytes came gives the original buffer with the bytes,
+/// with no copy.
+#[test]
+fn an_explicit_cancel_of_a_receive_gives_its_buffer_and_bytes_with_no_copy() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    peer.write_all(b"hello").unwrap();
+    let buffer = Backing::from(Vec::with_capacity(64));
+    let address = buffer.as_ptr();
+    let receive = driver.recv(&mut stream, buffer).unwrap();
+    posted(&mut driver, 1);
+    receive.cancel();
+    let (count, buffer) = drive(&mut driver, receive).unwrap();
+    assert_eq!(
+        (count.unwrap(), buffer.as_ptr(), buffer.bytes()),
+        (5, address, &b"hello"[..])
+    );
+    assert_eq!(driver.copied(), 0);
+}
+
+/// A receive whose future is forgotten after its bytes came leaves them to the next receive on
+/// its half, which gives them before it submits.
+#[test]
+#[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
+fn a_forgotten_receive_leaves_its_bytes_to_the_next_receive_which_gives_them_before_it_submits() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "[::1]:0");
+    let (reader, _) = stream.split();
+    let receive = driver.recv(reader, Backing::from(Vec::with_capacity(64))).unwrap();
+    peer.write_all(b"kept").unwrap();
+    drive_until_completed(&mut driver);
+    mem::forget(receive);
+
+    let next = driver.recv(reader, Backing::from(Vec::with_capacity(64))).unwrap();
+    assert_eq!(driver.ring.unsubmitted(), 0, "the receive submitted");
+    let (count, buffer) = drive(&mut driver, next).unwrap();
+    assert_eq!((count.unwrap(), buffer.bytes()), (4, &b"kept"[..]));
+    assert_eq!(driver.copied(), 4);
+}
+
+/// A send whose future drops sends only part of its bytes, so the write direction fails. The next
+/// send gives the count of the bytes that went, each later send gives no count, and the close
+/// reports none: the count is reported once. The peer reads exactly those bytes.
+#[test]
+fn a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    drop(driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap());
+    let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
+    assert!(0 < sent && sent < 64 << 20, "the send sent all or nothing: {sent}");
+    driver.turn().unwrap();
+
+    let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
+    let failed = drive(&mut driver, next).unwrap().0.unwrap_err();
+    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+    let later = driver.send(&mut stream, Lease::from(b"later".to_vec())).unwrap();
+    let failed = drive(&mut driver, later).unwrap().0.unwrap_err();
+    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(None));
+    let close = driver.close(stream).unwrap();
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert!(received == numbered(0, sent), "the peer read other bytes");
+}
+
+/// A send whose future drops and that sends all its bytes reports nothing, and the next send
+/// succeeds after it.
+#[test]
+fn a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    drop(driver.send(&mut stream, Lease::from(numbered(0, 1000))).unwrap());
+    let next = driver.send(&mut stream, Lease::from(numbered(1000, 1000))).unwrap();
+    assert_eq!(drive(&mut driver, next).unwrap().0.unwrap(), 1000);
+    let close = driver.close(stream).unwrap();
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert_eq!(received, numbered(0, 2000));
+}
+
+/// Two sends whose futures drop, one in the kernel and one that waits for it, still run, and a
+/// third send waits behind them and completes after both. Each submits after the end of the one
+/// before it: the peer reads one numbered stream in order.
+#[test]
+fn two_dropped_sends_and_a_third_send_run_in_start_order() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let filled = fill(&mut driver, &mut stream);
+    let first = driver.send(&mut stream, Lease::from(numbered(filled, 4096))).unwrap();
+    driver.turn().unwrap();
+    drop(first);
+    drop(
+        driver
+            .send(&mut stream, Lease::from(numbered(filled + 4096, 4096)))
+            .unwrap(),
+    );
+    let third = driver
+        .send(&mut stream, Lease::from(numbered(filled + 8192, 4096)))
+        .unwrap();
+    assert_eq!(
+        driver.ring.unsubmitted(),
+        0,
+        "a send submitted before the send before it ended"
+    );
+
+    let reader = thread::spawn(move || {
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        received
+    });
+    assert_eq!(drive(&mut driver, third).unwrap().0.unwrap(), 4096);
+    let close = driver.close(stream).unwrap();
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert!(
+        reader.join().unwrap() == numbered(0, filled + 3 * 4096),
+        "the peer read other bytes"
+    );
+}
+
+/// An explicit cancel of a send that waits for room gives its lease and its progress, and the
+/// next send in the direction succeeds.
+#[test]
+fn an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usable() {
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let filled = fill(&mut driver, &mut stream);
+    let send = driver.send(&mut stream, Lease::from(numbered(filled, 4096))).unwrap();
+    driver.turn().unwrap();
+    send.cancel();
+    let (result, lease) = drive(&mut driver, send).unwrap();
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(ECANCELED));
+    assert_eq!(lease.initialized(), 4096);
+
+    let reader = thread::spawn(move || {
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        received
+    });
+    let next = driver.send(&mut stream, lease).unwrap();
+    assert_eq!(drive(&mut driver, next).unwrap().0.unwrap(), 4096);
+    let close = driver.close(stream).unwrap();
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert!(
+        reader.join().unwrap() == numbered(0, filled + 4096),
+        "the peer read other bytes"
+    );
+}
+
+/// An accept whose future drops after the kernel accepted a connection leaves it with the
+/// listener, and the next accept gives it, with its peer address, before it submits. On IPv4 and
+/// on IPv6.
+#[test]
+fn a_dropped_accept_leaves_its_connection_to_the_next_accept() {
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let mut driver = driver(Config::new());
+        let mut listener = driver.bind(address.parse().unwrap()).unwrap();
+        let address = listener.local_addr();
+        let accept = driver.accept(&mut listener).unwrap();
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        posted(&mut driver, 1);
+        drop(accept);
+        driver.turn().unwrap();
+
+        let next = driver.accept(&mut listener).unwrap();
+        assert_eq!(driver.ring.unsubmitted(), 0, "the accept submitted");
+        let (mut stream, peer) = drive(&mut driver, next).unwrap().unwrap();
+        assert_eq!(peer, client.local_addr().unwrap());
+        client.write_all(b"up").unwrap();
+        let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
+        assert_eq!(drive(&mut driver, receive).unwrap().1.bytes(), b"up");
+    }
+}
+
+/// A close releases the bytes that no receive took, through the release hook of their buffer,
+/// and a close of a listener closes the connection that no accept took: its client reads the end
+/// of the stream.
+#[test]
+fn close_releases_the_bytes_and_the_connection_that_no_operation_took() {
+    let log = Log::default();
+    let mut driver = driver(Config::new());
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    peer.write_all(b"unread").unwrap();
+    let receive = driver.recv(&mut stream, recorded(&log, 64)).unwrap();
+    posted(&mut driver, 1);
+    drop(receive);
+    driver.turn().unwrap();
+    assert!(taken(&log).is_empty(), "the stream did not keep the bytes");
+    let close = driver.close(stream).unwrap();
+    drive(&mut driver, close).unwrap();
+    assert_eq!(taken(&log), ["released"]);
+
+    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = listener.local_addr();
+    let accept = driver.accept(&mut listener).unwrap();
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    posted(&mut driver, 1);
+    drop(accept);
+    driver.turn().unwrap();
+    let close = driver.close_listener(listener).unwrap();
+    drive(&mut driver, close).unwrap();
+    let mut byte = [0];
+    assert_eq!(client.read(&mut byte).unwrap(), 0);
+}
+
+/// A close of a stream whose peer neither reads nor sends, with a dropped receive and a dropped
+/// send in the kernel, sends one cancel for each of them, by its own user data. Each cancel finds
+/// its operation in flight, each operation gets its own result, and the close returns and reports
+/// the count of the send.
+#[test]
+fn close_cancels_each_dropped_operation_by_its_own_request_and_reports_the_send() {
+    let mut driver = driver(Config::new());
+    let (mut stream, _peer) = connected(&mut driver, "127.0.0.1:0");
+    let filled = fill(&mut driver, &mut stream);
+    let (reader, writer) = stream.split();
+    let receive = driver.recv(reader, Backing::from(Vec::with_capacity(64))).unwrap();
+    let send = driver.send(writer, Lease::from(numbered(filled, 4096))).unwrap();
+    driver.turn().unwrap();
+    drop((receive, send));
+
+    let close = driver.close(stream).unwrap();
+    assert_eq!(
+        driver.ring.unsubmitted(),
+        2,
+        "the close did not push one cancel for each operation"
+    );
+    let posted = posted(&mut driver, 4);
+    let cancel = 1 << 63;
+    let (results, targets): (Vec<&Cqe>, Vec<&Cqe>) = posted.iter().partition(|cqe| cqe.user_data & cancel != 0);
+    assert_eq!(
+        results.iter().map(|cqe| cqe.res).collect::<Vec<_>>(),
+        [0, 0],
+        "a cancel missed its target"
+    );
+    for target in &targets {
+        assert_eq!(target.res, -ECANCELED);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.user_data == target.user_data | cancel)
+                .count(),
+            1
+        );
+    }
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), Some(0));
+}
+
+/// Idle connections whose receives wait for a buffer that the kernel selects hold no receive
+/// buffer: eight receives wait while the pool has one slot, and its charge does not change. The
+/// data of the last connection then arrives in that slot.
+#[test]
+fn idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer() {
+    let budget = budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut driver = driver(Config::new());
+    driver
+        .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
+        .unwrap();
+    let charged = budget.available();
+    let (mut streams, mut peers): (Vec<_>, Vec<_>) = (0..8).map(|_| connected(&mut driver, "127.0.0.1:0")).unzip();
+    let mut waiting = Vec::new();
+    for stream in &mut streams {
+        waiting.push(driver.recv_selected(stream).unwrap());
+    }
+    driver.turn().unwrap();
+    assert_eq!(budget.available(), charged);
+
+    peers.last_mut().unwrap().write_all(b"last").unwrap();
+    let last = waiting.pop().unwrap();
+    assert_eq!(drive(&mut driver, last).unwrap().unwrap().bytes(), b"last");
+    drop(waiting);
+    driver.teardown().unwrap();
 }

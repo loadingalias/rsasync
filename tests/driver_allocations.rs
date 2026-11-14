@@ -65,7 +65,7 @@ fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
 #[test]
 fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
     let mut driver = Driver::new(Config::new()).unwrap();
-    let listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut listener = driver.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let address = listener.local_addr();
     let client = thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(address).unwrap();
@@ -74,8 +74,8 @@ fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
         stream.read_exact(&mut response).unwrap();
         response
     });
-    let accept = driver.accept(&listener).unwrap();
-    let (stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+    let accept = driver.accept(&mut listener).unwrap();
+    let (mut stream, _) = drive(&mut driver, accept).unwrap().unwrap();
     let buffer = Backing::from(Vec::with_capacity(64));
     let lease = Lease::from(b"pong".to_vec());
 
@@ -85,9 +85,9 @@ fn a_send_and_a_receive_allocate_nothing_for_each_operation() {
     let counted = ALLOCATIONS.get() - before;
 
     let before = ALLOCATIONS.get();
-    let receive = driver.recv(&stream, buffer).unwrap();
+    let receive = driver.recv(&mut stream, buffer).unwrap();
     let (received, buffer) = drive(&mut driver, receive).unwrap();
-    let send = driver.send(&stream, lease).unwrap();
+    let send = driver.send(&mut stream, lease).unwrap();
     let (sent, _lease) = drive(&mut driver, send).unwrap();
     let allocations = ALLOCATIONS.get() - before;
 

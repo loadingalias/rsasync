@@ -484,6 +484,34 @@ impl<T> Table<T> {
         }
     }
 
+    /// The resources of the operation `id` while its slot holds them, or `None` for a stale
+    /// identity.
+    pub(crate) fn resources(&self, id: OpId) -> Option<&T> {
+        let slot = self
+            .slots
+            .get(id.index as usize)
+            .filter(|slot| slot.generation == id.generation)?;
+        match &slot.state {
+            State::Live { resources, .. } | State::Notice { resources, .. } => Some(resources),
+            State::Done { resources, .. } => resources.as_ref(),
+            State::Free => None,
+        }
+    }
+
+    /// Whether the operation `id` runs: its terminal event can still come.
+    pub(crate) fn runs(&self, id: OpId) -> bool {
+        self.slots
+            .get(id.index as usize)
+            .is_some_and(|slot| slot.generation == id.generation && matches!(slot.state, State::Live { .. }))
+    }
+
+    /// Whether the consumer of the running operation `id` has interest in its result.
+    pub(crate) fn interest(&self, id: OpId) -> bool {
+        self.slots.get(id.index as usize).is_some_and(|slot| {
+            slot.generation == id.generation && matches!(slot.state, State::Live { interest: true, .. })
+        })
+    }
+
     /// The running operations: each one whose terminal event can still come.
     pub(crate) fn running(&self) -> impl Iterator<Item = OpId> {
         self.slots.iter().zip(0..).filter_map(|(slot, index)| {
