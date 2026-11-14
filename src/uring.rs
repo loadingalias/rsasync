@@ -602,6 +602,12 @@ impl Ring {
         self.fd.as_raw_fd()
     }
 
+    /// A new descriptor of the ring. It keeps the ring open after this ring closes, so a message
+    /// to it never names a descriptor number that another file took.
+    pub(crate) fn duplicate(&self) -> io::Result<OwnedFd> {
+        self.fd.try_clone()
+    }
+
     /// Copies `entry` to the next free entry of the submission queue. The kernel reads it at the
     /// next [`submit`](Self::submit).
     ///

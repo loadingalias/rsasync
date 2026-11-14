@@ -295,9 +295,10 @@ fn a_dropped_table_leaks_the_resources_that_the_kernel_can_still_use() {
     assert_eq!(budget.available(), 100 - 2 * CHARGE);
 }
 
-/// The allocation test needs threads and the system allocator.
+/// The allocation test needs threads and the system allocator. The allocator counts for each
+/// unit test of the crate, and `count` gives its count to them.
 #[cfg(feature = "std")]
-mod allocations {
+pub(crate) mod allocations {
     use alloc::vec::Vec;
     use core::alloc::{GlobalAlloc, Layout};
     use core::cell::Cell;
@@ -335,6 +336,11 @@ mod allocations {
     #[global_allocator]
     static COUNTING: Counting = Counting;
 
+    /// The allocations of the current thread so far.
+    pub(crate) fn count() -> u64 {
+        ALLOCATIONS.get()
+    }
+
     /// A post from another thread allocates nothing, and the home gets both requests.
     #[test]
     fn posting_a_request_never_allocates() {
@@ -349,13 +355,13 @@ mod allocations {
         let requests = table.requests();
         let (counted, allocations) = thread::spawn(move || {
             // The counter sees an allocation of this thread.
-            let before = ALLOCATIONS.get();
+            let before = count();
             drop(Vec::<u8>::with_capacity(1));
-            let counted = ALLOCATIONS.get() - before;
-            let before = ALLOCATIONS.get();
+            let counted = count() - before;
+            let before = count();
             requests.post(id, Request::Cancel);
             requests.post(id, Request::EndInterest);
-            (counted, ALLOCATIONS.get() - before)
+            (counted, count() - before)
         })
         .join()
         .unwrap();

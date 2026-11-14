@@ -28,13 +28,28 @@
 //!
 //! The list is a stack of slots, linked by one `next` index for each slot. The bit `SCHEDULED`
 //! gives each slot at most one entry, so the list needs no allocation and has a fixed bound. A push
-//! is a compare-exchange of the head with `Release`, and the pusher unparks the owner when the list
-//! was empty: one unpark for each batch. The owner takes the whole list with one swap with
-//! `Acquire`, before it parks. A push after that swap finds the list empty, so it unparks the
-//! owner, and the token of the park makes a park after the push return.
+//! is a compare-exchange of the head with `Release`, and the pusher signals the home when the list
+//! was empty: one signal for each batch. The owner takes the whole list with one swap with
+//! `Acquire`. A push after that swap finds the list empty, so it signals the home. A signal stays
+//! until the home takes it, so a park or a wait after the push returns.
+//!
+//! # The signal of the home
+//!
+//! The signal is the native one of the home and of the sender:
+//!
+//! - The home itself sends no signal. Its owner looks at the list and the root flag before it
+//!   parks or waits.
+//! - A home with no ring parks its thread, and the signal unparks it.
+//! - A home with a ring waits in its ring. A thread whose owner has a ring puts the home in the
+//!   outbox of that owner, which sends a message from its own ring after the poll (`ring`). Each
+//!   other thread writes the interrupt descriptor of the home, which the wait polls in its ring.
 
 use alloc::boxed::Box;
+use core::cell::Cell;
+use core::ptr;
 
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+use crate::driver;
 use crate::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -55,6 +70,26 @@ const GENERATION_SHIFT: u32 = 8;
 /// The link of a slot that ends the remote-ready list.
 const END: u32 = u32::MAX;
 
+/// The native signal of the home of an owner: it ends the park or the wait of the home.
+pub(super) enum Home {
+    /// A home that parks its thread.
+    Thread(thread::Thread),
+    /// A home that waits in the ring of its driver.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Ring(Arc<driver::Home>),
+}
+
+impl Home {
+    /// The room of the outbox of an owner with this home: a home with no ring sends no message.
+    pub(super) const fn outbox(&self) -> usize {
+        match self {
+            Self::Thread(_) => 0,
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            Self::Ring(_) => driver::MESSAGES,
+        }
+    }
+}
+
 pub(super) struct Shared {
     words: Box<[AtomicU64]>,
     /// The next slot in the remote-ready list, for each slot in it.
@@ -63,18 +98,18 @@ pub(super) struct Shared {
     remote: AtomicU32,
     /// The root future of `block_on` was woken.
     root: AtomicBool,
-    /// The thread of the owner, which a push to an empty list unparks.
-    thread: thread::Thread,
+    /// The signal of the home, which a push to an empty list sends.
+    home: Home,
 }
 
 impl Shared {
-    pub(super) fn new(words: Box<[AtomicU64]>, next: Box<[AtomicU32]>) -> Self {
+    pub(super) fn new(words: Box<[AtomicU64]>, next: Box<[AtomicU32]>, home: Home) -> Self {
         Self {
             words,
             next,
             remote: AtomicU32::new(END),
             root: AtomicBool::new(false),
-            thread: thread::current(),
+            home,
         }
     }
 
@@ -124,7 +159,7 @@ impl Shared {
         }
     }
 
-    /// Pushes `slot` to the remote-ready list, and unparks the owner if the list was empty.
+    /// Pushes `slot` to the remote-ready list, and signals the home if the list was empty.
     fn push(&self, slot: u32) {
         // Ordering: `Relaxed`: the compare-exchange below reads the latest head.
         let mut head = self.remote.load(Ordering::Relaxed);
@@ -142,8 +177,32 @@ impl Shared {
             }
         }
         if head == END {
-            self.thread.unpark();
+            self.signal();
         }
+    }
+
+    /// Ends the park or the wait of the home, after a push to an empty list or a wake of the root.
+    fn signal(&self) {
+        let current = super::HOME.with(Cell::get);
+        if ptr::eq(current, self) {
+            return;
+        }
+        match &self.home {
+            Home::Thread(thread) => thread.unpark(),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            Home::Ring(home) => {
+                if current.is_null() || !super::ring::post(home) {
+                    home.interrupt();
+                }
+            }
+        }
+    }
+
+    /// Whether the remote-ready list has a slot. Only the owner calls it, before it parks: a push
+    /// that it does not see found the list empty, and that push signals the home.
+    pub(super) fn has_remote(&self) -> bool {
+        // Ordering: `Relaxed`: the harvest takes the list with `Acquire`.
+        self.remote.load(Ordering::Relaxed) != END
     }
 
     /// Takes each slot of the remote-ready list, and gives it to `each`. Only the owner calls it.
@@ -207,12 +266,13 @@ impl Shared {
         }
     }
 
-    /// Wakes the root future of `block_on`.
+    /// Wakes the root future of `block_on`. Only the wake that sets the flag signals the home.
     pub(super) fn wake_root(&self) {
         // Ordering: `Release` orders the event of the wake before the poll of the root, which takes
         // the flag with `Acquire`.
-        self.root.store(true, Ordering::Release);
-        self.thread.unpark();
+        if !self.root.swap(true, Ordering::Release) {
+            self.signal();
+        }
     }
 
     /// Takes the flag of the root future. Gives `true` if it was woken.

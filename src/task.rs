@@ -51,10 +51,11 @@
 //! the waker of a task.
 
 use core::any::Any;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
+use core::ptr;
 use core::task::{Context, Poll};
 
 use alloc::boxed::Box;
@@ -65,6 +66,8 @@ use crate::channel::{Closed, oneshot};
 use crate::sync::thread_local;
 
 mod owner;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod ring;
 mod slot;
 mod waiting;
 
@@ -82,6 +85,17 @@ thread_local! {
         )
     )]
     static CURRENT: RefCell<Option<Rc<Local>>> = RefCell::new(None);
+
+    /// The shared state of the owner in `CURRENT`, or null. A wake reads only this value, which
+    /// needs no destructor, so a wake from a new thread never allocates for `CURRENT`.
+    #[cfg_attr(
+        not(all(test, loom)),
+        expect(
+            clippy::missing_const_for_thread_local,
+            reason = "the loom form of the macro takes no `const` block, and both forms take this one"
+        )
+    )]
+    static HOME: Cell<*const slot::Shared> = Cell::new(ptr::null());
 }
 
 /// A refusal to make an owner. A refusal keeps no charge and no memory.
@@ -121,8 +135,9 @@ impl LocalOwner {
     ///
     /// The number of slots is at least 1 and at most 2^16.
     pub fn new(budget: &Budget, slots: u32) -> Result<Self, Refused> {
+        let home = slot::Home::Thread(crate::sync::thread::current());
         Ok(Self {
-            local: Rc::new(Local::new(budget, slots)?),
+            local: Rc::new(Local::new(budget, slots, home)?),
         })
     }
 
@@ -133,7 +148,7 @@ impl LocalOwner {
     /// [`Outcome::OwnerFailed`], and the panic continues.
     pub fn block_on<F: Future>(&mut self, root: F) -> F::Output {
         let mut enter = Enter::new(&self.local);
-        let output = self.local.block_on(root);
+        let Ok(output) = self.local.block_on(root, &mut owner::Thread);
         enter.ended = true;
         output
     }
