@@ -3,7 +3,10 @@
 //!
 //! # Backends
 //!
-//! [`Backend::Kernel`] gives each completion to the driver as the kernel posts it.
+//! [`Backend::Kernel`] gives each completion to the driver as the kernel posts it to the io_uring
+//! ring. [`Backend::Epoll`] gives it as the epoll poller posts it: the poller takes the same
+//! entries, and runs each one as a nonblocking call when epoll reports its descriptor ready, and
+//! each file entry as a job of a blocking service of the case.
 //! [`Backend::Injected`] uses the completion-injection seam of the ring (`Ring::inject`), at the
 //! boundary of the backend. The ring keeps each completion that the kernel posts and gives it at
 //! the next take, after the driver applied the requests of that turn. So a drop, a cancel, or a
@@ -20,31 +23,33 @@
 //! # Forms of a case
 //!
 //! The body of a case stays beside the code of its surface, and this index gives each body its
-//! tests: `<suite>::kernel::<case>` and `<suite>::injected::<case>`. A case runs once, as
+//! tests: `<suite>::kernel::<case>`, `<suite>::injected::<case>`, and `<suite>::epoll::<case>`. A case runs once, as
 //! `<suite>::once::<case>`, when the seam can change none of its inputs: a refusal makes no
 //! completion, and a signal reaches its stream through the wake descriptor of the driver, not
 //! through a completion. Two cases run only under injection, as `law::injected_only::<case>`,
 //! because a kernel cannot make them on demand: a completion with a stale generation, and a cancel
-//! result that says that its target already runs.
+//! result that says that its target already runs. They do not apply to epoll: the data of each
+//! registration holds the generation of its resource, and an operation that the poller runs ends
+//! at the return of its call, so no cancel finds it running.
 //!
 //! # The ownership law
 //!
 //! The suite `law` holds the negative paths of the R2 exit, and the forgotten futures, abandoned
 //! operations, cancellation, close, and teardown of each resource. Each row of the terminal-event
-//! table of the design maps to a case of the suite, or to the reason that it does not apply to an
-//! io_uring driver:
+//! table of the design maps to a case of the suite, or to the reason that it does not apply to the
+//! backends of the driver:
 //!
 //! | Terminal-event row | Case, or the reason that no case applies |
 //! | --- | --- |
 //! | io_uring, single-completion request | `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion` |
 //! | io_uring, multishot request | No driver operation is multishot. The table rule runs in `uring::table_tests::a_multishot_operation_releases_at_its_last_completion` on the kernel, and in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` under injection |
 //! | io_uring, zero-copy send | No driver operation is a zero-copy send before R611. The table rule runs in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` |
-//! | epoll, `MSG_ZEROCOPY` send | No epoll backend: R503 adds it, and R6 adds its zero-copy send |
+//! | epoll, `MSG_ZEROCOPY` send | No driver operation is a zero-copy send before R611, which adds it on epoll too |
 //! | IOCP, each of its three rows | No IOCP backend: the Windows backend task of R5 adds it |
 //! | Windows IoRing | No IoRing backend: the Windows file task of R5 adds it |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
-//! | epoll and kqueue readiness operations | No readiness backend: R503 and R505 add them |
-//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite |
+//! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. No kqueue backend: R505 adds it |
+//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion` |
 //! | Child wait | `a_dropped_wait_and_child_leave_no_zombie_after_the_exit` |
 //!
 //! A cancel result is not a terminal event: `law::injected_only` and the table cases show it, with
@@ -128,25 +133,46 @@
 //!   - Refusals: `a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse`.
 //!   - Escalation: `escalation_at_the_second_delivery_ends_a_child_that_never_polls`.
 
+use core::num::NonZeroU64;
+
 use super::{Config, Driver};
+use crate::blocking::{self, Service};
+use crate::capacity::Budget;
 
 /// Where the completions of a case come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Backend {
-    /// The kernel, as it posts them.
+    /// The io_uring ring, as the kernel posts them.
     Kernel,
-    /// The completion-injection seam: each completion comes at the take after the one that found
-    /// it, unless the case holds, replaces, or adds a completion.
+    /// The completion-injection seam of the io_uring ring: each completion comes at the take after
+    /// the one that found it, unless the case holds, replaces, or adds a completion.
     Injected,
+    /// The epoll poller, as its nonblocking calls end. Each file operation runs on a blocking
+    /// service of the case.
+    Epoll,
 }
 
 /// A driver of `config` that takes its completions from `backend`.
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
-    let mut driver = super::tests::driver(config);
-    if backend == Backend::Injected {
-        driver.ring.inject();
+    let selected = match backend {
+        Backend::Kernel | Backend::Injected => super::Backend::IoUring,
+        Backend::Epoll => super::Backend::Epoll,
+    };
+    let mut driver = super::tests::driver(config.backend(selected));
+    match backend {
+        Backend::Kernel => {}
+        Backend::Injected => driver.queue.ring().unwrap().inject(),
+        Backend::Epoll => driver.use_blocking(service().submitter()),
     }
     driver
+}
+
+/// A blocking service for the file operations of an epoll driver. It lives until the test process
+/// ends, as the threads of the case do.
+fn service() -> &'static Service {
+    let budget = Budget::new(NonZeroU64::new(64 << 20).unwrap());
+    let config = blocking::Config::new().threads(4).jobs(64).stack(256 << 10);
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(Service::new(&budget, config).unwrap()))
 }
 
 /// Gives each case a test on the kernel and a test under injection.
@@ -166,6 +192,15 @@ macro_rules! cases {
                 #[test]
                 fn $case() {
                     crate::driver::$($module::)+$case(crate::driver::suite::Backend::Injected);
+                }
+            )*
+        }
+
+        mod epoll {
+            $(
+                #[test]
+                fn $case() {
+                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Epoll);
                 }
             )*
         }
@@ -285,7 +320,7 @@ mod law {
             let old = OpId::from_user_data(stale.user_data).expect("the completion of an operation");
             assert_eq!(running.index(), old.index());
             assert_ne!(running.generation(), old.generation());
-            driver.ring.add(stale);
+            driver.queue.ring().unwrap().add(stale);
             while driver.turn().expect("a turn works").more() {}
             assert!(pending(&mut second), "the stale completion ended the receive");
 
@@ -310,13 +345,13 @@ mod law {
 
             // The completion waits, and the result of the cancel says that the receive already
             // runs.
-            driver.ring.hold(completion.user_data);
-            driver.ring.replace(id.cancel_user_data(), -EALREADY);
+            driver.queue.ring().unwrap().hold(completion.user_data);
+            driver.queue.ring().unwrap().replace(id.cancel_user_data(), -EALREADY);
             receive.cancel();
             while driver.turn().expect("a turn works").more() {}
             assert!(pending(&mut receive), "the result of the cancel ended the receive");
 
-            driver.ring.release(completion.user_data);
+            driver.queue.ring().unwrap().release(completion.user_data);
             let (count, buffer) = drive(&mut driver, receive).expect("the driver runs");
             let count = count.expect("the receive works");
             assert_eq!((count, buffer.as_ptr(), buffer.bytes()), (5, address, &b"hello"[..]));

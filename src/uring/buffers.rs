@@ -56,6 +56,27 @@ impl BufferRing {
         })
     }
 
+    /// A buffer ring of `entries` entries, a power of two up to 32768, as the buffer group `group`
+    /// of a poller, which reads it as the kernel does. No kernel ring reads it.
+    pub(crate) fn unregistered(entries: u16, group: u16) -> io::Result<Self> {
+        Ok(Self {
+            memory: ManuallyDrop::new(Mapping::anonymous(usize::from(entries) * sys::BUF_SIZE)?),
+            entries,
+            tail: 0,
+            group,
+        })
+    }
+
+    /// The start of the memory of the ring.
+    pub(crate) fn base(&self) -> core::ptr::NonNull<u8> {
+        self.memory.base
+    }
+
+    /// Frees the memory of a ring of [`BufferRing::unregistered`], after its poller ended its use.
+    pub(crate) fn free(self) {
+        drop(ManuallyDrop::into_inner(self.memory));
+    }
+
     /// The buffer group of the ring.
     pub(crate) fn group(&self) -> u16 {
         self.group

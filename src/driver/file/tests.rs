@@ -196,14 +196,15 @@ impl Drop for Hold {
 }
 
 /// A length change runs on the ring from Linux 6.9 (`IORING_OP_FTRUNCATE`), and on the blocking
-/// service before it, and the report names the route before the first operation. On the
-/// blocking service, a driver with no service and a full service refuse.
+/// service before it and on epoll, and the report names the route before the first operation. On
+/// the blocking service, a driver with no service and a full service refuse. On epoll, each file
+/// operation needs the service, so the case shows only the full service.
 pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before(
     backend: Backend,
 ) {
     let scratch = Scratch::new("length");
     let mut driver = suite::driver(Config::new(), backend);
-    let on_service = kernel() < (6, 9);
+    let on_service = backend == Backend::Epoll || kernel() < (6, 9);
     let route = driver.report().route(Call::SetFileLen);
     assert_eq!(route == Route::BlockingService, on_service);
     let file = open(&mut driver, &scratch.join("data"), writable());
@@ -211,8 +212,10 @@ pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_
     let config = blocking::Config::new().threads(1).jobs(1).stack(256 << 10);
     let service = Service::new(&budget, config).unwrap();
     if on_service {
-        let refused = driver.set_file_len(&file, 100).unwrap_err();
-        assert_eq!(refused.reason(), Reason::Blocking);
+        if backend != Backend::Epoll {
+            let refused = driver.set_file_len(&file, 100).unwrap_err();
+            assert_eq!(refused.reason(), Reason::Blocking);
+        }
         driver.use_blocking(service.submitter());
         let hold = Hold::new(&service);
         let refused = driver.set_file_len(&file, 100).unwrap_err();

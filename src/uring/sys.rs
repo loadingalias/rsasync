@@ -33,8 +33,8 @@ pub(super) const SYS_IO_URING_SETUP: c_long = 425;
 pub(super) const SYS_IO_URING_ENTER: c_long = 426;
 pub(super) const SYS_IO_URING_REGISTER: c_long = 427;
 
-pub(super) const EPERM: i32 = 1;
-pub(super) const ENOSYS: i32 = 38;
+pub(crate) const EPERM: i32 = 1;
+pub(crate) const ENOSYS: i32 = 38;
 /// The time of a wait passed (`errno.h`).
 pub(super) const ETIME: i32 = 62;
 
@@ -79,47 +79,47 @@ pub(super) const IOU_PBUF_RING_INC: u16 = 2;
 
 pub(super) const IO_URING_OP_SUPPORTED: u16 = 1 << 0;
 
-pub(super) const IORING_OP_NOP: u8 = 0;
-pub(super) const IORING_OP_POLL_ADD: u8 = 6;
-pub(super) const IORING_OP_ACCEPT: u8 = 13;
-pub(super) const IORING_OP_ASYNC_CANCEL: u8 = 14;
-pub(super) const IORING_OP_READV: u8 = 1;
-pub(super) const IORING_OP_WRITEV: u8 = 2;
-pub(super) const IORING_OP_FSYNC: u8 = 3;
-pub(super) const IORING_OP_FALLOCATE: u8 = 17;
-pub(super) const IORING_OP_OPENAT: u8 = 18;
-pub(super) const IORING_OP_STATX: u8 = 21;
-pub(super) const IORING_OP_RENAMEAT: u8 = 35;
-pub(super) const IORING_OP_UNLINKAT: u8 = 36;
-pub(super) const IORING_OP_READ: u8 = 22;
-pub(super) const IORING_OP_WRITE: u8 = 23;
-pub(super) const IORING_OP_SENDMSG: u8 = 9;
-pub(super) const IORING_OP_RECVMSG: u8 = 10;
-pub(super) const IORING_OP_CONNECT: u8 = 16;
-pub(super) const IORING_OP_SHUTDOWN: u8 = 34;
-pub(super) const IORING_OP_SEND: u8 = 26;
-pub(super) const IORING_OP_RECV: u8 = 27;
-pub(super) const IORING_OP_MSG_RING: u8 = 40;
+pub(crate) const IORING_OP_NOP: u8 = 0;
+pub(crate) const IORING_OP_POLL_ADD: u8 = 6;
+pub(crate) const IORING_OP_ACCEPT: u8 = 13;
+pub(crate) const IORING_OP_ASYNC_CANCEL: u8 = 14;
+pub(crate) const IORING_OP_READV: u8 = 1;
+pub(crate) const IORING_OP_WRITEV: u8 = 2;
+pub(crate) const IORING_OP_FSYNC: u8 = 3;
+pub(crate) const IORING_OP_FALLOCATE: u8 = 17;
+pub(crate) const IORING_OP_OPENAT: u8 = 18;
+pub(crate) const IORING_OP_STATX: u8 = 21;
+pub(crate) const IORING_OP_RENAMEAT: u8 = 35;
+pub(crate) const IORING_OP_UNLINKAT: u8 = 36;
+pub(crate) const IORING_OP_READ: u8 = 22;
+pub(crate) const IORING_OP_WRITE: u8 = 23;
+pub(crate) const IORING_OP_SENDMSG: u8 = 9;
+pub(crate) const IORING_OP_RECVMSG: u8 = 10;
+pub(crate) const IORING_OP_CONNECT: u8 = 16;
+pub(crate) const IORING_OP_SHUTDOWN: u8 = 34;
+pub(crate) const IORING_OP_SEND: u8 = 26;
+pub(crate) const IORING_OP_RECV: u8 = 27;
+pub(crate) const IORING_OP_MSG_RING: u8 = 40;
 /// Linux 6.7.
 pub(super) const IORING_OP_WAITID: u8 = 50;
 /// Linux 6.9.
-pub(super) const IORING_OP_FTRUNCATE: u8 = 55;
+pub(crate) const IORING_OP_FTRUNCATE: u8 = 55;
 /// Linux 6.11.
-pub(super) const IORING_OP_BIND: u8 = 56;
+pub(crate) const IORING_OP_BIND: u8 = 56;
 /// Linux 6.11.
-pub(super) const IORING_OP_LISTEN: u8 = 57;
+pub(crate) const IORING_OP_LISTEN: u8 = 57;
 /// Linux 6.15.
 pub(super) const IORING_OP_RECV_ZC: u8 = 58;
 
 /// `IOSQE_IO_LINK`: the next entry starts after this one succeeds, and fails with `ECANCELED`
 /// when this one fails.
-pub(super) const IOSQE_IO_LINK: u8 = 1 << 2;
-pub(super) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+pub(crate) const IOSQE_IO_LINK: u8 = 1 << 2;
+pub(crate) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 /// `IOSQE_CQE_SKIP_SUCCESS` (Linux 5.17): the entry posts a completion only when it fails.
-pub(super) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
+pub(crate) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
 
-pub(super) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
-pub(super) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
+pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 pub(super) const IORING_CQE_F_MORE: u32 = 1 << 1;
 pub(super) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
 
@@ -134,7 +134,7 @@ pub(super) const SOCK_NONBLOCK: u32 = rsnetwork_udp::sys::SOCK_NONBLOCK.cast_uns
 pub(super) const SOCK_CLOEXEC: u32 = rsnetwork_udp::sys::SOCK_CLOEXEC.cast_unsigned();
 
 /// `IORING_FSYNC_DATASYNC`: the sync of `IORING_OP_FSYNC` is `fdatasync`, not `fsync`.
-pub(super) const IORING_FSYNC_DATASYNC: u32 = 1 << 0;
+pub(crate) const IORING_FSYNC_DATASYNC: u32 = 1 << 0;
 
 /// The command of `IORING_OP_MSG_RING` that posts `len` and `off` as a completion of the target.
 pub(super) const IORING_MSG_DATA: u64 = 0;
@@ -189,20 +189,20 @@ pub(super) struct Params {
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Sqe {
-    pub(super) opcode: u8,
-    pub(super) flags: u8,
-    pub(super) ioprio: u16,
-    pub(super) fd: i32,
-    pub(super) off: u64,
-    pub(super) addr: u64,
-    pub(super) len: u32,
-    pub(super) rw_flags: u32,
-    pub(super) user_data: u64,
-    pub(super) buf_index: u16,
-    pub(super) personality: u16,
-    pub(super) splice_fd_in: i32,
-    pub(super) addr3: u64,
-    pub(super) pad2: u64,
+    pub(crate) opcode: u8,
+    pub(crate) flags: u8,
+    pub(crate) ioprio: u16,
+    pub(crate) fd: i32,
+    pub(crate) off: u64,
+    pub(crate) addr: u64,
+    pub(crate) len: u32,
+    pub(crate) rw_flags: u32,
+    pub(crate) user_data: u64,
+    pub(crate) buf_index: u16,
+    pub(crate) personality: u16,
+    pub(crate) splice_fd_in: i32,
+    pub(crate) addr3: u64,
+    pub(crate) pad2: u64,
 }
 
 /// `struct io_uring_cqe`, 16 bytes: a ring without `IORING_SETUP_CQE32`.
@@ -256,11 +256,11 @@ impl Probe {
 
 /// `struct io_uring_buf`: one buffer of a provided buffer ring, 16 bytes. Its last field, `resv`,
 /// overlays the tail of the ring in the first entry, so the driver never writes it.
-pub(super) const BUF_SIZE: usize = 16;
-pub(super) const BUF_LEN: usize = 8;
-pub(super) const BUF_BID: usize = 12;
+pub(crate) const BUF_SIZE: usize = 16;
+pub(crate) const BUF_LEN: usize = 8;
+pub(crate) const BUF_BID: usize = 12;
 /// The byte offset of the tail in `struct io_uring_buf_ring`.
-pub(super) const BUF_RING_TAIL: usize = 14;
+pub(crate) const BUF_RING_TAIL: usize = 14;
 
 /// `struct io_uring_buf_reg`. Linux 6.4 renamed `pad` to `flags`.
 #[repr(C)]

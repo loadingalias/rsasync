@@ -1,7 +1,7 @@
 //! Pipe ends on the driver: the read end and the write end of a pipe or a FIFO, under the stream
 //! rules of TCP.
 
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 
 use super::tcp::{Closed, ReadHalf, WriteHalf};
 use super::{Driver, Medium, Operation, Reason, Refused, Resource, sys};
@@ -89,13 +89,14 @@ impl AsMut<WriteHalf> for PipeWriter {
 
 impl Driver {
     /// Takes `fd`, the read end of a pipe or a FIFO, for example the standard output of a child.
-    /// The driver clears `O_NONBLOCK` of its open file description, because a nonblocking read
-    /// ends at once with no data instead of waiting.
+    /// On io_uring, the driver clears `O_NONBLOCK` of its open file description, because a
+    /// nonblocking read ends at once with no data instead of waiting. On epoll, the driver sets
+    /// it, because its reads run when epoll reports the descriptor readable.
     ///
     /// # Errors
     ///
     /// A refusal, with `fd`, that gives [`Reason::NotPipe`], [`Reason::Direction`] for a write
-    /// end, or [`Reason::Resources`].
+    /// end, [`Reason::Resources`], or [`Reason::Register`] on epoll.
     pub fn adopt_reader(&mut self, fd: OwnedFd) -> Result<PipeReader, Refused<OwnedFd>> {
         let resource = self.adopt_pipe(fd, true)?;
         Ok(PipeReader {
@@ -104,13 +105,14 @@ impl Driver {
     }
 
     /// Takes `fd`, the write end of a pipe or a FIFO, for example the standard input of a child.
-    /// The driver clears `O_NONBLOCK` of its open file description, because a nonblocking write
-    /// to a full pipe ends at once instead of waiting.
+    /// On io_uring, the driver clears `O_NONBLOCK` of its open file description, because a
+    /// nonblocking write to a full pipe ends at once instead of waiting. On epoll, the driver sets
+    /// it, because its writes run when epoll reports the descriptor writable.
     ///
     /// # Errors
     ///
     /// A refusal, with `fd`, that gives [`Reason::NotPipe`], [`Reason::Direction`] for a read
-    /// end, or [`Reason::Resources`].
+    /// end, [`Reason::Resources`], or [`Reason::Register`] on epoll.
     pub fn adopt_writer(&mut self, fd: OwnedFd) -> Result<PipeWriter, Refused<OwnedFd>> {
         let resource = self.adopt_pipe(fd, false)?;
         Ok(PipeWriter {
@@ -165,20 +167,30 @@ impl Driver {
         }
         self.resources
             .adopt(fd, Medium::Pipe)
-            .or_else(|fd| refuse(Reason::Resources, fd))
+            .or_else(|(reason, fd)| refuse(reason, fd))
     }
 }
 
 /// Clears `O_NONBLOCK` of the open file description of `fd`, because a nonblocking read or write
 /// ends at once instead of waiting. Gives whether the description blocks now.
-#[expect(unsafe_code, reason = "fcntl names no memory with these commands")]
 pub(super) fn blocks(fd: &OwnedFd) -> bool {
+    set_nonblocking(fd.as_fd(), false)
+}
+
+/// Sets `O_NONBLOCK` of the open file description of `fd` when `nonblocking` holds, and clears it
+/// when it does not. Gives whether the flag has that value now.
+#[expect(unsafe_code, reason = "fcntl names no memory with these commands")]
+pub(super) fn set_nonblocking(fd: BorrowedFd<'_>, nonblocking: bool) -> bool {
     let raw = fd.as_raw_fd();
     // SAFETY: the command names no memory.
     let flags = unsafe { sys::fcntl(raw, sys::F_GETFL) };
+    let wanted = if nonblocking {
+        flags | sys::O_NONBLOCK
+    } else {
+        flags & !sys::O_NONBLOCK
+    };
     // SAFETY: the command names no memory, and its argument is an `int`.
-    flags >= 0
-        && (flags & sys::O_NONBLOCK == 0 || unsafe { sys::fcntl(raw, sys::F_SETFL, flags & !sys::O_NONBLOCK) } >= 0)
+    flags >= 0 && (flags == wanted || unsafe { sys::fcntl(raw, sys::F_SETFL, wanted) } >= 0)
 }
 
 // Two attributes, so that Clippy sees the test module (`allow-unwrap-in-tests`).

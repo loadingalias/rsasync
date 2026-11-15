@@ -922,7 +922,7 @@ impl Driver {
             if let Some(fd) = fd {
                 let entry = Sqe::poll_readable(fd.as_raw_fd()).with_user_data(id.user_data());
                 // SAFETY: a poll names no memory.
-                if unsafe { super::push_now(&mut self.ring, &entry) }.is_err() {
+                if unsafe { super::push_now(&mut self.queue, &entry) }.is_err() {
                     return;
                 }
             }

@@ -13,7 +13,8 @@ files, and child processes. The other operations come in later changes. [TCP on 
 [Child processes on the driver](processes.md) are the references for each operation and its
 results.
 
-The driver needs Linux on x86_64 or aarch64, the `std` feature, and io_uring. It does not need
+The driver needs Linux on x86_64 or aarch64 and the `std` feature. It runs on io_uring, and on
+[epoll](epoll.md) where the kernel refuses io_uring, with the same operations. It does not need
 the `local` feature, which holds the local tasks of `rsasync::task`, a scheduler. It starts no helper
 thread. Before Linux 6.9, a change of the length of a file runs on your
 [blocking service](blocking-service.md). `Driver::report` gives the features of the kernel and the
@@ -102,7 +103,7 @@ it.
 
 | Call | What it does |
 | --- | --- |
-| `Driver::new(Config)` | Starts the driver and allocates its bounded memory one time. It gives `Error::Refused` if the kernel or its policy refuses io_uring, for example in a container with the default seccomp profile |
+| `Driver::new(Config)` | Starts the driver and allocates its bounded memory one time. If the kernel or its policy refuses io_uring, for example in a container with the default seccomp profile, it runs [epoll](epoll.md), or it gives `Error::Refused` when `Config::backend` requires io_uring |
 | `Driver::report()` | What the driver found and applied when it started: the [capability report](capability-report.md) |
 | `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and takes up to `Config::completions_per_turn` completions from the ring. It gives the completion of each operation to its future. The bound and `Turn::completed()` also count the completions of the driver itself, such as cancel results |
 | `Turn::more()` | Work remains. Turn again before you wait |

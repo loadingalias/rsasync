@@ -84,7 +84,7 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
     drop(accept);
     driver.turn().unwrap();
     let next = driver.accept_local(&mut listener).unwrap();
-    assert_eq!(driver.ring.unsubmitted(), 0, "the accept submitted");
+    assert_eq!(driver.queue.unsubmitted(), 0, "the accept submitted");
     let mut stream = drive(&mut driver, next).unwrap().unwrap();
 
     drop(driver.send(&mut stream, Lease::from(numbered(0, 1000))).unwrap());

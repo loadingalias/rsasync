@@ -549,42 +549,76 @@ impl Submitter {
     /// occupied, [`Reason::Budget`] when the budget cannot charge the job and its result, and
     /// [`Reason::Ended`] when the service stopped.
     pub fn submit<J: Job>(&self, job: J) -> Result<Waiter<J::Output>, Refused<J>> {
+        match self.reserve() {
+            Ok(reservation) => Ok(reservation.send(job)),
+            Err(reason) => Err(Refused { reason, job }),
+        }
+    }
+
+    /// Admits one job of type `J` that comes later: it takes the job slot, the charge, and the
+    /// one-shot of the job now, so the [`Reservation::send`] of the job cannot fail. A drop of the
+    /// reservation gives them back. It never waits.
+    pub(crate) fn reserve<J: Job>(&self) -> Result<Reservation<'_, J>, Reason> {
         let shared = &*self.0;
-        let refuse = |reason, job| Err(Refused { reason, job });
         // Ordering: `Acquire` reads the release of the stop.
         if shared.stopped.load(Ordering::Acquire) {
-            return refuse(Reason::Ended, job);
+            return Err(Reason::Ended);
         }
         let Ok(slot) = shared.slots.reserve(1) else {
-            return refuse(Reason::Full, job);
+            return Err(Reason::Full);
         };
         let size = u64::try_from(size_of::<Task<J>>()).unwrap_or(u64::MAX);
-        let memory = match shared.memory.reserve(size) {
-            Ok(memory) => memory,
-            Err(exhausted) => return refuse(Reason::Budget(exhausted), job),
-        };
+        let memory = shared.memory.reserve(size).map_err(Reason::Budget)?;
         let (reply, waiter) = match oneshot::channel(&shared.memory) {
             Ok(pair) => pair,
-            Err(channel::Refused::Budget(exhausted)) => return refuse(Reason::Budget(exhausted), job),
+            Err(channel::Refused::Budget(exhausted)) => return Err(Reason::Budget(exhausted)),
             // A one-shot refuses its budget, or a size above `u64::MAX`, which no budget has.
             Err(_) => {
-                let exhausted = Exhausted {
+                return Err(Reason::Budget(Exhausted {
                     requested: u64::MAX,
                     available: shared.memory.available(),
-                };
-                return refuse(Reason::Budget(exhausted), job);
+                }));
             }
         };
+        Ok(Reservation {
+            shared,
+            reply,
+            waiter,
+            slot,
+            memory,
+        })
+    }
+}
+
+/// The admission of one job of type `J` that [`Submitter::reserve`] gave: its slot, its charge,
+/// and its one-shot.
+pub(crate) struct Reservation<'a, J: Job> {
+    shared: &'a Shared,
+    reply: oneshot::Sender<Result<J::Output, Failed>>,
+    waiter: oneshot::Receiver<Result<J::Output, Failed>>,
+    slot: Permit,
+    memory: Permit,
+}
+
+impl<J: Job> Reservation<'_, J> {
+    /// Sends `job` to the service, and gives the waiter of its result.
+    pub(crate) fn send(self, job: J) -> Waiter<J::Output> {
         let task = Box::new(Task {
             job,
-            reply,
-            slot,
-            _memory: memory,
+            reply: self.reply,
+            slot: self.slot,
+            _memory: self.memory,
         });
         // The queue has a slot for each job slot, so only the stop refuses the task. The stop came
-        // after the check above: the task drops, and its waiter gives `Failed::Ended`.
-        drop(shared.queue.try_send_shared(task));
-        Ok(Waiter { reply: waiter })
+        // after the reservation: the task drops, and its waiter gives `Failed::Ended`.
+        drop(self.shared.queue.try_send_shared(task));
+        Waiter { reply: self.waiter }
+    }
+}
+
+impl<J: Job> fmt::Debug for Reservation<'_, J> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reservation").finish_non_exhaustive()
     }
 }
 

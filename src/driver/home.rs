@@ -4,9 +4,10 @@
 use std::io::{self, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
+use super::queue::Queue;
 use super::{Driver, Shared};
 use crate::sync::Arc;
-use crate::uring::{Ring, Sqe};
+use crate::uring::Sqe;
 
 /// The user data of the completion that a wake message posts at its home. It only ends a wait.
 const ARRIVED: u64 = 1 << 62;
@@ -24,8 +25,8 @@ const MESSAGE_INDEX: u64 = MESSAGES as u64 - 1;
 
 /// The home of a local owner whose ring is a driver: the target of a wake from another thread.
 pub(crate) struct Home {
-    /// A duplicate of the ring descriptor. A message never names a closed descriptor, whose number
-    /// another file could take.
+    /// A duplicate of the ring descriptor, or of the epoll descriptor, to which a message fails. A
+    /// message never names a closed descriptor, whose number another file could take.
     ring: OwnedFd,
     shared: Arc<Shared>,
 }
@@ -61,10 +62,10 @@ pub(super) struct Wakes {
 }
 
 impl Wakes {
-    /// The home on `ring`, with a duplicate of its descriptor.
-    pub(super) fn new(ring: &Ring, shared: &Arc<Shared>) -> io::Result<Self> {
+    /// The home on `queue`, with a duplicate of its descriptor.
+    pub(super) fn new(queue: &Queue, shared: &Arc<Shared>) -> io::Result<Self> {
         let home = Arc::new(Home {
-            ring: ring.duplicate()?,
+            ring: queue.duplicate()?,
             shared: Arc::clone(shared),
         });
         Ok(Self {
@@ -109,7 +110,7 @@ impl Driver {
         let entry = Sqe::message(home.ring.as_raw_fd(), ARRIVED, 0, user_data);
         // SAFETY: a message names no memory. The entry of `index` keeps the descriptor of the
         // target open until the completion of the message.
-        if unsafe { self.ring.push(&entry) }.is_err() {
+        if unsafe { self.queue.push(&entry, None) }.is_err() {
             return Err(home);
         }
         self.wakes.sent[index] = Some(home);

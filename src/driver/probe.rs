@@ -55,7 +55,7 @@ use std::os::fd::AsRawFd as _;
 // A physical measurement of the kernel at startup. A deterministic run does not replace it.
 use std::time::Instant;
 
-use super::{push_now, sys};
+use super::sys;
 use crate::uring::{Ring, Sqe};
 
 /// The time for the first deferred signal. Each kernel gives it, but with `cd305ee3633a` only after
@@ -92,8 +92,8 @@ pub(super) fn probe(ring: &mut Ring, wake: &File, first: Duration) -> io::Result
     let mut limit = first;
     for _ in 0..2 {
         let poll = Sqe::poll_readable(reader.as_raw_fd());
-        // SAFETY: a poll names no memory.
-        unsafe { push_now(ring, &poll) }?;
+        // SAFETY: a poll names no memory. The queue of a new ring has room for it.
+        unsafe { ring.push(&poll) }.map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         // The poll waits in the kernel before the write wakes it.
         ring.submit(0)?;
         let start = Instant::now();

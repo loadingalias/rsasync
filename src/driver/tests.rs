@@ -286,8 +286,8 @@ fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     driver.turn().unwrap();
     writer.write_all(b"x").unwrap();
     wait_readable(&driver);
-    assert!(driver.ring.task_run_pending());
-    assert_eq!(driver.ring.unsubmitted(), 0);
+    assert!(driver.queue.ring().unwrap().task_run_pending());
+    assert_eq!(driver.queue.unsubmitted(), 0);
     assert_eq!(driver.turn().unwrap().completed(), 1);
     assert!(matches!(block_on(future), Ok((1, _))));
 }
@@ -458,8 +458,8 @@ pub(super) fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F:
 /// not in them, so they are the bytes that the kernel itself wrote at `address`.
 #[expect(unsafe_code, reason = "the test reads initialized memory that nothing writes now")]
 fn written_in_place(driver: &mut Driver, address: *const u8, len: usize) -> Vec<u8> {
-    while !driver.ring.ready() {
-        driver.ring.submit(1).expect("the test ring enters the kernel");
+    while !driver.queue.ready() {
+        driver.queue.submit(1).expect("the test ring enters the kernel");
     }
     // SAFETY: `address` is in a buffer that the driver holds for the completed operation, and the
     // test initialized its first `len` bytes before the submission. The kernel ended its writes
@@ -740,11 +740,11 @@ fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStr
 /// They stay in the ring for the driver.
 pub(super) fn posted(driver: &mut Driver, count: usize) -> Vec<Cqe> {
     loop {
-        let ready = driver.ring.peek();
+        let ready = driver.queue.peek();
         if ready.len() >= count {
             return ready;
         }
-        driver.ring.submit(1).expect("the test ring enters the kernel");
+        driver.queue.submit(1).expect("the test ring enters the kernel");
     }
 }
 
@@ -845,7 +845,7 @@ pub(in crate::driver) fn a_forgotten_receive_leaves_its_bytes_to_the_next_receiv
     mem::forget(receive);
 
     let next = driver.recv(reader, Backing::from(Vec::with_capacity(64))).unwrap();
-    assert_eq!(driver.ring.unsubmitted(), 0, "the receive submitted");
+    assert_eq!(driver.queue.unsubmitted(), 0, "the receive submitted");
     let (count, buffer) = drive(&mut driver, next).unwrap();
     assert_eq!((count.unwrap(), buffer.bytes()), (4, &b"kept"[..]));
     assert_eq!(driver.copied(), 4);
@@ -913,7 +913,7 @@ pub(in crate::driver) fn two_dropped_sends_and_a_third_send_run_in_start_order(b
         .send(&mut stream, Lease::from(numbered(filled + 8192, 4096)))
         .unwrap();
     assert_eq!(
-        driver.ring.unsubmitted(),
+        driver.queue.unsubmitted(),
         0,
         "a send submitted before the send before it ended"
     );
@@ -977,7 +977,7 @@ pub(in crate::driver) fn a_dropped_accept_leaves_its_connection_to_the_next_acce
         driver.turn().unwrap();
 
         let next = driver.accept(&mut listener).unwrap();
-        assert_eq!(driver.ring.unsubmitted(), 0, "the accept submitted");
+        assert_eq!(driver.queue.unsubmitted(), 0, "the accept submitted");
         let (mut stream, peer) = drive(&mut driver, next).unwrap().unwrap();
         assert_eq!(peer, client.local_addr().unwrap());
         client.write_all(b"up").unwrap();
@@ -1034,7 +1034,7 @@ pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request
 
     let close = driver.close(stream).unwrap();
     assert_eq!(
-        driver.ring.unsubmitted(),
+        driver.queue.unsubmitted(),
         2,
         "the close did not push one cancel for each operation"
     );
@@ -1323,7 +1323,7 @@ fn bind_and_listen_run_on_the_ring_exactly_where_the_report_gives_the_ring() {
     let ring = driver.report().route(Call::Bind) == Route::Ring;
     for address in ["127.0.0.1:0", "[::1]:0"] {
         let mut bind = driver.bind(address.parse().unwrap(), TcpOptions::default()).unwrap();
-        let unsubmitted = driver.ring.unsubmitted();
+        let unsubmitted = driver.queue.unsubmitted();
         let mut listener = match Pin::new(&mut bind).poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(listener) => {
                 assert!(!ring && unsubmitted == 0, "the bind did not use the ring that has it");
@@ -1498,7 +1498,7 @@ pub(in crate::driver) fn a_dropped_receive_leaves_its_datagram_metadata_and_trun
     let next = driver
         .recv_from(&mut receiver, Backing::from(Vec::with_capacity(200)))
         .unwrap();
-    assert_eq!(driver.ring.unsubmitted(), 0, "the receive submitted");
+    assert_eq!(driver.queue.unsubmitted(), 0, "the receive submitted");
     let (received, buffer) = drive(&mut driver, next).unwrap();
     let received = received.unwrap();
     assert!(buffer.bytes() == numbered(0, 100), "the kept bytes differ");
@@ -1539,7 +1539,7 @@ fn a_batch_of_datagrams_arrives_as_each_datagram_after_one_kernel_entry() {
     }
     let mut send = driver.send_batch(&mut sender, batch).unwrap();
     assert_eq!(
-        driver.ring.unsubmitted(),
+        driver.queue.unsubmitted(),
         3,
         "the batch did not push one entry for each datagram"
     );
@@ -1712,7 +1712,7 @@ fn a_strict_requirement_refuses_before_the_driver_is_ready() {
 #[test]
 fn a_new_driver_registers_no_file_or_buffer_and_starts_no_poller() {
     let driver = driver(Config::new());
-    let info = std::fs::read_to_string(alloc::format!("/proc/self/fdinfo/{}", driver.ring.fd())).unwrap();
+    let info = std::fs::read_to_string(alloc::format!("/proc/self/fdinfo/{}", driver.queue.fd())).unwrap();
     let field = |name: &str| info.lines().find_map(|line| line.strip_prefix(name)).map(str::trim);
     assert_eq!(
         (field("UserFiles:"), field("UserBufs:"), field("SqThread:")),

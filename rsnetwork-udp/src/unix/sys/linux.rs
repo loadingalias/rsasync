@@ -182,20 +182,14 @@ pub const EMSGSIZE: c_int = 90;
 #[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
 unsafe extern "C" {
     /// `ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)`.
-    pub(crate) fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
+    pub fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     /// `ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)`.
-    pub(crate) fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    pub fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     /// `int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags)`.
-    pub(crate) fn sendmmsg(sockfd: c_int, msgvec: *mut MmsgHdr, vlen: c_uint, flags: c_int) -> c_int;
+    pub fn sendmmsg(sockfd: c_int, msgvec: *mut MmsgHdr, vlen: c_uint, flags: c_int) -> c_int;
     /// `int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
     /// struct timespec *timeout)`.
-    pub(crate) fn recvmmsg(
-        sockfd: c_int,
-        msgvec: *mut MmsgHdr,
-        vlen: c_uint,
-        flags: c_int,
-        timeout: *mut c_void,
-    ) -> c_int;
+    pub fn recvmmsg(sockfd: c_int, msgvec: *mut MmsgHdr, vlen: c_uint, flags: c_int, timeout: *mut c_void) -> c_int;
     /// `int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)`.
     pub fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
     /// `int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)`.

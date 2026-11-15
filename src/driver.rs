@@ -1,5 +1,6 @@
-//! Driver-only use: the caller owns an io_uring driver, submits operations to it, and drives it
-//! with bounded nonblocking turns. No scheduler runs.
+//! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
+//! nonblocking turns. No scheduler runs. The driver runs on io_uring, or on epoll where the kernel
+//! refuses io_uring ([`Backend`]), with the same operations and the same ownership rules.
 //!
 //! A [`Driver`] is the home of each operation that it accepts, from the submission to the
 //! terminal event of the operation, which releases its buffer and its charge. Its future can move
@@ -27,11 +28,12 @@
 //! vectored reads and writes, length, space, sync, rename, unlink, directories, and
 //! [`Driver::close_file`]. Several operations of one file run at one time: see [`File`].
 //!
-//! [`Driver::report`] states what the driver found and applied when it started: the features of the
-//! kernel, and the [`Route`] of each [`Call`] that depends on them. The io_uring driver starts no
-//! helper thread. A kernel with no ring operation for a file call runs that call on the blocking
-//! service of the caller, which [`Driver::use_blocking`] gives. [`Config::require`] makes a missing
-//! feature refuse the driver.
+//! [`Driver::report`] states what the driver found and applied when it started: the backend, the
+//! features of the kernel, and the [`Route`] of each [`Call`] that depends on them. The driver
+//! starts no helper thread. A kernel with no ring operation for a file call runs that call on the
+//! blocking service of the caller, which [`Driver::use_blocking`] gives, and on epoll each file call
+//! runs there. [`Config::require`] makes a missing feature refuse the driver, and
+//! [`Config::backend`] a missing backend.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,6 +53,7 @@
 
 mod capability;
 mod completion;
+mod epoll;
 mod file;
 #[cfg(feature = "local")]
 mod home;
@@ -58,6 +61,7 @@ mod local;
 mod pipe;
 mod probe;
 mod process;
+mod queue;
 mod signal;
 // Two attributes each, so that Clippy sees the test modules (`allow-unwrap-in-tests`).
 #[cfg(test)]
@@ -90,8 +94,9 @@ use crate::capacity::Permit;
 use crate::sync::Arc;
 use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Ring, SetupError, Sqe};
+use queue::Queue;
 
-pub use capability::{Call, Feature, Features, Report, Route};
+pub use capability::{Backend, Call, Feature, Features, Report, Route};
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 pub use local::{LocalListener, LocalStream, Peer, Stale};
 pub use pipe::{PipeReader, PipeWriter};
@@ -115,11 +120,12 @@ pub struct Config {
     children: u32,
     completions_per_turn: u32,
     required: Features,
+    backend: Option<Backend>,
 }
 
 impl Config {
     /// 64 submission entries, 256 operations, 256 resources, 64 children, 64 completions per turn,
-    /// and no required feature.
+    /// no required feature, and the permissive selection of the backend.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -129,6 +135,19 @@ impl Config {
             children: 64,
             completions_per_turn: 64,
             required: Features::NONE,
+            backend: None,
+        }
+    }
+
+    /// Requires `backend`: with [`Backend::IoUring`], a kernel that refuses io_uring makes
+    /// [`Driver::new`] refuse with [`Error::Refused`], before a driver exists. With no
+    /// requirement, the driver runs io_uring, and it runs epoll when the creation of the ring
+    /// fails with `EPERM` or `ENOSYS`. [`Report::backend`] and [`Report::fallback`] state it.
+    #[must_use]
+    pub const fn backend(self, backend: Backend) -> Self {
+        Self {
+            backend: Some(backend),
+            ..self
         }
     }
 
@@ -189,7 +208,8 @@ impl Default for Config {
 #[non_exhaustive]
 pub enum Error {
     /// The kernel or its policy refuses io_uring (`EPERM` or `ENOSYS`), for example under the
-    /// default seccomp profile of a container or with `kernel.io_uring_disabled`.
+    /// default seccomp profile of a container or with `kernel.io_uring_disabled`, and
+    /// [`Config::backend`] requires [`Backend::IoUring`].
     Refused(io::Error),
     /// A limit of [`Config`] is 0 or above what the kernel takes.
     Config,
@@ -491,6 +511,9 @@ pub enum Reason {
     /// The child ended, and the [`std::process::Child`] that the refusal gives back has its
     /// status.
     Exited,
+    /// The poller of the epoll backend did not take the descriptor (`epoll_ctl` failed), for
+    /// example at the limit of `fs.epoll.max_user_watches`.
+    Register,
 }
 
 /// A refused operation: the reason, and the value that the caller gave, which it keeps.
@@ -665,14 +688,17 @@ struct Resources {
     slots: Box<[Owned]>,
     /// The free slots that spawns keep for the pipe ends of their children.
     reserved: u32,
+    /// The registrations in the poller, on the epoll backend.
+    registrar: Option<epoll::Registrar>,
 }
 
 impl Resources {
-    /// Takes `fd`, a descriptor of `medium`. Refuses with `fd` when each slot that no spawn keeps
-    /// is in use.
-    fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
+    /// Takes `fd`, a descriptor of `medium`. Refuses with `fd` and [`Reason::Resources`] when each
+    /// slot that no spawn keeps is in use, or with [`Reason::Register`] when the poller does not
+    /// take it.
+    fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, (Reason, OwnedFd)> {
         if self.reserved > 0 && self.free() <= self.reserved {
-            return Err(fd);
+            return Err((Reason::Resources, fd));
         }
         self.take(fd, medium)
     }
@@ -705,11 +731,23 @@ impl Resources {
         u32::try_from(free).unwrap_or(u32::MAX)
     }
 
-    /// Takes `fd` into the first free slot.
-    fn take(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
+    /// Takes `fd` into the first free slot, and registers it in the poller on the epoll backend.
+    /// A file has no readiness, so it has no registration.
+    fn take(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, (Reason, OwnedFd)> {
         let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
-            return Err(fd);
+            return Err((Reason::Resources, fd));
         };
+        if let Some(registrar) = &self.registrar
+            && medium != Medium::File
+        {
+            let token = epoll::Token {
+                index,
+                generation: slot.generation,
+            };
+            if registrar.add(fd.as_fd(), token, medium == Medium::Pipe).is_err() {
+                return Err((Reason::Register, fd));
+            }
+        }
         slot.fd = Some(fd);
         slot.medium = medium;
         Ok(Resource {
@@ -734,13 +772,22 @@ impl Resources {
             .map(AsFd::as_fd)
     }
 
-    /// Ends `resource` and gives its descriptor. The identity is stale from now on.
+    /// Ends `resource` and its registration, and gives its descriptor. The identity is stale from
+    /// now on.
     fn release(&mut self, resource: Resource) -> Option<OwnedFd> {
-        let slot = self.get(resource)?;
+        let registrar = self.registrar.as_ref();
+        let slot = self
+            .slots
+            .get_mut(resource.index as usize)
+            .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
         slot.running = 0;
-        slot.fd.take()
+        let fd = slot.fd.take()?;
+        if let Some(registrar) = registrar {
+            registrar.delete(fd.as_fd());
+        }
+        Some(fd)
     }
 }
 
@@ -766,7 +813,7 @@ struct Selected {
 
 impl Selected {
     /// Takes each slot of `pool`, up to 32768, and gives each to a new provided ring of `ring`.
-    fn new(ring: &Ring, mut pool: Pool) -> io::Result<Self> {
+    fn new(queue: &mut Queue, mut pool: Pool) -> io::Result<Self> {
         let mut buffers = Vec::new();
         while buffers.len() < 1 << 15 {
             match pool.acquire() {
@@ -781,7 +828,7 @@ impl Selected {
             .and_then(|buffer| u32::try_from(buffer.capacity()).ok())
             .ok_or(io::ErrorKind::InvalidInput)?;
         let mut selected = Self {
-            ring: BufferRing::register(ring, count.next_power_of_two(), GROUP)?,
+            ring: queue.provide(count.next_power_of_two(), GROUP)?,
             pool,
             buffers: buffers.into_boxed_slice(),
             free: Vec::with_capacity(usize::from(count)),
@@ -860,9 +907,11 @@ impl fmt::Debug for Shared {
     }
 }
 
-/// An io_uring driver that its caller owns and drives. It stays on the thread that created it.
+/// A driver that its caller owns and drives, on io_uring or on epoll ([`Backend`]). It stays on
+/// the thread that created it.
 pub struct Driver {
-    ring: Ring,
+    /// The queues of the backend: the ring, or the poller.
+    queue: Queue,
     table: Table<Tag>,
     shared: Arc<Shared>,
     resources: Resources,
@@ -901,7 +950,7 @@ pub struct Driver {
 impl fmt::Debug for Driver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Driver")
-            .field("ring", &self.ring)
+            .field("queue", &self.queue)
             .field("resources", &self.resources.slots.len())
             .field("selected", &self.selected)
             .field("completions_per_turn", &self.completions_per_turn)
@@ -911,15 +960,17 @@ impl fmt::Debug for Driver {
 }
 
 impl Driver {
-    /// Starts a driver with the limits of `config`. It allocates here, one time. It opens three
-    /// descriptors: the ring, the wake descriptor, and the interrupt descriptor. With the `local`
-    /// feature, it also opens a duplicate of the ring, the target of the wake messages of local
-    /// tasks.
+    /// Starts a driver with the limits of `config`. It allocates here, one time. On io_uring, it
+    /// opens three descriptors: the ring, the wake descriptor, and the interrupt descriptor. With
+    /// the `local` feature, it also opens a duplicate of the ring, the target of the wake messages
+    /// of local tasks. On epoll, the epoll descriptor takes the place of the ring.
     ///
     /// # Errors
     ///
-    /// [`Error::Refused`] when the kernel refuses io_uring, [`Error::Config`] for a limit that is
-    /// 0 or too large, and [`Error::System`] for another failure.
+    /// [`Error::Refused`] when the kernel refuses io_uring and [`Config::backend`] requires it,
+    /// [`Error::Config`] for a limit that is 0 or too large, [`Error::Unsupported`] for a required
+    /// feature that the kernel or the backend does not have, and [`Error::System`] for another
+    /// failure.
     pub fn new(config: Config) -> Result<Self, Error> {
         if config.operations == 0
             || config.operations > MAX_SLOTS
@@ -929,22 +980,66 @@ impl Driver {
             return Err(Error::Config);
         }
         let completions = config.operations.max(config.submissions).saturating_mul(2).min(1 << 16);
-        let mut ring = Ring::new(config.submissions, completions).map_err(|error| match error {
-            SetupError::Refused(error) => Error::Refused(error),
-            SetupError::Failed(error) if error.kind() == io::ErrorKind::InvalidInput => Error::Config,
-            SetupError::Failed(error) => Error::System(error),
-        })?;
-        // The probe needs a new ring, with no entry, completion, or buffer group.
-        let probed = Features::probed(ring.probe().map_err(Error::System)?);
-        // A strict requirement refuses before the driver exists.
-        let missing = config.required.without(probed);
-        if !missing.is_empty() {
-            return Err(Error::Unsupported(missing));
-        }
         let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
         let wake = fs::File::from(wake);
-        ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
-        let rearm_wake = probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?;
+        let mut selection = capability::Selection {
+            requested: config.backend,
+            backend: Backend::IoUring,
+            fallback: None,
+        };
+        let ring = match config.backend {
+            Some(Backend::Epoll) => None,
+            requested => match Ring::new(config.submissions, completions) {
+                Ok(ring) => Some(ring),
+                // The permissive selection runs epoll where the kernel refuses io_uring.
+                Err(SetupError::Refused(error)) if requested.is_none() => {
+                    selection.fallback = error.raw_os_error();
+                    None
+                }
+                Err(SetupError::Refused(error)) => return Err(Error::Refused(error)),
+                Err(SetupError::Failed(error)) if error.kind() == io::ErrorKind::InvalidInput => {
+                    return Err(Error::Config);
+                }
+                Err(SetupError::Failed(error)) => return Err(Error::System(error)),
+            },
+        };
+        let (queue, probed, rearm_wake) = match ring {
+            Some(mut ring) => {
+                // The probe needs a new ring, with no entry, completion, or buffer group.
+                let probed = Features::probed(ring.probe().map_err(Error::System)?);
+                // A strict requirement refuses before the driver exists.
+                let missing = config.required.without(probed);
+                if !missing.is_empty() {
+                    return Err(Error::Unsupported(missing));
+                }
+                ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
+                let rearm_wake = probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?;
+                (Queue::Ring(ring), probed, rearm_wake)
+            }
+            None => {
+                selection.backend = Backend::Epoll;
+                // A feature is a feature of io_uring, so epoll has none.
+                if !config.required.is_empty() {
+                    return Err(Error::Unsupported(config.required));
+                }
+                let poller = epoll::Poller::new(
+                    config.submissions,
+                    completions,
+                    config.resources,
+                    config.operations,
+                    wake.as_fd(),
+                )
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::InvalidInput => Error::Config,
+                    _ => Error::System(error),
+                })?;
+                (Queue::Poller(poller), Features::NONE, false)
+            }
+        };
+        let registrar = match &queue {
+            Queue::Poller(poller) => Some(poller.registrar()),
+            Queue::Ring(_) => None,
+        };
         let table = Table::new(config.operations);
         let shared = Arc::new(Shared {
             entries: (0..config.operations).map(|_| Entry::new()).collect(),
@@ -953,21 +1048,22 @@ impl Driver {
             interrupt: fs::File::from(interrupt),
         });
         #[cfg(feature = "local")]
-        let wakes = home::Wakes::new(&ring, &shared).map_err(Error::System)?;
+        let wakes = home::Wakes::new(&queue, &shared).map_err(Error::System)?;
         Ok(Self {
-            ring,
+            queue,
             table,
             shared,
             resources: Resources {
                 slots: (0..config.resources).map(|_| Owned::default()).collect(),
                 reserved: 0,
+                registrar,
             },
             children: process::Children::new(config.children),
             taken: Vec::with_capacity(config.operations as usize * 2),
             pending: Vec::with_capacity(config.resources as usize),
             copied: 0,
             selected: None,
-            report: Report::new(config.required, probed, rearm_wake),
+            report: Report::new(selection, config.required, probed, rearm_wake),
             completions_per_turn: config.completions_per_turn,
             waking: false,
             rearm_wake,
@@ -1067,7 +1163,7 @@ impl Driver {
         if self.selected.is_some() {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        self.selected = Some(Selected::new(&self.ring, pool)?);
+        self.selected = Some(Selected::new(&mut self.queue, pool)?);
         Ok(())
     }
 
@@ -1084,8 +1180,8 @@ impl Driver {
             selected.refill();
         }
         let mut more = false;
-        if self.ring.unsubmitted() > 0 || self.ring.needs_enter() {
-            match self.ring.submit(0) {
+        if self.queue.unsubmitted() > 0 || self.queue.needs_enter() {
+            match self.queue.submit(0) {
                 Ok(_) => {}
                 Err(error) if retryable(&error) => more = true,
                 Err(error) => return Err(error),
@@ -1097,16 +1193,17 @@ impl Driver {
         self.attend();
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
         // the descriptor already, so this turn reports it, or a later wake comes.
-        if self.shared.clear() && self.rearm_wake {
+        if self.shared.clear()
+            && self.rearm_wake
+            && let Some(ring) = self.queue.ring()
+        {
             // On a kernel with the defect of `probe`, the next deferred work signals only a new
             // registration. Deferred work that comes before the new registration sets
             // `IORING_SQ_TASKRUN` before it tries the signal, so the look below sees it.
-            rearm(&self.ring, &self.shared.wake)?;
+            rearm(ring, &self.shared.wake)?;
         }
-        more |= self.ring.ready()
-            || self.ring.needs_enter()
-            || self.ring.unsubmitted() > 0
-            || !self.shared.requests.is_empty();
+        more |=
+            self.queue.ready() || self.queue.more() || self.queue.unsubmitted() > 0 || !self.shared.requests.is_empty();
         Ok(Turn { completed, more })
     }
 
@@ -1138,7 +1235,7 @@ impl Driver {
         if !self.waking {
             let poll = Sqe::poll_readable(self.shared.interrupt.as_raw_fd()).with_user_data(WAKE);
             // SAFETY: a poll names no memory.
-            match unsafe { push_now(&mut self.ring, &poll) } {
+            match unsafe { push_now(&mut self.queue, &poll) } {
                 Ok(()) => self.waking = true,
                 // A full queue leaves work for the next turn.
                 Err(error) if retryable(&error) => return Ok(()),
@@ -1148,8 +1245,8 @@ impl Driver {
         loop {
             let entered = match timeout {
                 #[cfg(feature = "local")]
-                Some(timeout) => self.ring.submit_timeout(1, timeout),
-                _ => self.ring.submit(1),
+                Some(timeout) => self.queue.submit_timeout(1, timeout),
+                _ => self.queue.submit(1),
             };
             match entered {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -1211,7 +1308,7 @@ impl Driver {
                 }
                 _ => {}
             }
-            push_cancel(&mut self.ring, id)?;
+            push_cancel(&mut self.queue, id)?;
             cancelled = cancelled.saturating_add(1);
         }
         while self.table.busy() {
@@ -1246,9 +1343,9 @@ impl Driver {
         })
     }
 
-    /// Takes `fd`, a descriptor of `medium`, so that teardown closes it. Refuses with `fd` when
-    /// each resource slot is in use.
-    fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, OwnedFd> {
+    /// Takes `fd`, a descriptor of `medium`, so that teardown closes it. Refuses with `fd` and the
+    /// reason when each resource slot is in use or the poller does not take it.
+    fn adopt(&mut self, fd: OwnedFd, medium: Medium) -> Result<Resource, (Reason, OwnedFd)> {
         self.resources.adopt(fd, medium)
     }
 
@@ -1298,7 +1395,7 @@ impl Driver {
     /// Whether the submission queue has room for `entries` entries, after one submit if it does
     /// not.
     fn room(&mut self, entries: u32) -> bool {
-        self.ring.room() >= entries || (self.ring.submit(0).is_ok() && self.ring.room() >= entries)
+        self.queue.room() >= entries || (self.queue.submit(0).is_ok() && self.queue.room() >= entries)
     }
 
     /// Records a new operation at the home, before its submission, with the resources that
@@ -1376,10 +1473,18 @@ impl Driver {
         let mut sqe = None;
         slot.update(id, |held| sqe = held.as_mut().map(entry));
         if let Some(sqe) = sqe {
+            let token = self
+                .table
+                .resources(id)
+                .and_then(|tag| tag.resource)
+                .map(|resource| epoll::Token {
+                    index: resource.index,
+                    generation: resource.generation,
+                });
             // SAFETY: the entry of the slot keeps the resources in place until the terminal event
             // of `id`, and nothing changes the variant of their payload before it. The caller keeps
             // the descriptor open. The queue has room.
-            let pushed = unsafe { self.ring.push(&sqe.with_user_data(id.user_data())) }.is_ok();
+            let pushed = unsafe { self.queue.push(&sqe.with_user_data(id.user_data()), token) }.is_ok();
             debug_assert!(pushed, "the queue has room for the entry");
         }
     }
@@ -1483,7 +1588,7 @@ impl Driver {
                 }
             });
         }
-        if first && push_cancel(&mut self.ring, id).is_err() {
+        if first && push_cancel(&mut self.queue, id).is_err() {
             // The queue stays full: the next turn takes the request again.
             if let Some(slot) = self.shared.entries.get(id.index() as usize) {
                 slot.update(id, |held| {
@@ -1504,7 +1609,7 @@ impl Driver {
         #[cfg(feature = "local")]
         let wakes = &mut self.wakes;
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
-        for cqe in self.ring.completions().take(limit as usize) {
+        for cqe in self.queue.completions().take(limit as usize) {
             completed += 1;
             let mut event = cqe.event();
             // The completion of an exit operation ends it when the home has the status of its child.
@@ -1713,9 +1818,9 @@ fn finish(
                 } else {
                     match resources.adopt(fd, Medium::Stream) {
                         Ok(stream) => held.accepted = Some(stream),
-                        // With no free resource slot, the listener keeps the connection for the
-                        // next accept, and this one gives `OutOfMemory`.
-                        Err(fd) => {
+                        // With no free resource slot, or no registration, the listener keeps the
+                        // connection for the next accept, and this one gives `OutOfMemory`.
+                        Err((_, fd)) => {
                             if let Some(listener) = tag.resource.and_then(|listener| resources.get(listener)) {
                                 listener.directions.keep_connection(fd, *peer, *peer_len);
                             }
@@ -1730,7 +1835,8 @@ fn finish(
 impl AsFd for Driver {
     /// The wake descriptor. It becomes readable when a completion is ready, when the kernel has
     /// deferred work for the driver, and when another thread posts a request or a wake. Turn the
-    /// driver when it is readable.
+    /// driver when it is readable. On epoll, it is the epoll descriptor, which is readable when an
+    /// event of a resource or a wake waits.
     ///
     /// A Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c` signals the
     /// descriptor for deferred work only one time in each registration, for example Ubuntu 26.04
@@ -1739,7 +1845,7 @@ impl AsFd for Driver {
     /// becomes readable for each completion and each deferred work. A kernel with no defect makes
     /// no extra system call.
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.shared.wake.as_fd()
+        self.queue.readable(self.shared.wake.as_fd())
     }
 }
 
@@ -1760,7 +1866,7 @@ impl Drop for Driver {
                 let _leaked = ManuallyDrop::new(selected);
             } else {
                 // A failure leaves the ring registered, and then its memory leaks.
-                drop(selected.ring.unregister(&self.ring));
+                drop(self.queue.release(selected.ring));
             }
         }
     }
@@ -1768,7 +1874,7 @@ impl Drop for Driver {
 
 /// Pushes a cancel of `id` by its own user data, and submits once when the queue is full.
 #[expect(unsafe_code, reason = "a cancel names no memory")]
-fn push_cancel(ring: &mut Ring, id: OpId) -> io::Result<()> {
+fn push_cancel(ring: &mut Queue, id: OpId) -> io::Result<()> {
     // SAFETY: a cancel names no memory.
     unsafe { push_now(ring, &Sqe::cancel(id.user_data(), id.cancel_user_data())) }
 }
@@ -1779,14 +1885,14 @@ fn push_cancel(ring: &mut Ring, id: OpId) -> io::Result<()> {
 ///
 /// `entry` names no memory, as a cancel or a poll does.
 #[expect(unsafe_code, reason = "the caller gives an entry that names no memory")]
-unsafe fn push_now(ring: &mut Ring, entry: &Sqe) -> io::Result<()> {
+unsafe fn push_now(ring: &mut Queue, entry: &Sqe) -> io::Result<()> {
     // SAFETY: the entry names no memory.
-    if unsafe { ring.push(entry) }.is_ok() {
+    if unsafe { ring.push(entry, None) }.is_ok() {
         return Ok(());
     }
     ring.submit(0)?;
     // SAFETY: as above.
-    unsafe { ring.push(entry) }.map_err(|_| io::ErrorKind::WouldBlock.into())
+    unsafe { ring.push(entry, None) }.map_err(|_| io::ErrorKind::WouldBlock.into())
 }
 
 /// Ends the registration of the wake descriptor and makes a new one, which starts with no

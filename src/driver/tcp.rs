@@ -1317,7 +1317,7 @@ impl Driver {
         value: P,
         held: impl FnOnce(P) -> Held,
     ) -> Result<Completion, Refused<P>> {
-        if entries > self.ring.entries() {
+        if entries > self.queue.entries() {
             return Err(Refused {
                 reason: Reason::Queue,
                 value,
@@ -1545,9 +1545,9 @@ impl Driver {
                             }
                         }
                     }),
-                    // With no free resource slot, the listener keeps the connection, and this
-                    // accept gives `OutOfMemory`.
-                    Err(fd) => {
+                    // With no free resource slot, or no registration, the listener keeps the
+                    // connection, and this accept gives `OutOfMemory`.
+                    Err((_, fd)) => {
                         if let Some(listener) = self.resources.get(resource) {
                             listener.directions.keep_connection(fd, peer, peer_len);
                         }

@@ -14,17 +14,20 @@ tells how to start, turn, and end the driver.
 `OwnedFd::from(child.stdout.take().unwrap())`. A child of the driver has its piped streams as pipe
 ends already (see [Child processes on the driver](processes.md#standard-streams)).
 
-The driver clears `O_NONBLOCK` of the open file description of the end, because a nonblocking
-read or write ends at once instead of waiting. Another descriptor of the same open file
-description, for example a duplicate, then blocks too.
+On io_uring, the driver clears `O_NONBLOCK` of the open file description of the end, because a
+nonblocking read or write ends at once instead of waiting. On [epoll](epoll.md), the driver sets
+`O_NONBLOCK`, because each read and write runs when epoll reports the end ready. Another descriptor
+of the same open file description, for example a duplicate, gets the same flag.
 
-An adoption refuses, gives the descriptor back in its `Refused`, and changes nothing:
+An adoption refuses and gives the descriptor back in its `Refused`. Except as the table says, it
+changes nothing:
 
 | `Refused::reason()` | Cause |
 | --- | --- |
 | `Reason::NotPipe` | The descriptor is not a pipe or a FIFO, for example a socket |
 | `Reason::Direction` | A write end to `adopt_reader`, or a read end to `adopt_writer` |
 | `Reason::Resources` | Each resource slot of the driver is in use (`Config::resources`) |
+| `Reason::Register` | On epoll, epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. The descriptor has `O_NONBLOCK` then |
 
 ## Operations
 

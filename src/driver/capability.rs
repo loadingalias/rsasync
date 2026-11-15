@@ -1,10 +1,23 @@
-//! The capability report of a driver: the features that its caller required, the features that the
-//! probes of its kernel found, the route of each call that depends on them, and what the driver
-//! applied. [`Driver::new`](super::Driver::new) builds it one time.
+//! The capability report of a driver: the backend that its caller required and the backend that
+//! runs, the features that its caller required, the features that the probes of its kernel found,
+//! the route of each call that depends on them, and what the driver applied.
+//! [`Driver::new`](super::Driver::new) builds it one time.
 
 use core::fmt;
 
 use crate::uring;
+
+/// The kernel interface that runs the operations of a driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Backend {
+    /// io_uring: the kernel runs each operation and posts its completion.
+    IoUring,
+    /// epoll: the driver runs each socket and pipe operation as one nonblocking call on its own
+    /// thread when epoll reports its descriptor ready. Each file operation runs on the blocking
+    /// service ([`Route::BlockingService`]), because epoll cannot wait on regular files.
+    Epoll,
+}
 
 /// A feature of the kernel that the driver probes on its ring when it starts. A probe runs the
 /// feature, or reads it from the kernel: the version of the kernel proves nothing.
@@ -125,6 +138,9 @@ pub enum Call {
     SetFileLen,
     /// The exit of a [`Child`](super::Child): the reap of the child and its status.
     WaitChild,
+    /// Each other operation of a file or a directory: open, reads, writes, length, space, sync,
+    /// rename, and unlink.
+    File,
 }
 
 /// How a call runs.
@@ -139,31 +155,58 @@ pub enum Route {
     /// gives. With no service, the call refuses with
     /// [`Reason::Blocking`](super::Reason::Blocking).
     BlockingService,
-    /// A poll of a descriptor on the ring, then one nonblocking system call on the thread of the
-    /// driver when the descriptor is readable.
+    /// A poll of a descriptor on the ring or the poller, then one nonblocking system call on the
+    /// thread of the driver when the descriptor is readable.
     Poll,
 }
 
 /// Each call, in the order of the report.
-const CALLS: [Call; 4] = [Call::Bind, Call::BindUdp, Call::SetFileLen, Call::WaitChild];
+const CALLS: [Call; 5] = [Call::Bind, Call::BindUdp, Call::SetFileLen, Call::WaitChild, Call::File];
 
-/// What a driver found and applied when it started, for its io_uring backend. The report does not
-/// change after [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each
-/// call and the helper threads.
+/// What a driver found and applied when it started. The report does not change after
+/// [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each call and the
+/// helper threads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Report {
+    requested: Option<Backend>,
+    backend: Backend,
+    fallback: Option<i32>,
     required: Features,
     probed: Features,
     rearms_wake: bool,
 }
 
 impl Report {
-    pub(super) const fn new(required: Features, probed: Features, rearms_wake: bool) -> Self {
+    pub(super) const fn new(selection: Selection, required: Features, probed: Features, rearms_wake: bool) -> Self {
         Self {
+            requested: selection.requested,
+            backend: selection.backend,
+            fallback: selection.fallback,
             required,
             probed,
             rearms_wake,
         }
+    }
+
+    /// The backend that the caller required with [`Config::backend`](super::Config::backend), or
+    /// `None` for the permissive selection: io_uring, and epoll when the kernel refuses io_uring.
+    #[must_use]
+    pub const fn requested(&self) -> Option<Backend> {
+        self.requested
+    }
+
+    /// The backend that runs the operations of the driver.
+    #[must_use]
+    pub const fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// The error number with which the kernel refused to create a ring (`EPERM` or `ENOSYS`), when
+    /// the permissive selection runs epoll for that reason. `EPERM` comes, for example, from the
+    /// default seccomp profile of a container or from `kernel.io_uring_disabled`.
+    #[must_use]
+    pub const fn fallback(&self) -> Option<i32> {
+        self.fallback
     }
 
     /// The features that the caller required with [`Config::require`](super::Config::require).
@@ -179,7 +222,8 @@ impl Report {
         self.probed
     }
 
-    /// The route of `call` on this kernel.
+    /// The route of `call` on this kernel and backend. A probe runs only on io_uring, so on epoll
+    /// no feature is probed.
     #[must_use]
     pub const fn route(&self, call: Call) -> Route {
         let ring = match call {
@@ -187,17 +231,19 @@ impl Report {
             Call::BindUdp => self.probed.contains(Feature::Bind),
             Call::SetFileLen => self.probed.contains(Feature::Truncate),
             Call::WaitChild => self.probed.contains(Feature::ChildWait),
+            Call::File => matches!(self.backend, Backend::IoUring),
         };
         match (ring, call) {
             (true, _) => Route::Ring,
             (false, Call::Bind | Call::BindUdp) => Route::SystemCall,
-            (false, Call::SetFileLen) => Route::BlockingService,
+            (false, Call::SetFileLen | Call::File) => Route::BlockingService,
             (false, Call::WaitChild) => Route::Poll,
         }
     }
 
-    /// The threads that the driver starts: none. A call on [`Route::BlockingService`] runs on
-    /// a thread of that service.
+    /// The threads that the driver starts: none, on each backend. A call on
+    /// [`Route::BlockingService`] runs on a thread of the service that
+    /// [`Driver::use_blocking`](super::Driver::use_blocking) gives, which the caller owns.
     #[must_use]
     pub const fn helper_threads(&self) -> u32 {
         0
@@ -227,6 +273,9 @@ impl fmt::Debug for Report {
         }
 
         f.debug_struct("Report")
+            .field("requested", &self.requested)
+            .field("backend", &self.backend)
+            .field("fallback", &self.fallback)
             .field("required", &self.required)
             .field("probed", &self.probed)
             .field("routes", &Routes(self))
@@ -234,4 +283,13 @@ impl fmt::Debug for Report {
             .field("rearms_wake", &self.rearms_wake)
             .finish()
     }
+}
+
+/// The backend selection of [`Driver::new`](super::Driver::new): what the caller required, what
+/// runs, and the refusal of io_uring that made the permissive selection run epoll.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Selection {
+    pub(super) requested: Option<Backend>,
+    pub(super) backend: Backend,
+    pub(super) fallback: Option<i32>,
 }

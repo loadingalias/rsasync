@@ -11,7 +11,7 @@
 //! These words are hardware atomics in every build, because the other party is the kernel.
 
 mod buffers;
-mod sys;
+pub(crate) mod sys;
 #[cfg(all(test, not(loom)))]
 mod table_tests;
 #[cfg(test)]

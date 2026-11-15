@@ -13,7 +13,7 @@ use core::task::{Context, Poll};
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
@@ -21,10 +21,10 @@ use rsnetwork_udp::sys::IoVec;
 
 use super::tcp::{Regions, count};
 use super::{
-    Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
-    Route, Tag, sys,
+    Backend, Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource,
+    Resources, Route, Tag, epoll, sys,
 };
-use crate::blocking::Submitter;
+use crate::blocking::{Job, Submitter};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use crate::sync::Arc;
 use crate::uring::Sqe;
@@ -512,7 +512,7 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
                         *field = alignment;
                     }
                 }
-                Err(_closed) => held.error = Some(io::ErrorKind::OutOfMemory),
+                Err((_, _closed)) => held.error = Some(io::ErrorKind::OutOfMemory),
             }
         }
         Op::Read => {
@@ -620,6 +620,21 @@ fn poll_job(held: Option<&mut Held>, cx: &Context<'_>) -> Option<i32> {
     match job.poll(cx) {
         Poll::Ready(result) => Some(result.unwrap_or(-ECANCELED)),
         Poll::Pending => None,
+    }
+}
+
+/// The job of a file entry on the epoll backend: its entry, and the duplicate of its descriptor,
+/// which stays open until the job returns.
+struct FileJob {
+    sqe: Sqe,
+    _fd: Option<OwnedFd>,
+}
+
+impl Job for FileJob {
+    type Output = i32;
+
+    fn run(self) -> i32 {
+        epoll::run_file(&self.sqe)
     }
 }
 
@@ -1235,6 +1250,9 @@ impl Driver {
                 }
             },
         };
+        if self.report.backend() == Backend::Epoll {
+            return self.begin_file_job(resource, op, value, held, entry, cancel_on_drop);
+        }
         let tag = Tag {
             resource,
             kind: Kind::File(op),
@@ -1250,6 +1268,70 @@ impl Driver {
         #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
         unsafe {
             self.push(id, |held| entry(fd, held));
+        }
+        Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
+    }
+
+    /// Starts the file operation `op` of [`Driver::begin_file`] as a job of the blocking service,
+    /// which makes the call of its entry with one positional call ([`epoll::run_file`]), because
+    /// epoll cannot wait on a file. The job owns a duplicate of the descriptor, so it never names a
+    /// descriptor number that the driver closed and the system gave to another file. The job
+    /// posts the completion of the entry to the poller when it returns.
+    fn begin_file_job<P>(
+        &mut self,
+        resource: Option<Resource>,
+        op: Op,
+        value: P,
+        held: impl FnOnce(P) -> Held,
+        entry: impl FnOnce(RawFd, &mut Held) -> Sqe,
+        cancel_on_drop: bool,
+    ) -> Result<Completion, Refused<P>> {
+        let Some((submitter, waker)) = self
+            .blocking
+            .as_ref()
+            .map(|(submitter, waker)| (submitter.clone(), waker.clone()))
+        else {
+            return Err(Refused {
+                reason: Reason::Blocking,
+                value,
+            });
+        };
+        // The reservation comes first, so a full service refuses before the operation exists.
+        let Ok(reservation) = submitter.reserve::<FileJob>() else {
+            return Err(Refused {
+                reason: Reason::Blocking,
+                value,
+            });
+        };
+        let tag = Tag {
+            resource,
+            kind: Kind::File(op),
+        };
+        let id = self
+            .open(tag, 0, value, held)
+            .map_err(|(reason, value)| Refused { reason, value })?;
+        self.count_start(resource);
+        let duplicate = match resource.and_then(|resource| self.resources.get(resource)?.fd.as_ref()) {
+            Some(fd) => fd.try_clone().map(Some),
+            None => Ok(None),
+        };
+        let fd = match duplicate {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.complete_now(id, -error.raw_os_error().unwrap_or(EIO));
+                return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
+            }
+        };
+        let mut sqe = None;
+        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+            let raw = fd.as_ref().map_or(sys::AT_FDCWD, AsRawFd::as_raw_fd);
+            slot.update(id, |held| sqe = held.as_mut().map(|held| entry(raw, held)));
+        }
+        match (sqe, self.queue.poller()) {
+            (Some(sqe), Some(poller)) => {
+                poller.add_job(id.user_data(), reservation.send(FileJob { sqe, _fd: fd }), &waker)
+            }
+            _ => self.complete_now(id, -EINVAL),
         }
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
     }
