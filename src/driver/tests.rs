@@ -23,12 +23,13 @@ use rsnetwork_udp::{Ecn, Received};
 use super::suite::{self, Backend};
 use super::{
     Arrivals, Call, Completion, Config, Datagram, Datagrams, Driver, ECANCELED, Error, Feature, Features, Held, Medium,
-    Reason, Refused, Route, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, sys,
+    Reason, Refused, Route, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, eventfd, probe,
+    sys,
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 use crate::completion::Gone;
-use crate::uring::{Cqe, Sqe};
+use crate::uring::{Cqe, Ring, Sqe};
 
 #[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
 unsafe extern "C" {
@@ -675,7 +676,9 @@ fn only_the_first_driver_of_a_process_probes_the_kernel() {
 
 /// The probe finds the eventfd defect on the kernels of the evidence hosts that have it: the
 /// kernel `7.0.0-1016-aws` of Ubuntu 26.04 has `cd305ee3633a` and not `04fe9aeb4f3c`, and Linux
-/// 6.1 of Debian 12 has neither. On another kernel, only the start of the driver is checked.
+/// 6.1 of Debian 12 has neither. On a kernel with the defect, it also finds the defect when the
+/// first deferred signal comes after the first wait, as after a slow grace period. On another
+/// kernel, only the start of the driver is checked.
 #[test]
 fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
@@ -687,6 +690,14 @@ fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
     };
     if let Some(expected) = expected {
         assert_eq!(driver.rearm_wake, expected, "the kernel {release}");
+    }
+    if expected == Some(true) {
+        // A first wait of zero ends before the grace period of the first signal.
+        let mut ring = Ring::new(4, 8).unwrap();
+        let wake = File::from(eventfd().unwrap());
+        ring.register_eventfd(wake.as_raw_fd()).unwrap();
+        let defect = probe::probe(&mut ring, &wake, core::time::Duration::ZERO).unwrap();
+        assert!(defect, "a late first signal hid the defect of the kernel {release}");
     }
 }
 

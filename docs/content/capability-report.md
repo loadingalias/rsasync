@@ -26,7 +26,7 @@ println!("{report:#?}");
 | Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing |
 | Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring`, `Route::SystemCall`, `Route::BlockingService`, or `Route::Poll` |
 | Applied | `helper_threads()` | The threads that the driver starts: 0. A call on `Route::BlockingService` runs on a thread of your service |
-| Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so only on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws` |
+| Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws`. It also does so when a deferred signal came late during the probe of the kernel |
 
 The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `Bind` and `Listen`
 (6.11), `IncrementalBufferRings` (6.12), `RinglessMessages` (6.13), and `ZeroCopyReceive` (6.15).

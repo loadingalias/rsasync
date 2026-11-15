@@ -880,7 +880,8 @@ pub struct Driver {
     /// ends a wait.
     waking: bool,
     /// The kernel signals the wake descriptor for deferred work only one time in each
-    /// registration (`probe`), so each turn that takes a wake registers it again.
+    /// registration, or a signal of the probe came late (`probe`). Each turn that takes a wake thus
+    /// registers it again.
     rearm_wake: bool,
     /// The signal streams whose home is this driver.
     signals: Vec<Arc<signal::Home>>,
