@@ -78,6 +78,7 @@ use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop};
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
@@ -1117,8 +1118,19 @@ impl Driver {
     ///
     /// A failure of the kernel entry other than an interrupt or a full queue, which leave work for
     /// the next turn.
-    #[expect(unsafe_code, reason = "a poll names no memory")]
     pub fn wait(&mut self) -> io::Result<()> {
+        self.wait_in(None)
+    }
+
+    /// Blocks as [`wait`](Self::wait) does, but at most for `timeout`.
+    #[cfg(feature = "local")]
+    pub(crate) fn wait_for(&mut self, timeout: Duration) -> io::Result<()> {
+        self.wait_in(Some(timeout))
+    }
+
+    /// The wait of [`wait`](Self::wait), with no limit or at most for `timeout`.
+    #[expect(unsafe_code, reason = "a poll names no memory")]
+    fn wait_in(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         // A wait in the kernel ends only at a completion, so a request or a wake from another
         // thread, which only writes a descriptor, would not end it. That thread also writes the
         // interrupt descriptor, and the poll of it in the ring then completes. The poll does not
@@ -1134,7 +1146,12 @@ impl Driver {
             }
         }
         loop {
-            match self.ring.submit(1) {
+            let entered = match timeout {
+                #[cfg(feature = "local")]
+                Some(timeout) => self.ring.submit_timeout(1, timeout),
+                _ => self.ring.submit(1),
+            };
+            match entered {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if !retryable(&error) => return Err(error),
                 _ => return Ok(()),

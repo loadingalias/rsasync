@@ -469,3 +469,161 @@ fn a_task_that_loops_on_ready_channel_operations_yields_at_its_budget() {
     });
     assert_eq!(seen.get(), Some(BUDGET));
 }
+
+/// An owner with a timer storage of `capacity` timers, on the native clock that does not advance in
+/// a suspend.
+pub(super) fn timed(
+    budget: &Budget,
+    capacity: u32,
+    resolution: core::time::Duration,
+) -> (crate::clock::NativeClock, crate::timer::Timers) {
+    let clock = crate::clock::NativeClock::new(crate::time::Suspend::Pauses).expect("the test host has a native clock");
+    let timers = crate::timer::Timers::new(
+        core::num::NonZeroU32::new(capacity).unwrap(),
+        resolution,
+        clock.now(),
+        budget,
+    )
+    .expect("the test budget has room for the timers");
+    (clock, timers)
+}
+
+/// The deadlines of `wake_for_timers`: a quarter, a half, and a full tick, and more, after an
+/// instant of the clock.
+const OFFSETS: [u32; 4] = [1, 2, 5, 7];
+
+/// Waits for timers in sequence, with deadlines in different places of a tick, and gives how late
+/// each one fired. Each timer fires at or after its deadline. `waiting` holds the deadline of the
+/// timer that the task waits for.
+pub(super) async fn wake_for_timers(
+    clock: crate::clock::NativeClock,
+    resolution: core::time::Duration,
+    waiting: Rc<Cell<Option<crate::time::Instant>>>,
+) -> Vec<core::time::Duration> {
+    let mut lateness = Vec::new();
+    for offset in OFFSETS {
+        let after = resolution * offset / 4 + core::time::Duration::from_nanos(1);
+        let deadline = clock.now().checked_add(after).unwrap();
+        waiting.set(Some(deadline));
+        super::timer(crate::time::Deadline::at(deadline))
+            .unwrap()
+            .await
+            .unwrap();
+        let late = clock
+            .now()
+            .duration_since(deadline)
+            .expect("a timer never fires before its deadline");
+        lateness.push(late);
+    }
+    lateness
+}
+
+/// A home that records the instant of each timed park with the deadline of the timer that the
+/// task waits for, and then sleeps until that instant.
+struct Record {
+    waiting: Rc<Cell<Option<crate::time::Instant>>>,
+    parks: Vec<(crate::time::Instant, crate::time::Instant)>,
+}
+
+impl super::owner::Park for Record {
+    type Error = core::convert::Infallible;
+
+    fn drive(&mut self, _local: &super::owner::Local) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
+
+    fn park(&mut self, _local: &super::owner::Local, until: Option<super::owner::Until>) -> Result<(), Self::Error> {
+        let until = until.expect("an owner whose task waits for a timer parks with a limit");
+        let deadline = self.waiting.get().expect("the task names the deadline before it waits");
+        self.parks.push((until.instant, deadline));
+        std::thread::sleep(until.remaining());
+        Ok(())
+    }
+}
+
+/// The owner parks at most until the deadline of the next timer and the coarsening of the storage
+/// after it: the start of the tick of the timer, or an earlier turn of the storage. No wall clock
+/// bounds the check.
+#[test]
+fn the_owner_parks_at_most_until_the_deadline_and_the_coarsening_of_the_next_timer() {
+    let resolution = core::time::Duration::from_millis(1);
+    let budget = budget();
+    let (clock, timers) = timed(&budget, 4, resolution);
+    let coarsening = timers.max_coarsening();
+    let thread = crate::sync::thread::current();
+    let local = Rc::new(super::owner::Local::new(&budget, 1, super::slot::Home::Thread(thread)).unwrap());
+    local.use_timers(timers, clock).unwrap();
+    let waiting = Rc::new(Cell::new(None));
+    let mut home = Record {
+        waiting: Rc::clone(&waiting),
+        parks: Vec::new(),
+    };
+    let mut enter = super::owner::Enter::new(&local);
+    let Ok(_lateness) = local.block_on(wake_for_timers(clock, resolution, waiting), &mut home);
+    enter.ended = true;
+    drop(enter);
+    assert!(home.parks.len() >= OFFSETS.len(), "{:?}", home.parks);
+    for (until, deadline) in home.parks {
+        let latest = deadline.checked_add(coarsening).unwrap();
+        assert!(
+            until.compare(latest).unwrap().is_le(),
+            "a park until {until:?} for a deadline of {deadline:?}"
+        );
+    }
+}
+
+/// On a thread home, a parked owner wakes for the timer of a task when no other work comes, and
+/// the timer never fires before its deadline. The operating system adds its wake delay, which the
+/// runtime does not bound, so the check of lateness is only for a missed wake.
+#[test]
+fn a_timer_never_fires_early_and_wakes_its_parked_owner() {
+    let resolution = core::time::Duration::from_millis(1);
+    let budget = budget();
+    let (clock, timers) = timed(&budget, 4, resolution);
+    let mut owner = LocalOwner::new(&budget, 1).unwrap();
+    owner.use_timers(timers, clock).unwrap();
+    for late in owner.block_on(wake_for_timers(clock, resolution, Rc::default())) {
+        assert!(late < core::time::Duration::from_secs(1), "{late:?}");
+    }
+}
+
+/// A drop of a timer cancels it: its place is free for the next timer, and its deadline wakes no
+/// task.
+#[test]
+fn a_cancelled_timer_frees_its_place_and_wakes_nothing() {
+    let resolution = core::time::Duration::from_millis(1);
+    let budget = budget();
+    let (clock, timers) = timed(&budget, 1, resolution);
+    let mut owner = LocalOwner::new(&budget, 1).unwrap();
+    owner.use_timers(timers, clock).unwrap();
+    let soon = move |millis| {
+        crate::time::Deadline::at(
+            clock
+                .now()
+                .checked_add(core::time::Duration::from_millis(millis))
+                .unwrap(),
+        )
+    };
+    owner.block_on(async move {
+        let polls = Rc::new(Cell::new(0));
+        let task = spawn_local({
+            let polls = Rc::clone(&polls);
+            poll_fn(move |cx| {
+                polls.set(polls.get() + 1);
+                if polls.get() == 1 {
+                    let mut timer = super::timer(soon(2)).unwrap();
+                    assert!(Pin::new(&mut timer).poll(cx).is_pending());
+                    drop(timer);
+                }
+                Poll::<()>::Pending
+            })
+        })
+        .unwrap();
+        yield_once().await;
+        // The storage has one place, and the cancel freed it.
+        super::timer(soon(6)).unwrap().await.unwrap();
+        assert_eq!(polls.get(), 1);
+        task.cancel_handle().cancel();
+        assert!(matches!(task.join().await, Outcome::Cancelled));
+    });
+}

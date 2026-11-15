@@ -51,6 +51,67 @@ A turn never blocks. Its work is a fixed number of steps for each timer that it 
 moves to a finer level of the storage. A tick with no timer costs nothing, so the cost of a turn
 depends on its timers, not on the time since the last turn.
 
+## Timers of a task
+
+A local owner (see [Tasks](tasks.md)) can drive a timer storage for its tasks, so you do not turn
+the storage yourself:
+
+1. Make the storage with `Timers::new` on the instants of a `NativeClock` (see
+   [Clocks](clocks.md)).
+2. Give the storage and its clock to the owner with `LocalOwner::use_timers(timers, clock)`. It
+   refuses with `TimeError::DomainMismatch` when the clock is not on the domain of the storage. A
+   storage that the owner had before closes, and each of its timers gives `Closed`.
+3. In a task or in the root future, call `rsasync::task::timer(deadline)`, and await the `Timer`.
+
+Each turn of the owner fires at most 64 due timers, and the owner waits at most until the next
+timer is due: a thread home parks with a timeout, and a home with an io_uring driver waits in its
+ring with a timeout (`io_uring_enter` with `IORING_ENTER_EXT_ARG`). No helper thread and no poll
+loop run the timers.
+
+- A timer never fires before its deadline.
+- The owner parks at most until the next turn of the storage that has work: the start of the tick
+  of the next timer, or an earlier turn. That instant is at most the deadline and
+  `Timers::max_coarsening()` after it: the resolution of the storage less 1 ns.
+- The operating system then wakes the owner thread, and its wake delay comes on top of the
+  coarsening. The runtime does not bound that delay: on a host with a heavy load, a timer can fire
+  later.
+- A drop of the timer cancels it. Its place is free for the next timer, and its deadline wakes no
+  task.
+
+`timer` refuses with `TimerRefused`: `NoOwner` when no `block_on` runs on the thread, `NoTimers`
+when the owner has no storage, and `Storage` with the `Refused` value of the storage.
+
+```rust
+use core::num::{NonZeroU32, NonZeroU64};
+use core::time::Duration;
+
+use rsasync::capacity::Budget;
+use rsasync::clock::NativeClock;
+use rsasync::task::{LocalOwner, timer};
+use rsasync::time::{Deadline, Suspend};
+use rsasync::timer::Timers;
+
+let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+let clock = NativeClock::new(Suspend::Pauses)?;
+let resolution = Duration::from_millis(1);
+let timers = Timers::new(NonZeroU32::new(64).unwrap(), resolution, clock.now(), &budget)?;
+let mut owner = LocalOwner::new(&budget, 8)?;
+owner.use_timers(timers, clock)?;
+
+let deadline = clock.now().checked_add(Duration::from_millis(3))?;
+let fired = owner.block_on(async { timer(Deadline::at(deadline)).expect("the owner has timers").await });
+assert_eq!(fired, Ok(()));
+// The timer fired at or after its deadline.
+assert!(deadline.compare(clock.now())?.is_le());
+```
+
+A report of a kernel timer defect ([glommio issue #97](https://github.com/glommio/glommio/issues/97))
+says that Linux 7.1 to 7.2.9 delays io_uring timeouts by milliseconds. It gives commit
+`15dd3a948855` as the cause and `28fa9af353be` as the fix. The hosts that ran the timer tests of
+this page have Linux 6.1 and Linux 7.0, outside that range, and no test of rsasync ran on a kernel
+in it. On such a kernel, the wait of a home with an io_uring driver can end milliseconds after the
+instant that the owner asked for. The capability report does not name that kernel.
+
 ## Fire many due timers
 
 The limit of a turn bounds its fires, also when many timers are due at one time. When more timers
@@ -133,7 +194,7 @@ and it allocates nothing after `Timers::new`.
 
 ## Check the timers
 
-The example on this page is a doctest of `rsasync::timer`. From the repository root,
+The examples on this page are doctests of `rsasync::timer` and `rsasync::task`. From the repository root,
 `cargo xtask test` runs it with the other tests. `cargo xtask explore -p rsasync` checks a fire
 that races a poll on another thread, and a drop on another thread that races the reuse of its
 place, in each thread order within the preemption bound (see

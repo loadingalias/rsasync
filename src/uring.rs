@@ -21,6 +21,8 @@ use core::ffi::{c_int, c_long, c_void};
 use core::mem::size_of;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "local")]
+use core::time::Duration;
 use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 
@@ -663,6 +665,23 @@ impl Ring {
         enter(self.fd(), self.unsubmitted(), wait, sys::IORING_ENTER_GETEVENTS)
     }
 
+    /// Submits as [`submit`](Self::submit) does, and waits for `wait` completions at most for
+    /// `timeout` (`IORING_ENTER_EXT_ARG`). The end of the time is no error.
+    #[cfg(feature = "local")]
+    pub(crate) fn submit_timeout(&mut self, wait: u32, timeout: Duration) -> io::Result<u32> {
+        self.word(self.sq_tail).store(self.sq_pushed, Ordering::Release);
+        #[cfg(test)]
+        let wait = if self.injected_ready() { 0 } else { wait };
+        let ts = sys::KernelTimespec {
+            tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(timeout.subsec_nanos()),
+        };
+        match enter_timeout(self.fd(), self.unsubmitted(), wait, &ts) {
+            Err(error) if error.raw_os_error() == Some(sys::ETIME) => Ok(0),
+            entered => entered,
+        }
+    }
+
     /// Whether the kernel holds deferred task work for the ring (`IORING_SQ_TASKRUN`). Only a
     /// [`submit`](Self::submit) runs it, also when no entry waits.
     pub(crate) fn task_run_pending(&self) -> bool {
@@ -1065,6 +1084,34 @@ fn enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> io::Result
             c_long::from(flags),
             ptr::null::<c_void>(),
             0_usize,
+        )
+    })
+}
+
+/// `io_uring_enter(fd, to_submit, min_complete, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG,
+/// &arg, sizeof(arg))`, with no signal mask and the relative timeout `ts`.
+#[cfg(feature = "local")]
+#[expect(
+    unsafe_code,
+    reason = "the kernel reads the published entries and the argument of the wait"
+)]
+fn enter_timeout(fd: RawFd, to_submit: u32, min_complete: u32, ts: &sys::KernelTimespec) -> io::Result<u32> {
+    let arg = sys::GeteventsArg {
+        ts: ptr::from_ref(ts).addr() as u64,
+        ..sys::GeteventsArg::default()
+    };
+    // SAFETY: `arg` and the timespec that it names are valid for reads during the call, and the
+    // call reads no other memory but the ring of `fd`. Each published entry obeys the contract of
+    // `Ring::push`.
+    result(unsafe {
+        sys::syscall(
+            sys::SYS_IO_URING_ENTER,
+            c_long::from(fd),
+            c_long::from(to_submit),
+            c_long::from(min_complete),
+            c_long::from(sys::IORING_ENTER_GETEVENTS | sys::IORING_ENTER_EXT_ARG),
+            ptr::from_ref(&arg),
+            size_of::<sys::GeteventsArg>(),
         )
     })
 }

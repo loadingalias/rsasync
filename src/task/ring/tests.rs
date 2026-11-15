@@ -211,3 +211,21 @@ fn a_busy_owner_completes_a_burst_and_a_close_while_its_task_runs() {
     // The receives completed while the task still ran.
     assert!(busy_rounds < ROUNDS, "{busy_rounds}");
 }
+
+/// On a home with a ring, a parked owner wakes from its wait in the ring for the timer of a task
+/// when no other work comes, and the timer never fires before its deadline. The check of lateness
+/// is only for a missed wake: the runtime does not bound the wake delay of the system.
+#[test]
+fn a_timer_never_fires_early_and_wakes_its_owner_from_its_ring() {
+    let resolution = core::time::Duration::from_millis(1);
+    let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let (clock, timers) = crate::task::tests::timed(&budget, 4, resolution);
+    let mut owner = owner(1);
+    owner.use_timers(timers, clock).unwrap();
+    let lateness = owner
+        .block_on(crate::task::tests::wake_for_timers(clock, resolution, Rc::default()))
+        .unwrap();
+    for late in lateness {
+        assert!(late < core::time::Duration::from_secs(1), "{late:?}");
+    }
+}

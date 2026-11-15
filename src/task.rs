@@ -63,6 +63,43 @@
 //! a guarantee of fairness: the owner cannot stop a poll, so code that uses no leaf runs until it
 //! gives `Pending` or ends.
 //!
+//! # Timers
+//!
+//! [`LocalOwner::use_timers`] gives the owner a [`Timers`] storage and the native clock of its
+//! domain. In a task or in the root future, [`timer()`] then makes a [`Timer`] in that storage. Each
+//! turn of the owner fires at most 64 due timers. A timer never fires before its deadline.
+//!
+//! The owner parks at most until the next turn of the storage that has work: the start of the tick
+//! of the next timer, or an earlier turn. That instant is at most the deadline of the timer and
+//! [`Timers::max_coarsening`] after it, which is the resolution of the storage less 1 ns. The
+//! wake of the thread by the operating system comes on top of that, and the runtime does not bound
+//! it: on a host with a heavy load, a timer can fire later.
+//!
+//! ```
+//! use core::num::{NonZeroU32, NonZeroU64};
+//! use core::time::Duration;
+//!
+//! use rsasync::capacity::Budget;
+//! use rsasync::clock::NativeClock;
+//! use rsasync::task::{LocalOwner, timer};
+//! use rsasync::time::{Deadline, Suspend};
+//! use rsasync::timer::Timers;
+//!
+//! let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+//! let clock = NativeClock::new(Suspend::Pauses)?;
+//! let resolution = Duration::from_millis(1);
+//! let timers = Timers::new(NonZeroU32::new(64).unwrap(), resolution, clock.now(), &budget)?;
+//! let mut owner = LocalOwner::new(&budget, 8)?;
+//! owner.use_timers(timers, clock)?;
+//!
+//! let deadline = clock.now().checked_add(Duration::from_millis(3))?;
+//! let fired = owner.block_on(async { timer(Deadline::at(deadline)).expect("the owner has timers").await });
+//! assert_eq!(fired, Ok(()));
+//! // The timer fired at or after its deadline.
+//! assert!(deadline.compare(clock.now())?.is_le());
+//! # Ok::<(), Box<dyn core::error::Error>>(())
+//! ```
+//!
 //! # Panics
 //!
 //! The owner contains each panic of the state of a task: a poll of its future, and the drop of its
@@ -94,7 +131,10 @@ use alloc::rc::Rc;
 
 use crate::capacity::{Budget, Exhausted};
 use crate::channel::{Closed, oneshot};
+use crate::clock::NativeClock;
 use crate::sync::thread_local;
+use crate::time::{Deadline, TimeError};
+use crate::timer::{self, Timer, Timers};
 
 mod owner;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -195,6 +235,19 @@ impl LocalOwner {
         self.local.poll_budget.set(budget.get());
     }
 
+    /// Gives the owner a timer storage, which `clock` drives: each turn of the owner fires its due
+    /// timers, and the owner parks at most until the next timer is due. [`timer()`] makes a timer of
+    /// a task in it. A storage before this one closes, and each of its timers gives
+    /// [`Closed`](crate::timer::Closed). See [Timers](self#timers).
+    ///
+    /// # Errors
+    ///
+    /// [`TimeError::DomainMismatch`] when `clock` is not on the domain of `timers`. The owner keeps
+    /// the storage that it had.
+    pub fn use_timers(&mut self, timers: Timers, clock: NativeClock) -> Result<(), TimeError> {
+        self.local.use_timers(timers, clock)
+    }
+
     /// Makes this thread the owner, and polls `root` and the tasks of the owner until `root` gives
     /// its output. Then it cancels each task that is still live, and it returns after they end.
     ///
@@ -251,6 +304,53 @@ where
 
 fn current() -> Option<Rc<Local>> {
     CURRENT.with(|current| current.borrow().clone())
+}
+
+/// Makes a timer that expires at `deadline` in the timer storage of the owner of this thread
+/// ([`LocalOwner::use_timers`]). The owner fires it in the first turn at or after its tick: never
+/// before `deadline`. A drop of the timer cancels it and frees its place, and the cancel wakes no
+/// task.
+///
+/// # Errors
+///
+/// [`TimerRefused`] gives the reason, and nothing changes.
+pub fn timer(deadline: Deadline) -> Result<Timer, TimerRefused> {
+    let local = current().ok_or(TimerRefused::NoOwner)?;
+    let mut timers = local.timers.borrow_mut();
+    let (timers, _) = timers.as_mut().ok_or(TimerRefused::NoTimers)?;
+    timers.insert(deadline).map_err(TimerRefused::Storage)
+}
+
+/// Why [`timer()`] made no timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimerRefused {
+    /// No `block_on` runs on this thread.
+    NoOwner,
+    /// The owner has no timer storage: give it one with [`LocalOwner::use_timers`].
+    NoTimers,
+    /// The storage refused the timer: it is full, the deadline is after its range, or the deadline
+    /// is on another clock domain.
+    Storage(timer::Refused),
+}
+
+impl fmt::Display for TimerRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoOwner => f.write_str("no owner runs on this thread"),
+            Self::NoTimers => f.write_str("the owner of this thread has no timer storage"),
+            Self::Storage(refused) => write!(f, "the timer storage refused the timer: {refused}"),
+        }
+    }
+}
+
+impl core::error::Error for TimerRefused {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Storage(refused) => Some(refused),
+            Self::NoOwner | Self::NoTimers => None,
+        }
+    }
 }
 
 /// Why a spawn is refused.

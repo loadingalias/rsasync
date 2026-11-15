@@ -17,6 +17,7 @@ use core::future::Future;
 use core::panic::AssertUnwindSafe;
 use core::pin::{Pin, pin};
 use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use std::panic::catch_unwind;
 
 use super::slot::{Home, RootRef, Shared, TaskRef};
@@ -24,15 +25,20 @@ use super::waiting::List;
 use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, Refused, SpawnRefused};
 use crate::capacity::{Budget, Permit};
 use crate::channel::oneshot;
+use crate::clock::NativeClock;
 use crate::coop;
 use crate::sync::{
     Arc,
     atomic::{AtomicU32, AtomicU64},
     thread,
 };
+use crate::time::{Instant, TimeError};
+use crate::timer::Timers;
 
 /// The largest number of task slots of one owner.
 const MAX_SLOTS: u32 = 1 << 16;
+/// The most timers that one turn of an owner fires. The others fire in the turns that follow.
+const TIMERS_PER_TURN: u32 = 64;
 
 /// Why a task ends with no output.
 enum End {
@@ -142,8 +148,23 @@ pub(super) trait Park {
     /// turn.
     fn drive(&mut self, local: &Local) -> Result<bool, Self::Error>;
 
-    /// Waits until a signal of the home comes.
-    fn park(&mut self, local: &Local) -> Result<(), Self::Error>;
+    /// Waits until a signal of the home comes, or until the instant of `until` at the latest.
+    fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Self::Error>;
+}
+
+/// The instant at which a park ends at the latest: the next turn of the timers that has work, on
+/// the clock of the timers.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Until {
+    pub(super) instant: Instant,
+    clock: NativeClock,
+}
+
+impl Until {
+    /// The time from now until the instant, or zero when it passed.
+    pub(super) fn remaining(self) -> Duration {
+        self.instant.duration_since(self.clock.now()).unwrap_or(Duration::ZERO)
+    }
 }
 
 /// A home with no ring: it has no other work, and it parks its thread.
@@ -156,8 +177,13 @@ impl Park for Thread {
         Ok(false)
     }
 
-    fn park(&mut self, _local: &Local) -> Result<(), Infallible> {
-        thread::park();
+    fn park(&mut self, _local: &Local, until: Option<Until>) -> Result<(), Infallible> {
+        match until {
+            // The verification form has no timed park, and its models make no timer.
+            #[cfg(not(all(test, loom)))]
+            Some(until) => thread::park_timeout(until.remaining()),
+            _ => thread::park(),
+        }
         Ok(())
     }
 }
@@ -188,6 +214,8 @@ pub(super) struct Local {
     closed: Cell<bool>,
     /// The poll budget of each poll of a task or of the root (`crate::coop`).
     pub(super) poll_budget: Cell<u32>,
+    /// The timer storage of the owner and the clock of its domain, from `use_timers`.
+    pub(super) timers: RefCell<Option<(Timers, NativeClock)>>,
     pub(super) waiting: List,
     _charge: Permit,
 }
@@ -240,6 +268,7 @@ impl Local {
             live: Cell::new(0),
             closed: Cell::new(false),
             poll_budget: Cell::new(super::DEFAULT_POLL_BUDGET.get()),
+            timers: RefCell::new(None),
             waiting: List::new(),
             _charge: charge,
         })
@@ -364,6 +393,42 @@ impl Local {
         ready > 0
     }
 
+    /// Gives the owner `timers`, driven on `clock`, in place of its storage before.
+    pub(super) fn use_timers(&self, timers: Timers, clock: NativeClock) -> Result<(), TimeError> {
+        if timers.domain() != clock.domain() {
+            return Err(TimeError::DomainMismatch);
+        }
+        let before = self.timers.replace(Some((timers, clock)));
+        // The drop of the storage before closes it: each of its timers gives `Closed`.
+        drop(before);
+        Ok(())
+    }
+
+    /// Fires the due timers, at most `TIMERS_PER_TURN`. Gives `true` if more timers are due.
+    fn fire_timers(&self) -> bool {
+        // The turn wakes the tasks of the timers. The storage is out of its cell meanwhile, so a
+        // waker that makes a timer gets a refusal, not a panic of the cell.
+        let Some((mut timers, clock)) = self.timers.take() else {
+            return false;
+        };
+        // No mismatch: `use_timers` checked that the clock is on the domain of the storage.
+        let more = timers.turn(clock.now(), TIMERS_PER_TURN).unwrap_or(false);
+        let replaced = self.timers.replace(Some((timers, clock)));
+        drop(replaced);
+        more
+    }
+
+    /// The next turn of the timers that has work, or `None` with no waiting timer. It is at most
+    /// the deadline of the next timer and the coarsening of the storage after it.
+    fn until(&self) -> Option<Until> {
+        let timers = self.timers.borrow();
+        let (timers, clock) = timers.as_ref()?;
+        Some(Until {
+            instant: timers.next_turn()?,
+            clock: *clock,
+        })
+    }
+
     /// Requests the cancel of each live task.
     fn cancel_all(&self) {
         for (slot, entry) in (0..).zip(self.entries.iter()) {
@@ -411,18 +476,20 @@ impl Local {
                 }
             }
             let ran = self.turn();
+            let due = self.fire_timers();
             let more = home.drive(self)?;
-            if !ran && !more && !self.shared.has_remote() && !self.shared.root_woken() {
-                home.park(self)?;
+            if !ran && !due && !more && !self.shared.has_remote() && !self.shared.root_woken() {
+                home.park(self, self.until())?;
             }
         };
         self.closed.set(true);
         self.cancel_all();
         while self.live.get() > 0 {
             let ran = self.turn();
+            let due = self.fire_timers();
             let more = home.drive(self)?;
-            if !ran && !more && !self.shared.has_remote() {
-                home.park(self)?;
+            if !ran && !due && !more && !self.shared.has_remote() {
+                home.park(self, self.until())?;
             }
         }
         self.closed.set(false);

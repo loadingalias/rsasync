@@ -251,6 +251,12 @@ impl Timers {
         fixed as u64 + u64::from(capacity.get()) * each as u64
     }
 
+    /// The clock domain of the storage: each deadline and each turn instant is on it.
+    #[must_use]
+    pub fn domain(&self) -> ClockDomain {
+        self.domain
+    }
+
     /// The number of timers that the storage holds when it is full.
     #[must_use]
     pub fn capacity(&self) -> NonZeroU32 {

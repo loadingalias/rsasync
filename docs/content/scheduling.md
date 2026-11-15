@@ -13,12 +13,16 @@ work, and then the next turn starts:
 2. It takes the tasks that other threads woke. The list holds at most one entry for each task slot.
 3. It polls each task that was ready when the turn started, once, in the order of their wakes. A
    task that a poll wakes again waits for the next turn.
-4. On a home with an io_uring driver, it turns the driver: one bounded `Driver::turn`. The turn
+4. If the owner has a timer storage (see [Timers](timers.md#timers-of-a-task)), it fires at most 64
+   due timers. When more are due, they fire in the turns that follow, and the owner does not wait.
+5. On a home with an io_uring driver, it turns the driver: one bounded `Driver::turn`. The turn
    enters the kernel when the kernel holds deferred work for the ring (the task-run flag), also
    when nothing is to submit and tasks are ready. Thus a receive whose data came completes while
    other tasks keep the owner busy.
-5. When no task is ready and the driver has no work, the owner waits: it parks its thread, or it
-   waits in its ring. A wake, a completion, or a request of another thread ends the wait.
+6. When no task is ready, no timer is due, and the driver has no work, the owner waits: it parks
+   its thread, or it waits in its ring. A wake, a completion, or a request of another thread ends
+   the wait. With a waiting timer, the wait ends at the latest at the start of the tick of that
+   timer, and the wake delay of the operating system comes on top of it.
 
 A turn does not wait for more work to fill a batch. A short burst of data, or a close of the peer,
 completes its operation in the turn that takes its completion.

@@ -35,6 +35,8 @@ pub(super) const SYS_IO_URING_REGISTER: c_long = 427;
 
 pub(super) const EPERM: i32 = 1;
 pub(super) const ENOSYS: i32 = 38;
+/// The time of a wait passed (`errno.h`).
+pub(super) const ETIME: i32 = 62;
 
 pub(super) const PROT_READ: c_int = 0x1;
 pub(super) const PROT_WRITE: c_int = 0x2;
@@ -56,6 +58,8 @@ pub(super) const IORING_FEAT_RECVSEND_BUNDLE: u32 = 1 << 14;
 pub(super) const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
 pub(super) const IORING_SQ_TASKRUN: u32 = 1 << 2;
 pub(super) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+/// The argument of the call is an `io_uring_getevents_arg`, Linux 5.11.
+pub(super) const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
 
 pub(super) const IORING_OFF_SQ_RING: i64 = 0;
 pub(super) const IORING_OFF_SQES: i64 = 0x1000_0000;
@@ -269,7 +273,31 @@ pub(super) struct BufReg {
     pub(super) resv: [u64; 3],
 }
 
+/// `struct __kernel_timespec`.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct KernelTimespec {
+    pub(super) tv_sec: i64,
+    pub(super) tv_nsec: i64,
+}
+
+/// `struct io_uring_getevents_arg`. Linux 6.12 renamed `pad` to `min_wait_usec`, which stays 0.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct GeteventsArg {
+    pub(super) sigmask: u64,
+    pub(super) sigmask_sz: u32,
+    pub(super) min_wait_usec: u32,
+    pub(super) ts: u64,
+}
+
 const _: () = {
+    assert!(size_of::<KernelTimespec>() == 16);
+    assert!(offset_of!(KernelTimespec, tv_nsec) == 8);
+    assert!(size_of::<GeteventsArg>() == 24);
+    assert!(offset_of!(GeteventsArg, sigmask_sz) == 8);
+    assert!(offset_of!(GeteventsArg, min_wait_usec) == 12);
+    assert!(offset_of!(GeteventsArg, ts) == 16);
     assert!(size_of::<SqOffsets>() == 40);
     assert!(offset_of!(SqOffsets, flags) == 16);
     assert!(offset_of!(SqOffsets, array) == 24);

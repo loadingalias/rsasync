@@ -18,11 +18,14 @@ use core::future::Future;
 use std::io;
 
 use super::Refused;
-use super::owner::{Enter, Local, Park};
+use super::owner::{Enter, Local, Park, Until};
 use super::slot::Home;
 use crate::capacity::Budget;
+use crate::clock::NativeClock;
 use crate::driver::{self, Driver};
 use crate::sync::Arc;
+use crate::time::TimeError;
+use crate::timer::Timers;
 
 /// A local owner whose home waits in the ring of its driver.
 #[cfg_attr(not(test), expect(dead_code, reason = "R304 places workers with it"))]
@@ -40,6 +43,11 @@ impl RingOwner {
             local: Rc::new(local),
             driver,
         })
+    }
+
+    /// Gives the owner a timer storage, which `clock` drives, as `LocalOwner::use_timers` does.
+    pub(crate) fn use_timers(&mut self, timers: Timers, clock: NativeClock) -> Result<(), TimeError> {
+        self.local.use_timers(timers, clock)
     }
 
     /// Makes this thread the owner, and polls `root`, the tasks of the owner, and the driver until
@@ -68,10 +76,13 @@ impl Park for Drive<'_> {
         Ok(self.0.turn()?.more())
     }
 
-    fn park(&mut self, local: &Local) -> io::Result<()> {
+    fn park(&mut self, local: &Local, until: Option<Until>) -> io::Result<()> {
         // The turn of `drive` can wake a task of another home after its own flush.
         flush(local, self.0);
-        self.0.wait()
+        match until {
+            Some(until) => self.0.wait_for(until.remaining()),
+            None => self.0.wait(),
+        }
     }
 }
 
