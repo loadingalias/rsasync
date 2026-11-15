@@ -1,18 +1,17 @@
 //! The nonblocking datagram calls on a socket that the caller owns.
 
 use core::ffi::{c_int, c_void};
-use core::fmt;
-use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use core::ptr;
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd};
 
-use super::control::{Control, Metadata, Transmit};
+use super::control::Control;
 use super::sys::{
     self, EINTR, EMSGSIZE, IP_PKTINFO, IP_RECVTOS, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, IPV6_RECVPKTINFO,
     IPV6_RECVTCLASS, IPV6_V6ONLY, IoVec, MSG_DONTWAIT, MSG_TRUNC, MsgHdr,
 };
-use super::{AF_INET, AF_INET6, SockAddrStorage};
+use crate::addr::{AF_INET, AF_INET6, SockAddrStorage};
+use crate::datagram::{Received, Refused, Transmit};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -23,69 +22,6 @@ pub use linux::{recv_batch, send_batch, set_gro};
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{recv_batch, send_batch};
-
-/// The most datagrams of one [`send_batch`] or [`recv_batch`].
-pub const BATCH: usize = 32;
-
-/// A send that the kernel refused. It is the payload of the `io::Error` of [`send`] and
-/// [`send_batch`]: get it with [`Refused::of`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refused {
-    /// The datagram is larger than the path MTU, and the don't-fragment option is on
-    /// (`EMSGSIZE`). Send smaller datagrams. macOS also gives it for a datagram that is larger
-    /// than the send buffer of the socket.
-    TooLarge,
-    /// The path cannot segment the batch. On Linux, the device cannot (`EIO` on a send with a
-    /// segment size), and macOS has no segmentation offload. No datagram of it was sent. Send its
-    /// segments as separate datagrams, for example with [`send_batch`], and send no segment size
-    /// on this path again.
-    NoSegmentation,
-}
-
-impl Refused {
-    /// The refusal that `error` carries, or `None` for each other error.
-    #[must_use]
-    pub fn of(error: &io::Error) -> Option<Self> {
-        error.get_ref()?.downcast_ref().copied()
-    }
-}
-
-impl fmt::Display for Refused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::TooLarge => "the datagram is larger than the path MTU, and it cannot be fragmented",
-            Self::NoSegmentation => "the path cannot segment the batch; send its segments as separate datagrams",
-        })
-    }
-}
-
-impl core::error::Error for Refused {}
-
-/// A received datagram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Received {
-    /// The number of bytes in the buffer.
-    pub len: usize,
-    /// The peer. A dual-stack IPv6 socket gives an IPv4 peer as its IPv4-mapped address.
-    pub source: SocketAddr,
-    /// The datagram did not fit in the buffer, and the kernel dropped its rest. With the
-    /// `macos-private-batch` feature, [`recv_batch`] of macOS cannot tell a datagram that fits its
-    /// buffer exactly from a longer one, and it reports both as truncated.
-    pub truncated: bool,
-    /// The segment size, the ECN codepoint, and the local address.
-    pub metadata: Metadata,
-}
-
-impl Default for Received {
-    fn default() -> Self {
-        Self {
-            len: 0,
-            source: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            truncated: false,
-            metadata: Metadata::default(),
-        }
-    }
-}
 
 /// Asks the kernel to deliver the ECN codepoint and the local address with each received
 /// datagram. A dual-stack IPv6 socket gets them for IPv4 datagrams too.
@@ -325,7 +261,7 @@ fn families(socket: BorrowedFd<'_>) -> io::Result<(bool, bool)> {
 
 /// Sets the `int` option `name` of `level`.
 #[expect(unsafe_code, reason = "the kernel reads an option from owned storage")]
-fn set(socket: BorrowedFd<'_>, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
+pub(crate) fn set(socket: BorrowedFd<'_>, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
     // SAFETY: the option lives during the call, and the kernel reads `size_of::<c_int>()` bytes.
     let result = unsafe {
         sys::setsockopt(
@@ -342,10 +278,7 @@ fn set(socket: BorrowedFd<'_>, level: c_int, name: c_int, value: c_int) -> io::R
     Ok(())
 }
 
-/// A length of at most [`BATCH`] or a small structure, as a `c_uint`.
+/// A length of at most [`BATCH`](crate::BATCH) or a small structure, as a `c_uint`.
 fn c_uint_len(len: usize) -> u32 {
     u32::try_from(len).unwrap_or(u32::MAX)
 }
-
-#[cfg(test)]
-mod tests;

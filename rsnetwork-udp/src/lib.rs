@@ -3,16 +3,18 @@
 //!
 //! The calls send and receive with no wait, on a socket of any runtime or of no runtime, for
 //! example a Tokio socket through `UdpSocket::try_io`. Each call is one system call, except a batch
-//! on macOS:
+//! on macOS and Windows:
 //!
-//! - `send` sends one datagram, or on Linux a batch of segments that the kernel or the device sends
-//!   as one datagram for each segment (GSO). macOS has no segmentation offload, so there a segment
-//!   size gives `Refused::NoSegmentation`.
+//! - `send` sends one datagram, or on Linux and Windows a batch of segments that the stack or the
+//!   device sends as one datagram for each segment (GSO, USO). macOS has no segmentation offload,
+//!   so there a segment size gives `Refused::NoSegmentation`.
 //! - `send_batch` sends several datagrams: in one call on Linux (`sendmmsg`), and with one call
-//!   for each datagram on macOS. `recv_batch` receives several in the same way (`recvmmsg` on
-//!   Linux).
-//! - `recv` receives one datagram, or on Linux with `set_gro` several coalesced ones with their
-//!   segment size (GRO).
+//!   for each datagram on macOS and Windows. `recv_batch` receives several in the same way
+//!   (`recvmmsg` on Linux).
+//! - `recv` receives one datagram, or several coalesced ones with their segment size: on Linux
+//!   after `set_gro` (GRO), and on Windows after `set_uro` (URO).
+//! - A `Probe` validates the segmentation offload of a path whose two ends the caller controls, and
+//!   names the fault of a path that must fall back to plain sends and receives.
 //! - A send can set the ECN codepoint and the source address, and a receive reports them, after
 //!   `configure`. A receive reports truncation. `set_dont_fragment` turns on the
 //!   don't-fragment option that path MTU discovery needs.
@@ -26,8 +28,9 @@
 //! backend also uses. They need only `core`. The calls need the `std` feature, which is on by
 //! default.
 //!
-//! Each item agrees with the Linux 6.1 headers on x86_64 and aarch64, and with the macOS 27.2 SDK
-//! on aarch64, as the `sys` module names them. Other targets get no item yet.
+//! Each item agrees with the Linux 6.1 headers on x86_64 and aarch64, with the macOS 27.2 SDK on
+//! aarch64, and with the Windows 11 SDK on x86_64, as the `sys` module names them. Other targets
+//! get no item yet.
 //!
 //! With Tokio, each call runs in `UdpSocket::try_io`, which clears the readiness of the socket
 //! when the call gives `WouldBlock`:
@@ -95,18 +98,71 @@ extern crate std;
 
 #[cfg(any(
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", target_arch = "aarch64")
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64")
 ))]
-mod unix;
-
+mod addr;
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+mod datagram;
+#[cfg(all(
+    feature = "std",
+    any(
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )
+))]
+mod probe;
 #[cfg(any(
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
     all(target_os = "macos", target_arch = "aarch64")
 ))]
-pub use unix::{
-    AF_INET, AF_INET6, Control, Ecn, Metadata, SaFamily, SockAddrIn, SockAddrIn6, SockAddrStorage, Transmit, sys,
-};
+mod unix;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod windows;
 
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+pub use addr::{AF_INET, AF_INET6, SaFamily, SockAddrIn, SockAddrIn6, SockAddrStorage};
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64")
+))]
+pub use datagram::{Ecn, Metadata, Transmit};
+#[cfg(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+pub use unix::{Control, sys};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use windows::{Control, sys};
+
+#[cfg(all(
+    feature = "std",
+    any(
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )
+))]
+pub use datagram::{BATCH, Received, Refused};
+#[cfg(all(
+    feature = "std",
+    any(
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )
+))]
+pub use probe::{Probe, Reason, Verdict};
 #[cfg(all(
     feature = "std",
     any(
@@ -114,7 +170,9 @@ pub use unix::{
         all(target_os = "macos", target_arch = "aarch64")
     )
 ))]
-pub use unix::io::{BATCH, Received, Refused, configure, recv, recv_batch, send, send_batch, set_dont_fragment};
+pub use unix::io::{configure, recv, recv_batch, send, send_batch, set_dont_fragment};
+#[cfg(all(feature = "std", target_os = "windows", target_arch = "x86_64"))]
+pub use windows::io::{configure, recv, recv_batch, send, send_batch, set_dont_fragment, set_uro};
 
 #[cfg(all(
     feature = "std",
@@ -122,3 +180,15 @@ pub use unix::io::{BATCH, Received, Refused, configure, recv, recv_batch, send, 
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use unix::io::set_gro;
+
+/// The shared suite of the datagram calls, through sockets that Tokio owns.
+#[cfg(test)]
+#[cfg(all(
+    feature = "std",
+    any(
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
+    )
+))]
+mod tests;

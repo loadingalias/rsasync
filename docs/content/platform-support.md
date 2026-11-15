@@ -1,7 +1,7 @@
 # Platform support
 
 rsasync is in development, and its alpha releases are on crates.io. This page gives the Linux C
-libraries that rsasync supports, the hosts of the io_uring driver, the macOS part of
+libraries that rsasync supports, the hosts of the io_uring driver, the macOS and Windows parts of
 `rsnetwork-udp`, the WebAssembly targets of its portable subset, and the evidence that its tests
 give today.
 
@@ -108,6 +108,20 @@ sockets, with each of these commands:
 cargo xtask test -p rsnetwork-udp
 cargo xtask test -p rsnetwork-udp --features macos-private-batch
 ```
+
+## Windows
+
+The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
+[Datagram I/O on any socket](datagram-io.md#windows). The runtime has no Windows backend yet. CI
+does not run on Windows. On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
+Windows Server 2025, OS build 10.0.26100.33822. The tests use Tokio sockets:
+
+- At revision `e499889`, `cargo xtask test` ran the 153 tests of the whole workspace and the
+  doctests. In the same run, an MSVC build of the Windows SDK 10.0.28000.0 headers showed that the
+  40 checked `ws2_32` declarations of `rsnetwork-udp` match them.
+- At revision `71a8d92`, `cargo xtask test -p rsnetwork-udp` ran the 13 tests of the crate.
+
+Windows on aarch64 has no run evidence yet.
 
 ## WebAssembly
 
