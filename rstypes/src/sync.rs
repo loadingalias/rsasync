@@ -1,6 +1,7 @@
 //! The memory-model substitution point. Each atomic, reference count, and shared cell of this
-//! crate comes from this module, so one algorithm runs in each form. The one exception is the
-//! `Arc` of a trait object, which the loom `Arc` cannot hold: the owner of `Lease::from_owner`.
+//! crate comes from this module, so one algorithm runs in each form. The exceptions are the two
+//! `Arc`s of a trait object, which the loom `Arc` cannot hold: the owner of `Lease::from_owner`,
+//! and the release listener of a `Budget`.
 //!
 //! - Native, with or without `std`: the `core` atomics, `alloc::sync::Arc`, and a
 //!   `core::cell::UnsafeCell`. On a target with one thread, such as `wasm32v1-none`, the atomic

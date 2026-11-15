@@ -9,14 +9,14 @@ shared cells. This page tells you how to write and run these exploration tests.
 
 Each of the two crates has a private `sync` module. Each atomic, `Arc` reference count,
 `UnsafeCell` shared cell, and thread park of the crate comes from that module. In rsasync, the
-spin hint also comes from it, so loom can run another thread at the hint. One algorithm thus
-runs in three forms:
+lock and the spin hint also come from it. Thus loom knows each lock, and it can run another thread
+at the hint. One algorithm thus runs in three forms:
 
 | Form | Selected by | Items |
 | --- | --- | --- |
-| Native | The default build | `core::sync::atomic`, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, in rsasync `core::hint`, and, in rsasync with the `std` feature, `std::thread` |
-| Without `std` | `--no-default-features` | The same items with no `thread`. Thus a wait in this build is asynchronous |
-| Verification | `--cfg loom`, in the unit tests only | `loom::sync::atomic`, `loom::sync::Arc`, `loom::cell::UnsafeCell`, in rsasync `loom::hint`, and, with the `std` feature, `loom::thread` |
+| Native | The default build | `core::sync::atomic`, `alloc::sync::Arc`, a `core::cell::UnsafeCell`, in rsasync `core::hint`, and, in rsasync with the `std` feature, `std::thread` and `std::sync::Mutex` |
+| Without `std` | `--no-default-features` | The same items with no `thread`, and in rsasync a spin lock in place of the `Mutex`, for targets on which nothing preempts a holder of the lock, such as single-threaded WebAssembly. Thus a wait in this build is asynchronous |
+| Verification | `--cfg loom`, in the unit tests only | `loom::sync::atomic`, `loom::sync::Arc`, `loom::cell::UnsafeCell`, in rsasync `loom::hint` and `loom::sync::Mutex`, and, with the `std` feature, `loom::thread` |
 
 The native form adds no run-time work. Get access to a cell only through `with` and `with_mut`.
 Each one gives a raw pointer while its closure runs, so loom knows when each access starts and
@@ -35,11 +35,15 @@ The search also finds each import with braces, such as `use core::{...}`, becaus
 can name `sync` on a later line. It also finds the test modules that are not in a `tests.rs`
 file, and the doc examples. Examine each line that it finds.
 
-The search finds six exceptions:
+The search finds seven exceptions:
 
 - The `alloc::sync::Arc` of a trait object in `rstypes/src/buffer.rs`, which holds the owner of
-  `Lease::from_owner`. The loom `Arc` cannot hold a trait object. That count only drops the owner,
-  and the exploration of `rstypes` sees no algorithm in it.
+  `Lease::from_owner`, and in `rstypes/src/capacity.rs`, which holds the release listener of a
+  `Budget`. The loom `Arc` cannot hold a trait object. Each count only drops its owner or its
+  listener, and the exploration of `rstypes` sees no algorithm in it.
+- The `alloc::sync::Arc` of the waiter places in `src/acquire.rs`. The budget holds it as its
+  release listener, so it is the `Arc` of a trait object. Its count only drops the places: the
+  order and the waiters, which loom explores, use the items of the module.
 - The `core::sync::atomic` imports in `src/uring.rs` and `src/uring/buffers.rs`. The kernel also
   reads and writes the head, tail, and flag words of an io_uring ring and the tail of a provided
   buffer ring, so they are hardware atomics in each form. The tests

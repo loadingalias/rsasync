@@ -7,9 +7,10 @@
 //! use rsasync::{buffer, capacity, time};
 //! ```
 //!
-//! The [`channel`] module holds the bounded channels, [`clock`] holds the native and the injected
-//! clocks, and [`timer`] holds bounded timers. None of them needs a scheduler or driver. With the
-//! `local` feature, which turns on `std`, the [`task`] module runs local tasks on a local owner.
+//! The [`channel`] module holds the bounded channels, [`acquire`] holds the waiting reservation of
+//! capacity, [`clock`] holds the native and the injected clocks, and [`timer`] holds bounded
+//! timers. None of them needs a scheduler or driver. With the `local` feature, which turns on
+//! `std`, the [`task`] module runs local tasks on a local owner.
 //!
 //! With the `std` feature, the `blocking` module holds the bounded blocking service, which runs
 //! blocking host work on a fixed number of threads.
@@ -23,6 +24,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod acquire;
 // The blocking service needs the threads of `std`.
 #[cfg(feature = "std")]
 pub mod blocking;

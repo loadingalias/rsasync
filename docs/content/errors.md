@@ -119,9 +119,13 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 
 ## Capacity
 
-The errors of `rsasync::capacity` (see [Capacity](capacity.md)).
+The errors of `rsasync::capacity` and `rsasync::acquire` (see [Capacity](capacity.md)).
 
 | Error | When | Recovery |
 | --- | --- | --- |
-| `Exhausted` | The budget has fewer free units than the request | Request again after a charge returns, or give a larger budget |
+| `Exhausted` | The budget has fewer free units than the request | Request again after a charge returns, use the waiting reservation, or give a larger budget |
 | `NotCharged` | A refund is larger than the units that the credit charged | Correct the refund: it is a defect of the caller |
+| `acquire::Refused::TooManyPlaces` | `acquire::budget` got more than `acquire::MAX_PLACES` waiter places | Give fewer places |
+| `acquire::Refused::Memory(Exhausted)` | The memory budget cannot charge the waiter places | Give a larger memory budget or fewer places |
+| `TooManyWaiters` | Each waiter place of the budget is in use | Clone after an acquirer drops |
+| `AboveBound` | A wait asks for more units than the bound of the budget | Ask for at most the bound: no release can make such a wait end |

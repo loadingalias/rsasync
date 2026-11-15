@@ -163,3 +163,50 @@ fn a_permit_that_moves_to_another_thread_releases_once_there() {
     .unwrap();
     assert_eq!(budget.available(), 100);
 }
+
+#[test]
+fn the_listener_runs_after_each_release_and_sees_the_units_free() {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use std::sync::Mutex;
+
+    use super::ReleaseListener;
+
+    /// Records the free units of the budget at each call.
+    #[derive(Default)]
+    struct Record {
+        budget: Mutex<Option<Budget>>,
+        seen: Mutex<Vec<u64>>,
+    }
+
+    impl ReleaseListener for Record {
+        fn released(&self) {
+            let free = self.budget.lock().unwrap().as_ref().map(Budget::available);
+            self.seen.lock().unwrap().extend(free);
+        }
+    }
+
+    let record = Arc::new(Record::default());
+    let budget = Budget::with_listener(NonZeroU64::new(100).unwrap(), record.clone());
+    // The record and the budget hold each other. The last line of the test ends the cycle.
+    *record.budget.lock().unwrap() = Some(budget.clone());
+    let seen = || record.seen.lock().unwrap().clone();
+
+    let mut permit = budget.reserve(60).unwrap();
+    let part = permit.split(10).unwrap();
+    // A refusal and a release of zero units return nothing, so they do not call the listener.
+    budget.reserve(41).unwrap_err();
+    budget.reserve(0).unwrap().release();
+    assert_eq!(seen(), []);
+
+    // Each release path calls it after the units are free.
+    part.release();
+    drop(permit);
+    let mut credit = budget.credit(5);
+    credit.charge(20).unwrap();
+    credit.refund(20).unwrap();
+    drop(credit);
+    assert_eq!(seen(), [50, 100, 95, 100]);
+
+    record.budget.lock().unwrap().take();
+}

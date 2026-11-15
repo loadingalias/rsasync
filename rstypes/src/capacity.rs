@@ -10,6 +10,9 @@
 //! Units are `u64` on every target, also on 32-bit targets, so a total never depends on the pointer
 //! width.
 //!
+//! A budget from [`Budget::with_listener`] calls a [`ReleaseListener`] after units return to it.
+//! The waiting reservation of rsasync uses it to wake a waiter with no spin and no timed retry.
+//!
 //! ```
 //! # extern crate rstypes as rsasync;
 //! use core::num::NonZeroU64;
@@ -66,6 +69,21 @@ struct Inner {
     bound: u64,
     /// The bound minus the units that permits and credits hold.
     available: AtomicU64,
+    /// The listener of the releases. Its count is a standard `Arc`, because the loom `Arc` cannot
+    /// hold a trait object. That count only drops the listener.
+    listener: Option<alloc::sync::Arc<dyn ReleaseListener>>,
+}
+
+/// Code that a budget calls after units return to it.
+///
+/// The budget calls [`released`](Self::released) on the thread that gives the units back: in the
+/// drop of a permit or a credit, or in a refund of a credit. It calls it after the units are free,
+/// so a reservation that the listener starts can take them. A refusal, a reservation, and a release
+/// of zero units do not call it.
+pub trait ReleaseListener: Send + Sync {
+    /// Units returned to the budget. Keep it short, and do not wait in it: it runs in the drop of
+    /// a permit.
+    fn released(&self);
 }
 
 /// A refusal: the source has fewer units than the request. A refusal changes nothing.
@@ -92,10 +110,21 @@ impl core::error::Error for Exhausted {}
 impl Budget {
     /// Makes a budget of `bound` units, all of them free.
     pub fn new(bound: NonZeroU64) -> Self {
+        Self::make(bound, None)
+    }
+
+    /// Makes a budget of `bound` units, all of them free, that calls `listener` after units return
+    /// to it.
+    pub fn with_listener(bound: NonZeroU64, listener: alloc::sync::Arc<dyn ReleaseListener>) -> Self {
+        Self::make(bound, Some(listener))
+    }
+
+    fn make(bound: NonZeroU64, listener: Option<alloc::sync::Arc<dyn ReleaseListener>>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 bound: bound.get(),
                 available: AtomicU64::new(bound.get()),
+                listener,
             }),
         }
     }
@@ -161,11 +190,15 @@ impl Budget {
         }
     }
 
-    /// Gives back `amount` units that a permit or a credit took.
+    /// Gives back `amount` units that a permit or a credit took, and then tells the listener.
     fn give(&self, amount: u64) {
         if amount > 0 {
-            // Ordering: see `take`.
+            // Ordering: see `take`. The listener comes after the change in program order, so a
+            // listener that publishes with `Release` orders the change before its publication.
             self.inner.available.fetch_add(amount, Ordering::Release);
+            if let Some(listener) = &self.inner.listener {
+                listener.released();
+            }
         }
     }
 }
@@ -175,6 +208,7 @@ impl fmt::Debug for Budget {
         f.debug_struct("Budget")
             .field("bound", &self.bound())
             .field("available", &self.available())
+            .field("listener", &self.inner.listener.is_some())
             .finish()
     }
 }
