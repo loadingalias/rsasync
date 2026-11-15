@@ -19,7 +19,9 @@
 //!   port does not read the status here, because it can still show `STATUS_PENDING`.
 //! - The call failed at once: the port reads the status. A warning, such as
 //!   `STATUS_BUFFER_OVERFLOW`, which Win32 reports as a failure, means that a packet comes: it is
-//!   the terminal event, or on a socket that skips, the return is. An error status (`NT_ERROR`), or
+//!   the terminal event. On a socket that skips, the port takes the return as terminal, as the
+//!   design states, but no run shows yet whether a packet still comes there. No TCP operation
+//!   gives a warning status. An error status (`NT_ERROR`), or
 //!   a status that is still `STATUS_PENDING` because the call did not reach the I/O manager, means
 //!   that no packet comes, and the return is the terminal event.
 //!
@@ -259,7 +261,8 @@ enum Terminal {
 /// - The call succeeded at once: a packet comes, unless the socket skips it. The status is not read
 ///   here, because it can still show `STATUS_PENDING` at the return.
 /// - The call failed at once: a warning status, such as `STATUS_BUFFER_OVERFLOW`, means that a
-///   packet comes, unless the socket skips it. An error status, or a status that is still
+///   packet comes. On a socket that skips, the port takes the return as terminal, as the design
+///   states; no run shows yet whether a packet still comes there. An error status, or a status that is still
 ///   `STATUS_PENDING` because the call did not reach the I/O manager, means that no packet comes.
 const fn terminal(returned: Returned, status: u32, skips: bool) -> Terminal {
     match returned {

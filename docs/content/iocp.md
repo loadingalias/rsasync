@@ -49,7 +49,7 @@ Before each call, the driver sets the NT status of the `OVERLAPPED` of the call 
 | --- | --- |
 | Pending (`WSA_IO_PENDING`) | The completion packet. After `CancelIoEx`, the `OVERLAPPED` and the buffer stay owned until that packet comes, whatever status it gives |
 | Success at once | The completion packet, or on a socket that skips packets, the return |
-| Failure at once, with a warning status such as `STATUS_BUFFER_OVERFLOW` | The completion packet, or on a socket that skips packets, the return. Win32 reports this warning as a failure (`WSAEMSGSIZE`), and its packet still comes |
+| Failure at once, with a warning status such as `STATUS_BUFFER_OVERFLOW` | The completion packet. Win32 reports this warning as a failure (`WSAEMSGSIZE`), and its packet still comes. On a socket that skips packets, the driver takes the return as terminal, but no run shows yet whether a packet still comes there. No TCP operation gives a warning status |
 | Failure at once, with an error status (`NT_ERROR`), or with the status still `STATUS_PENDING` because the call did not reach the I/O manager | The return. No packet comes |
 
 The driver never classifies a failed return as terminal by the Win32 result alone: a warning status

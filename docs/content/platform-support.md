@@ -112,8 +112,11 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 ## Windows
 
 The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
-[Datagram I/O on any socket](datagram-io.md#windows). The runtime has no Windows backend yet. CI
-does not run on Windows. On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
+[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP on Windows x86_64, on an
+[I/O completion port](iocp.md), in driver-only use. UDP, files, pipes, local streams, processes,
+and signals of the driver have no Windows form yet. CI does not run on Windows.
+
+On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
 Windows Server 2025, OS build 10.0.26100.33822. The tests use Tokio sockets. Revision `285cc44` has
 the same `rsnetwork-udp` files and the same datagram page as the two trees that ran:
 
@@ -122,6 +125,12 @@ the same `rsnetwork-udp` files and the same datagram page as the two trees that 
   the 40 checked `ws2_32` declarations of `rsnetwork-udp` match them.
 - Run `20261115T063750Z-50670`: `cargo xtask test -p rsnetwork-udp` ran the 13 tests of the
   crate.
+
+On the same instance type and OS build, run `20261115T092057Z-52931` of revision `ac235f2` ran
+`cargo xtask test`: 211 tests of the workspace and the doctests passed. They include the 23 TCP
+cases of the driver suites on the port, each one with skip-on-success and with no skip. In the same
+run, an MSVC build of the Windows SDK headers showed that the 53 checked values and layouts and the
+15 signatures of the IOCP declarations of the driver match them.
 
 Windows on aarch64 has no run evidence yet.
 
