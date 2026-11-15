@@ -47,8 +47,8 @@
 //!   first, the drop reads `VALUE`, so the receiver owns the value and drops it.
 //! - The send sets the flags with `Release`, and the receiver reads them with `Acquire`, so the
 //!   write of the slot happens before its read. The drop of the receiver also reads with
-//!   `Acquire`. The send reads with `Acquire` too, which orders the slot read of a send that takes
-//!   its value back after its own write.
+//!   `Acquire`. A send that takes its value back needs no `Acquire`: a drop of the receiver that
+//!   comes first reads no slot, and the send reads only its own write.
 //! - A send or a drop of the sender against a waiting receive: the sender first changes the word
 //!   and then wakes the waiter of the receiver. The wait handshake (`crate::wait`) registers the
 //!   waker before it rechecks the word, so the recheck sees the change, or the wake comes.
@@ -168,9 +168,9 @@ impl<T> Sender<T> {
         };
         // SAFETY: the slot is empty, and no receiver reads it before `VALUE`.
         unsafe { shared.write(value) };
-        // Ordering: `Release` orders the write of the slot before the read of the receiver.
-        // `Acquire` orders the read below after a drop of the receiver (module docs).
-        if shared.state.fetch_or(VALUE | SENDER_GONE, Ordering::AcqRel) & RECEIVER_GONE != 0 {
+        // Ordering: `Release` orders the write of the slot before the read of the receiver. The
+        // read below needs no `Acquire`: a drop of the receiver that comes first reads no slot.
+        if shared.state.fetch_or(VALUE | SENDER_GONE, Ordering::Release) & RECEIVER_GONE != 0 {
             // SAFETY: the receiver was gone before `VALUE`, so it never reads the slot.
             return Err(SendError(unsafe { shared.take() }));
         }
@@ -182,9 +182,9 @@ impl<T> Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.take() {
-            // Ordering: `Release`: the change publishes no data, and the wake handshake orders it
+            // Ordering: `Relaxed`: the change publishes no data, and the wake handshake orders it
             // before the recheck of a waiting receiver.
-            shared.state.fetch_or(SENDER_GONE, Ordering::Release);
+            shared.state.fetch_or(SENDER_GONE, Ordering::Relaxed);
             shared.waiter.wake();
         }
     }

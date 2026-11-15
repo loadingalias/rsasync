@@ -105,6 +105,7 @@ impl ReturnList {
     /// Adds slot `index`, on any thread, with no lock and no allocation.
     fn push(&self, slots: &[Slot], index: u32) {
         let entry = &slots[index as usize].next;
+        // Ordering: `Relaxed`: the exchange below checks the value.
         let mut head = self.head.load(Ordering::Relaxed);
         loop {
             entry.store(head, Ordering::Relaxed);

@@ -111,24 +111,38 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 
 ## WebAssembly
 
-The portable subset is the part of rsasync that runs on WebAssembly. Today it is the `rstypes`
-crate, which holds the shared buffer and time types. The subset builds without `std`, and it uses
-only `core` and `alloc`.
+The portable subset is the part of rsasync that runs on WebAssembly. It builds without `std`, and
+it uses only `core` and `alloc`. It needs no scheduler and no driver. It has these items:
+
+| Item | Path | Not in the subset |
+| --- | --- | --- |
+| The shared buffer, capacity, and time types | `rsasync::buffer`, `rsasync::capacity`, `rsasync::time` (the `rstypes` crate) | Nothing |
+| The channels (see [Channels](channels.md)) | `rsasync::channel::spsc`, `mpsc`, `mpmc`, `oneshot` | The blocking forms, `send_blocking` and `recv_blocking`, which need `std` |
+| The waiting reservations (see [Wait for free units](capacity.md#wait-for-free-units)) | `rsasync::acquire` | Nothing |
+| The timer storage (see [Timers](timers.md)) | `rsasync::timer` | Nothing |
+| The injected clock (see [Inject the time in a test](clocks.md#inject-the-time-in-a-test)) | `rsasync::clock::InjectedClock` | `NativeClock` and `PhysicalClock`, which need `std` |
+
+The channels and the waiting reservations are not in a published release yet.
 
 | Target | What runs | Evidence today |
 | --- | --- | --- |
-| `wasm32-unknown-unknown` | The build of `rstypes` without `std` | The build compiles. No test runs on this target |
-| `wasm32-wasip1` | The tests of `rstypes`, with `rstypes` built without `std`, in Wasmtime | The tests pass in Wasmtime 50.0.1 on an aarch64 macOS host |
+| `wasm32-unknown-unknown` | The library builds of `rstypes` and `rsasync` without `std` | The builds compile. No test runs on this target |
+| `wasm32-wasip1` | The unit tests of `rstypes` and `rsasync`, with both crates built without `std`, in Wasmtime | The tests pass in Wasmtime 50.0.1 on an aarch64 macOS host |
 
-Both targets are 32-bit and have one thread. The tests on `wasm32-wasip1` use the same `rstypes`
-code and features as the `wasm32-unknown-unknown` build. The pinned toolchain in
-`rust-toolchain.toml` includes the two targets.
+Both targets are 32-bit and have one thread. The tests on `wasm32-wasip1` use the same code and
+features as the `wasm32-unknown-unknown` build. The pinned toolchain in `rust-toolchain.toml`
+includes the two targets.
 
 ### Limits
 
 - On `wasm32-unknown-unknown`, `std` compiles, but its clocks, threads, and blocking waits fail
   when they run. The subset does not use `std`, so it cannot call them.
-- A test that needs a second thread does not run on these targets.
+- A test that needs a second thread does not run on these targets. The native tests and the
+  exploration tests (see [Explore concurrent code](concurrency-exploration.md)) check the
+  concurrent behavior of the subset.
+- Without `std`, the lock of rsasync is a spin lock. When something preempts a holder of the lock,
+  the other users spin until the holder runs again. On a target with one thread, the lock never
+  spins.
 - The doctests do not run on WebAssembly.
 - A test that panics stops its process. Nextest runs each test in a separate process, so it
   reports that test as failed, with the panic message.
@@ -140,10 +154,11 @@ You need Wasmtime on your `PATH`; `.cargo/config.toml` makes it the test runner 
 `wasm32-wasip1`. Run these commands from the repository root:
 
 ```sh
-cargo build --locked -p rstypes --target wasm32-unknown-unknown --no-default-features
-cargo xtask test -p rstypes --target wasm32-wasip1 --no-default-features
+cargo build --locked -p rstypes -p rsasync --lib --target wasm32-unknown-unknown --no-default-features
+cargo xtask test -p rstypes -p rsasync --target wasm32-wasip1 --no-default-features
 ```
 
-`--no-default-features` builds `rstypes` without its `std` feature. The test harness uses the
-`std` of `wasm32-wasip1`, but the crate under test does not. The test command passes when Nextest
-reports that each test passed, for example `8 tests run: 8 passed, 0 skipped`.
+`--no-default-features` builds both crates without their `std` feature, and rsasync also without
+its `local` feature, the scheduler. The test harness uses the `std` of `wasm32-wasip1`, but the
+crates under test do not. The test command passes when Nextest reports that each test passed, for
+example `97 tests run: 97 passed, 0 skipped`.

@@ -3,6 +3,8 @@ use core::task::{Poll, Waker};
 
 use super::channel;
 use crate::channel::tests::{BOUND, Counted, budget, counted, poll};
+#[cfg(feature = "std")]
+use crate::channel::tests::{in_producer_order, tag};
 use crate::channel::{Aborted, Closed, Refused, ReserveError, SendError, TooManySenders, TryRecvError, TrySendError};
 use crate::wait::tests::counter;
 
@@ -247,22 +249,6 @@ fn a_pending_receive_is_woken_by_a_send_and_by_the_last_sender_drop() {
     drop(second);
     assert_eq!(count.get(), 2);
     assert_eq!(poll(&mut recv, &waker), Poll::Ready(Err(Closed)));
-}
-
-/// Gives the producer and the number of each value that a test sends.
-#[cfg(feature = "std")]
-fn tag(producer: u32, number: u32) -> u32 {
-    (producer << 16) | number
-}
-
-/// Checks that the values of each producer are in the order of their numbers.
-#[cfg(feature = "std")]
-fn in_producer_order(values: &[u32]) -> bool {
-    let mut last = std::collections::HashMap::new();
-    values.iter().all(|value| {
-        let (producer, number) = (value >> 16, value & 0xffff);
-        last.insert(producer, number).is_none_or(|previous| previous < number)
-    })
 }
 
 #[cfg(feature = "std")]

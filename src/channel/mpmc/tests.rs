@@ -3,6 +3,8 @@ use core::task::{Poll, Waker};
 
 use super::channel;
 use crate::channel::tests::{BOUND, Counted, budget, counted, poll};
+#[cfg(feature = "std")]
+use crate::channel::tests::{in_producer_order, tag};
 use crate::channel::{Aborted, Closed, Refused, ReserveError, SendError, TooManyReceivers, TryRecvError, TrySendError};
 use crate::wait::tests::counter;
 
@@ -247,6 +249,70 @@ fn an_abort_drops_the_values_and_a_later_publication_fails_and_drops_its_values_
     assert_eq!(drops.load(Ordering::Relaxed), 3);
     drop(sender);
     assert_eq!(drops.load(Ordering::Relaxed), 3);
+}
+
+/// A claim takes each slot of a reservation only when the slot is free for its lap. A claim that
+/// checks only the first slot takes a slot that still holds a value, and holds more than the bound.
+#[cfg(feature = "std")]
+#[test]
+fn producers_that_clone_reserve_and_drop_never_hold_more_than_the_bound() {
+    use alloc::vec::Vec;
+    use core::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+
+    // Not a power of two: a bound that a ring rounds up shows here.
+    const CAPACITY: u32 = 6;
+    let budget = budget();
+    for _ in 0..50 {
+        let (sender, mut receiver) = channel(&budget, CAPACITY, 16, 1).unwrap();
+        // The claimed slots: each value, and each slot of a reservation, published or not. No
+        // receive runs while the producers work, so no slot becomes free again.
+        let held = Arc::new(AtomicU32::new(0));
+        let sent = Arc::new(AtomicU32::new(0));
+        let producers = Arc::new(AtomicU32::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let mut sender = sender.try_clone().unwrap();
+                let counts = [&held, &sent, &producers].map(Arc::clone);
+                std::thread::spawn(move || {
+                    let [held, sent, producers] = counts;
+                    for step in 0..8 {
+                        let mut clone = sender.try_clone().unwrap();
+                        let id = producers.fetch_add(1, Ordering::Relaxed);
+                        let mut number = 0;
+                        if clone.try_send(tag(id, number)).is_ok() {
+                            held.fetch_add(1, Ordering::Relaxed);
+                            sent.fetch_add(1, Ordering::Relaxed);
+                            number += 1;
+                        }
+                        if let Ok(mut reservation) = clone.try_reserve(2) {
+                            held.fetch_add(2, Ordering::Relaxed);
+                            reservation.push(tag(id, number)).unwrap();
+                            if step % 2 == 0 {
+                                reservation.publish().unwrap();
+                                sent.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    let id = producers.fetch_add(1, Ordering::Relaxed);
+                    if sender.try_send(tag(id, 0)).is_ok() {
+                        held.fetch_add(1, Ordering::Relaxed);
+                        sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        drop(sender);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let held = held.load(Ordering::Relaxed);
+        assert!(held <= CAPACITY, "the senders hold {held} slots of {CAPACITY}");
+        let values: Vec<u32> = core::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert_eq!(values.len(), sent.load(Ordering::Relaxed) as usize);
+        assert!(in_producer_order(&values));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+    }
 }
 
 #[cfg(feature = "std")]

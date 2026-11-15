@@ -73,7 +73,7 @@
 //! - A release gives its units back with a `Release` change of the counter of the budget, and then
 //!   calls [`ReleaseListener::released`]. That changes `head` with a `Release` read-modify-write,
 //!   which reads the latest first place, and wakes the waiter of that place.
-//! - A first place that `head` gets after that change: the change that writes it is `AcqRel`, so it
+//! - A first place that `head` gets after that change: the change that writes it is `Acquire`, so it
 //!   reads the release. Thus the release happens before the wake of the new first place, and
 //!   before its recheck.
 //! - A first place that the release reads: the wake goes through the handshake of its waiter
@@ -303,9 +303,9 @@ impl Queue {
             return NONE;
         }
         // Ordering: `Acquire` reads each release before it, so a release happens before the wake
-        // of the new first place and its recheck. `Release` orders the change of the order before a
-        // later read of `head`.
-        self.head.swap(order.first, Ordering::AcqRel);
+        // of the new first place and its recheck. No reader of `head` acquires, so the change needs
+        // no `Release`: the lock orders the changes, and a new first place gets its wake.
+        self.head.swap(order.first, Ordering::Acquire);
         order.first
     }
 

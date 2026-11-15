@@ -148,6 +148,7 @@ impl End {
 /// Changes `word` to `change` of its value, with `order` on success, unless `change` gives `None`.
 /// Gives the value before the change. A refusal reads no data, so it has no order.
 fn update(word: &AtomicU32, order: Ordering, change: impl Fn(u32) -> Option<u32>) -> Option<u32> {
+    // Ordering: `Relaxed`: the exchange below checks the value.
     let mut current = word.load(Ordering::Relaxed);
     loop {
         let next = change(current)?;

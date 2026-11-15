@@ -463,6 +463,7 @@ impl Drop for Timer {
         // A wake that the home gives at this time takes the waker itself.
         entry.waiter.cancel();
         let released = &self.shared.released;
+        // Ordering: `Relaxed`: the exchange below checks the value.
         let mut head = released.load(Ordering::Relaxed);
         loop {
             entry.next.store(head, Ordering::Relaxed);

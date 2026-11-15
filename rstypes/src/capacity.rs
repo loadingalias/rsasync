@@ -136,6 +136,7 @@ impl Budget {
 
     /// The number of free units now. Other owners can change it at any time.
     pub fn available(&self) -> u64 {
+        // Ordering: `Relaxed`: a snapshot, which orders no data.
         self.inner.available.load(Ordering::Relaxed)
     }
 

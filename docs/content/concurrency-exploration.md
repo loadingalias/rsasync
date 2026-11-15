@@ -104,7 +104,7 @@ mod explore {
 ## Run the tests
 
 ```sh
-cargo xtask explore                  # each exploration test in the workspace
+cargo xtask explore                  # each exploration test of rstypes and rsasync
 cargo xtask explore -p rsasync       # the tests of one crate
 cargo xtask explore close            # the tests whose names contain `close`
 cargo xtask explore --no-run         # build the verification form, and run nothing
@@ -115,6 +115,14 @@ The command builds the unit tests with `--cfg loom` and debug assertions, in rel
 tests in modules named `explore`. The other unit tests do not run, because a loom item works only
 inside a model. If no test agrees with the selection, the command fails, because an empty
 selection is not a pass.
+
+With no `-p` or `--package` argument, the command selects only `rstypes` and `rsasync`, the two
+crates with a `sync` module. `--cfg loom` applies to each crate of the build, and another crate can
+give it a different meaning. For example, tokio, a dev-dependency of `rsnetwork-udp`, does not
+compile with it.
+
+The command removes `LOOM_MAX_DURATION`, `LOOM_MAX_PERMUTATIONS`, and `LOOM_CHECKPOINT_FILE` from
+the environment. Each one makes a test pass after a partial search.
 
 The command gives each other argument to Nextest. A test name makes the selection smaller. Do not
 add a `-E` filterset: Nextest adds its tests to the selection, which can then include a test that

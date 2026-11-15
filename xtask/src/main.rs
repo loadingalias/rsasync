@@ -38,7 +38,8 @@ Commands
   model [model[/file]]...
                        Check the TLA+ models in models/; with no argument, every profile
 
-fix, check, test, and explore select the whole workspace unless their
+fix, check, and test select the whole workspace, and explore selects the
+packages that have exploration tests (rstypes and rsasync), unless their
 arguments select packages with -p or --package. With the whole workspace, fix
 and check also lint each crate that builds without `std` with no default
 feature: its library on wasm32v1-none, a target with no `std`, and all of its
@@ -69,6 +70,15 @@ const NO_STD_TARGET: &str = "wasm32v1-none";
 
 /// The packages whose library builds without `std`.
 const NO_STD_PACKAGES: &[&str] = &["rstypes", "rsasync", "rsnetwork-udp"];
+
+/// The packages that have exploration tests: each has a `sync` module with a
+/// loom form. `--cfg loom` applies to each crate of the build, and another
+/// crate can give it a different meaning. For example, tokio, a
+/// dev-dependency of rsnetwork-udp, does not compile with it.
+const LOOM_PACKAGES: &[&str] = &["--package", "rstypes", "--package", "rsasync"];
+
+/// The selection of the whole workspace.
+const WORKSPACE: &[&str] = &["--workspace"];
 
 /// The keywords of a TLC configuration file.
 const TLC_KEYWORDS: &[&str] = &[
@@ -188,7 +198,7 @@ impl Repo {
     /// `clippy --fix` reports each lint that it cannot fix as a warning and
     /// still succeeds. Thus a last pass that changes nothing fails on them.
     fn fix(&self, args: &[String]) -> Result<(), Failure> {
-        let scope = scope(args);
+        let scope = scope(args, WORKSPACE);
         step(
             "clippy --fix",
             self.cargo(&[
@@ -270,7 +280,7 @@ impl Repo {
 
     /// Checks formatting, lints, and rustdoc. It changes no file.
     fn check(&self, args: &[String]) -> Result<(), Failure> {
-        let scope = scope(args);
+        let scope = scope(args, WORKSPACE);
         step("fmt --check", &mut self.cargo(&["fmt", "--all", "--check"]))?;
         step(
             "clippy",
@@ -289,7 +299,10 @@ impl Repo {
     /// arguments select packages. With no arguments, it then runs the
     /// doctests, which Nextest does not run.
     fn test(&self, args: &[String]) -> Result<(), Failure> {
-        step("nextest", self.cargo(&["nextest", "run", "--locked"]).args(scope(args)))?;
+        step(
+            "nextest",
+            self.cargo(&["nextest", "run", "--locked"]).args(scope(args, WORKSPACE)),
+        )?;
         if !args.is_empty() {
             return Ok(());
         }
@@ -299,11 +312,15 @@ impl Repo {
         )
     }
 
-    /// Runs the exploration tests. `--cfg loom` gives each `sync` module its
-    /// loom form, which works only inside a loom model, so the other unit
-    /// tests do not run. The release build with debug assertions makes each
+    /// Runs the exploration tests, in `LOOM_PACKAGES` unless the arguments
+    /// select packages. `--cfg loom` gives each `sync` module its loom form,
+    /// which works only inside a loom model, so the other unit tests do not
+    /// run. The release build with debug assertions makes each
     /// model fast and keeps its assertions. Its own target directory keeps the
-    /// builds of the other commands valid.
+    /// builds of the other commands valid. Loom ends a search early at
+    /// `LOOM_MAX_DURATION` or `LOOM_MAX_PERMUTATIONS`, and starts it from
+    /// `LOOM_CHECKPOINT_FILE`. The test then passes after a partial search, so the
+    /// command removes the three variables.
     fn explore(&self, args: &[String]) -> Result<(), Failure> {
         step(
             "nextest with loom",
@@ -318,8 +335,11 @@ impl Repo {
                 "--filterset",
                 "test(/(^|::)explore::/)",
             ])
-            .args(scope(args))
-            .env("RUSTFLAGS", "--cfg loom -C debug-assertions"),
+            .args(scope(args, LOOM_PACKAGES))
+            .env("RUSTFLAGS", "--cfg loom -C debug-assertions")
+            .env_remove("LOOM_MAX_DURATION")
+            .env_remove("LOOM_MAX_PERMUTATIONS")
+            .env_remove("LOOM_CHECKPOINT_FILE"),
         )
     }
 
@@ -934,19 +954,16 @@ fn scrubbed(name: &OsStr) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// The Cargo or Nextest arguments of the caller, after `--workspace` unless
-/// they select packages. With no selection, Cargo takes only the root package.
-/// With `--workspace`, Cargo ignores `-p`, and a second `--workspace` is an
-/// error.
-fn scope(args: &[String]) -> Vec<&str> {
+/// The Cargo or Nextest arguments of the caller, after the selection `default`
+/// unless they select packages. With no selection, Cargo takes only the root
+/// package. With `--workspace`, Cargo ignores `-p`, and a second `--workspace`
+/// is an error.
+fn scope<'a>(args: &'a [String], default: &[&'a str]) -> Vec<&'a str> {
     let selects = args
         .iter()
         .any(|arg| arg == "--workspace" || arg.starts_with("--package") || arg.starts_with("-p"));
-    (!selects)
-        .then_some("--workspace")
-        .into_iter()
-        .chain(args.iter().map(String::as_str))
-        .collect()
+    let default = if selects { &[][..] } else { default };
+    default.iter().copied().chain(args.iter().map(String::as_str)).collect()
 }
 
 /// Runs `command` as the step `name`. A failure keeps the exit code of the command.
@@ -995,7 +1012,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{Report, profiles, scope};
+    use super::{Report, WORKSPACE, profiles, scope};
 
     fn report(apalache: bool, lines: &[&str]) -> Report {
         let mut report = Report::default();
@@ -1122,7 +1139,8 @@ mod tests {
     /// without `std` does not run. Each package flag keeps its own selection.
     #[test]
     fn only_package_flags_narrow_the_scope() {
-        let joined = |args: &[&str]| scope(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()).join(" ");
+        let joined =
+            |args: &[&str]| scope(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), WORKSPACE).join(" ");
         for args in [
             &[][..],
             &["--all-features"],

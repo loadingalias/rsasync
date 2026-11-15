@@ -176,6 +176,7 @@ impl Places {
     /// Takes a free place for a new endpoint.
     pub(super) fn take(&self) -> Option<u32> {
         for (index, word) in self.used.iter().enumerate() {
+            // Ordering: `Relaxed`: the exchange below checks the value.
             let mut bits = word.load(Ordering::Relaxed);
             while bits != u32::MAX {
                 let bit = !bits & bits.wrapping_add(1);
@@ -252,6 +253,7 @@ impl Places {
         for step in 0..=words {
             let index = (first + step) % words;
             let word = &self.waiting[index];
+            // Ordering: `Relaxed`: the `Acquire` change below checks each bit.
             let mut bits = word.load(Ordering::Relaxed);
             if step == 0 {
                 bits &= u32::MAX << from_bit;
