@@ -108,6 +108,14 @@ The destructor of a task can use the owner again: it can spawn, wake, and cancel
 `block_on`, and after a panic of the root, a spawn gives `Reason::Closed` and its future back.
 [Errors](errors.md) gives each error of a task and its recovery.
 
+## Turns and the poll budget
+
+The owner polls its tasks in bounded turns, and each poll of a task has a budget of runtime leaves:
+the futures of rsasync that wait for the runtime, such as a channel receive. A task that loops on
+leaves that are always ready yields its thread at the budget, so the other tasks run.
+[Scheduling](scheduling.md) gives the turn, the budget and its measured default, and what the owner
+cannot stop.
+
 ## Wakes
 
 The waker of a task works from each thread. A wake on another thread schedules the task on its

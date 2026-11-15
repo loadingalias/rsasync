@@ -1,13 +1,19 @@
+use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use core::future::{Future, poll_fn};
 use core::num::NonZeroU64;
 use core::task::{Poll, Waker};
 use core::time::Duration;
+use std::io::{self, Write as _};
+use std::os::fd::OwnedFd;
 use std::sync::mpsc;
 use std::thread;
 
 use super::RingOwner;
 use crate::blocking::{self, Service};
+use crate::buffer::{Backing, Buffer as _};
 use crate::capacity::Budget;
 use crate::driver::{Config, Driver};
 use crate::table::tests::allocations;
@@ -150,4 +156,58 @@ fn a_wake_from_a_blocking_service_thread_reaches_its_home() {
         .unwrap();
     assert!(matches!(outcome, Outcome::Completed(Ok(5))));
     service.teardown();
+}
+
+/// A task that is always ready keeps the owner from its wait in the ring, which runs the deferred
+/// work of the kernel. A turn that sees the task-run flag enters the kernel to run that work, so
+/// the receives complete while the task still runs. A short burst completes its receive with no
+/// wait for a full buffer, and a close of the peer completes its receive at the end of the stream.
+#[test]
+fn a_busy_owner_completes_a_burst_and_a_close_while_its_task_runs() {
+    /// The rounds of the busy task, far more than the receives need.
+    const ROUNDS: u32 = 1_000_000;
+    let mut owner = owner(2);
+    let receive = |owner: &mut RingOwner| {
+        let (read, write) = io::pipe().expect("the test host makes a pipe");
+        let reader = owner
+            .driver
+            .adopt_reader(OwnedFd::from(read))
+            .expect("the test driver has room");
+        // The future borrows its reader for the rest of the test.
+        let reader = Box::leak(Box::new(reader));
+        let future = owner
+            .driver
+            .recv(reader, Backing::from(Vec::with_capacity(64)))
+            .expect("the test driver has room");
+        (future, write)
+    };
+    let (burst, mut burst_writer) = receive(&mut owner);
+    let (close, close_writer) = receive(&mut owner);
+    let (received, busy_rounds) = owner
+        .block_on(async move {
+            let (done, rounds) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(0)));
+            let busy = spawn_local({
+                let (done, rounds) = (Rc::clone(&done), Rc::clone(&rounds));
+                async move {
+                    while !done.get() && rounds.get() < ROUNDS {
+                        rounds.set(rounds.get() + 1);
+                        yield_once().await;
+                    }
+                }
+            })
+            .unwrap();
+            // The turns of the yield submit the two receives, which then wait for data.
+            yield_once().await;
+            burst_writer.write_all(b"abc").unwrap();
+            drop(close_writer);
+            let (burst, close) = (burst.await.unwrap(), close.await.unwrap());
+            let at = rounds.get();
+            done.set(true);
+            assert!(matches!(busy.join().await, Outcome::Completed(())));
+            ((burst.0.unwrap(), burst.1.bytes().to_vec(), close.0.unwrap()), at)
+        })
+        .unwrap();
+    assert_eq!(received, (3, b"abc".to_vec(), 0));
+    // The receives completed while the task still ran.
+    assert!(busy_rounds < ROUNDS, "{busy_rounds}");
 }

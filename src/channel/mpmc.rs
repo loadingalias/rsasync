@@ -588,19 +588,21 @@ impl<T> Future for SendFuture<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let Some(value) = this.value.take() else {
-            return Poll::Pending;
-        };
-        match this
-            .sender
-            .send_step(value, &mut this.waits, |waiter| waiter.register(cx.waker()))
-        {
-            Ok(result) => Poll::Ready(result),
-            Err(value) => {
-                this.value = Some(value);
-                Poll::Pending
+        crate::coop::poll(cx, |cx| {
+            let Some(value) = this.value.take() else {
+                return Poll::Pending;
+            };
+            match this
+                .sender
+                .send_step(value, &mut this.waits, |waiter| waiter.register(cx.waker()))
+            {
+                Ok(result) => Poll::Ready(result),
+                Err(value) => {
+                    this.value = Some(value);
+                    Poll::Pending
+                }
             }
-        }
+        })
     }
 }
 
@@ -892,13 +894,15 @@ impl<T> Future for RecvFuture<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        match this
-            .receiver
-            .recv_step(&mut this.waits, |waiter| waiter.register(cx.waker()))
-        {
-            Some(result) => Poll::Ready(result),
-            None => Poll::Pending,
-        }
+        crate::coop::poll(cx, |cx| {
+            match this
+                .receiver
+                .recv_step(&mut this.waits, |waiter| waiter.register(cx.waker()))
+            {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            }
+        })
     }
 }
 

@@ -382,7 +382,7 @@ impl Future for Recv<'_> {
     type Output = Result<(), Ended>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.0.poll_recv(cx)
+        crate::coop::poll(cx, |cx| self.0.poll_recv(cx))
     }
 }
 

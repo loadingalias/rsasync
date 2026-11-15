@@ -444,14 +444,16 @@ impl Future for Timer {
     type Output = Result<(), Closed>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let entry = self.entry();
-        entry
-            .waiter
-            .poll_wait(cx, || match entry.state.load(Ordering::Relaxed) {
-                ARMED => None,
-                EXPIRED => Some(Ok(())),
-                _ => Some(Err(Closed)),
-            })
+        crate::coop::poll(cx, |cx| {
+            let entry = self.entry();
+            entry
+                .waiter
+                .poll_wait(cx, || match entry.state.load(Ordering::Relaxed) {
+                    ARMED => None,
+                    EXPIRED => Some(Ok(())),
+                    _ => Some(Err(Closed)),
+                })
+        })
     }
 }
 

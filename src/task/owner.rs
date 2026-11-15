@@ -24,6 +24,7 @@ use super::waiting::List;
 use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, Refused, SpawnRefused};
 use crate::capacity::{Budget, Permit};
 use crate::channel::oneshot;
+use crate::coop;
 use crate::sync::{
     Arc,
     atomic::{AtomicU32, AtomicU64},
@@ -185,6 +186,8 @@ pub(super) struct Local {
     live: Cell<u32>,
     /// The end of `block_on` refuses new spawns.
     closed: Cell<bool>,
+    /// The poll budget of each poll of a task or of the root (`crate::coop`).
+    pub(super) poll_budget: Cell<u32>,
     pub(super) waiting: List,
     _charge: Permit,
 }
@@ -236,6 +239,7 @@ impl Local {
             outbox,
             live: Cell::new(0),
             closed: Cell::new(false),
+            poll_budget: Cell::new(super::DEFAULT_POLL_BUDGET.get()),
             waiting: List::new(),
             _charge: charge,
         })
@@ -316,7 +320,11 @@ impl Local {
             return self.finish(slot, entry);
         }
         let Entry { task, waker } = &mut entry;
-        let polled = catch_unwind(AssertUnwindSafe(|| task.as_mut().poll(&mut Context::from_waker(waker))));
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            coop::with_budget(self.poll_budget.get(), || {
+                task.as_mut().poll(&mut Context::from_waker(waker))
+            })
+        }));
         match polled {
             Ok(Poll::Pending) => {
                 self.entries[slot as usize].set(Some(entry));
@@ -398,7 +406,7 @@ impl Local {
         let output = loop {
             if poll_root || self.shared.take_root() {
                 poll_root = false;
-                if let Poll::Ready(output) = root.as_mut().poll(&mut cx) {
+                if let Poll::Ready(output) = coop::with_budget(self.poll_budget.get(), || root.as_mut().poll(&mut cx)) {
                     break output;
                 }
             }

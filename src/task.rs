@@ -50,6 +50,19 @@
 //! or after the poll that is running ends. A [`CancelHandle`] works from each thread, and so does
 //! the waker of a task.
 //!
+//! # Poll budget
+//!
+//! Each poll of a task, and of the root future, has a budget of runtime leaves: the futures of this
+//! crate that wait for the runtime, such as a channel send or receive, an I/O operation of the
+//! driver, a permit acquisition, and a timer. Each leaf that becomes ready in the poll spends one
+//! unit. When none is left, the next leaf wakes its task and gives `Pending` once. The owner then
+//! polls the other ready tasks before it polls that task again. Thus a task that loops on leaves
+//! that are always ready cannot keep the thread from the other tasks.
+//!
+//! The budget is [`DEFAULT_POLL_BUDGET`], and [`LocalOwner::set_poll_budget`] changes it. It is not
+//! a guarantee of fairness: the owner cannot stop a poll, so code that uses no leaf runs until it
+//! gives `Pending` or ends.
+//!
 //! # Panics
 //!
 //! The owner contains each panic of the state of a task: a poll of its future, and the drop of its
@@ -71,6 +84,7 @@ use core::any::Any;
 use core::cell::{Cell, RefCell};
 use core::fmt;
 use core::future::Future;
+use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::ptr;
 use core::task::{Context, Poll};
@@ -148,6 +162,14 @@ impl core::error::Error for Refused {
     }
 }
 
+/// The poll budget of an owner that [`LocalOwner::set_poll_budget`] did not change: the runtime
+/// leaves that one poll of a task can complete before the next leaf yields. See
+/// [Poll budget](self#poll-budget).
+///
+/// The value is measured (`benches/poll_budget.rs`): it is the smallest budget whose loop on
+/// always-ready channel operations costs at most 2% more than no limit, on x86_64 and on aarch64.
+pub const DEFAULT_POLL_BUDGET: NonZeroU32 = NonZeroU32::new(128).expect("the budget is not zero");
+
 /// An owner of local tasks, with a fixed number of task slots. It stays on the thread that made it.
 pub struct LocalOwner {
     local: Rc<Local>,
@@ -163,6 +185,14 @@ impl LocalOwner {
         Ok(Self {
             local: Rc::new(Local::new(budget, slots, home)?),
         })
+    }
+
+    /// Sets the poll budget of each later poll of a task or of the root future: the runtime leaves
+    /// that one poll can complete. When a poll has spent it, the next leaf wakes its task and gives
+    /// `Pending` once, so the owner polls its other ready tasks. See
+    /// [Poll budget](self#poll-budget).
+    pub fn set_poll_budget(&mut self, budget: NonZeroU32) {
+        self.local.poll_budget.set(budget.get());
     }
 
     /// Makes this thread the owner, and polls `root` and the tasks of the owner until `root` gives

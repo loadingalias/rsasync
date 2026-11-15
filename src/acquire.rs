@@ -456,33 +456,35 @@ impl Future for Acquire<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Permit> {
         let this = self.get_mut();
-        let (acquirer, amount) = (&*this.acquirer, this.amount);
-        let (queue, place) = (&acquirer.queue, acquirer.place);
-        if !this.waits {
-            // With no waiter in the order, take the units now if they are free.
-            // Ordering: `Relaxed`: an old value only selects the order, which a waiter then
-            // rechecks.
-            if (amount == 0 || queue.head.load(Ordering::Relaxed) == NONE)
-                && let Ok(permit) = acquirer.budget.reserve(amount)
-            {
-                return Poll::Ready(permit);
+        crate::coop::poll(cx, |cx| {
+            let (acquirer, amount) = (&*this.acquirer, this.amount);
+            let (queue, place) = (&acquirer.queue, acquirer.place);
+            if !this.waits {
+                // With no waiter in the order, take the units now if they are free.
+                // Ordering: `Relaxed`: an old value only selects the order, which a waiter then
+                // rechecks.
+                if (amount == 0 || queue.head.load(Ordering::Relaxed) == NONE)
+                    && let Ok(permit) = acquirer.budget.reserve(amount)
+                {
+                    return Poll::Ready(permit);
+                }
+                // The new first place of a push can only be this place, so it needs no wake.
+                queue.change(|order| order.push(place));
+                this.waits = true;
             }
-            // The new first place of a push can only be this place, so it needs no wake.
-            queue.change(|order| order.push(place));
-            this.waits = true;
-        }
-        let polled = queue.waiter(place).poll_wait(cx, || {
-            if queue.is_first(place) {
-                acquirer.budget.reserve(amount).ok()
-            } else {
-                None
+            let polled = queue.waiter(place).poll_wait(cx, || {
+                if queue.is_first(place) {
+                    acquirer.budget.reserve(amount).ok()
+                } else {
+                    None
+                }
+            });
+            if polled.is_ready() {
+                this.waits = false;
+                acquirer.stop();
             }
-        });
-        if polled.is_ready() {
-            this.waits = false;
-            acquirer.stop();
-        }
-        polled
+            polled
+        })
     }
 }
 

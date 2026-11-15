@@ -47,6 +47,8 @@ pub mod channel;
     expect(dead_code, reason = "with no driver, only the exploration tests use the entries")
 )]
 mod completion;
+// The poll budget of the runtime leaves.
+mod coop;
 mod sync;
 #[cfg_attr(
     not(all(

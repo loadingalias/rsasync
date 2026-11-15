@@ -57,17 +57,19 @@ impl Future for Completion {
         if self.done {
             panic!("an `Operation` was polled after it gave `Ready`");
         }
-        let id = self.id;
-        let Some(entry) = self.entry() else {
-            return Poll::Ready(Err(Gone));
-        };
-        let output = entry.poll_take(cx, id);
-        if output.is_ready() {
-            self.done = true;
-            // The home frees the slot at its next turn, and it needs no wake for that.
-            self.shared.requests.post(id, Request::EndInterest);
-        }
-        output
+        crate::coop::poll(cx, |cx| {
+            let id = self.id;
+            let Some(entry) = self.entry() else {
+                return Poll::Ready(Err(Gone));
+            };
+            let output = entry.poll_take(cx, id);
+            if output.is_ready() {
+                self.done = true;
+                // The home frees the slot at its next turn, and it needs no wake for that.
+                self.shared.requests.post(id, Request::EndInterest);
+            }
+            output
+        })
     }
 }
 

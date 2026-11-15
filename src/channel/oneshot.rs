@@ -315,9 +315,11 @@ impl<T> Future for RecvFuture<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let polled = this.receiver.poll_recv(cx);
-        this.waits = polled.is_pending();
-        polled
+        crate::coop::poll(cx, |cx| {
+            let polled = this.receiver.poll_recv(cx);
+            this.waits = polled.is_pending();
+            polled
+        })
     }
 }
 

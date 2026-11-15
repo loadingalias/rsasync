@@ -430,3 +430,42 @@ fn the_debug_of_a_panic_holds_no_payload() {
     assert!(matches!(outcome, Outcome::Panicked(_)));
     assert!(!debug.contains("7f3a"), "{debug}");
 }
+
+/// A task that loops on channel operations that are always ready completes its poll budget of
+/// them, and then yields, so the owner polls the second task. Without the budget, the loop would
+/// run all its rounds before the second task.
+#[test]
+fn a_task_that_loops_on_ready_channel_operations_yields_at_its_budget() {
+    const BUDGET: u32 = 8;
+    const ROUNDS: u32 = 1000;
+    let budget = budget();
+    let mut owner = LocalOwner::new(&budget, 2).unwrap();
+    owner.set_poll_budget(core::num::NonZeroU32::new(BUDGET).unwrap());
+    let (completed, seen) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(None)));
+    let (mut sender, mut receiver) = crate::channel::spsc::channel::<u32>(&budget, 1).unwrap();
+    owner.block_on({
+        let (completed, seen) = (Rc::clone(&completed), Rc::clone(&seen));
+        async move {
+            let looper = spawn_local({
+                let (completed, seen) = (Rc::clone(&completed), Rc::clone(&seen));
+                async move {
+                    // Each send and each receive is ready at once.
+                    for round in 0..ROUNDS {
+                        if seen.get().is_some() {
+                            break;
+                        }
+                        sender.send(round).await.unwrap();
+                        completed.set(completed.get() + 1);
+                        assert_eq!(receiver.recv().await, Ok(round));
+                        completed.set(completed.get() + 1);
+                    }
+                }
+            })
+            .unwrap();
+            let second = spawn_local(async move { seen.set(Some(completed.get())) }).unwrap();
+            assert!(matches!(looper.join().await, Outcome::Completed(())));
+            assert!(matches!(second.join().await, Outcome::Completed(())));
+        }
+    });
+    assert_eq!(seen.get(), Some(BUDGET));
+}
