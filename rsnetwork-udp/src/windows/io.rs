@@ -13,7 +13,7 @@ use super::sys::{
     IPV6_PKTINFO, IPV6_V6ONLY, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET_ERROR, Socket,
     UDP_RECV_MAX_COALESCED_SIZE, WSAEINVAL, WSAEMSGSIZE, WSAEOPNOTSUPP, WSAID_WSARECVMSG, WsaBuf, WsaMsg, WsaRecvMsg,
 };
-use crate::addr::{AF_INET, AF_INET6, SockAddrStorage};
+use crate::addr::{AF_INET, AF_INET6, SaFamily, SockAddrStorage};
 use crate::datagram::{BATCH, Received, Refused, Transmit};
 
 /// The most bytes of a coalesced receive that [`set_uro`] asks for.
@@ -272,6 +272,45 @@ fn wsa_recv_msg(socket: Socket) -> io::Result<WsaRecvMsg> {
     Ok(*POINTER.get_or_init(|| receive))
 }
 
+impl Received {
+    /// The datagram that a receive wrote, from its message: `len` bytes, the peer address of
+    /// `name_len` bytes in `name`, the received `flags`, and `control_len` bytes of control messages
+    /// in `control`. A completion backend that makes its own receive gives the same result as
+    /// [`recv`].
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` when the peer address is not an IP address.
+    pub fn from_message(
+        name: &SockAddrStorage,
+        name_len: u32,
+        flags: u32,
+        control: &Control,
+        control_len: usize,
+        len: usize,
+    ) -> io::Result<Self> {
+        let source = name
+            .to_socket_addr(name_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "the datagram has no IP peer address"))?;
+        Ok(Self {
+            len,
+            source,
+            truncated: flags & MSG_TRUNC != 0,
+            metadata: control.decode(control_len),
+        })
+    }
+}
+
+impl Refused {
+    /// The error of a send, with its [`Refused`] payload when it has one. `segmented` is whether
+    /// the send had a segment size. A completion backend that makes its own send gives the same
+    /// error as [`send`].
+    #[must_use]
+    pub fn of_send(error: io::Error, segmented: bool) -> io::Error {
+        refusal(error, segmented)
+    }
+}
+
 /// A send error with its [`Refused`] payload when it has one.
 fn refusal(error: io::Error, segmented: bool) -> io::Error {
     match error.raw_os_error() {
@@ -314,15 +353,23 @@ fn peer(socket: BorrowedSocket<'_>) -> io::Result<SocketAddr> {
     reason = "the stack writes the local address and an option into owned storage"
 )]
 fn families(socket: BorrowedSocket<'_>) -> io::Result<(bool, bool)> {
-    let mut name = SockAddrStorage::EMPTY;
-    let mut len = c_int::try_from(SockAddrStorage::LEN).unwrap_or(0);
+    // The provider of the socket gives its family also before a bind, where `getsockname` fails.
+    let mut info = sys::WsaProtocolInfoW::ZERO;
+    let mut len = c_int::try_from(size_of::<sys::WsaProtocolInfoW>()).unwrap_or(0);
     // SAFETY: the storage and its length live during the call, and the stack writes at most `len`.
-    if unsafe { sys::getsockname(socket.as_raw_socket(), ptr::from_mut(&mut name).cast(), &raw mut len) }
-        == SOCKET_ERROR
+    if unsafe {
+        sys::getsockopt(
+            socket.as_raw_socket(),
+            sys::SOL_SOCKET,
+            sys::SO_PROTOCOL_INFOW,
+            ptr::from_mut(&mut info).cast::<c_char>(),
+            &raw mut len,
+        )
+    } == SOCKET_ERROR
     {
         return Err(last_error());
     }
-    match name.ss_family {
+    match SaFamily::try_from(info.address_family).unwrap_or(0) {
         AF_INET => Ok((true, false)),
         AF_INET6 => {
             let mut only: c_int = 0;

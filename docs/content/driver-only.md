@@ -15,8 +15,8 @@ results.
 
 The driver needs the `std` feature, and Linux on x86_64 or aarch64 or Windows on x86_64. On Linux,
 it runs on io_uring, and on [epoll](epoll.md) where the kernel refuses io_uring, with the same
-operations. On Windows, it runs TCP on an [I/O completion port](iocp.md), and the other operations
-of this page have no Windows form yet. It does not need
+operations. On Windows, it runs TCP and UDP on an [I/O completion port](iocp.md), and the other
+operations of this page have no Windows form yet. It does not need
 the `local` feature, which holds the local tasks of `rsasync::task`, a scheduler. It starts no helper
 thread. Before Linux 6.9, a change of the length of a file runs on your
 [blocking service](blocking-service.md). `Driver::report` gives the features of the kernel and the

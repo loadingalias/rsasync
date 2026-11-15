@@ -81,7 +81,39 @@ pub struct Guid {
     pub data4: [u8; 8],
 }
 
+/// `WSAPROTOCOL_INFOW`, 628 bytes: the provider of a socket, which `getsockopt` gives with
+/// [`SO_PROTOCOL_INFOW`], also before a bind.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct WsaProtocolInfoW {
+    /// `dwServiceFlags1`, for example `XP1_IFS_HANDLES`.
+    pub service_flags1: u32,
+    /// The fields from `dwServiceFlags2` to `iVersion`.
+    pub before_family: [u32; 18],
+    /// `iAddressFamily`: the family of the socket, for example [`AF_INET`](crate::AF_INET).
+    pub address_family: c_int,
+    /// The fields from `iMaxSockAddr` to `szProtocol`.
+    pub rest: [u32; 137],
+}
+
+impl WsaProtocolInfoW {
+    /// A structure of zero bytes, which `getsockopt` fills.
+    pub const ZERO: Self = Self {
+        service_flags1: 0,
+        before_family: [0; 18],
+        address_family: 0,
+        rest: [0; 137],
+    };
+}
+
+/// `SOL_SOCKET`, the level of the socket options.
+pub const SOL_SOCKET: c_int = 0xFFFF;
+/// `SO_PROTOCOL_INFOW`: the `WSAPROTOCOL_INFOW` of the provider of a socket.
+pub const SO_PROTOCOL_INFOW: c_int = 0x2005;
+
 const _: () = {
+    assert!(size_of::<WsaProtocolInfoW>() == 628);
+    assert!(offset_of!(WsaProtocolInfoW, address_family) == 76);
     assert!(size_of::<WsaBuf>() == 16);
     assert!(offset_of!(WsaBuf, buf) == 8);
     assert!(size_of::<WsaMsg>() == 56);
@@ -142,6 +174,8 @@ pub const UDP_RECV_MAX_COALESCED_SIZE: c_int = 3;
 /// `UDP_COALESCED_INFO`: the segment size of a coalesced receive, as a `DWORD` control message.
 pub const UDP_COALESCED_INFO: c_int = 3;
 
+/// `MSG_PEEK`: a receive leaves the datagram in the socket.
+pub const MSG_PEEK: u32 = 0x2;
 /// `MSG_TRUNC`: the datagram did not fit, and the stack dropped its rest.
 pub const MSG_TRUNC: u32 = 0x100;
 /// `MSG_CTRUNC`: the control messages did not fit.
@@ -184,7 +218,7 @@ pub type WsaRecvMsg = unsafe extern "system" fn(
 unsafe extern "system" {
     /// `int WSASendMsg(SOCKET Handle, LPWSAMSG lpMsg, DWORD dwFlags, LPDWORD lpNumberOfBytesSent,
     /// LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)`.
-    pub(crate) fn WSASendMsg(
+    pub fn WSASendMsg(
         handle: Socket,
         msg: *const WsaMsg,
         flags: u32,

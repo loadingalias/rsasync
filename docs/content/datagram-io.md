@@ -187,6 +187,8 @@ Windows differs from Linux and macOS in these ways:
   binds at once, so make the socket yourself and give it to the `UdpSocket::from_std` of Tokio.
 - A source address must be an address of the host. Windows refuses another one (`WSAEINVAL`), also
   127.0.0.2.
+- `configure` and `set_dont_fragment` read the family of the socket from its provider
+  (`SO_PROTOCOL_INFOW`), so they also work on a socket before its bind.
 
 ## Validate segmentation offload
 
@@ -212,10 +214,10 @@ fallback.
 and `MsgHdrX` on macOS with the `macos-private-batch` feature, or `WsaMsg` and `WsaBuf` on
 Windows), the packet information, and the
 constants of the calls and of the control messages, each with the values and the layout of the
-target system. On Linux and macOS, with the `std` feature, it also declares the socket calls that the networking
-family and its runtimes share: `setsockopt`, `getsockopt`, and `getsockname`, and on Linux `socket`,
-`bind`, and `listen`, with the TCP socket options. The io_uring driver of rsasync makes its TCP
-sockets with them. `Control` is the one
+target system. With the `std` feature, it also declares the socket calls that the networking
+family and its runtimes share: `setsockopt`, `getsockopt`, and `getsockname`; on Linux `socket`,
+`bind`, and `listen`, with the TCP socket options; and on Windows `bind`, `getpeername`, `WSAIoctl`,
+`WSASendMsg`, and `WSAPROTOCOL_INFOW`. The drivers of rsasync make their sockets with them. `Control` is the one
 encoding of the control messages: `Control::encode` writes those of a `Transmit`, and
 `Control::decode` reads those of a received datagram. They need only `core`, so a completion
 backend, such as the io_uring driver of rsasync, builds its messages with them. The calls need the

@@ -83,7 +83,6 @@ mod tcp;
 #[cfg(test)]
 #[cfg(not(loom))]
 mod tests;
-#[cfg(target_os = "linux")]
 mod udp;
 
 use alloc::boxed::Box;
@@ -134,7 +133,6 @@ pub use process::{Child, ChildOptions, End, SignalChildError, Wait};
 #[cfg(target_os = "linux")]
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
-#[cfg(target_os = "linux")]
 pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
 
 use crate::completion::Entry;
@@ -394,16 +392,13 @@ pub(crate) enum Payload {
         connection: Option<Handle>,
     },
     /// The message of a datagram receive, which the kernel writes, and the facts of the datagram.
-    #[cfg(target_os = "linux")]
     Receive {
         message: udp::Message,
         received: Option<rsnetwork_udp::Received>,
     },
     /// The datagram of a send, and its message, which the kernel reads.
-    #[cfg(target_os = "linux")]
     SendTo { message: udp::Message, datagram: Datagram },
     /// The datagrams of a batch, and its progress while its completions come.
-    #[cfg(target_os = "linux")]
     Batch { batch: udp::Batch, progress: udp::Progress },
     /// The C strings of the paths of a rename or an unlink, which the kernel reads.
     #[cfg(target_os = "linux")]
@@ -449,7 +444,6 @@ impl Payload {
     }
 
     /// The datagrams of a batch.
-    #[cfg(target_os = "linux")]
     pub(crate) fn batch(&mut self) -> Option<&mut udp::Batch> {
         match self {
             Self::Batch { batch, .. } => Some(batch),
@@ -482,20 +476,15 @@ pub(crate) enum Kind {
     /// An accept: the result is a new descriptor.
     Accept,
     /// A receive of one datagram into the loan of the caller's buffer.
-    #[cfg(target_os = "linux")]
     RecvFrom,
     /// A receive of one datagram into a buffer that the kernel selects.
-    #[cfg(target_os = "linux")]
     RecvSelectedFrom,
     /// A receive of several datagrams, one linked receive for each, into buffers that the kernel
     /// selects.
-    #[cfg(target_os = "linux")]
     RecvBatch,
     /// A send of one datagram, or of a batch of segments.
-    #[cfg(target_os = "linux")]
     SendTo,
     /// A send of several datagrams, one linked send for each.
-    #[cfg(target_os = "linux")]
     SendBatch,
     /// A close, which ends after each operation of its resource ends.
     Close,
@@ -516,21 +505,15 @@ impl Kind {
     /// Whether the operation uses the write direction of a stream. A drop of its future does not
     /// cancel it.
     pub(crate) const fn writes(self) -> bool {
-        match self {
-            Self::Send | Self::Vectored | Self::Shutdown => true,
-            #[cfg(target_os = "linux")]
-            Self::SendTo | Self::SendBatch => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Self::Send | Self::Vectored | Self::Shutdown | Self::SendTo | Self::SendBatch
+        )
     }
 
     /// Whether the operation is a batch of linked entries, one completion for each, in order.
     pub(crate) const fn batch(self) -> bool {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::SendBatch | Self::RecvBatch => true,
-            _ => false,
-        }
+        matches!(self, Self::SendBatch | Self::RecvBatch)
     }
 }
 
@@ -754,7 +737,6 @@ enum Medium {
     #[cfg(target_os = "linux")]
     Pipe,
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
-    #[cfg(target_os = "linux")]
     Udp,
     /// A file or a directory: its operations are positional, and several run at one time.
     #[cfg(target_os = "linux")]
@@ -1803,11 +1785,7 @@ impl Driver {
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
         for cqe in self.queue.completions().take(limit as usize) {
             completed += 1;
-            // Only the exits and the batches of Linux change the event.
-            #[cfg(target_os = "linux")]
             let mut event = cqe.event();
-            #[cfg(target_os = "windows")]
-            let event = cqe.event();
             // The completion of an exit operation ends it when the home has the status of its child.
             #[cfg(target_os = "linux")]
             if let Some(id) = OpId::from_user_data(cqe.user_data)
@@ -1835,7 +1813,6 @@ impl Driver {
             }
             // A completion of a batch is one of its entries: its last one ends the batch, and the
             // result of the batch is its count.
-            #[cfg(target_os = "linux")]
             if let Some(id) = OpId::from_user_data(cqe.user_data)
                 && table.resources(id).is_some_and(|tag| tag.kind.batch())
                 && table.runs(id)
@@ -1928,10 +1905,16 @@ fn finish(
     match tag.kind {
         #[cfg(target_os = "linux")]
         Kind::File(op) => file::finish(held, op, cqe.res, abandoned, resources),
-        Kind::Other | Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::Close => {}
+        Kind::Other
+        | Kind::Send
+        | Kind::Vectored
+        | Kind::Shutdown
+        | Kind::Close
+        | Kind::SendTo
+        | Kind::SendBatch
+        | Kind::RecvBatch => {}
         #[cfg(target_os = "linux")]
-        Kind::SendTo | Kind::SendBatch | Kind::RecvBatch | Kind::Spawn(_) | Kind::Exit(_) => {}
-        #[cfg(target_os = "linux")]
+        Kind::Spawn(_) | Kind::Exit(_) => {}
         Kind::RecvFrom => {
             if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
                 // SAFETY: the receive named the capacity of the loan in its message, and the kernel
@@ -1942,7 +1925,6 @@ fn finish(
                 }
             }
         }
-        #[cfg(target_os = "linux")]
         Kind::RecvSelectedFrom => {
             if let (Ok(count), Some(buffer)) = (
                 count,

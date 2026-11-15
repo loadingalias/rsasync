@@ -112,9 +112,9 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 ## Windows
 
 The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
-[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP on Windows x86_64, on an
-[I/O completion port](iocp.md), in driver-only use. UDP, files, pipes, local streams, processes,
-and signals of the driver have no Windows form yet. CI does not run on Windows.
+[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP and UDP on Windows x86_64, on
+an [I/O completion port](iocp.md), in driver-only use. Files, pipes, local streams, processes, and
+signals of the driver have no Windows form yet. CI does not run on Windows.
 
 On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
 Windows Server 2025, OS build 10.0.26100.33822. The tests use Tokio sockets. Revision `285cc44` has

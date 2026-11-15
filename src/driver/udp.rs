@@ -8,16 +8,22 @@
 //! datagram form.
 
 use alloc::vec::Vec;
+#[cfg(target_os = "windows")]
+use core::ffi::c_int;
 use core::net::{IpAddr, SocketAddr};
 use core::ptr;
 use std::io;
-use std::os::fd::BorrowedFd;
 
-use rsnetwork_udp::sys::{IoVec, MsgHdr};
+// The message header of one datagram and its region: `struct msghdr` and `struct iovec` on Linux,
+// `WSAMSG` and `WSABUF` on Windows.
+#[cfg(target_os = "linux")]
+use rsnetwork_udp::sys::{IoVec as Region, MsgHdr as Header};
+#[cfg(target_os = "windows")]
+use rsnetwork_udp::sys::{WsaBuf as Region, WsaMsg as Header};
 use rsnetwork_udp::{Control, Ecn, Received, SockAddrStorage, Transmit};
 
 use super::tcp::{ReadHalf, TcpOptions, WriteHalf};
-use super::{Completion, Driver, Held, Kind, Operation, Payload, Reason, Refused, Resource};
+use super::{Borrowed, Completion, Driver, Held, Kind, Operation, Payload, Reason, Refused, Resource};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 
 /// A UDP socket that a driver owns: its read half and its write half.
@@ -128,13 +134,14 @@ pub struct UdpOptions {
     /// Refuse a datagram above the path MTU, which path MTU discovery needs
     /// (`datagram::set_dont_fragment`). Such a send gives `Refused::TooLarge`.
     pub dont_fragment: bool,
-    /// Deliver coalesced datagrams of one peer in one receive, with their segment size (GRO).
+    /// Deliver coalesced datagrams of one peer in one receive, with their segment size (GRO, and
+    /// URO on Windows).
     pub gro: bool,
 }
 
 impl UdpOptions {
     /// Sets the options on the new socket `socket`.
-    fn apply(self, socket: BorrowedFd<'_>) -> io::Result<()> {
+    fn apply(self, socket: Borrowed<'_>) -> io::Result<()> {
         TcpOptions {
             only_v6: self.only_v6,
             send_buffer: self.send_buffer,
@@ -149,8 +156,13 @@ impl UdpOptions {
         if self.dont_fragment {
             rsnetwork_udp::set_dont_fragment(socket)?;
         }
+        #[cfg(target_os = "linux")]
         if self.gro {
             rsnetwork_udp::set_gro(socket, true)?;
+        }
+        #[cfg(target_os = "windows")]
+        if self.gro {
+            rsnetwork_udp::set_uro(socket, true)?;
         }
         Ok(())
     }
@@ -208,8 +220,8 @@ impl Datagram {
 /// array of a batch.
 #[derive(Debug)]
 pub(crate) struct Message {
-    header: MsgHdr,
-    region: IoVec,
+    header: Header,
+    region: Region,
     name: SockAddrStorage,
     control: Control,
 }
@@ -227,18 +239,39 @@ impl Default for Message {
     fn default() -> Self {
         Self {
             header: EMPTY_HEADER,
-            region: IoVec {
-                iov_base: ptr::null_mut(),
-                iov_len: 0,
-            },
+            region: EMPTY_REGION,
             name: SockAddrStorage::EMPTY,
             control: Control::new(),
         }
     }
 }
 
+/// A region of no bytes.
+#[cfg(target_os = "linux")]
+const EMPTY_REGION: Region = Region {
+    iov_base: ptr::null_mut(),
+    iov_len: 0,
+};
+#[cfg(target_os = "windows")]
+const EMPTY_REGION: Region = Region {
+    len: 0,
+    buf: ptr::null_mut(),
+};
+
 /// A message header with no address, no region, and no control message.
-const EMPTY_HEADER: MsgHdr = MsgHdr {
+#[cfg(target_os = "windows")]
+const EMPTY_HEADER: Header = Header {
+    name: ptr::null_mut(),
+    namelen: 0,
+    buffers: ptr::null_mut(),
+    buffer_count: 0,
+    control: EMPTY_REGION,
+    flags: 0,
+};
+
+/// A message header with no address, no region, and no control message.
+#[cfg(target_os = "linux")]
+const EMPTY_HEADER: Header = Header {
     msg_name: ptr::null_mut(),
     msg_namelen: 0,
     msg_iov: ptr::null_mut(),
@@ -248,20 +281,94 @@ const EMPTY_HEADER: MsgHdr = MsgHdr {
     msg_flags: 0,
 };
 
+#[cfg(target_os = "windows")]
 impl Message {
     /// The header of a send of `datagram`.
-    pub(super) fn send(&mut self, datagram: &Datagram) -> *const MsgHdr {
+    pub(super) fn send(&mut self, datagram: &Datagram) -> *const Header {
         let (name, name_len) = datagram
             .destination
             .map_or((SockAddrStorage::EMPTY, 0), SockAddrStorage::new);
         self.name = name;
         let contents = datagram.contents.bytes();
-        self.region = IoVec {
+        // A `WSABUF` holds at most `u32::MAX` bytes, more than a datagram can have.
+        self.region = Region {
+            len: u32::try_from(contents.len()).unwrap_or(u32::MAX),
+            buf: contents.as_ptr().cast_mut().cast(),
+        };
+        let control_len = self.control.encode(&datagram.transmit());
+        self.header = Header {
+            name: if name_len == 0 {
+                ptr::null_mut()
+            } else {
+                (&raw mut self.name).cast()
+            },
+            namelen: c_int::try_from(name_len).unwrap_or(0),
+            buffers: &raw mut self.region,
+            buffer_count: 1,
+            control: Region {
+                len: u32::try_from(control_len).unwrap_or(0),
+                buf: if control_len == 0 {
+                    ptr::null_mut()
+                } else {
+                    self.control.as_mut_ptr().cast()
+                },
+            },
+            flags: 0,
+        };
+        &raw const self.header
+    }
+
+    /// The header of a receive of at most `len` bytes at `region`, or into a buffer that the port
+    /// selects, of at most `len` bytes, for a null `region`.
+    pub(super) fn receive(&mut self, region: *mut u8, len: usize) -> *mut Header {
+        self.name = SockAddrStorage::EMPTY;
+        self.control = Control::new();
+        self.region = Region {
+            len: u32::try_from(len).unwrap_or(u32::MAX),
+            buf: region.cast(),
+        };
+        self.header = Header {
+            name: (&raw mut self.name).cast(),
+            namelen: c_int::try_from(SockAddrStorage::LEN).unwrap_or(0),
+            buffers: &raw mut self.region,
+            buffer_count: 1,
+            control: Region {
+                len: u32::try_from(Control::LEN).unwrap_or(0),
+                buf: self.control.as_mut_ptr().cast(),
+            },
+            flags: 0,
+        };
+        &raw mut self.header
+    }
+
+    /// The datagram of `len` bytes that the stack received with this header.
+    pub(super) fn received(&self, len: usize) -> io::Result<Received> {
+        Received::from_message(
+            &self.name,
+            u32::try_from(self.header.namelen).unwrap_or(0),
+            self.header.flags,
+            &self.control,
+            usize::try_from(self.header.control.len).unwrap_or(0),
+            len,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Message {
+    /// The header of a send of `datagram`.
+    pub(super) fn send(&mut self, datagram: &Datagram) -> *const Header {
+        let (name, name_len) = datagram
+            .destination
+            .map_or((SockAddrStorage::EMPTY, 0), SockAddrStorage::new);
+        self.name = name;
+        let contents = datagram.contents.bytes();
+        self.region = Region {
             iov_base: contents.as_ptr().cast_mut().cast(),
             iov_len: contents.len(),
         };
         let control_len = self.control.encode(&datagram.transmit());
-        self.header = MsgHdr {
+        self.header = Header {
             msg_name: if name_len == 0 {
                 ptr::null_mut()
             } else {
@@ -283,14 +390,14 @@ impl Message {
 
     /// The header of a receive of at most `len` bytes at `region`, or into a buffer that the
     /// kernel selects, of at most `len` bytes, for a null `region`.
-    pub(super) fn receive(&mut self, region: *mut u8, len: usize) -> *mut MsgHdr {
+    pub(super) fn receive(&mut self, region: *mut u8, len: usize) -> *mut Header {
         self.name = SockAddrStorage::EMPTY;
         self.control = Control::new();
-        self.region = IoVec {
+        self.region = Region {
             iov_base: region.cast(),
             iov_len: len,
         };
-        self.header = MsgHdr {
+        self.header = Header {
             msg_name: (&raw mut self.name).cast(),
             msg_namelen: SockAddrStorage::LEN,
             msg_iov: &raw mut self.region,
@@ -372,7 +479,7 @@ impl Datagrams {
     }
 
     /// The header of the message of datagram `index`, for a submission.
-    pub(super) fn message(&mut self, index: usize) -> Option<*const MsgHdr> {
+    pub(super) fn message(&mut self, index: usize) -> Option<*const Header> {
         let datagram = self.datagrams.get(index)?;
         Some(self.messages.get_mut(index)?.send(datagram))
     }
@@ -444,7 +551,7 @@ impl Arrivals {
 
     /// The header of the message of entry `index`, for a receive into a buffer of at most `len`
     /// bytes that the kernel selects.
-    pub(super) fn message(&mut self, index: usize, len: usize) -> Option<*mut MsgHdr> {
+    pub(super) fn message(&mut self, index: usize, len: usize) -> Option<*mut Header> {
         Some(self.messages.get_mut(index)?.receive(ptr::null_mut(), len))
     }
 

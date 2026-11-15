@@ -16,8 +16,8 @@ use core::ffi::{c_char, c_int, c_void};
 use core::mem::{offset_of, size_of};
 
 pub(crate) use rsnetwork_udp::sys::{
-    Guid, IPPROTO_IPV6, IPV6_V6ONLY, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCK_DGRAM, SOCKET_ERROR, Socket, WSAIoctl,
-    WsaBuf, bind, getpeername, getsockname, getsockopt, setsockopt,
+    Guid, IPPROTO_IPV6, IPV6_V6ONLY, SIO_GET_EXTENSION_FUNCTION_POINTER, SO_PROTOCOL_INFOW, SOCK_DGRAM, SOCKET_ERROR,
+    SOL_SOCKET, Socket, WSAIoctl, WsaBuf, WsaProtocolInfoW, bind, getpeername, getsockname, getsockopt, setsockopt,
 };
 
 /// `HANDLE`.
@@ -68,17 +68,6 @@ pub(crate) struct WsaData {
     pub(crate) description_and_status: [u8; 257 + 129],
 }
 
-/// `WSAPROTOCOL_INFOW`, 628 bytes: the provider of a socket. The driver reads only
-/// `dwServiceFlags1`.
-#[repr(C)]
-#[derive(Debug)]
-pub(crate) struct WsaProtocolInfoW {
-    /// `dwServiceFlags1`, for example [`XP1_IFS_HANDLES`].
-    pub(crate) service_flags1: u32,
-    /// The other fields, from `dwServiceFlags2` to `szProtocol`.
-    pub(crate) rest: [u32; 156],
-}
-
 const _: () = {
     assert!(size_of::<Overlapped>() == 32);
     assert!(offset_of!(Overlapped, internal_high) == 8);
@@ -91,7 +80,6 @@ const _: () = {
     assert!(size_of::<WsaData>() == 408);
     assert!(offset_of!(WsaData, vendor_info) == 8);
     assert!(offset_of!(WsaData, description_and_status) == 16);
-    assert!(size_of::<WsaProtocolInfoW>() == 628);
     assert!(size_of::<Socket>() == size_of::<usize>());
 };
 
@@ -103,6 +91,15 @@ pub(crate) const STATUS_PENDING: u32 = 0x0000_0103;
 pub(crate) const fn nt_error(status: u32) -> bool {
     status >> 30 == 3
 }
+
+/// `NT_WARNING`: the severity of `status` is a warning, for example `STATUS_BUFFER_OVERFLOW`
+/// (0x80000005) for a datagram larger than its buffer. A packet comes for it.
+pub(crate) const fn nt_warning(status: u32) -> bool {
+    status >> 30 == 2
+}
+
+/// `WSAEMSGSIZE`: a datagram did not fit its buffer.
+pub(crate) const WSAEMSGSIZE: c_int = 10040;
 
 /// `ERROR_IO_PENDING`, also `WSA_IO_PENDING`: the overlapped call runs.
 pub(crate) const ERROR_IO_PENDING: c_int = 997;
@@ -141,16 +138,12 @@ pub(crate) const FIONBIO: c_int = 0x8004_667E_u32.cast_signed();
 /// `SD_SEND`: the half-close of the send side.
 pub(crate) const SD_SEND: c_int = 1;
 
-/// `SOL_SOCKET`, the level of the socket options.
-pub(crate) const SOL_SOCKET: c_int = 0xFFFF;
 /// `SO_KEEPALIVE`.
 pub(crate) const SO_KEEPALIVE: c_int = 0x0008;
 /// `SO_SNDBUF`.
 pub(crate) const SO_SNDBUF: c_int = 0x1001;
 /// `SO_RCVBUF`.
 pub(crate) const SO_RCVBUF: c_int = 0x1002;
-/// `SO_PROTOCOL_INFOW`: the `WSAPROTOCOL_INFOW` of the provider of a socket.
-pub(crate) const SO_PROTOCOL_INFOW: c_int = 0x2005;
 /// `SO_UPDATE_ACCEPT_CONTEXT`: an accepted socket takes the state of its listener.
 pub(crate) const SO_UPDATE_ACCEPT_CONTEXT: c_int = 0x700B;
 /// `SO_UPDATE_CONNECT_CONTEXT`: a socket that `ConnectEx` connected takes its connected state.

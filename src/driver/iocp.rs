@@ -19,11 +19,12 @@
 //!   port does not read the status here, because it can still show `STATUS_PENDING`.
 //! - The call failed at once: the port reads the status. A warning, such as
 //!   `STATUS_BUFFER_OVERFLOW`, which Win32 reports as a failure, means that a packet comes: it is
-//!   the terminal event. On a socket that skips, the port takes the return as terminal, as the
-//!   design states, but no run shows yet whether a packet still comes there. No TCP operation
-//!   gives a warning status. An error status (`NT_ERROR`), or
-//!   a status that is still `STATUS_PENDING` because the call did not reach the I/O manager, means
-//!   that no packet comes, and the return is the terminal event.
+//!   the terminal event. On a socket that skips, no packet comes, and the return is the terminal
+//!   event, because the I/O manager skips each status that is not an error (the design row and its
+//!   source). No host run shows this case: an overlapped receive of a datagram larger than its
+//!   buffer returns pending on Windows Server 2025. An error status (`NT_ERROR`), or a status
+//!   that is still `STATUS_PENDING` because the call did not reach the I/O manager, means that no
+//!   packet comes, and the return is the terminal event.
 //!
 //! A cancel calls `CancelIoEx` with the `OVERLAPPED` of its target, and posts its own result at
 //! once. The result is no terminal event: the target keeps its slot, and the driver keeps its
@@ -183,10 +184,7 @@ impl Registrar {
 #[expect(unsafe_code, reason = "the calls write into storage that lives during the call")]
 fn installed(socket: BorrowedSocket<'_>) -> bool {
     let raw = socket.as_raw_socket();
-    let mut info = sys::WsaProtocolInfoW {
-        service_flags1: 0,
-        rest: [0; 156],
-    };
+    let mut info = sys::WsaProtocolInfoW::ZERO;
     let mut len = c_int::try_from(size_of::<sys::WsaProtocolInfoW>()).unwrap_or(0);
     // SAFETY: the option storage and its length live during the call, and the stack writes at most
     // `len` bytes.
@@ -233,6 +231,10 @@ struct Slot {
     queued: bool,
     /// The socket that an accept makes, which the port owns until the completion of the accept.
     accepted: Option<OwnedSocket>,
+    /// The next entry of its linked chain, a batch of datagrams, which starts after this entry.
+    link: Option<u32>,
+    /// The entry is not the first of its chain: a receive takes only a datagram that waits.
+    follows: bool,
 }
 
 /// How a call returned: it runs, it ended with this count of bytes, or it failed with this error.
@@ -261,13 +263,15 @@ enum Terminal {
 /// - The call succeeded at once: a packet comes, unless the socket skips it. The status is not read
 ///   here, because it can still show `STATUS_PENDING` at the return.
 /// - The call failed at once: a warning status, such as `STATUS_BUFFER_OVERFLOW`, means that a
-///   packet comes. On a socket that skips, the port takes the return as terminal, as the design
-///   states; no run shows yet whether a packet still comes there. An error status, or a status that is still
-///   `STATUS_PENDING` because the call did not reach the I/O manager, means that no packet comes.
+///   packet comes, unless the socket skips it: the I/O manager skips each status that is not an
+///   error, as the design states. An error status, or a status that is still `STATUS_PENDING`
+///   because the call did not reach the I/O manager, means that no packet comes.
 const fn terminal(returned: Returned, status: u32, skips: bool) -> Terminal {
     match returned {
         Returned::Pending => Terminal::Packet,
         Returned::Failed(_) if status == sys::STATUS_PENDING || sys::nt_error(status) => Terminal::Return,
+        // The design row "IOCP, immediate return with any other status": on a handle that skips,
+        // the I/O manager queues no packet for a status that is not an error, also a warning.
         Returned::Done(_) | Returned::Failed(_) if skips => Terminal::Return,
         Returned::Done(_) | Returned::Failed(_) => Terminal::Packet,
     }
@@ -438,22 +442,42 @@ impl Port {
     /// Takes each entry of the submission queue that has room in flight, and starts it.
     fn take(&mut self) -> u32 {
         let mut taken = 0;
-        // Each entry in flight posts at most one completion, so the completion queue keeps its
-        // bound.
-        while !self.queue.is_empty() && self.free.len() > self.completions.len() {
-            let (Some((sqe, token)), Some(index)) = (self.queue.pop_front(), self.free.pop()) else {
-                break;
-            };
-            self.slots[index as usize] = Some(Slot {
-                sqe,
-                skips: token.is_some_and(|token| token.skips),
-                queued: false,
-                accepted: None,
-            });
-            taken += 1;
-            self.start(index);
+        loop {
+            let chain = self
+                .queue
+                .iter()
+                .position(|(sqe, _)| sqe.flags & ring::IOSQE_IO_LINK == 0)
+                .map_or(0, |last| last + 1);
+            // Each entry in flight posts at most one completion, so the completion queue keeps its
+            // bound. A chain whose last entry is not pushed yet waits.
+            if chain == 0 || self.free.len() < chain + self.completions.len() {
+                return taken;
+            }
+            let mut head = None;
+            let mut previous: Option<u32> = None;
+            for _ in 0..chain {
+                let (Some((sqe, token)), Some(index)) = (self.queue.pop_front(), self.free.pop()) else {
+                    return taken;
+                };
+                self.slots[index as usize] = Some(Slot {
+                    sqe,
+                    skips: token.is_some_and(|token| token.skips),
+                    queued: false,
+                    accepted: None,
+                    link: None,
+                    follows: previous.is_some(),
+                });
+                match previous.and_then(|previous| self.slots[previous as usize].as_mut()) {
+                    Some(slot) => slot.link = Some(index),
+                    None => head = Some(index),
+                }
+                previous = Some(index);
+            }
+            taken += u32::try_from(chain).unwrap_or(u32::MAX);
+            if let Some(head) = head {
+                self.start(head);
+            }
         }
-        taken
     }
 
     /// Starts the entry of `index`.
@@ -478,7 +502,9 @@ impl Port {
             | ring::IORING_OP_SEND
             | ring::IORING_OP_WRITEV
             | ring::IORING_OP_ACCEPT
-            | ring::IORING_OP_CONNECT => self.call(index),
+            | ring::IORING_OP_CONNECT
+            | ring::IORING_OP_SENDMSG
+            | ring::IORING_OP_RECVMSG => self.call(index),
             // The driver submits no other entry on this backend.
             _ => self.post(index, -sys::WSAEINVAL, 0),
         }
@@ -498,7 +524,16 @@ impl Port {
         // SAFETY: no call of the slot runs, so nothing else reads or writes its `OVERLAPPED`.
         unsafe { overlapped.write(idle()) };
         let returned = match slot.sqe.opcode {
-            ring::IORING_OP_RECV if slot.sqe.flags & ring::IOSQE_BUFFER_SELECT != 0 => {
+            ring::IORING_OP_RECVMSG if selects(&slot.sqe) => {
+                // SAFETY: a peek of no bytes names no memory but its `OVERLAPPED`.
+                unsafe { peek(slot.sqe.fd, overlapped) }
+            }
+            // SAFETY: the driver keeps the message, its region, its address storage, and its control
+            // storage until the completion.
+            ring::IORING_OP_RECVMSG => unsafe { receive_message(slot.sqe.fd, pointer(slot.sqe.addr), overlapped) },
+            // SAFETY: as above, for the message of a send.
+            ring::IORING_OP_SENDMSG => unsafe { send_message(slot.sqe.fd, pointer(slot.sqe.addr), overlapped) },
+            ring::IORING_OP_RECV if selects(&slot.sqe) => {
                 // SAFETY: a receive of no bytes names no memory but its `OVERLAPPED`.
                 unsafe { receive(slot.sqe.fd, ptr::null_mut(), 0, overlapped) }
             }
@@ -541,6 +576,13 @@ impl Port {
         }
         match returned {
             Returned::Done(bytes) => self.ended(index, Ok(bytes)),
+            // A warning at once on a socket that skips: the call ended with its bytes.
+            Returned::Failed(_) if sys::nt_warning(status) => {
+                // SAFETY: the call ended at once, so the kernel wrote its count before the return.
+                let bytes = unsafe { transferred(overlapped) };
+                self.truncated(index);
+                self.ended(index, Ok(bytes));
+            }
             Returned::Failed(error) => self.ended(index, Err(error)),
             Returned::Pending => {}
         }
@@ -598,6 +640,9 @@ impl Port {
             // aborts the connection, and its packet gives no count, also when bytes went, so the
             // send gives the abort and no count.
             let sends = matches!(opcode, ring::IORING_OP_SEND | ring::IORING_OP_WRITEV);
+            if sys::nt_warning(status) {
+                self.truncated(index);
+            }
             let result = if !sys::nt_error(status) || (sends && bytes > 0) {
                 Ok(bytes)
             } else {
@@ -639,7 +684,7 @@ impl Port {
             return;
         };
         match sqe.opcode {
-            ring::IORING_OP_RECV if sqe.flags & ring::IOSQE_BUFFER_SELECT != 0 => self.select(index),
+            ring::IORING_OP_RECV | ring::IORING_OP_RECVMSG if selects(&sqe) => self.select(index),
             ring::IORING_OP_ACCEPT => {
                 let Some(accepted) = accepted else {
                     self.post(index, -sys::WSAEINVAL, 0);
@@ -684,25 +729,74 @@ impl Port {
         reason = "the receive writes into a provided buffer that the driver published"
     )]
     fn select(&mut self, index: u32) {
-        let Some(fd) = self.slots[index as usize].as_ref().map(|slot| slot.sqe.fd) else {
+        let Some((sqe, follows)) = self.slots[index as usize].as_ref().map(|slot| (slot.sqe, slot.follows)) else {
             return;
         };
         let Some((address, len, bid)) = self.group.as_ref().and_then(|group| group.peek(0)) else {
             self.post(index, -super::tcp::ENOBUFS, 0);
             return;
         };
-        // SAFETY: the buffer is free in the ring until the port takes it, and it has `len` bytes.
-        match unsafe { receive(fd, pointer(address), len, ptr::null_mut()) } {
-            Returned::Done(bytes) => {
-                if let Some(group) = self.group.as_mut() {
-                    group.advance();
-                }
-                let flags = ring::IORING_CQE_F_BUFFER | (u32::from(bid) << ring::IORING_CQE_BUFFER_SHIFT);
-                self.post(index, i32::try_from(bytes).unwrap_or(i32::MAX), flags);
+        let message = pointer::<rsnetwork_udp::sys::WsaMsg>(sqe.addr);
+        let returned = if sqe.opcode == ring::IORING_OP_RECVMSG {
+            // SAFETY: the driver keeps the message and its storage until the completion, and the
+            // buffer is free in the ring until the port takes it, with `len` bytes.
+            unsafe {
+                let region = (*message).buffers;
+                (*region).buf = pointer(address);
+                (*region).len = (*region).len.min(len);
+                receive_message(sqe.fd, message, ptr::null_mut())
             }
-            Returned::Failed(sys::WSAEWOULDBLOCK) => self.call(index),
-            Returned::Failed(error) => self.post(index, error.saturating_neg(), 0),
-            Returned::Pending => {}
+        } else {
+            // SAFETY: the buffer is free in the ring until the port takes it, and it has `len` bytes.
+            unsafe { receive(sqe.fd, pointer(address), len, ptr::null_mut()) }
+        };
+        let taken = match returned {
+            Returned::Done(bytes) => Some(bytes),
+            // A datagram larger than the buffer fills it, and the rest is lost.
+            Returned::Failed(sys::WSAEMSGSIZE) if sqe.opcode == ring::IORING_OP_RECVMSG => {
+                // SAFETY: as above.
+                unsafe {
+                    (*message).flags |= rsnetwork_udp::sys::MSG_TRUNC;
+                    Some((*(*message).buffers).len)
+                }
+            }
+            // No datagram waits after the first of a batch, and the batch ends there.
+            Returned::Failed(sys::WSAEWOULDBLOCK) if follows => {
+                self.post(index, -super::tcp::EAGAIN, 0);
+                None
+            }
+            Returned::Failed(sys::WSAEWOULDBLOCK) => {
+                self.call(index);
+                None
+            }
+            Returned::Failed(error) => {
+                self.post(index, error.saturating_neg(), 0);
+                None
+            }
+            Returned::Pending => None,
+        };
+        if let Some(bytes) = taken {
+            if let Some(group) = self.group.as_mut() {
+                group.advance();
+            }
+            let flags = ring::IORING_CQE_F_BUFFER | (u32::from(bid) << ring::IORING_CQE_BUFFER_SHIFT);
+            self.post(index, i32::try_from(bytes).unwrap_or(i32::MAX), flags);
+        }
+    }
+
+    /// The datagram receive of `index` ended with a warning, `STATUS_BUFFER_OVERFLOW`: the datagram
+    /// was larger than its buffer. Marks its message truncated, as Linux marks it.
+    #[expect(
+        unsafe_code,
+        reason = "the driver keeps the message of the receive until its completion"
+    )]
+    fn truncated(&self, index: u32) {
+        if let Some(slot) = self.slots[index as usize].as_ref()
+            && slot.sqe.opcode == ring::IORING_OP_RECVMSG
+            && !selects(&slot.sqe)
+        {
+            // SAFETY: the driver keeps the message until the completion of the receive.
+            unsafe { (*pointer::<rsnetwork_udp::sys::WsaMsg>(slot.sqe.addr)).flags |= rsnetwork_udp::sys::MSG_TRUNC };
         }
     }
 
@@ -717,6 +811,20 @@ impl Port {
             res: result,
             flags,
         });
+        // The next entry of a batch starts after this one, and a failure ends the rest. A receive
+        // after the first of a batch takes only a datagram that waits.
+        if let Some(link) = slot.link {
+            if result < 0 {
+                self.post(link, -super::ECANCELED, 0);
+            } else if self.slots[link as usize]
+                .as_ref()
+                .is_some_and(|next| selects(&next.sqe))
+            {
+                self.select(link);
+            } else {
+                self.start(link);
+            }
+        }
     }
 
     /// Cancels the call of the entry of `user_data`. Gives the result of the cancel: 0, or the
@@ -804,6 +912,24 @@ unsafe fn status(overlapped: *mut Overlapped) -> u32 {
     unsafe { (&raw const (*overlapped).internal).read_volatile() as u32 }
 }
 
+/// The bytes that the call of the `OVERLAPPED` at `overlapped` transferred.
+///
+/// # Safety
+///
+/// The call ended, and the kernel writes no more.
+#[expect(
+    unsafe_code,
+    reason = "the caller gives an OVERLAPPED that the kernel no longer writes"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a count of one socket call fits a `DWORD`, in the low bits of `InternalHigh`"
+)]
+unsafe fn transferred(overlapped: *mut Overlapped) -> u32 {
+    // SAFETY: the caller's contract, and the field is in an `OVERLAPPED` of the array.
+    unsafe { (&raw const (*overlapped).internal_high).read_volatile() as u32 }
+}
+
 /// The Winsock error of the call of the `OVERLAPPED` at `overlapped` on the socket `fd`, whose
 /// packet came with an error status.
 #[expect(unsafe_code, reason = "the call reads the OVERLAPPED of a call that ended")]
@@ -843,6 +969,90 @@ unsafe fn receive(fd: i32, buffer: *mut c_char, len: u32, overlapped: *mut Overl
         )
     };
     returned(result != sys::SOCKET_ERROR, received)
+}
+
+/// Whether `sqe` is a receive into a buffer that the port selects.
+const fn selects(sqe: &Sqe) -> bool {
+    sqe.flags & ring::IOSQE_BUFFER_SELECT != 0
+}
+
+/// One overlapped `WSARecv` of no bytes with `MSG_PEEK` on the datagram socket `fd`: it waits for
+/// a datagram and leaves it in the socket.
+///
+/// # Safety
+///
+/// `overlapped` stays in place until the terminal event of the call.
+#[expect(unsafe_code, reason = "the caller keeps the OVERLAPPED")]
+unsafe fn peek(fd: i32, overlapped: *mut Overlapped) -> Returned {
+    let mut region = sys::WsaBuf {
+        len: 0,
+        buf: ptr::null_mut(),
+    };
+    let (mut received, mut flags) = (0, rsnetwork_udp::sys::MSG_PEEK);
+    // SAFETY: the caller's contract, and the call copies the `WSABUF` before it returns.
+    let result = unsafe {
+        sys::WSARecv(
+            socket(fd),
+            &raw mut region,
+            1,
+            &raw mut received,
+            &raw mut flags,
+            overlapped,
+            ptr::null_mut(),
+        )
+    };
+    returned(result != sys::SOCKET_ERROR, received)
+}
+
+/// One `WSARecvMsg` of the message at `message` on the socket `fd`, overlapped with `overlapped`,
+/// or with no wait for a null `overlapped`.
+///
+/// # Safety
+///
+/// The message, its region, and its storage stay valid until the terminal event of the call, and
+/// `overlapped` stays in place until then.
+#[expect(unsafe_code, reason = "the caller keeps the message and the OVERLAPPED")]
+unsafe fn receive_message(fd: i32, message: *mut rsnetwork_udp::sys::WsaMsg, overlapped: *mut Overlapped) -> Returned {
+    let Some(receive) =
+        extension::<rsnetwork_udp::sys::WsaRecvMsg>(socket(fd), &RECV_MSG, rsnetwork_udp::sys::WSAID_WSARECVMSG)
+    else {
+        return Returned::Failed(sys::WSAEINVAL);
+    };
+    let mut received = 0;
+    // SAFETY: the caller's contract.
+    let result = unsafe {
+        receive(
+            socket(fd),
+            message,
+            &raw mut received,
+            overlapped.cast(),
+            ptr::null_mut(),
+        )
+    };
+    returned(result != sys::SOCKET_ERROR, received)
+}
+
+/// One overlapped `WSASendMsg` of the message at `message` on the socket `fd`.
+///
+/// # Safety
+///
+/// The message, its region, and its storage stay valid until the terminal event of the call, and
+/// `overlapped` stays in place until then.
+#[expect(unsafe_code, reason = "the caller keeps the message and the OVERLAPPED")]
+unsafe fn send_message(fd: i32, message: *const rsnetwork_udp::sys::WsaMsg, overlapped: *mut Overlapped) -> Returned {
+    let mut sent = 0;
+    // SAFETY: the caller's contract.
+    let result = unsafe {
+        rsnetwork_udp::sys::WSASendMsg(
+            socket(fd),
+            message,
+            0,
+            &raw mut sent,
+            overlapped.cast(),
+            ptr::null_mut(),
+        )
+    };
+    returned(result != sys::SOCKET_ERROR, sent)
 }
 
 /// One overlapped `WSASend` of the `count` regions at `regions` on the socket `fd`.
@@ -1035,6 +1245,7 @@ fn u32_len(len: usize) -> u32 {
 /// The pointers of `AcceptEx` and `ConnectEx`, the same for each socket of the base provider.
 static ACCEPT_EX: OnceLock<sys::AcceptEx> = OnceLock::new();
 static CONNECT_EX: OnceLock<sys::ConnectEx> = OnceLock::new();
+static RECV_MSG: OnceLock<rsnetwork_udp::sys::WsaRecvMsg> = OnceLock::new();
 
 /// The extension function `id`, which `ws2_32.dll` gives only as a pointer, through `socket`. The
 /// first call keeps it in `cell`.

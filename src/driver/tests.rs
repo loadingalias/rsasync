@@ -26,19 +26,17 @@ use std::thread::Thread;
 use std::time::Instant;
 use std::vec::Vec;
 
-#[cfg(target_os = "linux")]
 use core::net::IpAddr;
 
-#[cfg(target_os = "linux")]
 use rsnetwork_udp::{Ecn, Received};
 
 use super::suite::{self, Backend};
-#[cfg(target_os = "linux")]
 use super::{
-    Arrivals, Call, Completion, Datagram, Datagrams, Error, Feature, Features, Held, Medium, Route, UdpOptions,
-    UdpSocket, eventfd, probe, sys,
+    Arrivals, Config, Datagram, Datagrams, Driver, ECANCELED, Reason, Refused, TcpListener, TcpOptions, TcpStream,
+    UdpOptions, UdpSocket, WriteFailed,
 };
-use super::{Config, Driver, ECANCELED, Reason, Refused, TcpListener, TcpOptions, TcpStream, WriteFailed};
+#[cfg(target_os = "linux")]
+use super::{Call, Completion, Error, Feature, Features, Held, Medium, Route, eventfd, probe, sys};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 #[cfg(target_os = "linux")]
@@ -1563,7 +1561,6 @@ fn bind_and_listen_run_on_the_ring_exactly_where_the_report_gives_the_ring() {
 }
 
 /// A UDP socket of the driver at `address`, with `options`.
-#[cfg(target_os = "linux")]
 fn udp(driver: &mut Driver, address: &str, options: UdpOptions) -> UdpSocket {
     let address = address.parse().expect("the test gives a socket address");
     let bind = driver.bind_udp(address, options).expect("the test driver has room");
@@ -1573,7 +1570,6 @@ fn udp(driver: &mut Driver, address: &str, options: UdpOptions) -> UdpSocket {
 }
 
 /// The options of a receiver that reports the metadata of each datagram.
-#[cfg(target_os = "linux")]
 const METADATA: UdpOptions = UdpOptions {
     only_v6: None,
     send_buffer: None,
@@ -1585,7 +1581,6 @@ const METADATA: UdpOptions = UdpOptions {
 };
 
 /// Receives one datagram on `socket` into a buffer of `capacity` bytes.
-#[cfg(target_os = "linux")]
 fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Received, Vec<u8>) {
     let receive = driver
         .recv_from(socket, Backing::from(Vec::with_capacity(capacity)))
@@ -1597,7 +1592,6 @@ fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Rec
 /// One send with a segment size sends one datagram for each segment, all of them, and its report
 /// counts them. A receiver with no GRO gets each segment as a datagram; a receiver with GRO gets
 /// them in one receive, with their segment size. On IPv4 and IPv6.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size(
     backend: Backend,
 ) {
@@ -1635,10 +1629,14 @@ pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesc
 /// The receiver reports the local destination address and the ECN codepoint that the sender set,
 /// and the source address that the sender chose. On IPv4, with a source that is not the address
 /// of the route, and on IPv6.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
-    for (any, receiver, source) in [("0.0.0.0:0", "127.0.0.1:0", "127.0.0.2"), ("[::]:0", "[::1]:0", "::1")] {
+    // Windows has one IPv4 loopback address, so the source there is that address.
+    #[cfg(target_os = "linux")]
+    let ipv4 = "127.0.0.2";
+    #[cfg(target_os = "windows")]
+    let ipv4 = "127.0.0.1";
+    for (any, receiver, source) in [("0.0.0.0:0", "127.0.0.1:0", ipv4), ("[::]:0", "[::1]:0", "::1")] {
         let mut sender = udp(&mut driver, any, UdpOptions::default());
         let mut receiver = udp(&mut driver, receiver, METADATA);
         let source: IpAddr = source.parse().unwrap();
@@ -1659,7 +1657,6 @@ pub(in crate::driver) fn send_metadata_sets_the_source_and_ecn_that_the_receive_
 
 /// A half-close of a UDP socket refuses before any submission, and the socket goes on: a datagram
 /// goes and arrives after it.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_half_close_of_a_udp_socket_refuses_and_changes_nothing(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1679,7 +1676,6 @@ pub(in crate::driver) fn a_half_close_of_a_udp_socket_refuses_and_changes_nothin
 }
 
 /// A datagram larger than its buffer gives the truncation outcome, with the bytes that fit.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn an_oversized_datagram_gives_the_truncation_outcome(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1699,7 +1695,6 @@ pub(in crate::driver) fn an_oversized_datagram_gives_the_truncation_outcome(back
 /// A receive whose future drops after its datagram came leaves the datagram, its metadata, and its
 /// truncation result to the next receive, which gives them before it submits, with one counted
 /// copy. A close then releases a datagram that no receive took.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive(
     backend: Backend,
 ) {
@@ -1787,7 +1782,6 @@ fn a_batch_of_datagrams_arrives_as_each_datagram_after_one_kernel_entry() {
 /// A datagram of a batch that the kernel refuses ends the batch: the report counts the datagrams
 /// before it, and the datagrams after it do not go, so no rest becomes a new datagram. The
 /// receiver gets exactly the counted datagrams.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it(
     backend: Backend,
 ) {
@@ -1825,7 +1819,6 @@ pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts
 
 /// A batch with more datagrams than the submission queue has entries can never start, so it
 /// refuses with `Reason::Queue` and gives its datagrams back. The socket then sends a datagram.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back() {
     let mut driver = driver(Config::new().submissions(8));
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1856,7 +1849,6 @@ pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gi
 
 /// A batch receive takes the datagrams that wait in one kernel entry, each into a buffer that the
 /// kernel selects, with its own metadata. Its report counts them.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its_metadata(backend: Backend) {
     let budget = Budget::new(NonZeroU64::new(4096).unwrap());
     let mut driver = suite::driver(Config::new(), backend);
@@ -1866,7 +1858,11 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
         .unwrap();
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "127.0.0.1:0", METADATA);
+    // Windows refuses to send the CE codepoint (`WSAEINVAL`).
+    #[cfg(target_os = "linux")]
     let codepoints = [Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
+    #[cfg(target_os = "windows")]
+    let codepoints = [Ecn::Ect0, Ecn::Ect1, Ecn::Ect0];
     for (index, ecn) in codepoints.into_iter().enumerate() {
         let datagram = Datagram {
             ecn: Some(ecn),
@@ -1891,7 +1887,6 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
 /// A receive into a buffer that the kernel selects waits for its datagram, which then arrives in
 /// the one slot of the pool, with its length and its source. When that buffer drops, the slot goes
 /// back to the kernel ring, so the next datagram arrives in it again.
-#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_selected_datagram_arrives_in_the_slot_of_the_pool_which_returns_at_its_drop(
     backend: Backend,
 ) {

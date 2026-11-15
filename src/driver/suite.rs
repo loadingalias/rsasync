@@ -19,8 +19,8 @@
 //! On Windows, `Backend::Iocp` gives each completion as the completion port gives it, where each
 //! socket that passes the installed-provider check skips the packet of a call that ends at once,
 //! and `Backend::Packets` gives it with no skip, so each call that does not fail at once ends at
-//! its packet. Only the TCP cases run on Windows: its UDP, files, pipes, local streams, processes,
-//! and signals have no IOCP form yet. The cases whose kernel facts differ on Windows state the
+//! its packet. Only the TCP and UDP cases run on Windows: its files, pipes, local streams,
+//! processes, and signals have no IOCP form yet. The cases whose kernel facts differ on Windows state the
 //! difference beside their bodies: a send there goes whole or fails, so a send goes in part only at
 //! a reset of its connection, and a cancel of a send that runs aborts the connection.
 //!
@@ -54,8 +54,8 @@
 //! | io_uring, zero-copy send | No driver operation is a zero-copy send before R611. The table rule runs in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` |
 //! | epoll, `MSG_ZEROCOPY` send | No driver operation is a zero-copy send before R611, which adds it on epoll too |
 //! | IOCP, initiating call returns `STATUS_PENDING` | On Windows, `law::iocp` and `law::packets`, for example `a_dropped_accept_leaves_its_connection_to_the_next_accept`; after `CancelIoEx`, `a_cancelled_receive_keeps_its_buffer_until_its_packet` |
-//! | IOCP, immediate return with an error status | No TCP case makes a call fail at once with an error status on demand: a refused connect fails at its packet. The UDP form of IOCP adds a case |
-//! | IOCP, immediate return with any other status | On Windows, with skip-on-success in `law::iocp` and with a packet in `law::packets`: `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order`, whose receive ends at once with its bytes. The warning status of an oversized datagram needs UDP, which the UDP form of IOCP adds |
+//! | IOCP, immediate return with an error status | On Windows, `a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it`: the stack refuses a datagram above 65507 bytes at once |
+//! | IOCP, immediate return with any other status | On Windows, with skip-on-success in `law::iocp` and with a packet in `law::packets`: `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order`, whose receive ends at once with its bytes. The warning status of an oversized datagram comes in the packet of `an_oversized_datagram_gives_the_truncation_outcome`: on Windows Server 2025, the receive of a datagram that waits returns pending, so no case makes the warning at once |
 //! | Windows IoRing | No IoRing backend: the Windows file task of R5 adds it |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
 //! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. No kqueue backend: R505 adds it |
@@ -318,7 +318,6 @@ mod law {
         pipe::tests => a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer,
         #[cfg(target_os = "linux")]
         local::tests => a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations,
-        #[cfg(target_os = "linux")]
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
         #[cfg(target_os = "linux")]
         file::tests => a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion,
@@ -357,7 +356,6 @@ mod law {
     once! {
         #[cfg(target_os = "linux")]
         tests => a_full_driver_refuses_a_submission_and_returns_its_resources,
-        #[cfg(target_os = "linux")]
         tests => a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back,
     }
 
@@ -481,19 +479,12 @@ mod operation {
         #[cfg(target_os = "linux")]
         local::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,
         // UDP.
-        #[cfg(target_os = "linux")]
         tests => send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports,
-        #[cfg(target_os = "linux")]
         tests => a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size,
-        #[cfg(target_os = "linux")]
         tests => an_oversized_datagram_gives_the_truncation_outcome,
-        #[cfg(target_os = "linux")]
         tests => a_selected_datagram_arrives_in_the_slot_of_the_pool_which_returns_at_its_drop,
-        #[cfg(target_os = "linux")]
         tests => a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it,
-        #[cfg(target_os = "linux")]
         tests => a_batch_receive_returns_several_datagrams_each_with_its_metadata,
-        #[cfg(target_os = "linux")]
         tests => a_half_close_of_a_udp_socket_refuses_and_changes_nothing,
         // Pipe.
         #[cfg(target_os = "linux")]

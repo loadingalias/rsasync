@@ -10,23 +10,18 @@ use alloc::vec::Vec;
 use core::ffi::c_int;
 #[cfg(target_os = "linux")]
 use core::ffi::c_void;
-use core::fmt;
 use core::net::SocketAddr;
-#[cfg(target_os = "linux")]
-use core::ptr;
+use core::{fmt, ptr};
 use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
 #[cfg(target_os = "linux")]
-use rsnetwork_udp::Received;
-#[cfg(target_os = "linux")]
 use rsnetwork_udp::sys::{self, IoVec, IoVec as Region, MsgHdr};
-use rsnetwork_udp::{AF_INET6, SaFamily, SockAddrStorage};
+use rsnetwork_udp::{AF_INET6, Received, SaFamily, SockAddrStorage};
 
 #[cfg(target_os = "windows")]
 use super::iocp::sys::{self, WsaBuf as Region};
-#[cfg(target_os = "linux")]
 use super::udp::{self, Arrivals, Batch};
 use super::{
     Borrowed, Call, Completion, Driver, ECANCELED, Handle, Held, Kind, Medium, Operation, Payload, Reason, Refused,
@@ -43,9 +38,11 @@ use crate::uring::Sqe;
 const ENOBUFS: i32 = 105;
 #[cfg(target_os = "windows")]
 pub(super) const ENOBUFS: i32 = 10055;
-/// `EAGAIN`: a receive with no wait found no datagram.
+/// `EAGAIN`, on Windows `WSAEWOULDBLOCK`: a receive with no wait found no datagram.
 #[cfg(target_os = "linux")]
-const EAGAIN: i32 = 11;
+pub(super) const EAGAIN: i32 = 11;
+#[cfg(target_os = "windows")]
+pub(super) const EAGAIN: i32 = 10035;
 /// `ENOMEM`, on Windows `ERROR_NOT_ENOUGH_MEMORY`: each resource slot of the driver is in use. It
 /// reads as `OutOfMemory`.
 #[cfg(target_os = "linux")]
@@ -645,10 +642,8 @@ enum Kept {
     /// The error of a receive.
     Error(i32),
     /// A datagram that a receive took, with its facts.
-    #[cfg(target_os = "linux")]
     Datagram { buffer: Backing, received: Received },
     /// The datagrams that a batch receive took, in order.
-    #[cfg(target_os = "linux")]
     Arrivals(Arrivals),
     /// An accepted connection, and the address of its peer.
     Connection {
@@ -694,12 +689,10 @@ impl Directions {
     /// The direction of an operation of `kind`.
     fn direction(&mut self, kind: Kind) -> Option<&mut Direction> {
         match kind {
-            Kind::Recv | Kind::Selected | Kind::Accept => Some(&mut self.read),
-            #[cfg(target_os = "linux")]
-            Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => Some(&mut self.read),
-            Kind::Send | Kind::Vectored | Kind::Shutdown => Some(&mut self.write),
-            #[cfg(target_os = "linux")]
-            Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
+            Kind::Recv | Kind::Selected | Kind::Accept | Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => {
+                Some(&mut self.read)
+            }
+            Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
             #[cfg(target_os = "linux")]
             Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => None,
@@ -717,14 +710,13 @@ impl Directions {
             Kind::Recv | Kind::Selected => matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_))),
             Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
             Kind::Send | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
-            #[cfg(target_os = "linux")]
             Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => matches!(
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => false,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
             #[cfg(target_os = "linux")]
-            Kind::SendTo | Kind::SendBatch | Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => false,
+            Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => false,
         }
     }
 }
@@ -820,7 +812,6 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
                 directions.sent = Sent::Owe;
             }
         }
-        #[cfg(target_os = "linux")]
         Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.payload) {
             (
                 Some(loan),
@@ -839,7 +830,6 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
             }
             _ => {}
         },
-        #[cfg(target_os = "linux")]
         Kind::RecvBatch => match held.payload {
             Payload::Batch {
                 batch: Batch::Receive(arrivals),
@@ -852,10 +842,10 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
             }
             _ => {}
         },
-        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => {}
         // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
+        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
         #[cfg(target_os = "linux")]
-        Kind::SendTo | Kind::SendBatch | Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => {}
+        Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => {}
     }
 }
 
@@ -1178,14 +1168,11 @@ impl Driver {
         let socket = new_socket(family, kind)?;
         setup(borrow(&socket))?;
         let fd = number(borrow(&socket));
-        #[cfg(target_os = "linux")]
         let medium = if kind == sys::SOCK_DGRAM {
             Medium::Udp
         } else {
             Medium::Stream
         };
-        #[cfg(target_os = "windows")]
-        let medium = Medium::Stream;
         let resource = self
             .adopt(socket, medium)
             .map_err(|_| io::Error::from_raw_os_error(ENOMEM))?;
@@ -1620,13 +1607,11 @@ impl Driver {
                 }
                 Some(0)
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvFrom, Some(Kept::Datagram { buffer, received })) => {
                 let (result, copied) = deliver_copy(slot, id, &buffer, received);
                 self.copied = self.copied.saturating_add(copied as u64);
                 Some(result)
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvFrom, Some(Kept::Arrivals(mut arrivals))) => {
                 let first = arrivals.take_first();
                 directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
@@ -1636,17 +1621,14 @@ impl Driver {
                     result
                 })
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvSelectedFrom, Some(Kept::Datagram { buffer, received })) => {
                 Some(deliver(slot, id, buffer, received))
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvSelectedFrom, Some(Kept::Arrivals(mut arrivals))) => {
                 let first = arrivals.take_first();
                 directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
                 first.map(|(buffer, received)| deliver(slot, id, buffer, received))
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvBatch, Some(Kept::Datagram { buffer, received })) => {
                 let mut taken = Some((buffer, received));
                 slot.update(id, |held| {
@@ -1659,7 +1641,6 @@ impl Driver {
                 directions.kept = taken.map(|(buffer, received)| Kept::Datagram { buffer, received });
                 Some(1)
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvBatch, Some(Kept::Arrivals(mut kept))) => {
                 let mut count = 0;
                 slot.update(id, |held| {
@@ -1677,7 +1658,6 @@ impl Driver {
                 directions.kept = udp::keep_arrivals(kept).map(Kept::Arrivals);
                 Some(count)
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch, Some(Kept::Error(error))) => Some(error),
             (Kind::Send | Kind::Vectored | Kind::Shutdown, kept) => {
                 directions.kept = kept;
@@ -1711,7 +1691,6 @@ impl Driver {
             self.complete_now(id, result);
             return true;
         }
-        #[cfg(target_os = "linux")]
         if kind.batch() {
             return self.start_batch(id, fd);
         }
@@ -1719,7 +1698,6 @@ impl Driver {
             return false;
         }
         let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
-        #[cfg(target_os = "linux")]
         let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
         // A batch submits in `start_batch`, and each other kind always has its resources, so the
         // last arm gives no entry that the kernel runs.
@@ -1758,16 +1736,13 @@ impl Driver {
             (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SHUT_WR),
             #[cfg(target_os = "windows")]
             (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SD_SEND),
-            #[cfg(target_os = "linux")]
             (Kind::RecvFrom, Payload::Receive { message, .. }, Some(loan)) => {
                 let (region, len) = (loan.as_mut_ptr(), loan.capacity());
                 Sqe::recv_message(fd, message.receive(region, len), 0)
             }
-            #[cfg(target_os = "linux")]
             (Kind::RecvSelectedFrom, Payload::Receive { message, .. }, _) => {
                 Sqe::recv_message_selected(fd, message.receive(ptr::null_mut(), slot_len), 0, group)
             }
-            #[cfg(target_os = "linux")]
             (Kind::SendTo, Payload::SendTo { message, datagram }, _) => Sqe::send_message(fd, message.send(datagram)),
             (Kind::Accept, Payload::Socket { peer, peer_len, .. }, _) => {
                 Sqe::accept(fd, (&raw mut *peer).cast(), &raw mut *peer_len)
@@ -1788,8 +1763,7 @@ impl Driver {
     /// Submits the batch `id` on the socket `fd`: one entry for each datagram, each linked to the
     /// next, in one kernel entry. A batch receive waits only in its first entry. Gives `false`, and
     /// changes nothing, when the queue has no room for each entry.
-    #[cfg(target_os = "linux")]
-    fn start_batch(&mut self, id: OpId, fd: std::os::fd::RawFd) -> bool {
+    fn start_batch(&mut self, id: OpId, fd: i32) -> bool {
         let mut entries = 0;
         self.hold(id, |held| {
             entries = match held.payload.batch() {
@@ -1817,11 +1791,16 @@ impl Driver {
                     Some(Batch::Receive(arrivals)) => {
                         // The first receive waits for a datagram; the next ones take only the
                         // datagrams that wait.
+                        // On Windows, the port takes the receives after the first of a chain with
+                        // no wait.
+                        #[cfg(target_os = "linux")]
                         let flags = if index == 0 {
                             0
                         } else {
                             rsnetwork_udp::sys::MSG_DONTWAIT
                         };
+                        #[cfg(target_os = "windows")]
+                        let flags = 0;
                         arrivals.message(index, slot_len).map_or_else(Sqe::nop, |message| {
                             Sqe::recv_message_selected(fd, message, flags, group)
                         })
@@ -1981,7 +1960,6 @@ impl Driver {
 /// Gives the kept datagram of `buffer` with `received` to the receive `id`, copied into its
 /// buffer: one copy, which [`Driver::copied`] counts. Gives the result of the receive and the
 /// bytes that it copied.
-#[cfg(target_os = "linux")]
 fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backing, received: Received) -> (i32, usize) {
     let mut copied = 0;
     slot.update(id, |held| {
@@ -1999,7 +1977,6 @@ fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backin
 
 /// Gives the kept datagram of `buffer` with `received` to the selecting receive `id`, with no
 /// copy. Gives the result of the receive.
-#[cfg(target_os = "linux")]
 fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, received: Received) -> i32 {
     let len = i32::try_from(received.len).unwrap_or(i32::MAX);
     slot.update(id, |held| {

@@ -1,9 +1,9 @@
 # The IOCP backend
 
-On Windows, the driver runs on an I/O completion port (IOCP). TCP has the same API and the same
-ownership rules as on io_uring and epoll: the terminal event of an operation releases its buffer and
+On Windows, the driver runs on an I/O completion port (IOCP). TCP and UDP have the same API and the
+same ownership rules as on io_uring and epoll: the terminal event of an operation releases its buffer and
 its charge, and a dropped or forgotten future ends only the interest. This page tells how each TCP
-operation runs on the port, when the port skips a packet, and what differs from Linux. rsasync is in
+and UDP operation runs on the port, when the port skips a packet, and what differs from Linux. rsasync is in
 development, and the IOCP backend is not in a published release yet.
 
 ## Select the backend
@@ -49,11 +49,37 @@ Before each call, the driver sets the NT status of the `OVERLAPPED` of the call 
 | --- | --- |
 | Pending (`WSA_IO_PENDING`) | The completion packet. After `CancelIoEx`, the `OVERLAPPED` and the buffer stay owned until that packet comes, whatever status it gives |
 | Success at once | The completion packet, or on a socket that skips packets, the return |
-| Failure at once, with a warning status such as `STATUS_BUFFER_OVERFLOW` | The completion packet. Win32 reports this warning as a failure (`WSAEMSGSIZE`), and its packet still comes. On a socket that skips packets, the driver takes the return as terminal, but no run shows yet whether a packet still comes there. No TCP operation gives a warning status |
+| Failure at once, with a warning status such as `STATUS_BUFFER_OVERFLOW` | The completion packet, or on a socket that skips packets, the return. Win32 reports this warning as a failure (`WSAEMSGSIZE`), and its packet still comes. The I/O manager skips the packet of each status that is not an error, so a skipping socket gets none. This case has no run evidence: on Windows Server 2025, an overlapped receive of a datagram larger than its buffer returns pending, also when the datagram waits |
 | Failure at once, with an error status (`NT_ERROR`), or with the status still `STATUS_PENDING` because the call did not reach the I/O manager | The return. No packet comes |
 
 The driver never classifies a failed return as terminal by the Win32 result alone: a warning status
 means that the kernel still writes the buffer and queues a packet.
+
+## UDP
+
+UDP runs on the port with the API of [UDP on the driver](udp.md), and the datagram calls and control
+messages of [datagram I/O](datagram-io.md#windows):
+
+| Operation | On IOCP |
+| --- | --- |
+| Bind (`Driver::bind_udp`) | System calls on the thread of the driver. `UdpOptions::gro` turns on coalesced receive (URO) with `UDP_RECV_MAX_COALESCED_SIZE` |
+| One datagram, with its metadata and segment size (USO) | One overlapped `WSASendMsg` or `WSARecvMsg`, with the control messages of `rsnetwork-udp` |
+| Receive into a selected buffer | A receive of zero bytes with `MSG_PEEK`, which waits for a datagram and holds no buffer. When one waits, one nonblocking `WSARecvMsg` reads it into a free slot of the pool |
+| Batches: `send_batch` and `recv_batch` | One call for each datagram, one at a time. A send that the stack refuses ends the batch, and the report counts the datagrams before it. A batch receive waits for its first datagram, and then takes only the datagrams that wait |
+
+A datagram larger than its buffer fills the buffer, and the receive reports `truncated`. The stack
+gives the warning status `STATUS_BUFFER_OVERFLOW` for it, which Win32 reports as the failure
+`WSAEMSGSIZE`. The driver keeps the buffer until the terminal event of the receive and reports the
+truncation, never an error. On Windows Server 2025, an overlapped receive of a datagram that waits
+returns pending, on both forms of socket, so the receive ends at its packet, which carries the
+warning. No run shows the immediate form of this warning.
+
+The validation of USO and URO on a path is the [probe of datagram I/O](datagram-io.md#validate-segmentation-offload): send
+its segments through the driver, give each received datagram to `Probe::observe`, and turn the
+offload off when the verdict is `Verdict::Fallback`, which names the reason. Windows loopback keeps
+the segment sizes and each datagram, so no run shows a fallback.
+
+Windows refuses to send the CE codepoint (`WSAEINVAL`), and it has one IPv4 loopback address.
 
 ## Skip-on-success
 
@@ -103,5 +129,5 @@ The driver starts no thread, and `report().helper_threads()` gives 0.
 
 ## Limits
 
-- TCP only. UDP, files, pipes, local streams, processes, and signals have no Windows form yet.
+- TCP and UDP only. Files, pipes, local streams, processes, and signals have no Windows form yet.
 - Windows x86_64 only. Windows on aarch64 has no run evidence.

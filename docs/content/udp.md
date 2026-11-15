@@ -5,7 +5,7 @@ operation, its result, the batch report, the truncation rule, and what happens w
 forget a future. [Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end
 the driver. For datagram I/O on a socket of another runtime, with no driver, see
 [Datagram I/O on any socket](datagram-io.md): both use the same metadata and the same control
-messages.
+messages. The same operations run on Windows, on the [IOCP backend](iocp.md#udp).
 
 ## Operations
 
