@@ -132,6 +132,13 @@ cases of the driver suites on the port, each one with skip-on-success and with n
 run, an MSVC build of the Windows SDK headers showed that the 53 checked values and layouts and the
 15 signatures of the IOCP declarations of the driver match them.
 
+UDP on the port then passed in run `20261115T100000Z-87983` of the same instance type and OS
+build: `cargo xtask test` ran 228 tests of the workspace and the doctests. They include the 31 TCP
+and UDP cases of the driver suites, each one with skip-on-success and with no skip, and the header
+check matched 57 values and layouts. Revision `067075e` differs from the tree of that run only in
+the classification of a warning at once on a skipping socket, which no host run can make, and in
+its docs.
+
 Windows on aarch64 has no run evidence yet.
 
 ## WebAssembly
