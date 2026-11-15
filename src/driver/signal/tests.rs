@@ -76,8 +76,7 @@ fn stream(driver: &mut Driver, signal: Signal) -> SignalStream {
     driver.signal(signal, Escalation::Never).unwrap()
 }
 
-#[test]
-fn several_raises_before_one_poll_give_one_report() {
+pub(in crate::driver) fn several_raises_before_one_poll_give_one_report() {
     let mut driver = Driver::new(Config::new()).unwrap();
     let mut stream = stream(&mut driver, Signal::TERMINATE);
     let (woken, waker) = counter();
@@ -92,8 +91,7 @@ fn several_raises_before_one_poll_give_one_report() {
     assert_eq!(stream.poll_recv(&cx), Poll::Pending);
 }
 
-#[test]
-fn two_streams_of_one_signal_on_two_drivers_both_report() {
+pub(in crate::driver) fn two_streams_of_one_signal_on_two_drivers_both_report() {
     let mut drivers = [Driver::new(Config::new()).unwrap(), Driver::new(Config::new()).unwrap()];
     let mut streams = drivers.each_mut().map(|driver| stream(driver, Signal::TERMINATE));
     let cx = Context::from_waker(Waker::noop());
@@ -111,8 +109,7 @@ fn two_streams_of_one_signal_on_two_drivers_both_report() {
     }
 }
 
-#[test]
-fn a_close_restores_the_earlier_disposition_and_other_signals_keep_theirs() {
+pub(in crate::driver) fn a_close_restores_the_earlier_disposition_and_other_signals_keep_theirs() {
     ignore(SIGUSR1);
     let other = handler_of(SIGUSR2);
     let mut driver = Driver::new(Config::new()).unwrap();
@@ -127,8 +124,7 @@ fn a_close_restores_the_earlier_disposition_and_other_signals_keep_theirs() {
     assert_eq!(handler_of(SIGUSR2), other);
 }
 
-#[test]
-fn a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse() {
+pub(in crate::driver) fn a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse() {
     let mut driver = Driver::new(Config::new()).unwrap();
     let refusal = |driver: &mut Driver, number| driver.signal(Signal::from_raw(number), Escalation::Never).unwrap_err();
     for fault in [4, 5, 7, 8, 11, 31] {
@@ -155,9 +151,10 @@ fn a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse() {
 
 /// The child process registers `SIGINT` with escalation at the second delivery, never polls, and
 /// raises `SIGINT` two times. It exits with 0 only when the second delivery does not end it.
-#[test]
-fn escalation_at_the_second_delivery_ends_a_child_that_never_polls() {
-    const NAME: &str = "driver::signal::tests::escalation_at_the_second_delivery_ends_a_child_that_never_polls";
+pub(in crate::driver) fn escalation_at_the_second_delivery_ends_a_child_that_never_polls() {
+    // The test of this case in the index of `driver::suite`, which the child runs.
+    const NAME: &str =
+        "driver::suite::operation::once::escalation_at_the_second_delivery_ends_a_child_that_never_polls";
     const CHILD: &str = "RSASYNC_SIGNAL_ESCALATION_CHILD";
     if std::env::var_os(CHILD).is_some() {
         let mut driver = Driver::new(Config::new()).unwrap();

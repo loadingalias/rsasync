@@ -1,6 +1,7 @@
 //! Each test runs in a process of its own (nextest), so the children, the threads, and the signal
 //! state of one test do not reach another.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ffi::c_int;
@@ -10,6 +11,7 @@ use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
+use std::io::{BufRead as _, BufReader};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Command, Stdio};
@@ -17,6 +19,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+use super::super::suite::{self, Backend};
 use super::super::tests::{drive, driver, numbered};
 use super::super::{Call, Config, Driver, PipeReader, Reason, Route, Signal, sys};
 use super::{Child, ChildOptions, End, SignalChildError, pidfd_open};
@@ -31,12 +34,13 @@ const P_PID: c_int = 1;
 /// `ESRCH` (`include/uapi/asm-generic/errno-base.h`).
 const ESRCH: i32 = 3;
 
-/// A driver with a blocking service of one thread and `jobs` job slots, for its spawns.
-fn with_service(config: Config, jobs: u32) -> (Driver, Service) {
+/// A driver on `backend` with a blocking service of one thread and `jobs` job slots, for its
+/// spawns.
+fn with_service(config: Config, jobs: u32, backend: Backend) -> (Driver, Service) {
     let budget = Budget::new(NonZeroU64::new(64 << 20).expect("not 0"));
     let service = Service::new(&budget, blocking::Config::new().threads(1).jobs(jobs).stack(256 << 10))
         .expect("the test budget holds the service");
-    let mut driver = driver(config);
+    let mut driver = suite::driver(config, backend);
     driver.use_blocking(service.submitter());
     (driver, service)
 }
@@ -173,9 +177,10 @@ fn poll_ready<F: Future>(future: Pin<&mut F>, cx: &mut Context<'_>) -> Option<F:
 
 /// The exit status is the one of the child, the driver installs no `SIGCHLD` handler, and no
 /// thread waits for the child. A second wait gives the same status at once.
-#[test]
-fn a_child_exit_status_is_reported_once_with_no_sigchld_handler_and_no_helper_thread() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn a_child_exit_status_is_reported_once_with_no_sigchld_handler_and_no_helper_thread(
+    backend: Backend,
+) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let before = threads();
     let mut command = sh("read line; exit 3");
     command.stdin(Stdio::piped());
@@ -199,9 +204,8 @@ fn a_child_exit_status_is_reported_once_with_no_sigchld_handler_and_no_helper_th
 
 /// A drop of the wait and of the child ends the interest only: the driver still reaps the child
 /// when it ends, so no zombie remains.
-#[test]
-fn a_dropped_wait_and_child_leave_no_zombie_after_the_exit() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn a_dropped_wait_and_child_leave_no_zombie_after_the_exit(backend: Backend) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let mut command = sh("read line");
     command.stdin(Stdio::piped());
     let mut child = spawn(&mut driver, command, ChildOptions::new());
@@ -219,11 +223,38 @@ fn a_dropped_wait_and_child_leave_no_zombie_after_the_exit() {
     assert!(reaped, "the child stays a {:?}", state(pid));
 }
 
+/// A drop of a spawn ends the interest only: the job of the blocking service still starts the
+/// child, and the return of the job is the terminal event of the spawn. The driver then applies the
+/// end policy of the child, as at a drop of the child: with [`End::Kill`], it kills the child and
+/// reaps it.
+pub(in crate::driver) fn a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy(
+    backend: Backend,
+) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
+    // The child writes its process ID into a pipe of the test, not into a pipe end of the driver.
+    let (reader, writer) = std::io::pipe().expect("the test host makes a pipe");
+    let mut command = sh("echo $$; exec sleep 600");
+    command.stdout(writer);
+    let options = ChildOptions::new().end(End::Kill);
+    drop(
+        driver
+            .spawn(command, options)
+            .expect("the test driver admits the spawn"),
+    );
+    let mut line = String::new();
+    BufReader::new(reader)
+        .read_line(&mut line)
+        .expect("the child writes its process ID");
+    let pid = line.trim().parse::<u32>().expect("the child gives a process ID");
+    let reaped = drive_until(&mut driver, || state(pid) == State::Reaped);
+    assert!(reaped, "the child stays {:?}", state(pid));
+    assert_eq!(driver.teardown().expect("the teardown works").kept(), 0);
+}
+
 /// A wait for any child, or a `SIGCHLD` handler that reaps, would take the zombie of the test's
 /// own child. The driver reaps only its own children: a spawned one and an adopted one.
-#[test]
-fn the_driver_never_reaps_a_child_that_the_test_starts_itself() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn the_driver_never_reaps_a_child_that_the_test_starts_itself(backend: Backend) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let mut own = Command::new("true").spawn().expect("the test host runs true");
     let own_pidfd = pidfd_open(own.id()).expect("the kernel gives process descriptors");
     assert!(readable(&own_pidfd, 10_000), "the test's own child ends");
@@ -245,9 +276,8 @@ fn the_driver_never_reaps_a_child_that_the_test_starts_itself() {
 
 /// A spawn that finds each child slot in use, and one that finds the service full, refuse and
 /// give the command back.
-#[test]
-fn a_full_child_table_and_a_full_blocking_service_give_the_command_back() {
-    let (mut driver, service) = with_service(Config::new().children(1), 1);
+pub(in crate::driver) fn a_full_child_table_and_a_full_blocking_service_give_the_command_back(backend: Backend) {
+    let (mut driver, service) = with_service(Config::new().children(1), 1, backend);
     let mut first = spawn(&mut driver, sleeper(), ChildOptions::new());
     let refused = driver
         .spawn(Command::new("true"), ChildOptions::new())
@@ -276,9 +306,8 @@ fn a_full_child_table_and_a_full_blocking_service_give_the_command_back() {
 
 /// A kill ends the child, and a signal after the reap refuses: no process has the identity for
 /// the driver now.
-#[test]
-fn a_kill_ends_the_child_and_a_signal_after_the_reap_refuses() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn a_kill_ends_the_child_and_a_signal_after_the_reap_refuses(backend: Backend) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let mut child = spawn(&mut driver, sleeper(), ChildOptions::new());
     driver.kill_child(&child).expect("the child runs");
     let status = drive(&mut driver, child.wait()).expect("the driver runs");
@@ -289,9 +318,8 @@ fn a_kill_ends_the_child_and_a_signal_after_the_reap_refuses() {
 
 /// A tree kill ends each process of the group of the child, also a grandchild. A tree signal
 /// after the reap of the leader refuses, because its group ID can name another group then.
-#[test]
-fn a_tree_kill_ends_a_grandchild_and_a_tree_signal_after_the_reap_refuses() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn a_tree_kill_ends_a_grandchild_and_a_tree_signal_after_the_reap_refuses(backend: Backend) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let mut command = sh("sleep 600 & echo $!; wait");
     command.stdout(Stdio::piped());
     let mut child = spawn(&mut driver, command, ChildOptions::new().tree(true));
@@ -321,9 +349,8 @@ fn a_tree_kill_ends_a_grandchild_and_a_tree_signal_after_the_reap_refuses() {
 
 /// The input and both outputs are separate pipe ends, so the caller writes the input while both
 /// outputs drain, and no full pipe stops the child.
-#[test]
-fn the_caller_writes_the_input_while_both_outputs_drain() {
-    let (driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn the_caller_writes_the_input_while_both_outputs_drain(backend: Backend) {
+    let (driver, _service) = with_service(Config::new(), 4, backend);
     let driver = RefCell::new(driver);
     let mut command = sh("tee /dev/stderr");
     command
@@ -372,13 +399,14 @@ fn the_caller_writes_the_input_while_both_outputs_drain() {
 }
 
 /// With [`End::Keep`], a close and a drop leave the child running, and teardown counts each one.
-#[test]
 #[expect(
     unsafe_code,
     reason = "a kill names no memory, and the wait writes only its structure"
 )]
-fn the_keep_policy_leaves_a_closed_and_a_dropped_child_running_and_teardown_counts_them() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn the_keep_policy_leaves_a_closed_and_a_dropped_child_running_and_teardown_counts_them(
+    backend: Backend,
+) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let closed = spawn(&mut driver, sleeper(), ChildOptions::new());
     let dropped = spawn(&mut driver, sleeper(), ChildOptions::new());
     let pids = [closed.id(), dropped.id()];
@@ -401,9 +429,8 @@ fn the_keep_policy_leaves_a_closed_and_a_dropped_child_running_and_teardown_coun
 }
 
 /// With [`End::Kill`], a close kills the child, and the driver reaps it.
-#[test]
-fn the_kill_policy_close_kills_and_reaps_the_child() {
-    let (mut driver, _service) = with_service(Config::new(), 4);
+pub(in crate::driver) fn the_kill_policy_close_kills_and_reaps_the_child(backend: Backend) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let options = ChildOptions::new().end(End::Kill);
     let child = spawn(&mut driver, sleeper(), options);
     let pid = child.id();

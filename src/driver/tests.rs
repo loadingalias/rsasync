@@ -345,10 +345,11 @@ pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_an
 
 /// A driver that drops with a running read ends the future with `Gone`, and it keeps the buffer
 /// that the kernel can still use.
-#[test]
-fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers_of_running_operations() {
+pub(in crate::driver) fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers_of_running_operations(
+    backend: Backend,
+) {
     let (log, budget) = (Log::default(), budget());
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let (reader, _writer) = pipe();
     let future = read(&mut driver, reader, held(&log, &budget));
     driver.turn().unwrap();
@@ -521,8 +522,9 @@ pub(in crate::driver) fn a_request_into_an_owned_buffer_and_a_response_from_a_le
 /// become a lease at the same address. When the last view of that buffer drops on another thread,
 /// the buffer comes back to the kernel ring through the home, so the next selecting receive gets it
 /// again.
-#[test]
-fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere() {
+pub(in crate::driver) fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere(
+    backend: Backend,
+) {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut pool = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
@@ -530,7 +532,7 @@ fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last
     let mut zeroed = WriteLoan::new(pool.acquire().unwrap());
     zeroed.fill_from(&[0; 64]);
     let slot = zeroed.into_inner().as_ptr();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     driver.provide(pool).unwrap();
     let mut listener = listen(&mut driver, "127.0.0.1:0");
     let address = listener.local_addr();
@@ -1060,11 +1062,10 @@ pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request
 /// Idle connections whose receives wait for a buffer that the kernel selects hold no receive
 /// buffer: eight receives wait while the pool has one slot, and its charge does not change. The
 /// data of the last connection then arrives in that slot.
-#[test]
-fn idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer() {
+pub(in crate::driver) fn idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer(backend: Backend) {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
@@ -1196,9 +1197,8 @@ pub(in crate::driver) fn a_vectored_send_gives_its_exact_progress_across_regions
 /// A vectored send whose future drops sends only part of its regions, so the write direction
 /// fails, and the next send gives the count of the bytes that went: the bytes that the peer
 /// reads.
-#[test]
-fn a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     drop(
         driver
@@ -1219,9 +1219,8 @@ fn a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count() {
 
 /// Each option reads back the value that the caller set, on a listener that set them before its
 /// bind and on a stream that sets them after its accept. Linux doubles the buffer sizes.
-#[test]
-fn each_socket_option_reads_back_the_value_that_was_set() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn each_socket_option_reads_back_the_value_that_was_set(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     for (on, off) in [(true, false), (false, true)] {
         let options = TcpOptions {
             no_delay: Some(on),
@@ -1272,9 +1271,10 @@ fn each_socket_option_reads_back_the_value_that_was_set() {
 
 /// A half-close ends the peer's receive after the bytes that went before it, and the receives of
 /// this side still complete.
-#[test]
-fn a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     let send = driver.send(&mut stream, Lease::from(numbered(0, 1000))).unwrap();
     assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 1000);
@@ -1291,9 +1291,8 @@ fn a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on
 
 /// On a failed write direction, a half-close gives `WriteFailed` and sends nothing: the peer reads
 /// the bytes that went, and then no end of the stream, until the close.
-#[test]
-fn a_half_close_on_a_failed_write_direction_sends_no_end_of_stream() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_half_close_on_a_failed_write_direction_sends_no_end_of_stream(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     drop(driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap());
     let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
@@ -1377,9 +1376,10 @@ fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Rec
 /// One send with a segment size sends one datagram for each segment, all of them, and its report
 /// counts them. A receiver with no GRO gets each segment as a datagram; a receiver with GRO gets
 /// them in one receive, with their segment size. On IPv4 and IPv6.
-#[test]
-fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     for address in ["127.0.0.1:0", "[::1]:0"] {
         let mut sender = udp(&mut driver, address, UdpOptions::default());
         let mut plain = udp(&mut driver, address, UdpOptions::default());
@@ -1413,9 +1413,8 @@ fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its
 /// The receiver reports the local destination address and the ECN codepoint that the sender set,
 /// and the source address that the sender chose. On IPv4, with a source that is not the address
 /// of the route, and on IPv6.
-#[test]
-fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     for (any, receiver, source) in [("0.0.0.0:0", "127.0.0.1:0", "127.0.0.2"), ("[::]:0", "[::1]:0", "::1")] {
         let mut sender = udp(&mut driver, any, UdpOptions::default());
         let mut receiver = udp(&mut driver, receiver, METADATA);
@@ -1437,9 +1436,8 @@ fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports() {
 
 /// A half-close of a UDP socket refuses before any submission, and the socket goes on: a datagram
 /// goes and arrives after it.
-#[test]
-fn a_half_close_of_a_udp_socket_refuses_and_changes_nothing() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_half_close_of_a_udp_socket_refuses_and_changes_nothing(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let refused = driver.shutdown_write(&mut sender).unwrap_err();
@@ -1457,9 +1455,8 @@ fn a_half_close_of_a_udp_socket_refuses_and_changes_nothing() {
 }
 
 /// A datagram larger than its buffer gives the truncation outcome, with the bytes that fit.
-#[test]
-fn an_oversized_datagram_gives_the_truncation_outcome() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn an_oversized_datagram_gives_the_truncation_outcome(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let send = driver
@@ -1477,9 +1474,10 @@ fn an_oversized_datagram_gives_the_truncation_outcome() {
 /// A receive whose future drops after its datagram came leaves the datagram, its metadata, and its
 /// truncation result to the next receive, which gives them before it submits, with one counted
 /// copy. A close then releases a datagram that no receive took.
-#[test]
-fn a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "[::1]:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "[::1]:0", METADATA);
     let to = receiver.local_addr();
@@ -1562,9 +1560,10 @@ fn a_batch_of_datagrams_arrives_as_each_datagram_after_one_kernel_entry() {
 /// A datagram of a batch that the kernel refuses ends the batch: the report counts the datagrams
 /// before it, and the datagrams after it do not go, so no rest becomes a new datagram. The
 /// receiver gets exactly the counted datagrams.
-#[test]
-fn a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut batch = Datagrams::with_capacity(3);
@@ -1628,10 +1627,9 @@ pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gi
 
 /// A batch receive takes the datagrams that wait in one kernel entry, each into a buffer that the
 /// kernel selects, with its own metadata. Its report counts them.
-#[test]
-fn a_batch_receive_returns_several_datagrams_each_with_its_metadata() {
+pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its_metadata(backend: Backend) {
     let budget = Budget::new(NonZeroU64::new(4096).unwrap());
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let slot = Layout::from_size_align(64, 64).unwrap();
     driver
         .provide(Pool::new(&budget, NonZeroU32::new(1).unwrap().saturating_add(3), slot).unwrap())
@@ -1657,6 +1655,34 @@ fn a_batch_receive_returns_several_datagrams_each_with_its_metadata() {
         );
         assert_eq!(received.metadata.ecn, Some(codepoints[index]));
         assert_eq!(received.source, sender.local_addr());
+    }
+}
+
+/// A receive into a buffer that the kernel selects waits for its datagram, which then arrives in
+/// the one slot of the pool, with its length and its source. When that buffer drops, the slot goes
+/// back to the kernel ring, so the next datagram arrives in it again.
+pub(in crate::driver) fn a_selected_datagram_arrives_in_the_slot_of_the_pool_which_returns_at_its_drop(
+    backend: Backend,
+) {
+    let budget = budget();
+    let mut pool = Pool::new(&budget, NonZeroU32::MIN, Layout::from_size_align(64, 64).unwrap()).unwrap();
+    let slot = pool.acquire().unwrap().as_ptr();
+    let mut driver = suite::driver(Config::new(), backend);
+    driver.provide(pool).unwrap();
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let to = receiver.local_addr();
+    for bytes in [&b"first"[..], b"second"] {
+        let receive = driver.recv_selected_from(&mut receiver).unwrap();
+        // The turn submits the receive, which finds no datagram and waits for it.
+        driver.turn().unwrap();
+        let send = driver
+            .send_to(&mut sender, Datagram::new(Lease::from(bytes.to_vec()), to))
+            .unwrap();
+        drive(&mut driver, send).unwrap().0.unwrap();
+        let (received, buffer) = drive(&mut driver, receive).unwrap().unwrap();
+        assert_eq!((received.len, received.source), (bytes.len(), sender.local_addr()));
+        assert_eq!((buffer.bytes(), buffer.as_ptr()), (bytes, slot));
     }
 }
 

@@ -116,11 +116,10 @@ pub(in crate::driver) fn a_short_read_gives_its_exact_extent_and_the_exact_read_
 
 /// A direct-I/O file refuses a buffer, a length, or an offset that does not have its alignment,
 /// before the submission, and gives the buffer back. An aligned read runs.
-#[test]
-fn a_misaligned_direct_io_buffer_refuses_before_submission() {
+pub(in crate::driver) fn a_misaligned_direct_io_buffer_refuses_before_submission(backend: Backend) {
     let scratch = Scratch::new("direct");
     fs::write(scratch.join("data"), numbered(0, 65536)).unwrap();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(
         &mut driver,
         &scratch.join("data"),
@@ -199,10 +198,11 @@ impl Drop for Hold {
 /// A length change runs on the ring from Linux 6.9 (`IORING_OP_FTRUNCATE`), and on the blocking
 /// service before it, and the report names the route before the first operation. On the
 /// blocking service, a driver with no service and a full service refuse.
-#[test]
-fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before() {
+pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before(
+    backend: Backend,
+) {
     let scratch = Scratch::new("length");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let on_service = kernel() < (6, 9);
     let route = driver.report().route(Call::SetFileLen);
     assert_eq!(route == Route::BlockingService, on_service);
@@ -243,10 +243,9 @@ fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_b
 
 /// A rename, an unlink, and the sync of their directory complete, and the names change as they
 /// say.
-#[test]
-fn a_rename_an_unlink_and_a_directory_sync_complete() {
+pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backend: Backend) {
     let scratch = Scratch::new("names");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("first"), writable().create_new(true));
     write(&mut driver, &file, b"contents", 0);
     sync(&mut driver, &file);
@@ -275,11 +274,10 @@ fn a_rename_an_unlink_and_a_directory_sync_complete() {
 }
 
 /// A preallocation keeps or extends the length as asked, and the file system allocates its blocks.
-#[test]
-fn a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks() {
+pub(in crate::driver) fn a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks(backend: Backend) {
     const MIB: u64 = 1 << 20;
     let scratch = Scratch::new("allocate");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("data"), writable());
     let allocate = driver.allocate(&file, 0, MIB, Length::Keep).unwrap();
     drive(&mut driver, allocate).unwrap().unwrap();
@@ -296,11 +294,10 @@ fn a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks() {
 }
 
 /// A punched hole reads as zeros, keeps the length, and frees its blocks.
-#[test]
-fn a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks() {
+pub(in crate::driver) fn a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks(backend: Backend) {
     const KIB: usize = 1 << 10;
     let scratch = Scratch::new("hole");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("data"), writable().read(true));
     write(&mut driver, &file, &alloc::vec![0xab; 1024 * KIB], 0);
     sync(&mut driver, &file);
@@ -357,11 +354,10 @@ fn a_file_system_without_hole_punching_refuses_with_unsupported() {
 
 /// A dropped write still runs and changes the file, and the driver keeps its lease until the
 /// completion: the release comes after it in the release record.
-#[test]
-fn a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion() {
+pub(in crate::driver) fn a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion(backend: Backend) {
     let scratch = Scratch::new("dropped");
     let log = Log::default();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("data"), writable());
     let mut loan = WriteLoan::new(recorded(&log, 4096));
     loan.fill_from(&numbered(0, 4096));
@@ -372,17 +368,16 @@ fn a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion() {
     );
     posted(&mut driver, 1);
     note(&log, "completed");
-    driver.turn().unwrap();
+    while driver.turn().unwrap().more() {}
     assert_eq!(taken(&log), ["completed", "released"]);
     assert_eq!(fs::read(scratch.join("data")).unwrap(), numbered(0, 4096));
 }
 
 /// A vectored write writes its regions in order at its offset, and a vectored read fills its
 /// buffers in order, each up to its capacity.
-#[test]
-fn vectored_writes_and_reads_keep_the_order_of_their_regions() {
+pub(in crate::driver) fn vectored_writes_and_reads_keep_the_order_of_their_regions(backend: Backend) {
     let scratch = Scratch::new("vectored");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("data"), writable().read(true));
     let mut regions = Regions::with_capacity(2);
     regions.push(Lease::from(numbered(0, 300)));

@@ -126,11 +126,10 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
 
 /// The socket file of a local listener has mode 0600 when the bind ends, before any connect, also
 /// with the usual umask of 022, which leaves the group and others the read and execute bits.
-#[test]
-fn the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends() {
+pub(in crate::driver) fn the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends(backend: Backend) {
     let scratch = Scratch::new("mode");
     let path = scratch.join("socket");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let metadata = fs::symlink_metadata(&path).unwrap();
     assert_eq!(metadata.mode() & 0o7777, 0o600);
@@ -140,11 +139,10 @@ fn the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends() {
 /// live listener keeps its socket file. After the close of the listener, the socket file stays: a
 /// bind with `Stale::Refuse` gives `AddrInUse`, and a bind with `Stale::Replace` replaces it. A
 /// bind with `Stale::Replace` on a file that is not a socket gives `AddrInUse` and keeps the file.
-#[test]
-fn a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file() {
+pub(in crate::driver) fn a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file(backend: Backend) {
     let scratch = Scratch::new("stale");
     let path = scratch.join("socket");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     for stale in [Stale::Refuse, Stale::Replace] {
         let error = bind(&mut driver, &path, stale).unwrap_err();
@@ -176,10 +174,9 @@ fn a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file() {
 /// A path that the kernel would change gives `InvalidInput` and makes no socket: an empty path,
 /// which would bind an abstract name with no file and no permission, a path with a NUL byte, and a
 /// path of 108 bytes, which has no room for the NUL byte. A path of 107 bytes binds.
-#[test]
-fn a_path_that_does_not_fit_a_socket_address_gives_invalid_input() {
+pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid_input(backend: Backend) {
     let scratch = Scratch::new("path");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let base = scratch.join("").into_os_string().into_vec();
     let long = |len: usize| {
         let mut path = base.clone();
@@ -200,6 +197,24 @@ fn a_path_that_does_not_fit_a_socket_address_gives_invalid_input() {
     let path = long(107);
     let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     UnixStream::connect(&path).unwrap();
+}
+
+/// An accepted stream reports the identity of the process that connected, here this process: the
+/// user and the group that own the socket file, which this process made, and its process ID.
+pub(in crate::driver) fn an_accepted_stream_reports_the_user_group_and_process_of_this_process(backend: Backend) {
+    let scratch = Scratch::new("own");
+    let path = scratch.join("socket");
+    let mut driver = suite::driver(Config::new(), backend);
+    let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
+    let _peer = UnixStream::connect(&path).unwrap();
+    let accept = driver.accept_local(&mut listener).unwrap();
+    let stream = drive(&mut driver, accept).unwrap().unwrap();
+    let peer = driver.local_peer(&stream).unwrap();
+    let owner = fs::symlink_metadata(&path).unwrap();
+    assert_eq!(
+        (peer.user(), peer.group(), peer.process()),
+        (owner.uid(), owner.gid(), std::process::id())
+    );
 }
 
 /// Starts a process as the user and the group `nobody` that connects a socket to `path`, and gives

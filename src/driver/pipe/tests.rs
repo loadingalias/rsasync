@@ -133,11 +133,10 @@ pub(in crate::driver) fn a_close_returns_while_the_other_end_is_idle_and_reports
 
 /// Idle read ends whose receives wait for a buffer that the kernel selects hold no buffer: eight
 /// receives wait while the pool has one slot. The data of the last pipe then arrives in that slot.
-#[test]
-fn idle_read_ends_with_a_waiting_selecting_receive_hold_no_buffer() {
+pub(in crate::driver) fn idle_read_ends_with_a_waiting_selecting_receive_hold_no_buffer(backend: Backend) {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     driver
         .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .unwrap();
@@ -163,9 +162,8 @@ fn idle_read_ends_with_a_waiting_selecting_receive_hold_no_buffer() {
 
 /// A half-close of a pipe writer refuses before any submission, and the writer goes on: its close
 /// is the end of its stream.
-#[test]
-fn a_half_close_of_a_pipe_writer_refuses_and_changes_nothing() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn a_half_close_of_a_pipe_writer_refuses_and_changes_nothing(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (mut reader, mut writer) = adopted(&mut driver);
     let refused = driver.shutdown_write(&mut writer).unwrap_err();
     assert_eq!(refused.reason(), Reason::Unsupported);
@@ -178,8 +176,7 @@ fn a_half_close_of_a_pipe_writer_refuses_and_changes_nothing() {
 
 /// A socket, an end of the wrong direction, and an end with no free resource slot refuse with
 /// their reasons, and give the descriptor back.
-#[test]
-fn an_adoption_refuses_a_socket_a_wrong_direction_and_a_full_driver() {
+pub(in crate::driver) fn an_adoption_refuses_a_socket_a_wrong_direction_and_a_full_driver() {
     let mut driver = driver(Config::new().resources(1));
     let socket = OwnedFd::from(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
     let raw = socket.as_raw_fd();
@@ -202,10 +199,9 @@ fn an_adoption_refuses_a_socket_a_wrong_direction_and_a_full_driver() {
 }
 
 /// A read end that was nonblocking waits for data after its adoption, and does not end at once.
-#[test]
 #[expect(unsafe_code, reason = "fcntl names no memory with these commands")]
-fn an_adopted_nonblocking_read_end_waits_for_data() {
-    let mut driver = driver(Config::new());
+pub(in crate::driver) fn an_adopted_nonblocking_read_end_waits_for_data(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let (read, mut write) = io::pipe().unwrap();
     let read = OwnedFd::from(read);
     // SAFETY: the commands name no memory, and the argument is an `int`.
