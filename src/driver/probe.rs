@@ -32,6 +32,19 @@
 //! no wake. A signal that comes after the probe wakes the descriptor one time more, which a turn
 //! clears.
 //!
+//! A wake from inside an eventfd write takes the deferred path on each kernel, also without
+//! `cd305ee3633a`. There, `eventfd_write` has set `current->in_eventfd`, so
+//! `eventfd_signal_allowed()` is false. Before `60b6c075e8eb` (6.11), `io_eventfd_ops` cleared the
+//! bit after the deferred signal, as 6.1.y and 6.6.y still do. A kernel from 6.11 with neither
+//! `cd305ee3633a` nor `04fe9aeb4f3c` thus gives only the first such signal of a registration. The
+//! pipe of the probe finds no defect there. Of the kernel.org releases, these kernels are 6.11 to
+//! 7.0.14, except 6.12.114 and later and 6.18.49 and later, which have `cd305ee3633a`.
+//!
+//! The probe does not test that path, because the only ring poll of an eventfd is the poll of the
+//! interrupt descriptor in `Driver::wait`. Each writer that must wake a host reactor also writes
+//! the wake descriptor directly. A ring operation that polls a caller's descriptor or another
+//! eventfd makes this path matter, and the probe must then test it.
+//!
 //! The defect is a fact of the kernel, not of a ring, so only the first driver of a process
 //! probes. Each later driver reads that result.
 
