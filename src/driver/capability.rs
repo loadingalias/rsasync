@@ -5,6 +5,7 @@
 
 use core::fmt;
 
+#[cfg(target_os = "linux")]
 use crate::uring;
 
 /// The kernel interface that runs the operations of a driver.
@@ -17,6 +18,9 @@ pub enum Backend {
     /// thread when epoll reports its descriptor ready. Each file operation runs on the blocking
     /// service ([`Route::BlockingService`]), because epoll cannot wait on regular files.
     Epoll,
+    /// IOCP, on Windows: each socket operation is one overlapped call, and its completion packet
+    /// or the return of the call ends it, by the NT status of the call.
+    Iocp,
 }
 
 /// A feature of the kernel that the driver probes on its ring when it starts. A probe runs the
@@ -105,6 +109,7 @@ impl fmt::Debug for Features {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Features {
     /// The features that `probed` found.
     pub(super) fn probed(probed: uring::Features) -> Self {
@@ -129,14 +134,14 @@ impl Features {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Call {
-    /// [`Driver::bind`](super::Driver::bind) and [`Driver::bind_local`](super::Driver::bind_local):
-    /// a bind and a listen of a TCP or a local listener.
+    /// [`Driver::bind`](super::Driver::bind), and on Linux `Driver::bind_local`: a bind and a
+    /// listen of a TCP or a local listener.
     Bind,
-    /// [`Driver::bind_udp`](super::Driver::bind_udp): a bind of a UDP socket.
+    /// `Driver::bind_udp`, on Linux: a bind of a UDP socket.
     BindUdp,
-    /// [`Driver::set_file_len`](super::Driver::set_file_len): a change of the length of a file.
+    /// `Driver::set_file_len`, on Linux: a change of the length of a file.
     SetFileLen,
-    /// The exit of a [`Child`](super::Child): the reap of the child and its status.
+    /// The exit of a `Child`, on Linux: the reap of the child and its status.
     WaitChild,
     /// Each other operation of a file or a directory: open, reads, writes, length, space, sync,
     /// rename, and unlink.
@@ -151,9 +156,8 @@ pub enum Route {
     Ring,
     /// System calls on the thread of the driver, which end at once.
     SystemCall,
-    /// A job of the blocking service that [`Driver::use_blocking`](super::Driver::use_blocking)
-    /// gives. With no service, the call refuses with
-    /// [`Reason::Blocking`](super::Reason::Blocking).
+    /// A job of the blocking service that `Driver::use_blocking` gives, on Linux. With no service,
+    /// the call refuses with `Reason::Blocking`.
     BlockingService,
     /// A poll of a descriptor on the ring or the poller, then one nonblocking system call on the
     /// thread of the driver when the descriptor is readable.
@@ -242,8 +246,8 @@ impl Report {
     }
 
     /// The threads that the driver starts: none, on each backend. A call on
-    /// [`Route::BlockingService`] runs on a thread of the service that
-    /// [`Driver::use_blocking`](super::Driver::use_blocking) gives, which the caller owns.
+    /// [`Route::BlockingService`] runs on a thread of the service that `Driver::use_blocking`
+    /// gives, which the caller owns.
     #[must_use]
     pub const fn helper_threads(&self) -> u32 {
         0
@@ -252,7 +256,7 @@ impl Report {
     /// Whether the driver registers its wake descriptor again in each turn that takes a wake. It
     /// does so on a kernel whose registered event descriptor signals deferred work one time. It
     /// also does so when a deferred signal came late during the probe of the kernel (see the
-    /// [`AsFd`](std::os::fd::AsFd) form of the driver).
+    /// `AsFd` form of the driver on Linux).
     #[must_use]
     pub const fn rearms_wake(&self) -> bool {
         self.rearms_wake

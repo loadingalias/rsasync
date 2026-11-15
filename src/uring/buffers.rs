@@ -11,7 +11,9 @@ use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU16, Ordering};
 use std::io;
 
-use super::{Mapping, Ring, register, sys};
+use super::{Mapping, sys};
+#[cfg(target_os = "linux")]
+use super::{Ring, register};
 
 /// A provided buffer ring that is registered with one ring.
 #[derive(Debug)]
@@ -28,6 +30,7 @@ pub(crate) struct BufferRing {
 impl BufferRing {
     /// Registers a buffer ring of `entries` entries, a power of two up to 32768, as the buffer
     /// group `group` of `ring`.
+    #[cfg(target_os = "linux")]
     #[expect(unsafe_code, reason = "the kernel reads the registration")]
     pub(crate) fn register(ring: &Ring, entries: u16, group: u16) -> io::Result<Self> {
         let memory = Mapping::anonymous(usize::from(entries) * sys::BUF_SIZE)?;
@@ -57,7 +60,7 @@ impl BufferRing {
     }
 
     /// A buffer ring of `entries` entries, a power of two up to 32768, as the buffer group `group`
-    /// of a poller, which reads it as the kernel does. No kernel ring reads it.
+    /// of a poller or a port, which reads it as the kernel does. No kernel ring reads it.
     pub(crate) fn unregistered(entries: u16, group: u16) -> io::Result<Self> {
         Ok(Self {
             memory: ManuallyDrop::new(Mapping::anonymous(usize::from(entries) * sys::BUF_SIZE)?),
@@ -117,6 +120,7 @@ impl BufferRing {
     /// Removes the ring from `ring`, after which the kernel takes no buffer of it, and frees its
     /// memory.
     /// A failure leaves the ring registered, and its memory leaks.
+    #[cfg(target_os = "linux")]
     #[expect(unsafe_code, reason = "the kernel reads the registration")]
     pub(crate) fn unregister(self, ring: &Ring) -> io::Result<()> {
         let mut registration = sys::BufReg {
@@ -134,5 +138,56 @@ impl BufferRing {
         }?;
         drop(ManuallyDrop::into_inner(self.memory));
         Ok(())
+    }
+}
+
+/// The provided buffers of one group, as a backend that is not a kernel ring reads them: the memory
+/// of a buffer ring of [`BufferRing::unregistered`]. The reader takes its buffers from the head, as
+/// the kernel does.
+#[derive(Debug)]
+pub(crate) struct Group {
+    base: core::ptr::NonNull<u8>,
+    mask: u16,
+    head: u16,
+}
+
+impl Group {
+    /// The reader of the ring at `base` with `entries` entries, a power of two.
+    pub(crate) const fn new(base: core::ptr::NonNull<u8>, entries: u16) -> Self {
+        Self {
+            base,
+            mask: entries.wrapping_sub(1),
+            head: 0,
+        }
+    }
+
+    /// The address, the length, and the identifier of the buffer `nth` after the head.
+    #[expect(unsafe_code, reason = "the reader reads the entries that the driver published")]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the mapping starts at a page, and each field is at its natural offset in a 16-byte entry"
+    )]
+    pub(crate) fn peek(&self, nth: u16) -> Option<(u64, u32, u16)> {
+        // SAFETY: the tail is a `u16` at a 2-aligned offset of the page-aligned mapping, which
+        // lives until the group ends.
+        let tail = unsafe { AtomicU16::from_ptr(self.base.as_ptr().add(sys::BUF_RING_TAIL).cast()) };
+        if tail.load(Ordering::Acquire).wrapping_sub(self.head) <= nth {
+            return None;
+        }
+        let entry = usize::from(self.head.wrapping_add(nth) & self.mask) * sys::BUF_SIZE;
+        // SAFETY: the entry is in the mapping, and the driver published it before the tail.
+        unsafe {
+            let base = self.base.as_ptr().add(entry);
+            Some((
+                base.cast::<u64>().read(),
+                base.add(sys::BUF_LEN).cast::<u32>().read(),
+                base.add(sys::BUF_BID).cast::<u16>().read(),
+            ))
+        }
+    }
+
+    /// Takes the buffer at the head.
+    pub(crate) const fn advance(&mut self) {
+        self.head = self.head.wrapping_add(1);
     }
 }

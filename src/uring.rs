@@ -12,39 +12,62 @@
 
 mod buffers;
 pub(crate) mod sys;
+// Two attributes each, so that Clippy sees the test modules (`allow-unwrap-in-tests`).
 #[cfg(all(test, not(loom)))]
+#[cfg(target_os = "linux")]
 mod table_tests;
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests;
 
+#[cfg(target_os = "linux")]
 use core::ffi::{c_int, c_long, c_void};
+#[cfg(target_os = "linux")]
 use core::mem::size_of;
+#[cfg(target_os = "linux")]
 use core::ptr::{self, NonNull};
+#[cfg(target_os = "linux")]
 use core::sync::atomic::{AtomicU32, Ordering};
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", target_os = "linux"))]
 use core::time::Duration;
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+/// The descriptor number of an entry. On Windows it holds the low 32 bits of a socket handle, which
+/// are its significant bits: 64-bit Windows uses 32-bit handles for interoperability.
+#[cfg(target_os = "windows")]
+type RawFd = i32;
 
-pub(crate) use buffers::BufferRing;
+/// One region of a vectored entry, and the message header of a message entry: `struct iovec` and
+/// `struct msghdr` on Linux, `WSABUF` and `WSAMSG` on Windows.
+#[cfg(target_os = "linux")]
+use rsnetwork_udp::sys::{IoVec as Region, MsgHdr as Message};
+#[cfg(target_os = "windows")]
+use rsnetwork_udp::sys::{WsaBuf as Region, WsaMsg as Message};
+
+pub(crate) use buffers::{BufferRing, Group};
 pub(crate) use sys::{Cqe, Sqe};
 
 use crate::table::Event;
 
 /// The setup flags of each ring.
+#[cfg(target_os = "linux")]
 const FLAGS: u32 = sys::IORING_SETUP_SINGLE_ISSUER
     | sys::IORING_SETUP_DEFER_TASKRUN
     | sys::IORING_SETUP_TASKRUN_FLAG
     | sys::IORING_SETUP_CQSIZE;
 
 /// The buffer group that the probe of incremental buffer rings registers and removes again.
+#[cfg(target_os = "linux")]
 const PROBE_GROUP: u16 = u16::MAX;
 
 /// The user data of the message that the probe of ringless messages sends to its own ring.
+#[cfg(target_os = "linux")]
 const PROBE_MESSAGE: u64 = u64::MAX;
 
 /// Why a ring was not created.
 #[derive(Debug)]
+#[cfg(target_os = "linux")]
 pub(crate) enum SetupError {
     /// `EPERM` or `ENOSYS`: the kernel, a seccomp profile, or `kernel.io_uring_disabled` refuses
     /// io_uring. The runtime then selects epoll.
@@ -55,10 +78,12 @@ pub(crate) enum SetupError {
 
 /// Each entry of the submission queue waits for the kernel.
 #[derive(Debug)]
+#[cfg(target_os = "linux")]
 pub(crate) struct Full;
 
 /// The later kernel features, each probed on the ring, not read from the kernel version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
 pub(crate) struct Features {
     /// `IORING_OP_WAITID`: wait for a child (Linux 6.7).
     pub(crate) child_wait: bool,
@@ -129,7 +154,7 @@ impl Sqe {
 
     /// A write of the `count` regions of the iovec array `vectors` to the pipe `fd`, in order
     /// (`IORING_OP_WRITEV`).
-    pub(crate) fn writev(fd: RawFd, vectors: *const rsnetwork_udp::sys::IoVec, count: u32) -> Self {
+    pub(crate) fn writev(fd: RawFd, vectors: *const Region, count: u32) -> Self {
         Self {
             opcode: sys::IORING_OP_WRITEV,
             fd,
@@ -142,7 +167,7 @@ impl Sqe {
 
     /// A read of the `count` regions of the iovec array `vectors` from `fd`, in order
     /// (`IORING_OP_READV`), at the position of the file.
-    pub(crate) fn readv(fd: RawFd, vectors: *const rsnetwork_udp::sys::IoVec, count: u32) -> Self {
+    pub(crate) fn readv(fd: RawFd, vectors: *const Region, count: u32) -> Self {
         Self {
             opcode: sys::IORING_OP_READV,
             fd,
@@ -275,6 +300,7 @@ impl Sqe {
             fd,
             addr: address.addr() as u64,
             off: len.addr() as u64,
+            #[cfg(target_os = "linux")]
             rw_flags: sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC,
             ..Self::default()
         }
@@ -318,7 +344,7 @@ impl Sqe {
 
     /// A send of the message `message` on the socket `fd` (`IORING_OP_SENDMSG`): the regions that
     /// its iovec array names, in order. A closed peer gives `EPIPE` and no `SIGPIPE`.
-    pub(crate) fn send_message(fd: RawFd, message: *const rsnetwork_udp::sys::MsgHdr) -> Self {
+    pub(crate) fn send_message(fd: RawFd, message: *const Message) -> Self {
         Self {
             opcode: sys::IORING_OP_SENDMSG,
             fd,
@@ -332,7 +358,7 @@ impl Sqe {
     /// A receive of one message on the socket `fd` into the regions, the address storage, and the
     /// control storage that `message` names (`IORING_OP_RECVMSG`), with the call flags `flags`, for
     /// example `MSG_DONTWAIT`. The kernel writes the lengths and the flags back into `message`.
-    pub(crate) fn recv_message(fd: RawFd, message: *mut rsnetwork_udp::sys::MsgHdr, flags: i32) -> Self {
+    pub(crate) fn recv_message(fd: RawFd, message: *mut Message, flags: i32) -> Self {
         Self {
             opcode: sys::IORING_OP_RECVMSG,
             fd,
@@ -346,12 +372,7 @@ impl Sqe {
     /// A receive of one message into a buffer that the kernel selects from the provided buffer
     /// ring of `group` (`IOSQE_BUFFER_SELECT`). `message` names one region with no address, whose
     /// length is the most that the kernel writes.
-    pub(crate) fn recv_message_selected(
-        fd: RawFd,
-        message: *mut rsnetwork_udp::sys::MsgHdr,
-        flags: i32,
-        group: u16,
-    ) -> Self {
+    pub(crate) fn recv_message_selected(fd: RawFd, message: *mut Message, flags: i32, group: u16) -> Self {
         Self {
             flags: sys::IOSQE_BUFFER_SELECT,
             buf_index: group,
@@ -476,13 +497,51 @@ impl Sqe {
     }
 }
 
-/// A shared mapping of a ring descriptor. It unmaps on drop.
+/// A shared mapping of a ring descriptor. It unmaps on drop. On Windows, it is only the memory of
+/// a buffer ring that no kernel ring reads, and it frees on drop.
 #[derive(Debug)]
 struct Mapping {
-    base: NonNull<u8>,
+    base: core::ptr::NonNull<u8>,
     len: usize,
 }
 
+#[cfg(target_os = "windows")]
+impl Mapping {
+    /// The alignment of the memory: a page, as a mapping has on Linux.
+    const PAGE: usize = 4096;
+
+    /// New zero memory of `len` bytes that starts at a page boundary.
+    #[expect(unsafe_code, reason = "the allocator gives new memory")]
+    fn anonymous(len: usize) -> io::Result<Self> {
+        let layout =
+            core::alloc::Layout::from_size_align(len.max(1), Self::PAGE).map_err(|_| io::ErrorKind::InvalidInput)?;
+        // SAFETY: the layout has a size above 0.
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        core::ptr::NonNull::new(base)
+            .map(|base| Self {
+                base,
+                len: layout.size(),
+            })
+            .ok_or_else(|| io::ErrorKind::OutOfMemory.into())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Mapping {
+    #[expect(unsafe_code, reason = "the memory ends with its owner")]
+    fn drop(&mut self) {
+        // SAFETY: `anonymous` allocated `base` with this layout, which is valid, and no reference
+        // into it outlives its owner.
+        unsafe {
+            alloc::alloc::dealloc(
+                self.base.as_ptr(),
+                core::alloc::Layout::from_size_align_unchecked(self.len, Self::PAGE),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Mapping {
     /// A shared mapping of the ring descriptor `fd`.
     fn new(fd: &OwnedFd, len: usize, offset: i64) -> io::Result<Self> {
@@ -518,6 +577,7 @@ impl Mapping {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Mapping {
     #[expect(unsafe_code, reason = "the mapping ends with its owner")]
     fn drop(&mut self) {
@@ -529,6 +589,7 @@ impl Drop for Mapping {
 
 /// An io_uring ring with one issuer and deferred task running.
 #[derive(Debug)]
+#[cfg(target_os = "linux")]
 pub(crate) struct Ring {
     /// The submission and completion rings, in one mapping (`IORING_FEAT_SINGLE_MMAP`).
     rings: Mapping,
@@ -556,6 +617,7 @@ pub(crate) struct Ring {
     injection: core::cell::RefCell<Option<Injection>>,
 }
 
+#[cfg(target_os = "linux")]
 impl Ring {
     /// Creates a ring with `submissions` submission entries and `completions` completion entries.
     /// The kernel rounds each up to a power of two.
@@ -888,6 +950,7 @@ impl Ring {
 
 /// The ready completions of a ring. See [`Ring::completions`].
 #[derive(Debug)]
+#[cfg(target_os = "linux")]
 pub(crate) struct Completions<'ring> {
     ring: &'ring Ring,
     head: u32,
@@ -897,6 +960,7 @@ pub(crate) struct Completions<'ring> {
     given: alloc::collections::VecDeque<Cqe>,
 }
 
+#[cfg(target_os = "linux")]
 impl Iterator for Completions<'_> {
     type Item = Cqe;
 
@@ -917,7 +981,7 @@ impl Iterator for Completions<'_> {
 }
 
 /// A completion that the take did not give stays for the next take, first.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for Completions<'_> {
     fn drop(&mut self) {
         if let Some(injection) = self.ring.injection.borrow_mut().as_mut() {
@@ -934,7 +998,7 @@ impl Drop for Completions<'_> {
 /// operation until it releases them, replace a result, and add a completion that the kernel never
 /// posted. It changes no transition of the table or the driver: it only chooses their inputs. It
 /// exists only in the tests, and no public injection exists.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[derive(Debug, Default)]
 pub(crate) struct Injection {
     /// The completions that the next take gives, in order.
@@ -947,7 +1011,7 @@ pub(crate) struct Injection {
     results: alloc::vec::Vec<(u64, i32)>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Injection {
     /// Gives the completions due now, and keeps the `posted` ones for the next take.
     fn take(&mut self, posted: alloc::vec::Vec<Cqe>) -> alloc::collections::VecDeque<Cqe> {
@@ -966,7 +1030,7 @@ impl Injection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Ring {
     /// Starts the injection: from now on, each take gives the completions that the injection lets
     /// through.
@@ -1037,8 +1101,10 @@ impl Cqe {
 
 /// The opcode table that `IORING_REGISTER_PROBE` wrote.
 #[derive(Debug)]
+#[cfg(target_os = "linux")]
 struct Opcodes(sys::Probe);
 
+#[cfg(target_os = "linux")]
 impl Opcodes {
     fn supports(&self, opcode: u8) -> bool {
         opcode < self.0.ops_len && self.0.ops[usize::from(opcode)].flags & sys::IO_URING_OP_SUPPORTED != 0
@@ -1046,23 +1112,27 @@ impl Opcodes {
 }
 
 /// The byte offset of a kernel offset.
+#[cfg(target_os = "linux")]
 fn offset(kernel: u32) -> usize {
     kernel as usize
 }
 
 /// The end of `count` items of `size` bytes from the kernel offset `start`. The kernel gives at
 /// most 32768 submission and 65536 completion entries, so the result cannot overflow.
+#[cfg(target_os = "linux")]
 fn span(start: u32, count: u32, size: usize) -> usize {
     offset(start) + count as usize * size
 }
 
 /// A system call result: a negative result is the error in `errno`.
+#[cfg(target_os = "linux")]
 fn result(value: c_long) -> io::Result<u32> {
     u32::try_from(value).map_err(|_| io::Error::last_os_error())
 }
 
 /// `io_uring_setup(entries, params)`.
 #[expect(unsafe_code, reason = "the kernel returns a new descriptor")]
+#[cfg(target_os = "linux")]
 fn setup(entries: u32, params: &mut sys::Params) -> io::Result<OwnedFd> {
     // SAFETY: `params` is a valid `io_uring_params` for reads and writes during the call.
     let fd = result(unsafe { sys::syscall(sys::SYS_IO_URING_SETUP, c_long::from(entries), ptr::from_mut(params)) })?;
@@ -1072,6 +1142,7 @@ fn setup(entries: u32, params: &mut sys::Params) -> io::Result<OwnedFd> {
 
 /// `io_uring_enter(fd, to_submit, min_complete, flags, NULL, 0)`.
 #[expect(unsafe_code, reason = "the kernel reads the published submission entries")]
+#[cfg(target_os = "linux")]
 fn enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> io::Result<u32> {
     // SAFETY: with no argument pointer, the call uses only the ring of `fd`. Each published entry
     // obeys the contract of `Ring::push`.
@@ -1090,7 +1161,7 @@ fn enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> io::Result
 
 /// `io_uring_enter(fd, to_submit, min_complete, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG,
 /// &arg, sizeof(arg))`, with no signal mask and the relative timeout `ts`.
-#[cfg(feature = "local")]
+#[cfg(all(feature = "local", target_os = "linux"))]
 #[expect(
     unsafe_code,
     reason = "the kernel reads the published entries and the argument of the wait"
@@ -1123,6 +1194,7 @@ fn enter_timeout(fd: RawFd, to_submit: u32, min_complete: u32, ts: &sys::KernelT
 /// `arg` points to `nr_args` values of the type that `opcode` reads or writes, valid for that
 /// access during the call.
 #[expect(unsafe_code, reason = "the kernel reads or writes the argument of the operation")]
+#[cfg(target_os = "linux")]
 unsafe fn register(fd: RawFd, opcode: u32, arg: *mut c_void, nr_args: u32) -> io::Result<u32> {
     // SAFETY: the caller makes `arg` valid for `opcode` and `nr_args`.
     result(unsafe {

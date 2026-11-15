@@ -2,7 +2,8 @@
 
 This page is the reference for TCP on the io_uring driver, `rsasync::driver::Driver`: each
 operation, its result, and what happens when you drop, forget, or cancel its future.
-[Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end the driver.
+[Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end the driver. The
+same operations run on Windows, on the [IOCP backend](iocp.md), which states the differences.
 
 ## Operations
 

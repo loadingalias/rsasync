@@ -23,7 +23,6 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::ffi::c_int;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU16, Ordering};
 use core::task::{Context, Waker};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
@@ -33,7 +32,7 @@ use rsnetwork_udp::sys::{IoVec, MmsgHdr, MsgHdr};
 
 use crate::blocking::Waiter;
 use crate::uring::sys as ring;
-use crate::uring::{Cqe, Sqe};
+use crate::uring::{Cqe, Group, Sqe};
 
 /// The data of the registration of the wake descriptor.
 const WAKE: u64 = u64::MAX;
@@ -159,42 +158,6 @@ struct Readiness {
     /// The first and the last entry that wait in each direction.
     head: [Option<u32>; 2],
     tail: [Option<u32>; 2],
-}
-
-/// The provided buffers of one group: the memory of a buffer ring that no kernel ring reads. The
-/// poller takes its buffers from the head, as the kernel does.
-#[derive(Debug)]
-struct Group {
-    base: NonNull<u8>,
-    mask: u16,
-    head: u16,
-}
-
-impl Group {
-    /// The address, the length, and the identifier of the buffer `nth` after the head.
-    #[expect(unsafe_code, reason = "the poller reads the entries that the driver published")]
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the mapping starts at a page, and each field is at its natural offset in a 16-byte entry"
-    )]
-    fn peek(&self, nth: u16) -> Option<(u64, u32, u16)> {
-        // SAFETY: the tail is a `u16` at a 2-aligned offset of the page-aligned mapping, which
-        // lives until the group ends.
-        let tail = unsafe { AtomicU16::from_ptr(self.base.as_ptr().add(ring::BUF_RING_TAIL).cast()) };
-        if tail.load(Ordering::Acquire).wrapping_sub(self.head) <= nth {
-            return None;
-        }
-        let entry = usize::from(self.head.wrapping_add(nth) & self.mask) * ring::BUF_SIZE;
-        // SAFETY: the entry is in the mapping, and the driver published it before the tail.
-        unsafe {
-            let base = self.base.as_ptr().add(entry);
-            Some((
-                base.cast::<u64>().read(),
-                base.add(ring::BUF_LEN).cast::<u32>().read(),
-                base.add(ring::BUF_BID).cast::<u16>().read(),
-            ))
-        }
-    }
 }
 
 /// What one call of an entry did.
@@ -350,11 +313,7 @@ impl Poller {
     /// Takes the buffer ring at `base` with `entries` entries, a power of two, as the buffers of
     /// `group`. The memory stays mapped until [`Poller::release_group`].
     pub(crate) fn provide_group(&mut self, base: NonNull<u8>, entries: u16) {
-        self.group = Some(Group {
-            base,
-            mask: entries.wrapping_sub(1),
-            head: 0,
-        });
+        self.group = Some(Group::new(base, entries));
     }
 
     /// Ends the use of the buffer ring of [`Poller::provide_group`].
@@ -780,7 +739,7 @@ impl Poller {
             Ok(result) => match buffer {
                 Some((_, _, bid)) => {
                     if let Some(group) = self.group.as_mut() {
-                        group.head = group.head.wrapping_add(1);
+                        group.advance();
                     }
                     Step::Done(
                         result,
@@ -967,7 +926,7 @@ impl Poller {
                 if let Some(group) = self.group.as_mut()
                     && let Some((_, _, bid)) = group.peek(0)
                 {
-                    group.head = group.head.wrapping_add(1);
+                    group.advance();
                     flags = ring::IORING_CQE_F_BUFFER | (u32::from(bid) << ring::IORING_CQE_BUFFER_SHIFT);
                 }
             }

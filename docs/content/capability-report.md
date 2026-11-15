@@ -24,7 +24,7 @@ println!("{report:#?}");
 | Part | Method | What it gives |
 | --- | --- | --- |
 | Requested | `requested()` | The backend of `Config::backend`, or `None` for the permissive selection |
-| Resolved | `backend()` | The backend that runs: `Backend::IoUring` or `Backend::Epoll` ([the epoll backend](epoll.md)) |
+| Resolved | `backend()` | The backend that runs: `Backend::IoUring` or `Backend::Epoll` ([the epoll backend](epoll.md)) on Linux, and `Backend::Iocp` ([the IOCP backend](iocp.md)) on Windows |
 | Resolved | `fallback()` | The error number of the ring creation (`EPERM` or `ENOSYS`) when the permissive selection runs epoll for that reason, else `None` |
 | Requested | `required()` | The features of `Config::require`. The driver has each of them |
 | Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing. On epoll, no probe runs, and the set is empty |

@@ -7,34 +7,56 @@
 //! it, what an abandoned receive or accept left, and the progress that dropped sends owe.
 
 use alloc::vec::Vec;
-use core::ffi::{c_int, c_void};
+use core::ffi::c_int;
+#[cfg(target_os = "linux")]
+use core::ffi::c_void;
+use core::fmt;
 use core::net::SocketAddr;
-use core::{fmt, ptr};
+#[cfg(target_os = "linux")]
+use core::ptr;
 use std::io;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-use rsnetwork_udp::sys::{self, IoVec, MsgHdr};
-use rsnetwork_udp::{AF_INET6, Received, SaFamily, SockAddrStorage};
+#[cfg(target_os = "linux")]
+use rsnetwork_udp::Received;
+#[cfg(target_os = "linux")]
+use rsnetwork_udp::sys::{self, IoVec, IoVec as Region, MsgHdr};
+use rsnetwork_udp::{AF_INET6, SaFamily, SockAddrStorage};
 
+#[cfg(target_os = "windows")]
+use super::iocp::sys::{self, WsaBuf as Region};
+#[cfg(target_os = "linux")]
 use super::udp::{self, Arrivals, Batch};
 use super::{
-    Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
-    Route, Tag,
+    Borrowed, Call, Completion, Driver, ECANCELED, Handle, Held, Kind, Medium, Operation, Payload, Reason, Refused,
+    Resource, Resources, Route, Tag, borrow, number,
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
 use crate::table::OpId;
 use crate::uring::Sqe;
 
-/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`): a selecting receive found no free buffer, and
-/// the data stays in the socket.
+/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`), on Windows `WSAENOBUFS` (`winerror.h`): a
+/// selecting receive found no free buffer, and the data stays in the socket.
+#[cfg(target_os = "linux")]
 const ENOBUFS: i32 = 105;
+#[cfg(target_os = "windows")]
+pub(super) const ENOBUFS: i32 = 10055;
 /// `EAGAIN`: a receive with no wait found no datagram.
+#[cfg(target_os = "linux")]
 const EAGAIN: i32 = 11;
-/// `ENOMEM`: each resource slot of the driver is in use. It reads as `OutOfMemory`.
+/// `ENOMEM`, on Windows `ERROR_NOT_ENOUGH_MEMORY`: each resource slot of the driver is in use. It
+/// reads as `OutOfMemory`.
+#[cfg(target_os = "linux")]
 const ENOMEM: i32 = 12;
-/// `EINVAL`: an option value that the kernel cannot take.
+#[cfg(target_os = "windows")]
+const ENOMEM: i32 = 8;
+/// `EINVAL`, on Windows `WSAEINVAL`: an option value that the kernel cannot take.
+#[cfg(target_os = "linux")]
 const EINVAL: i32 = 22;
+#[cfg(target_os = "windows")]
+const EINVAL: i32 = 10022;
 
 /// The backlog of a listener: the most that the kernel takes, `net.core.somaxconn`.
 const BACKLOG: c_int = c_int::MAX;
@@ -150,15 +172,15 @@ impl TcpStream {
     }
 }
 
-/// The read half of a [`TcpStream`], a [`UdpSocket`](super::UdpSocket), or a
-/// [`PipeReader`](super::PipeReader): its receives borrow it.
+/// The read half of a [`TcpStream`], and on Linux of a `UdpSocket` or a `PipeReader`: its receives
+/// borrow it.
 #[derive(Debug)]
 pub struct ReadHalf {
     pub(super) resource: Resource,
 }
 
-/// The write half of a [`TcpStream`], a [`UdpSocket`](super::UdpSocket), or a
-/// [`PipeWriter`](super::PipeWriter): its sends borrow it.
+/// The write half of a [`TcpStream`], and on Linux of a `UdpSocket` or a `PipeWriter`: its sends
+/// borrow it.
 #[derive(Debug)]
 pub struct WriteHalf {
     pub(super) resource: Resource,
@@ -239,17 +261,23 @@ pub struct TcpOptions {
     /// and it doubles the value as for `send_buffer`.
     pub receive_buffer: Option<u32>,
     /// Sockets of one user can bind the same address, and the kernel spreads the connections
-    /// between them (`SO_REUSEPORT`).
+    /// between them (`SO_REUSEPORT`). Windows has no such option: a value gives the error
+    /// `WSAENOPROTOOPT`, and [`Driver::options`] gives `None`.
     pub reuse_port: Option<bool>,
 }
 
 impl TcpOptions {
     /// Sets each option that is not `None` on `socket`.
-    pub(super) fn apply(self, socket: BorrowedFd<'_>) -> io::Result<()> {
+    pub(super) fn apply(self, socket: Borrowed<'_>) -> io::Result<()> {
+        #[cfg(target_os = "windows")]
+        if self.reuse_port.is_some() {
+            return Err(io::Error::from_raw_os_error(sys::WSAENOPROTOOPT));
+        }
         let flags = [
             (self.no_delay, sys::IPPROTO_TCP, sys::TCP_NODELAY),
             (self.keepalive, sys::SOL_SOCKET, sys::SO_KEEPALIVE),
             (self.only_v6, sys::IPPROTO_IPV6, sys::IPV6_V6ONLY),
+            #[cfg(target_os = "linux")]
             (self.reuse_port, sys::SOL_SOCKET, sys::SO_REUSEPORT),
         ];
         for (value, level, name) in flags {
@@ -271,7 +299,7 @@ impl TcpOptions {
     }
 
     /// Reads each option of `socket`.
-    fn read(socket: BorrowedFd<'_>) -> io::Result<Self> {
+    fn read(socket: Borrowed<'_>) -> io::Result<Self> {
         let flag = |level, name| int(socket, level, name).map(|value| Some(value != 0));
         let size = |name| {
             let value = int(socket, sys::SOL_SOCKET, name)?;
@@ -290,7 +318,10 @@ impl TcpOptions {
             },
             send_buffer: size(sys::SO_SNDBUF)?,
             receive_buffer: size(sys::SO_RCVBUF)?,
+            #[cfg(target_os = "linux")]
             reuse_port: flag(sys::SOL_SOCKET, sys::SO_REUSEPORT)?,
+            #[cfg(target_os = "windows")]
+            reuse_port: None,
         })
     }
 }
@@ -347,14 +378,16 @@ impl TcpOptions {
 #[derive(Debug)]
 pub struct Regions {
     leases: Vec<Lease>,
-    /// The iovec array of the leases, which the home writes before each submission. Its capacity
-    /// is at least the number of leases.
-    vectors: Vec<IoVec>,
+    /// The iovec array of the leases, or on Windows the `WSABUF` array, which the home writes
+    /// before each submission. Its capacity is at least the number of leases.
+    vectors: Vec<Region>,
     /// The message header that names `vectors`, which the home writes before each submission.
+    #[cfg(target_os = "linux")]
     header: MsgHdr,
 }
 
 /// A message header with no address, no region, and no control message.
+#[cfg(target_os = "linux")]
 const EMPTY_HEADER: MsgHdr = MsgHdr {
     msg_name: ptr::null_mut(),
     msg_namelen: 0,
@@ -385,6 +418,7 @@ impl Regions {
         Self {
             leases: Vec::with_capacity(regions),
             vectors: Vec::with_capacity(regions),
+            #[cfg(target_os = "linux")]
             header: EMPTY_HEADER,
         }
     }
@@ -449,6 +483,7 @@ impl Regions {
 
     /// The header of a message of each region, for a submission. Its capacity holds the array, so
     /// it allocates nothing.
+    #[cfg(target_os = "linux")]
     fn message(&mut self) -> *const MsgHdr {
         self.vectors();
         self.header = MsgHdr {
@@ -461,11 +496,19 @@ impl Regions {
 
     /// The iovec array of each region, and its length, for a submission. Its capacity holds the
     /// array, so it allocates nothing.
-    pub(super) fn vectors(&mut self) -> (*const IoVec, u32) {
+    pub(super) fn vectors(&mut self) -> (*const Region, u32) {
         self.vectors.clear();
+        #[cfg(target_os = "linux")]
         self.vectors.extend(self.leases.iter().map(|lease| IoVec {
             iov_base: lease.as_ptr().cast_mut().cast::<c_void>(),
             iov_len: lease.initialized(),
+        }));
+        // A `WSABUF` holds at most `u32::MAX` bytes, so a larger lease sends a prefix, and the
+        // count of the send reports it.
+        #[cfg(target_os = "windows")]
+        self.vectors.extend(self.leases.iter().map(|lease| Region {
+            len: u32::try_from(lease.initialized()).unwrap_or(u32::MAX),
+            buf: lease.as_ptr().cast_mut().cast(),
         }));
         (
             self.vectors.as_ptr(),
@@ -480,6 +523,7 @@ impl From<Vec<Lease>> for Regions {
         Self {
             vectors: Vec::with_capacity(leases.len()),
             leases,
+            #[cfg(target_os = "linux")]
             header: EMPTY_HEADER,
         }
     }
@@ -538,7 +582,8 @@ pub struct WriteFailed {
 impl WriteFailed {
     /// The bytes that the dropped sends sent, from the first byte of the first send whose result
     /// no future took. The first send after the failure gives the count, and each later send gives
-    /// `None`.
+    /// `None`. On Windows, each send gives `None` after a cancel of a send that ran: the cancel
+    /// aborts the connection, and the kernel gives no count.
     #[must_use]
     pub const fn sent(self) -> Option<usize> {
         self.sent
@@ -574,7 +619,9 @@ pub struct Closed {
 impl Closed {
     /// The bytes that the dropped sends sent, from the first byte of the first send whose result
     /// no future took, when a send that the close cancelled, or a failed send, owes that count.
-    /// `None` when no send owes it, also when a send already gave it with [`WriteFailed`].
+    /// `None` when no send owes it, also when a send already gave it with [`WriteFailed`]. On
+    /// Windows, also `None` when the close cancelled a send that ran: the cancel aborts the
+    /// connection, and the kernel gives no count.
     #[must_use]
     pub const fn sent(self) -> Option<usize> {
         self.sent
@@ -598,12 +645,14 @@ enum Kept {
     /// The error of a receive.
     Error(i32),
     /// A datagram that a receive took, with its facts.
+    #[cfg(target_os = "linux")]
     Datagram { buffer: Backing, received: Received },
     /// The datagrams that a batch receive took, in order.
+    #[cfg(target_os = "linux")]
     Arrivals(Arrivals),
     /// An accepted connection, and the address of its peer.
     Connection {
-        fd: OwnedFd,
+        fd: Handle,
         peer: SockAddrStorage,
         peer_len: u32,
     },
@@ -619,6 +668,10 @@ enum Sent {
     Owe,
     /// The direction failed, and a send gave the count.
     Reported,
+    /// The direction failed, and the progress of a send is unknown: on Windows, a cancel of a send
+    /// that runs aborts the connection, and the kernel gives no count. No report gives a count.
+    #[cfg(target_os = "windows")]
+    Lost,
 }
 
 /// The directions of a stream or a listener, at the home.
@@ -641,18 +694,20 @@ impl Directions {
     /// The direction of an operation of `kind`.
     fn direction(&mut self, kind: Kind) -> Option<&mut Direction> {
         match kind {
-            Kind::Recv | Kind::Selected | Kind::Accept | Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => {
-                Some(&mut self.read)
-            }
-            Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => {
-                None
-            }
+            Kind::Recv | Kind::Selected | Kind::Accept => Some(&mut self.read),
+            #[cfg(target_os = "linux")]
+            Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => Some(&mut self.read),
+            Kind::Send | Kind::Vectored | Kind::Shutdown => Some(&mut self.write),
+            #[cfg(target_os = "linux")]
+            Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
+            #[cfg(target_os = "linux")]
+            Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => None,
         }
     }
 
     /// The listener keeps a connection that no accept took.
-    pub(super) fn keep_connection(&mut self, fd: OwnedFd, peer: SockAddrStorage, peer_len: u32) {
+    pub(super) fn keep_connection(&mut self, fd: Handle, peer: SockAddrStorage, peer_len: u32) {
         self.kept = Some(Kept::Connection { fd, peer, peer_len });
     }
 
@@ -662,19 +717,14 @@ impl Directions {
             Kind::Recv | Kind::Selected => matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_))),
             Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
             Kind::Send | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
+            #[cfg(target_os = "linux")]
             Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => matches!(
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
-            Kind::Other
-            | Kind::Close
-            | Kind::Connect
-            | Kind::Bind
-            | Kind::SendTo
-            | Kind::SendBatch
-            | Kind::File(_)
-            | Kind::Spawn(_)
-            | Kind::Exit(_) => false,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => false,
+            #[cfg(target_os = "linux")]
+            Kind::SendTo | Kind::SendBatch | Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => false,
         }
     }
 }
@@ -689,7 +739,11 @@ pub(super) fn count(result: i32) -> io::Result<usize> {
 /// for the next operation of the direction. A send that failed, sent only part of its bytes, or
 /// was cancelled makes the write direction fail.
 pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: Held) {
-    if matches!(tag.kind, Kind::Connect | Kind::Bind | Kind::File(_)) {
+    #[cfg(target_os = "linux")]
+    let closes = matches!(tag.kind, Kind::Connect | Kind::Bind | Kind::File(_));
+    #[cfg(target_os = "windows")]
+    let closes = matches!(tag.kind, Kind::Connect | Kind::Bind);
+    if closes {
         // No caller holds the socket or the file, so the home closes it: the peer of a connection
         // reads the end of the stream.
         if let Some(socket) = held.accepted {
@@ -757,10 +811,16 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
                 _ => 0,
             };
             directions.unreported = directions.unreported.saturating_add(sent);
+            #[cfg(target_os = "windows")]
+            if result == -sys::WSAECONNABORTED {
+                directions.sent = Sent::Lost;
+                return;
+            }
             if (result < 0 || sent < len || held.cancelled) && directions.sent == Sent::Ok {
                 directions.sent = Sent::Owe;
             }
         }
+        #[cfg(target_os = "linux")]
         Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.payload) {
             (
                 Some(loan),
@@ -779,6 +839,7 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
             }
             _ => {}
         },
+        #[cfg(target_os = "linux")]
         Kind::RecvBatch => match held.payload {
             Payload::Batch {
                 batch: Batch::Receive(arrivals),
@@ -791,17 +852,10 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
             }
             _ => {}
         },
+        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => {}
         // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
-        Kind::Accept
-        | Kind::Other
-        | Kind::Close
-        | Kind::Connect
-        | Kind::Bind
-        | Kind::SendTo
-        | Kind::SendBatch
-        | Kind::File(_)
-        | Kind::Spawn(_)
-        | Kind::Exit(_) => {}
+        #[cfg(target_os = "linux")]
+        Kind::SendTo | Kind::SendBatch | Kind::File(_) | Kind::Spawn(_) | Kind::Exit(_) => {}
     }
 }
 
@@ -852,7 +906,11 @@ impl Driver {
         address: SocketAddr,
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<TcpListener>>, Refused<()>> {
-        let setup = |socket: BorrowedFd<'_>| {
+        // A listener on Linux binds again while connections of an earlier one wait in
+        // `TIME_WAIT`. On Windows, `SO_REUSEADDR` lets another socket take a bound port, so the
+        // listener does not set it, as the standard library does.
+        let setup = |socket: Borrowed<'_>| {
+            #[cfg(target_os = "linux")]
             set_int(socket, sys::SOL_SOCKET, sys::SO_REUSEADDR, 1)?;
             options.apply(socket)
         };
@@ -879,7 +937,7 @@ impl Driver {
         &mut self,
         (storage, len): (SockAddrStorage, u32),
         listen: bool,
-        setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
+        setup: impl FnOnce(Borrowed<'_>) -> io::Result<()>,
     ) -> Result<Completion, Refused<()>> {
         let call = if listen { Call::Bind } else { Call::BindUdp };
         let ring = self.report.route(call) == Route::Ring;
@@ -983,7 +1041,7 @@ impl Driver {
     pub(super) fn connect_socket(
         &mut self,
         (storage, len): (SockAddrStorage, u32),
-        setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
+        setup: impl FnOnce(Borrowed<'_>) -> io::Result<()>,
     ) -> Result<Completion, Refused<()>> {
         let tag = Tag {
             resource: None,
@@ -1058,8 +1116,8 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation, and [`Reason::Unsupported`] for a
-    /// resource that is not a TCP or local stream: a [`PipeWriter`](super::PipeWriter), which you
-    /// close instead, or a [`UdpSocket`](super::UdpSocket). A refusal changes nothing.
+    /// resource that is not a TCP or local stream: a `PipeWriter`, which you close instead, or a
+    /// `UdpSocket`. A refusal changes nothing.
     pub fn shutdown_write<'a, W: AsMut<WriteHalf>>(
         &mut self,
         writer: &'a mut W,
@@ -1115,16 +1173,19 @@ impl Driver {
         id: OpId,
         family: SaFamily,
         kind: c_int,
-        setup: impl FnOnce(BorrowedFd<'_>) -> io::Result<()>,
-    ) -> io::Result<(Resource, std::os::fd::RawFd)> {
+        setup: impl FnOnce(Borrowed<'_>) -> io::Result<()>,
+    ) -> io::Result<(Resource, i32)> {
         let socket = new_socket(family, kind)?;
-        setup(socket.as_fd())?;
-        let fd = socket.as_raw_fd();
+        setup(borrow(&socket))?;
+        let fd = number(borrow(&socket));
+        #[cfg(target_os = "linux")]
         let medium = if kind == sys::SOCK_DGRAM {
             Medium::Udp
         } else {
             Medium::Stream
         };
+        #[cfg(target_os = "windows")]
+        let medium = Medium::Stream;
         let resource = self
             .adopt(socket, medium)
             .map_err(|_| io::Error::from_raw_os_error(ENOMEM))?;
@@ -1492,10 +1553,14 @@ impl Driver {
         let Some(owned) = self.resources.get(resource) else {
             return true;
         };
-        let Some(fd) = owned.fd.as_ref().map(OwnedFd::as_raw_fd) else {
+        let Some(fd) = owned.fd.as_ref().map(|fd| number(borrow(fd))) else {
             return true;
         };
+        #[cfg(target_os = "linux")]
         let pipe = owned.medium == Medium::Pipe;
+        // On Windows, the driver owns no pipe end.
+        #[cfg(target_os = "windows")]
+        let pipe = false;
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return true;
         };
@@ -1555,11 +1620,13 @@ impl Driver {
                 }
                 Some(0)
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvFrom, Some(Kept::Datagram { buffer, received })) => {
                 let (result, copied) = deliver_copy(slot, id, &buffer, received);
                 self.copied = self.copied.saturating_add(copied as u64);
                 Some(result)
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvFrom, Some(Kept::Arrivals(mut arrivals))) => {
                 let first = arrivals.take_first();
                 directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
@@ -1569,14 +1636,17 @@ impl Driver {
                     result
                 })
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvSelectedFrom, Some(Kept::Datagram { buffer, received })) => {
                 Some(deliver(slot, id, buffer, received))
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvSelectedFrom, Some(Kept::Arrivals(mut arrivals))) => {
                 let first = arrivals.take_first();
                 directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
                 first.map(|(buffer, received)| deliver(slot, id, buffer, received))
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvBatch, Some(Kept::Datagram { buffer, received })) => {
                 let mut taken = Some((buffer, received));
                 slot.update(id, |held| {
@@ -1589,6 +1659,7 @@ impl Driver {
                 directions.kept = taken.map(|(buffer, received)| Kept::Datagram { buffer, received });
                 Some(1)
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvBatch, Some(Kept::Arrivals(mut kept))) => {
                 let mut count = 0;
                 slot.update(id, |held| {
@@ -1606,6 +1677,7 @@ impl Driver {
                 directions.kept = udp::keep_arrivals(kept).map(Kept::Arrivals);
                 Some(count)
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch, Some(Kept::Error(error))) => Some(error),
             (Kind::Send | Kind::Vectored | Kind::Shutdown, kept) => {
                 directions.kept = kept;
@@ -1613,6 +1685,8 @@ impl Driver {
                     Sent::Ok => None,
                     // A dropped send that waited never ran, so it gives no report.
                     Sent::Owe if !self.table.interest(id) => Some(-ECANCELED),
+                    #[cfg(target_os = "windows")]
+                    Sent::Lost if !self.table.interest(id) => Some(-ECANCELED),
                     sent => {
                         let failed = WriteFailed {
                             sent: (sent == Sent::Owe).then_some(directions.unreported),
@@ -1637,6 +1711,7 @@ impl Driver {
             self.complete_now(id, result);
             return true;
         }
+        #[cfg(target_os = "linux")]
         if kind.batch() {
             return self.start_batch(id, fd);
         }
@@ -1644,6 +1719,7 @@ impl Driver {
             return false;
         }
         let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
+        #[cfg(target_os = "linux")]
         let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
         // A batch submits in `start_batch`, and each other kind always has its resources, so the
         // last arm gives no entry that the kernel runs.
@@ -1670,15 +1746,28 @@ impl Driver {
                 let (vectors, count) = regions.vectors();
                 Sqe::writev(fd, vectors, count)
             }
+            #[cfg(target_os = "linux")]
             (Kind::Vectored, Payload::Regions(regions), _) => Sqe::send_message(fd, regions.message()),
+            // The port sends the `WSABUF` array of a vectored write with one `WSASend`.
+            #[cfg(target_os = "windows")]
+            (Kind::Vectored, Payload::Regions(regions), _) => {
+                let (vectors, count) = regions.vectors();
+                Sqe::writev(fd, vectors, count)
+            }
+            #[cfg(target_os = "linux")]
             (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SHUT_WR),
+            #[cfg(target_os = "windows")]
+            (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SD_SEND),
+            #[cfg(target_os = "linux")]
             (Kind::RecvFrom, Payload::Receive { message, .. }, Some(loan)) => {
                 let (region, len) = (loan.as_mut_ptr(), loan.capacity());
                 Sqe::recv_message(fd, message.receive(region, len), 0)
             }
+            #[cfg(target_os = "linux")]
             (Kind::RecvSelectedFrom, Payload::Receive { message, .. }, _) => {
                 Sqe::recv_message_selected(fd, message.receive(ptr::null_mut(), slot_len), 0, group)
             }
+            #[cfg(target_os = "linux")]
             (Kind::SendTo, Payload::SendTo { message, datagram }, _) => Sqe::send_message(fd, message.send(datagram)),
             (Kind::Accept, Payload::Socket { peer, peer_len, .. }, _) => {
                 Sqe::accept(fd, (&raw mut *peer).cast(), &raw mut *peer_len)
@@ -1699,6 +1788,7 @@ impl Driver {
     /// Submits the batch `id` on the socket `fd`: one entry for each datagram, each linked to the
     /// next, in one kernel entry. A batch receive waits only in its first entry. Gives `false`, and
     /// changes nothing, when the queue has no room for each entry.
+    #[cfg(target_os = "linux")]
     fn start_batch(&mut self, id: OpId, fd: std::os::fd::RawFd) -> bool {
         let mut entries = 0;
         self.hold(id, |held| {
@@ -1868,7 +1958,7 @@ impl Driver {
             .any(|operation| table.runs(operation))
             || directions.read.first.is_some()
             || directions.write.first.is_some()
-            || owned.running > 0;
+            || running(owned);
         if runs {
             return;
         }
@@ -1891,6 +1981,7 @@ impl Driver {
 /// Gives the kept datagram of `buffer` with `received` to the receive `id`, copied into its
 /// buffer: one copy, which [`Driver::copied`] counts. Gives the result of the receive and the
 /// bytes that it copied.
+#[cfg(target_os = "linux")]
 fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backing, received: Received) -> (i32, usize) {
     let mut copied = 0;
     slot.update(id, |held| {
@@ -1908,6 +1999,7 @@ fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backin
 
 /// Gives the kept datagram of `buffer` with `received` to the selecting receive `id`, with no
 /// copy. Gives the result of the receive.
+#[cfg(target_os = "linux")]
 fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, received: Received) -> i32 {
     let len = i32::try_from(received.len).unwrap_or(i32::MAX);
     slot.update(id, |held| {
@@ -1921,19 +2013,37 @@ fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, rec
     len
 }
 
+/// Whether operations of the file of `owned` run, which its close waits for. Windows has no file
+/// resource yet.
+#[cfg(target_os = "linux")]
+const fn running(owned: &super::Owned) -> bool {
+    owned.running > 0
+}
+
+#[cfg(target_os = "windows")]
+const fn running(_: &super::Owned) -> bool {
+    false
+}
+
 /// The negative errno of `error`, as a kernel result gives it.
 fn errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or(EINVAL).saturating_neg()
 }
 
+// The socket calls of Windows, which the port module declares.
+#[cfg(target_os = "windows")]
+pub(super) use super::iocp::{bind_now, int, local_address, new_socket, set_int};
+
 /// The size of an `int`, as a `socklen_t`.
+#[cfg(target_os = "linux")]
 const INT_LEN: u32 = 4;
 
 const _: () = assert!(size_of::<c_int>() == 4);
 
 /// A new nonblocking socket of `family` and `kind`, `SOCK_STREAM` or `SOCK_DGRAM`.
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "the C library gives a new descriptor")]
-pub(super) fn new_socket(family: SaFamily, kind: c_int) -> io::Result<OwnedFd> {
+pub(super) fn new_socket(family: SaFamily, kind: c_int) -> io::Result<Handle> {
     let kind = kind | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC;
     // SAFETY: the call takes no pointer.
     let fd = unsafe { sys::socket(c_int::from(family), kind, 0) };
@@ -1941,12 +2051,13 @@ pub(super) fn new_socket(family: SaFamily, kind: c_int) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the C library gave a new descriptor that nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { Handle::from_raw_fd(fd) })
 }
 
 /// Sets the option `name` of `level` of `socket` to the `int` `value`.
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "the call reads one `int` that lives during the call")]
-fn set_int(socket: BorrowedFd<'_>, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
+fn set_int(socket: Borrowed<'_>, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
     // SAFETY: `value` is an `int` that lives during the call, and `INT_LEN` is its size.
     let result = unsafe { sys::setsockopt(socket.as_raw_fd(), level, name, (&raw const value).cast(), INT_LEN) };
     if result < 0 {
@@ -1957,8 +2068,9 @@ fn set_int(socket: BorrowedFd<'_>, level: c_int, name: c_int, value: c_int) -> i
 }
 
 /// The `int` option `name` of `level` of `socket`.
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "the kernel writes one `int` that lives during the call")]
-fn int(socket: BorrowedFd<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
+fn int(socket: Borrowed<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
     let (mut value, mut len): (c_int, u32) = (0, INT_LEN);
     // SAFETY: the kernel writes at most `len` bytes into `value`, which is an `int` that lives
     // during the call, and the length into `len`.
@@ -1971,6 +2083,7 @@ fn int(socket: BorrowedFd<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
 }
 
 /// The local address of `socket`, and its length.
+#[cfg(target_os = "linux")]
 #[expect(
     unsafe_code,
     reason = "the kernel writes the address into storage that lives during the call"
@@ -1985,8 +2098,9 @@ pub(super) fn local_address(socket: impl std::os::fd::AsFd) -> Option<(SockAddrS
 
 /// Binds `socket` to the address of `len` bytes in `address`, and with `listen` listens on it,
 /// with system calls.
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "the call reads the address, which lives during the call")]
-fn bind_now(socket: BorrowedFd<'_>, address: &SockAddrStorage, len: u32, listen: bool) -> io::Result<()> {
+fn bind_now(socket: Borrowed<'_>, address: &SockAddrStorage, len: u32, listen: bool) -> io::Result<()> {
     // SAFETY: `address` holds an address of `len` bytes during the call.
     if unsafe { sys::bind(socket.as_raw_fd(), ptr::from_ref(address).cast(), len) } < 0 {
         return Err(io::Error::last_os_error());

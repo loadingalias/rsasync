@@ -1,37 +1,54 @@
+#[cfg(target_os = "linux")]
 use alloc::task::Wake;
 use core::alloc::Layout;
+#[cfg(target_os = "linux")]
 use core::ffi::c_int;
 use core::future::Future;
 use core::mem::{self, ManuallyDrop};
 use core::num::{NonZeroU32, NonZeroU64};
-use core::pin::{Pin, pin};
+use core::pin::Pin;
+#[cfg(target_os = "linux")]
+use core::pin::pin;
 use core::ptr::NonNull;
+#[cfg(target_os = "linux")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
+#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io::{ErrorKind, Read as _, Write as _};
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, Thread};
+use std::thread;
+#[cfg(target_os = "linux")]
+use std::thread::Thread;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 use std::vec::Vec;
 
+#[cfg(target_os = "linux")]
 use core::net::IpAddr;
 
+#[cfg(target_os = "linux")]
 use rsnetwork_udp::{Ecn, Received};
 
 use super::suite::{self, Backend};
+#[cfg(target_os = "linux")]
 use super::{
-    Arrivals, Call, Completion, Config, Datagram, Datagrams, Driver, ECANCELED, Error, Feature, Features, Held, Medium,
-    Reason, Refused, Route, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed, eventfd, probe,
-    sys,
+    Arrivals, Call, Completion, Datagram, Datagrams, Error, Feature, Features, Held, Medium, Route, UdpOptions,
+    UdpSocket, eventfd, probe, sys,
 };
+use super::{Config, Driver, ECANCELED, Reason, Refused, TcpListener, TcpOptions, TcpStream, WriteFailed};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
+#[cfg(target_os = "linux")]
 use crate::completion::Gone;
-use crate::uring::{Cqe, Ring, Sqe};
+use crate::uring::Cqe;
+#[cfg(target_os = "linux")]
+use crate::uring::{Ring, Sqe};
 
 #[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     /// `int pipe2(int pipefd[2], int flags)`.
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
@@ -40,6 +57,7 @@ unsafe extern "C" {
 /// Blocks until the wake descriptor of `driver` is readable, as the reactor of a host waits for
 /// it.
 #[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
+#[cfg(target_os = "linux")]
 fn wait_readable(driver: &Driver) {
     let mut fd = sys::PollFd {
         fd: driver.as_fd().as_raw_fd(),
@@ -51,13 +69,16 @@ fn wait_readable(driver: &Driver) {
 }
 
 /// `O_NONBLOCK` and `O_CLOEXEC` (`include/uapi/asm-generic/fcntl.h`).
+#[cfg(target_os = "linux")]
 const O_NONBLOCK: c_int = 0o4_000;
+#[cfg(target_os = "linux")]
 const O_CLOEXEC: c_int = 0o2_000_000;
 
 /// A nonblocking pipe: its read end and its write end. Linux 6.1 then waits for its readiness and
 /// reads it in the task work of the ring, as Linux 7.0 does for each pipe. A read of a blocking
 /// pipe on 6.1 goes to an io-wq worker instead, because 6.1 pipes lack `FMODE_NOWAIT`.
 #[expect(unsafe_code, reason = "the test makes its pipe with the C library")]
+#[cfg(target_os = "linux")]
 fn pipe() -> (OwnedFd, File) {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for the two descriptors.
@@ -127,6 +148,7 @@ pub(super) fn driver(config: Config) -> Driver {
 
 /// Submits a read of the pipe `fd`, which the driver then owns, into the loan of `held`.
 #[expect(unsafe_code, reason = "the read names the buffer of its resources")]
+#[cfg(target_os = "linux")]
 fn read(driver: &mut Driver, fd: OwnedFd, mut held: Held) -> Completion {
     let resource = driver
         .adopt(fd, Medium::Pipe)
@@ -155,8 +177,10 @@ fn drive_until_completed(driver: &mut Driver) {
 
 /// Counts its wakes.
 #[derive(Default)]
+#[cfg(target_os = "linux")]
 struct Count(AtomicUsize);
 
+#[cfg(target_os = "linux")]
 impl Wake for Count {
     fn wake(self: Arc<Self>) {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -164,6 +188,7 @@ impl Wake for Count {
 }
 
 /// Polls `future` to its end on this thread.
+#[cfg(target_os = "linux")]
 fn block_on<F: Future>(future: F) -> F::Output {
     struct Unpark(Thread);
     impl Wake for Unpark {
@@ -182,6 +207,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn held(log: &Log, budget: &Budget) -> Held {
     Held {
         loan: Some(WriteLoan::new(recorded(log, 16))),
@@ -192,6 +218,7 @@ fn held(log: &Log, budget: &Budget) -> Held {
 
 /// A future polled with waker A, then with waker B, wakes only B at the completion.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_completion_wakes_only_the_waker_of_its_latest_poll() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new());
@@ -220,6 +247,7 @@ fn a_completion_wakes_only_the_waker_of_its_latest_poll() {
 /// A forgotten future ends no operation: the buffer and the charge stay until the terminal
 /// completion, and teardown releases them after it.
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion(
     backend: Backend,
 ) {
@@ -241,6 +269,7 @@ pub(in crate::driver) fn a_forgotten_future_releases_its_buffer_and_charge_only_
 
 /// A future on a second thread completes while the first thread drives the home.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_future_on_a_second_thread_completes_while_the_first_drives() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new());
@@ -258,6 +287,7 @@ fn a_future_on_a_second_thread_completes_while_the_first_drives() {
 /// A turn gives at most its bound of completions, and it reports the work that remains.
 #[test]
 #[expect(unsafe_code, reason = "a no-op names no memory")]
+#[cfg(target_os = "linux")]
 fn a_turn_stops_at_its_bound_and_reports_the_remaining_work() {
     let mut driver = driver(Config::new().completions_per_turn(2));
     let futures: Vec<Completion> = (0..3)
@@ -278,6 +308,7 @@ fn a_turn_stops_at_its_bound_and_reports_the_remaining_work() {
 /// deferred work, and the pending read completes. The test waits for the wake descriptor, as a
 /// host reactor does, because `Driver::wait` runs the deferred work itself.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new());
@@ -307,6 +338,7 @@ fn a_wake_from_another_thread_ends_a_wait() {
 /// watches a descriptor that only the other threads signal, not the wake descriptor, which the
 /// kernel signals at each completion.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_completion_during_a_wait_adds_no_other_completion() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new());
@@ -329,6 +361,7 @@ fn a_completion_during_a_wait_adds_no_other_completion() {
 
 /// Teardown cancels a read that gets no data, returns after the completion of the read, closes
 /// the pipe, and reports the cancelled read. Its future then gets `Gone`.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_and_reports_it(backend: Backend) {
     let (log, budget) = (Log::default(), budget());
     let mut driver = suite::driver(Config::new(), backend);
@@ -345,6 +378,7 @@ pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_an
 
 /// A driver that drops with a running read ends the future with `Gone`, and it keeps the buffer
 /// that the kernel can still use.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers_of_running_operations(
     backend: Backend,
 ) {
@@ -362,6 +396,7 @@ pub(in crate::driver) fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers
 /// A driver with each operation slot in use refuses the next submission with a typed reason, and
 /// it gives back the buffer and the charge.
 #[expect(unsafe_code, reason = "a no-op names no memory")]
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_full_driver_refuses_a_submission_and_returns_its_resources() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new().operations(1));
@@ -399,6 +434,7 @@ fn the_debug_of_a_refused_send_shows_its_reason_and_none_of_its_bytes() {
 /// entry, so it goes to the kernel and completes.
 #[test]
 #[expect(unsafe_code, reason = "a no-op names no memory")]
+#[cfg(target_os = "linux")]
 fn a_submission_completes_after_the_requests_that_it_takes_fill_the_queue() {
     let (log, budget) = (Log::default(), budget());
     let mut driver = driver(Config::new().operations(9).submissions(8));
@@ -430,6 +466,7 @@ fn a_submission_completes_after_the_requests_that_it_takes_fill_the_queue() {
 #[test]
 #[should_panic(expected = "polled after it gave `Ready`")]
 #[expect(unsafe_code, reason = "a no-op names no memory")]
+#[cfg(target_os = "linux")]
 fn a_poll_after_ready_panics() {
     let mut driver = driver(Config::new());
     // SAFETY: a no-op names no memory.
@@ -568,7 +605,10 @@ pub(in crate::driver) fn a_selected_buffer_is_decrypted_in_place_and_returns_to_
 }
 
 /// `ENOBUFS` (`include/uapi/asm-generic/errno.h`).
+#[cfg(target_os = "linux")]
 const ENOBUFS: i32 = 105;
+#[cfg(target_os = "windows")]
+const ENOBUFS: i32 = 10055;
 
 /// A selecting receive that finds no free buffer ends with `ENOBUFS`, which its future gives: the
 /// driver does not retry it. The data stays in the socket, and a receive after the buffer comes
@@ -609,6 +649,7 @@ pub(in crate::driver) fn a_selecting_receive_with_no_free_buffer_gives_enobufs(b
 
 /// Turns the driver each time that its wake descriptor is readable, as the reactor of a host does,
 /// and polls `future` after each turn, until it gives its output. It never calls `Driver::wait`.
+#[cfg(target_os = "linux")]
 fn drive_from_reactor<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
     loop {
@@ -626,6 +667,7 @@ fn drive_from_reactor<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> 
 /// for their data. On a kernel with the eventfd defect of `probe`, the second receive completes
 /// only because the driver registers the descriptor again.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
@@ -660,6 +702,7 @@ fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
 /// makes no probe. On a kernel with the defect, the probe waits for a deferred signal that does not
 /// come, so the start of the second driver is then far shorter than the start of the first.
 #[test]
+#[cfg(target_os = "linux")]
 fn only_the_first_driver_of_a_process_probes_the_kernel() {
     let start = Instant::now();
     let first = driver(Config::new());
@@ -682,6 +725,7 @@ fn only_the_first_driver_of_a_process_probes_the_kernel() {
 /// first deferred signal comes after the first wait, as after a slow grace period. On another
 /// kernel, only the start of the driver is checked.
 #[test]
+#[cfg(target_os = "linux")]
 fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
     let driver = driver(Config::new());
@@ -748,8 +792,38 @@ pub(super) fn posted(driver: &mut Driver, count: usize) -> Vec<Cqe> {
     }
 }
 
+/// On Windows, the socket of `stream` gets no send buffer (`SO_SNDBUF` 0), so a send larger than
+/// the window of a peer that does not read waits in the kernel. With a send buffer, the stack takes
+/// each byte of a send of 64 MiB at once.
+#[cfg(target_os = "windows")]
+fn unbuffered(driver: &mut Driver, stream: &TcpStream) {
+    let options = TcpOptions {
+        send_buffer: Some(0),
+        ..TcpOptions::default()
+    };
+    driver
+        .set_options(stream, options)
+        .expect("the socket takes the option");
+}
+
+/// On Windows, a send goes in part only when its connection fails, so the case resets the
+/// connection of the send that waits (`unbuffered`): after turns that submit it and a pause in
+/// which the window of the peer fills, a close of `peer`, which has unread bytes, resets the
+/// connection. The send then ends with the count of the bytes that went, and no peer remains to
+/// read them.
+#[cfg(target_os = "windows")]
+fn reset(driver: &mut Driver, peer: std::net::TcpStream) {
+    for _ in 0..10 {
+        driver.turn().expect("a turn of the test driver works");
+    }
+    thread::sleep(core::time::Duration::from_millis(100));
+    assert!(driver.queue.peek().is_empty(), "the send ended before the reset");
+    drop(peer);
+}
+
 /// A send of 64 MiB, more than the socket buffers hold while the peer does not read, so the
 /// kernel sends only part of it. Gives the count that it sent, from the numbered stream.
+#[cfg(target_os = "linux")]
 fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
     let send = driver
         .send(stream, Lease::from(numbered(0, 64 << 20)))
@@ -757,6 +831,25 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
     let sent = drive(driver, send).expect("the driver runs").0.expect("the send works");
     assert!(sent < 64 << 20, "the socket buffers held the whole send");
     sent
+}
+
+/// A send of 64 MiB that waits in the kernel, because the peer does not read and the socket has no
+/// send buffer (`unbuffered`), and whose future drops. A dropped send is not cancelled: it holds the
+/// write direction until the peer reads each of its bytes, so each later send waits behind it.
+/// Gives its count. A send on Windows goes whole or fails, so this form takes the place of a send
+/// that goes only in part.
+#[cfg(target_os = "windows")]
+fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
+    unbuffered(driver, stream);
+    let send = driver
+        .send(stream, Lease::from(numbered(0, 64 << 20)))
+        .expect("the test driver has room");
+    for _ in 0..10 {
+        driver.turn().expect("a turn of the test driver works");
+    }
+    assert!(driver.queue.peek().is_empty(), "the send did not wait");
+    drop(send);
+    64 << 20
 }
 
 /// A receive whose future drops after its bytes came leaves them with the stream. The next
@@ -791,7 +884,10 @@ pub(in crate::driver) fn a_dropped_receive_leaves_its_bytes_to_the_next_receives
 }
 
 /// `ECONNRESET` (`include/uapi/asm-generic/errno.h`).
+#[cfg(target_os = "linux")]
 const ECONNRESET: i32 = 104;
+#[cfg(target_os = "windows")]
+const ECONNRESET: i32 = 10054;
 
 /// A receive whose future drops after it failed leaves its error with the stream, and the next
 /// receive gives it. The peer resets the connection: it closes with bytes that it did not read.
@@ -856,8 +952,12 @@ pub(in crate::driver) fn a_forgotten_receive_leaves_its_bytes_to_the_next_receiv
 /// reports none: the count is reported once. The peer reads exactly those bytes.
 pub(in crate::driver) fn a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
-    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let (mut stream, peer) = connected(&mut driver, "127.0.0.1:0");
+    #[cfg(target_os = "windows")]
+    unbuffered(&mut driver, &stream);
     drop(driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap());
+    #[cfg(target_os = "windows")]
+    reset(&mut driver, peer);
     let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
     assert!(0 < sent && sent < 64 << 20, "the send sent all or nothing: {sent}");
     driver.turn().unwrap();
@@ -871,9 +971,13 @@ pub(in crate::driver) fn a_dropped_partial_send_fails_the_write_direction_and_re
     let close = driver.close(stream).unwrap();
     assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
 
-    let mut received = Vec::new();
-    peer.read_to_end(&mut received).unwrap();
-    assert!(received == numbered(0, sent), "the peer read other bytes");
+    #[cfg(target_os = "linux")]
+    {
+        let mut peer = peer;
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        assert!(received == numbered(0, sent), "the peer read other bytes");
+    }
 }
 
 /// A send whose future drops and that sends all its bytes reports nothing, and the next send
@@ -1046,8 +1150,16 @@ pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request
         [0, 0],
         "a cancel missed its target"
     );
+    // On Windows, the dropped send in the kernel is the send of `fill`, and its cancel aborts the
+    // connection: it gives the abort and no count, and so does the close.
+    #[cfg(target_os = "linux")]
+    let (ends, sent) = ([-ECANCELED, -ECANCELED], Some(0));
+    #[cfg(target_os = "windows")]
+    let (ends, sent) = ([-WSAECONNABORTED, -ECANCELED], None);
+    let mut results_of_targets: Vec<i32> = targets.iter().map(|target| target.res).collect();
+    results_of_targets.sort_unstable();
+    assert_eq!(results_of_targets, ends);
     for target in &targets {
-        assert_eq!(target.res, -ECANCELED);
         assert_eq!(
             results
                 .iter()
@@ -1056,7 +1168,61 @@ pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request
             1
         );
     }
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), Some(0));
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), sent);
+}
+
+/// `WSAECONNABORTED` (`winerror.h`): the stack aborted the connection.
+#[cfg(target_os = "windows")]
+const WSAECONNABORTED: i32 = 10053;
+
+/// On Windows, a cancel of a send that runs in the kernel aborts the connection, and the kernel
+/// gives no count, also when bytes went. So the send gives the abort with its whole lease and no
+/// count, and the read direction fails too.
+#[cfg(target_os = "windows")]
+pub(in crate::driver) fn a_cancel_of_a_send_that_runs_aborts_the_connection_and_gives_no_count(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, _peer) = connected(&mut driver, "127.0.0.1:0");
+    unbuffered(&mut driver, &stream);
+    let send = driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap();
+    for _ in 0..10 {
+        driver.turn().unwrap();
+    }
+    assert!(driver.queue.peek().is_empty(), "the send did not wait");
+    send.cancel();
+    let (result, lease) = drive(&mut driver, send).unwrap();
+    assert_eq!(result.unwrap_err().raw_os_error(), Some(WSAECONNABORTED));
+    assert_eq!(lease.initialized(), 64 << 20);
+
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
+    let (received, _) = drive(&mut driver, receive).unwrap();
+    assert!(received.is_err(), "the read direction did not fail: {received:?}");
+}
+
+/// On Windows, a buffer stays owned after `CancelIoEx` until the packet of its operation: the
+/// close of a stream with a forgotten receive cancels the receive, the cancel gives its own result
+/// at once, and the receive gives its result, `ERROR_OPERATION_ABORTED`, only from its packet.
+/// The buffer returns once, after that packet.
+#[cfg(target_os = "windows")]
+#[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
+pub(in crate::driver) fn a_cancelled_receive_keeps_its_buffer_until_its_packet(backend: Backend) {
+    let log = Log::default();
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, _peer) = connected(&mut driver, "127.0.0.1:0");
+    mem::forget(driver.recv(&mut stream, recorded(&log, 16)).unwrap());
+    driver.turn().unwrap();
+    let close = driver.close(stream).unwrap();
+    let posted = posted(&mut driver, 2);
+    assert!(
+        taken(&log).is_empty(),
+        "the buffer returned before the driver took the packet"
+    );
+    assert_eq!(
+        posted.iter().map(|cqe| cqe.res).collect::<Vec<_>>(),
+        [0, -ECANCELED],
+        "the cancel did not end before the packet of its receive"
+    );
+    drive(&mut driver, close).unwrap();
+    assert_eq!(taken(&log), ["released"]);
 }
 
 /// Idle connections whose receives wait for a buffer that the kernel selects hold no receive
@@ -1086,6 +1252,7 @@ pub(in crate::driver) fn idle_connections_with_a_waiting_selecting_receive_hold_
 }
 
 /// Turns the driver until no operation runs and no event can come, for at most 1000 turns.
+#[cfg(target_os = "linux")]
 fn settle(driver: &mut Driver) {
     for _ in 0..1000 {
         if !driver.table.busy() {
@@ -1101,6 +1268,7 @@ fn settle(driver: &mut Driver) {
 }
 
 /// The descriptors that this process has open.
+#[cfg(target_os = "linux")]
 fn descriptors() -> usize {
     std::fs::read_dir("/proc/self/fd")
         .expect("Linux lists the descriptors of a process")
@@ -1121,6 +1289,7 @@ pub(in crate::driver) fn a_connect_to_a_port_with_no_listener_is_refused(backend
 
 /// A connect whose future drops after the kernel connected leaves no descriptor open after its
 /// terminal event: the driver closes the connection, and the peer reads the end of the stream.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_dropped_connect_that_completes_closes_its_connection(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1163,31 +1332,43 @@ fn regions(start: usize, lens: &[usize]) -> super::Regions {
 /// second vectored send sends the rest, and the peer reads one numbered stream.
 pub(in crate::driver) fn a_vectored_send_gives_its_exact_progress_across_regions(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
-    let (mut stream, mut peer) = connected(&mut driver, "[::1]:0");
+    let (mut stream, peer) = connected(&mut driver, "[::1]:0");
     let lens = [1000, 2000, 64 << 20];
+    #[cfg(target_os = "windows")]
+    unbuffered(&mut driver, &stream);
     let send = driver.send_vectored(&mut stream, regions(0, &lens)).unwrap();
+    #[cfg(target_os = "windows")]
+    reset(&mut driver, peer);
     let (sent, mut rest) = drive(&mut driver, send).unwrap();
     let sent = sent.unwrap();
     assert!(
         3000 < sent && sent < 3000 + (64 << 20),
         "the send ended outside the third region: {sent}"
     );
+    rest.advance(sent);
+    assert_eq!(rest.total(), 3000 + (64 << 20) - sent);
+    // On Windows, the reset connection takes no more bytes.
+    #[cfg(target_os = "linux")]
+    send_the_rest(&mut driver, stream, peer, rest);
+}
 
+/// Sends `rest` of a numbered stream of the regions `[1000, 2000, 64 MiB]` on `stream` until each
+/// byte went, closes it, and checks that `peer` read the whole numbered stream.
+#[cfg(target_os = "linux")]
+fn send_the_rest(driver: &mut Driver, mut stream: TcpStream, mut peer: std::net::TcpStream, mut rest: super::Regions) {
     let reader = thread::spawn(move || {
         let mut received = Vec::new();
         peer.read_to_end(&mut received).unwrap();
         received
     });
-    rest.advance(sent);
-    assert_eq!(rest.total(), 3000 + (64 << 20) - sent);
     while !rest.is_empty() {
         let send = driver.send_vectored(&mut stream, rest).unwrap();
-        let (more, back) = drive(&mut driver, send).unwrap();
+        let (more, back) = drive(driver, send).unwrap();
         rest = back;
         rest.advance(more.unwrap());
     }
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(driver, close).unwrap().sent(), None);
     assert!(
         reader.join().unwrap() == numbered(0, 3000 + (64 << 20)),
         "the peer read other bytes"
@@ -1199,12 +1380,16 @@ pub(in crate::driver) fn a_vectored_send_gives_its_exact_progress_across_regions
 /// reads.
 pub(in crate::driver) fn a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
-    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let (mut stream, peer) = connected(&mut driver, "127.0.0.1:0");
+    #[cfg(target_os = "windows")]
+    unbuffered(&mut driver, &stream);
     drop(
         driver
             .send_vectored(&mut stream, regions(0, &[1000, 64 << 20]))
             .unwrap(),
     );
+    #[cfg(target_os = "windows")]
+    reset(&mut driver, peer);
     let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
     driver.turn().unwrap();
     let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
@@ -1212,14 +1397,24 @@ pub(in crate::driver) fn a_dropped_partial_vectored_send_fails_the_write_directi
     assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
     let close = driver.close(stream).unwrap();
     drive(&mut driver, close).unwrap();
-    let mut received = Vec::new();
-    peer.read_to_end(&mut received).unwrap();
-    assert!(received == numbered(0, sent), "the peer read other bytes");
+    #[cfg(target_os = "linux")]
+    {
+        let mut peer = peer;
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        assert!(received == numbered(0, sent), "the peer read other bytes");
+    }
 }
 
 /// Each option reads back the value that the caller set, on a listener that set them before its
 /// bind and on a stream that sets them after its accept. Linux doubles the buffer sizes.
 pub(in crate::driver) fn each_socket_option_reads_back_the_value_that_was_set(backend: Backend) {
+    // Linux doubles each buffer size for its own bookkeeping, and Windows keeps it. Windows has no
+    // `SO_REUSEPORT`, so the option reads `None` there.
+    #[cfg(target_os = "linux")]
+    let (scale, reuse_port) = (2, |off| Some(off));
+    #[cfg(target_os = "windows")]
+    let (scale, reuse_port) = (1, |_| None);
     let mut driver = suite::driver(Config::new(), backend);
     for (on, off) in [(true, false), (false, true)] {
         let options = TcpOptions {
@@ -1228,14 +1423,14 @@ pub(in crate::driver) fn each_socket_option_reads_back_the_value_that_was_set(ba
             only_v6: Some(on),
             send_buffer: Some(64 << 10),
             receive_buffer: Some(32 << 10),
-            reuse_port: Some(off),
+            reuse_port: reuse_port(off),
         };
         // A bind to one IPv6 address makes Linux set `only_v6` itself, so the test binds `::`.
         let bind = driver.bind("[::]:0".parse().unwrap(), options).unwrap();
         let mut listener = drive(&mut driver, bind).unwrap().unwrap();
         let doubled = TcpOptions {
-            send_buffer: Some(128 << 10),
-            receive_buffer: Some(64 << 10),
+            send_buffer: Some(scale * (64 << 10)),
+            receive_buffer: Some(scale * (32 << 10)),
             ..options
         };
         assert_eq!(driver.options(&listener).unwrap(), doubled);
@@ -1255,8 +1450,19 @@ pub(in crate::driver) fn each_socket_option_reads_back_the_value_that_was_set(ba
         let read = driver.options(&stream).unwrap();
         assert_eq!(
             (read.no_delay, read.keepalive, read.send_buffer, read.receive_buffer),
-            (Some(off), Some(on), Some(32 << 10), Some(16 << 10))
+            (Some(off), Some(on), Some(scale * (16 << 10)), Some(scale * (8 << 10)))
         );
+    }
+    // Windows refuses the option that it does not have, and binds nothing.
+    #[cfg(target_os = "windows")]
+    {
+        let options = TcpOptions {
+            reuse_port: Some(true),
+            ..TcpOptions::default()
+        };
+        let bind = driver.bind("127.0.0.1:0".parse().unwrap(), options).unwrap();
+        let refused = drive(&mut driver, bind).unwrap().unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(10042), "not `WSAENOPROTOOPT`");
     }
     let bind = driver
         .bind("127.0.0.1:0".parse().unwrap(), TcpOptions::default())
@@ -1293,14 +1499,25 @@ pub(in crate::driver) fn a_half_close_ends_the_peer_receive_at_the_sent_count_an
 /// the bytes that went, and then no end of the stream, until the close.
 pub(in crate::driver) fn a_half_close_on_a_failed_write_direction_sends_no_end_of_stream(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
-    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let (mut stream, peer) = connected(&mut driver, "127.0.0.1:0");
+    #[cfg(target_os = "windows")]
+    unbuffered(&mut driver, &stream);
     drop(driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap());
+    #[cfg(target_os = "windows")]
+    reset(&mut driver, peer);
     let sent = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
     driver.turn().unwrap();
     let shutdown = driver.shutdown_write(&mut stream).unwrap();
     let failed = drive(&mut driver, shutdown).unwrap().unwrap_err();
     assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+    // On Windows, the reset peer cannot show that no end of the stream came.
+    #[cfg(target_os = "linux")]
+    no_end_of_stream_after(peer, sent);
+}
 
+/// `peer` reads the `sent` bytes of a numbered stream, and then no end of the stream.
+#[cfg(target_os = "linux")]
+fn no_end_of_stream_after(mut peer: std::net::TcpStream, sent: usize) {
     let mut received = std::vec![0; sent];
     peer.read_exact(&mut received).unwrap();
     assert!(received == numbered(0, sent), "the peer read other bytes");
@@ -1318,6 +1535,7 @@ pub(in crate::driver) fn a_half_close_on_a_failed_write_direction_sends_no_end_o
 /// `Route::Ring`, and as system calls with a future that is ready at once elsewhere. On IPv4 and IPv6, the
 /// listener then accepts.
 #[test]
+#[cfg(target_os = "linux")]
 fn bind_and_listen_run_on_the_ring_exactly_where_the_report_gives_the_ring() {
     let mut driver = driver(Config::new());
     let ring = driver.report().route(Call::Bind) == Route::Ring;
@@ -1345,6 +1563,7 @@ fn bind_and_listen_run_on_the_ring_exactly_where_the_report_gives_the_ring() {
 }
 
 /// A UDP socket of the driver at `address`, with `options`.
+#[cfg(target_os = "linux")]
 fn udp(driver: &mut Driver, address: &str, options: UdpOptions) -> UdpSocket {
     let address = address.parse().expect("the test gives a socket address");
     let bind = driver.bind_udp(address, options).expect("the test driver has room");
@@ -1354,6 +1573,7 @@ fn udp(driver: &mut Driver, address: &str, options: UdpOptions) -> UdpSocket {
 }
 
 /// The options of a receiver that reports the metadata of each datagram.
+#[cfg(target_os = "linux")]
 const METADATA: UdpOptions = UdpOptions {
     only_v6: None,
     send_buffer: None,
@@ -1365,6 +1585,7 @@ const METADATA: UdpOptions = UdpOptions {
 };
 
 /// Receives one datagram on `socket` into a buffer of `capacity` bytes.
+#[cfg(target_os = "linux")]
 fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Received, Vec<u8>) {
     let receive = driver
         .recv_from(socket, Backing::from(Vec::with_capacity(capacity)))
@@ -1376,6 +1597,7 @@ fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Rec
 /// One send with a segment size sends one datagram for each segment, all of them, and its report
 /// counts them. A receiver with no GRO gets each segment as a datagram; a receiver with GRO gets
 /// them in one receive, with their segment size. On IPv4 and IPv6.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size(
     backend: Backend,
 ) {
@@ -1413,6 +1635,7 @@ pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesc
 /// The receiver reports the local destination address and the ECN codepoint that the sender set,
 /// and the source address that the sender chose. On IPv4, with a source that is not the address
 /// of the route, and on IPv6.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     for (any, receiver, source) in [("0.0.0.0:0", "127.0.0.1:0", "127.0.0.2"), ("[::]:0", "[::1]:0", "::1")] {
@@ -1436,6 +1659,7 @@ pub(in crate::driver) fn send_metadata_sets_the_source_and_ecn_that_the_receive_
 
 /// A half-close of a UDP socket refuses before any submission, and the socket goes on: a datagram
 /// goes and arrives after it.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_half_close_of_a_udp_socket_refuses_and_changes_nothing(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1455,6 +1679,7 @@ pub(in crate::driver) fn a_half_close_of_a_udp_socket_refuses_and_changes_nothin
 }
 
 /// A datagram larger than its buffer gives the truncation outcome, with the bytes that fit.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn an_oversized_datagram_gives_the_truncation_outcome(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1474,6 +1699,7 @@ pub(in crate::driver) fn an_oversized_datagram_gives_the_truncation_outcome(back
 /// A receive whose future drops after its datagram came leaves the datagram, its metadata, and its
 /// truncation result to the next receive, which gives them before it submits, with one counted
 /// copy. A close then releases a datagram that no receive took.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive(
     backend: Backend,
 ) {
@@ -1526,6 +1752,7 @@ pub(in crate::driver) fn a_dropped_receive_leaves_its_datagram_metadata_and_trun
 /// A batch of datagrams of different sizes goes in one kernel entry, one linked send for each, and
 /// arrives as those datagrams, each with its own size. Its report counts them.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_batch_of_datagrams_arrives_as_each_datagram_after_one_kernel_entry() {
     let mut driver = driver(Config::new());
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1560,6 +1787,7 @@ fn a_batch_of_datagrams_arrives_as_each_datagram_after_one_kernel_entry() {
 /// A datagram of a batch that the kernel refuses ends the batch: the report counts the datagrams
 /// before it, and the datagrams after it do not go, so no rest becomes a new datagram. The
 /// receiver gets exactly the counted datagrams.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it(
     backend: Backend,
 ) {
@@ -1597,6 +1825,7 @@ pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts
 
 /// A batch with more datagrams than the submission queue has entries can never start, so it
 /// refuses with `Reason::Queue` and gives its datagrams back. The socket then sends a datagram.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back() {
     let mut driver = driver(Config::new().submissions(8));
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
@@ -1627,6 +1856,7 @@ pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gi
 
 /// A batch receive takes the datagrams that wait in one kernel entry, each into a buffer that the
 /// kernel selects, with its own metadata. Its report counts them.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its_metadata(backend: Backend) {
     let budget = Budget::new(NonZeroU64::new(4096).unwrap());
     let mut driver = suite::driver(Config::new(), backend);
@@ -1661,6 +1891,7 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
 /// A receive into a buffer that the kernel selects waits for its datagram, which then arrives in
 /// the one slot of the pool, with its length and its source. When that buffer drops, the slot goes
 /// back to the kernel ring, so the next datagram arrives in it again.
+#[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_selected_datagram_arrives_in_the_slot_of_the_pool_which_returns_at_its_drop(
     backend: Backend,
 ) {
@@ -1690,6 +1921,7 @@ pub(in crate::driver) fn a_selected_datagram_arrives_in_the_slot_of_the_pool_whi
 /// `Error::Unsupported` with that feature. A kernel with it gives a driver whose report states the
 /// requirement. The test prints the report of the kernel.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_strict_requirement_refuses_before_the_driver_is_ready() {
     let report = driver(Config::new()).report();
     std::println!("capability report: {report:#?}");
@@ -1710,6 +1942,7 @@ fn a_strict_requirement_refuses_before_the_driver_is_ready() {
 /// A new driver registers no file and no buffer, and it starts no submission poller: the view of
 /// the kernel of its ring (`/proc/self/fdinfo`) shows none.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_new_driver_registers_no_file_or_buffer_and_starts_no_poller() {
     let driver = driver(Config::new());
     let info = std::fs::read_to_string(alloc::format!("/proc/self/fdinfo/{}", driver.queue.fd())).unwrap();

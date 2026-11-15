@@ -160,8 +160,7 @@ pub const WSAEOPNOTSUPP: c_int = 10045;
 pub const SOCKET_ERROR: c_int = -1;
 
 /// `SOCK_DGRAM`: datagrams, such as UDP.
-#[cfg(test)]
-pub(crate) const SOCK_DGRAM: c_int = 2;
+pub const SOCK_DGRAM: c_int = 2;
 /// `INVALID_SOCKET`: the result of a `socket` call that failed.
 #[cfg(test)]
 pub(crate) const INVALID_SOCKET: Socket = !0;
@@ -196,7 +195,7 @@ unsafe extern "system" {
     /// `int WSAIoctl(SOCKET s, DWORD dwIoControlCode, LPVOID lpvInBuffer, DWORD cbInBuffer, LPVOID
     /// lpvOutBuffer, DWORD cbOutBuffer, LPDWORD lpcbBytesReturned, LPWSAOVERLAPPED lpOverlapped,
     /// LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)`.
-    pub(crate) fn WSAIoctl(
+    pub fn WSAIoctl(
         s: Socket,
         code: u32,
         input: *const c_void,
@@ -208,20 +207,19 @@ unsafe extern "system" {
         completion: *mut c_void,
     ) -> c_int;
     /// `int setsockopt(SOCKET s, int level, int optname, const char *optval, int optlen)`.
-    pub(crate) fn setsockopt(s: Socket, level: c_int, name: c_int, value: *const c_char, len: c_int) -> c_int;
+    pub fn setsockopt(s: Socket, level: c_int, name: c_int, value: *const c_char, len: c_int) -> c_int;
     /// `int getsockopt(SOCKET s, int level, int optname, char *optval, int *optlen)`.
-    pub(crate) fn getsockopt(s: Socket, level: c_int, name: c_int, value: *mut c_char, len: *mut c_int) -> c_int;
+    pub fn getsockopt(s: Socket, level: c_int, name: c_int, value: *mut c_char, len: *mut c_int) -> c_int;
     /// `int getsockname(SOCKET s, struct sockaddr *name, int *namelen)`.
-    pub(crate) fn getsockname(s: Socket, name: *mut c_void, len: *mut c_int) -> c_int;
+    pub fn getsockname(s: Socket, name: *mut c_void, len: *mut c_int) -> c_int;
     /// `int getpeername(SOCKET s, struct sockaddr *name, int *namelen)`.
-    pub(crate) fn getpeername(s: Socket, name: *mut c_void, len: *mut c_int) -> c_int;
+    pub fn getpeername(s: Socket, name: *mut c_void, len: *mut c_int) -> c_int;
     /// `SOCKET socket(int af, int type, int protocol)`. Only the tests make a socket: a dual-stack
     /// one, whose `IPV6_V6ONLY` must be off before the bind.
     #[cfg(test)]
     pub(crate) fn socket(af: c_int, kind: c_int, protocol: c_int) -> Socket;
     /// `int bind(SOCKET s, const struct sockaddr *name, int namelen)`.
-    #[cfg(test)]
-    pub(crate) fn bind(s: Socket, name: *const c_void, len: c_int) -> c_int;
+    pub fn bind(s: Socket, name: *const c_void, len: c_int) -> c_int;
     /// `int WSAGetLastError(void)`.
     pub(crate) fn WSAGetLastError() -> c_int;
 }

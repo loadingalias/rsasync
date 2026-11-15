@@ -130,7 +130,9 @@ pub(super) const POLLIN: u32 = 0x1;
 pub(super) const MSG_NOSIGNAL: u32 = 0x4000;
 /// The flags of a new descriptor, from their declarations in `rsnetwork_udp::sys`, as the `u32`
 /// flags of an entry.
+#[cfg(target_os = "linux")]
 pub(super) const SOCK_NONBLOCK: u32 = rsnetwork_udp::sys::SOCK_NONBLOCK.cast_unsigned();
+#[cfg(target_os = "linux")]
 pub(super) const SOCK_CLOEXEC: u32 = rsnetwork_udp::sys::SOCK_CLOEXEC.cast_unsigned();
 
 /// `IORING_FSYNC_DATASYNC`: the sync of `IORING_OP_FSYNC` is `fdatasync`, not `fsync`.
