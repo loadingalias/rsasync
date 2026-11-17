@@ -243,30 +243,35 @@ fn hold_lock(path: &Path) -> fs::File {
     file
 }
 
+/// Connects to the listener at `path` until a connect fails, and gives the streams and the error.
+fn fill(driver: &mut Driver, path: &Path) -> (Vec<LocalStream>, io::Error) {
+    /// More connects than a queue of one connection takes: two on Linux, and one on macOS.
+    const CONNECTS_MAX: usize = 8;
+    let mut streams = Vec::new();
+    loop {
+        assert!(
+            streams.len() < CONNECTS_MAX,
+            "the queue took {CONNECTS_MAX} connections"
+        );
+        let connect = driver.connect_local(path).unwrap();
+        match drive(driver, connect).unwrap() {
+            Ok(stream) => streams.push(stream),
+            Err(error) => return (streams, error),
+        }
+    }
+}
+
 /// A connect to a live listener whose queue of connections that wait for an accept is full gives
 /// `ResourceBusy`. After the listener closes and its lock ends, a connect gives
 /// `ConnectionRefused`. macOS refuses both connects with one error, and the lock of the listener
 /// tells them apart.
 pub(in crate::driver) fn a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused(backend: Backend) {
-    /// More connects than a queue of one connection takes: two on Linux, and one on macOS.
-    const CONNECTS_MAX: usize = 8;
     let scratch = Scratch::new("busy");
     let path = scratch.join("socket");
     let mut driver = suite::driver(Config::new(), backend);
     let listener = small_listener(&path);
     let lock = hold_lock(&path);
-    let mut streams = Vec::new();
-    let busy = loop {
-        assert!(
-            streams.len() < CONNECTS_MAX,
-            "the queue took {CONNECTS_MAX} connections"
-        );
-        let connect = driver.connect_local(&path).unwrap();
-        match drive(&mut driver, connect).unwrap() {
-            Ok(stream) => streams.push(stream),
-            Err(error) => break error,
-        }
-    };
+    let (streams, busy) = fill(&mut driver, &path);
     assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy);
     assert!(
         !streams.is_empty(),
@@ -276,6 +281,24 @@ pub(in crate::driver) fn a_connect_to_a_full_listener_is_busy_and_to_a_closed_on
     let connect = driver.connect_local(&path).unwrap();
     let error = drive(&mut driver, connect).unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+}
+
+/// A bind with `Stale::Replace` on the path of a live listener that holds the lock gives
+/// `AddrInUse` when the queue of the listener is full, and the socket file stays. On macOS, a full
+/// queue refuses a connect, as a socket file with no listener does, so only the lock keeps the
+/// file.
+pub(in crate::driver) fn a_bind_does_not_replace_the_socket_file_of_a_busy_listener_that_holds_the_lock(
+    backend: Backend,
+) {
+    let scratch = Scratch::new("busy-replace");
+    let path = scratch.join("socket");
+    let mut driver = suite::driver(Config::new(), backend);
+    let _listener = small_listener(&path);
+    let _lock = hold_lock(&path);
+    let _streams = fill(&mut driver, &path);
+    let error = bind(&mut driver, &path, Stale::Replace).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
 }
 
 /// A path that the kernel would change gives `InvalidInput` and makes no socket: an empty path,

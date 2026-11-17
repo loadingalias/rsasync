@@ -526,6 +526,8 @@ mod operation {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
+        local::tests => a_bind_does_not_replace_the_socket_file_of_a_busy_listener_that_holds_the_lock,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_path_that_does_not_fit_a_socket_address_gives_invalid_input,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,

@@ -555,8 +555,7 @@ fn lock(path: &Path) -> Result<OwnedFd, i32> {
 }
 
 /// Whether a listener holds the lock of `path`. `F_GETLK` reads the lock and takes none, so a
-/// bind of the path at the same time does not fail. macOS keeps the locks of `flock` and of
-/// `fcntl` in one list, so `F_GETLK` sees the lock of a listener.
+/// bind of the path at the same time does not fail.
 #[cfg(target_os = "macos")]
 #[expect(
     unsafe_code,
@@ -577,6 +576,9 @@ fn locked(path: &Path) -> bool {
         l_type: sys::F_WRLCK,
         l_whence: 0,
     };
+    // XNU keeps the locks of `flock` and of `fcntl` in one list, so `F_GETLK` sees the `flock` lock
+    // of a listener: measured on macOS 27.2.1, and not in the man pages. If a later macOS changes
+    // that, `a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused` fails on kqueue.
     // SAFETY: `F_GETLK` reads and writes one `struct flock`, which lives during the call.
     unsafe { sys::fcntl(file.as_raw_fd(), sys::F_GETLK, &raw mut lock) == 0 && lock.l_type != sys::F_UNLCK }
 }
