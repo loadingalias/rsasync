@@ -8,14 +8,19 @@ use core::num::NonZeroU64;
 use core::pin::pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::task::Wake;
 use std::thread;
+use std::time::Instant;
 
 use rsasync::blocking::{Config, Failed, Job, Reason, Refused, Service};
 use rsasync::capacity::Budget;
 
 const STACK: usize = 256 << 10;
+
+/// The longest wait of a test for a job that returns with no waiter to show it.
+const RETURN_WAIT: Duration = Duration::from_secs(10);
 
 fn budget() -> Budget {
     Budget::new(NonZeroU64::new(64 << 20).unwrap())
@@ -266,12 +271,17 @@ fn a_panic_in_the_drop_of_an_abandoned_result_does_not_end_the_thread() {
     );
     gate.open();
     // The one thread still runs the next job. No waiter shows when the job returns and its slot
-    // ends, so the test submits until the service admits the job.
+    // ends, so the test submits until the service admits the job, at most for `RETURN_WAIT`.
+    let deadline = Instant::now() + RETURN_WAIT;
     let mut next = loop {
         match submitter.submit(|| 7) {
             Ok(waiter) => break waiter,
             Err(refused) => assert_eq!(refused.reason, Reason::Full),
         }
+        assert!(
+            Instant::now() < deadline,
+            "the job with no waiter did not return in {RETURN_WAIT:?}"
+        );
         thread::yield_now();
     };
     assert_eq!(next.wait_blocking(), Ok(7));
