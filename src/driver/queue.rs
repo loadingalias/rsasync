@@ -280,9 +280,10 @@ impl Queue {
     }
 
     /// The poller.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn poller(&mut self) -> Option<&mut Poller> {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Ring(_) => None,
             Self::Poller(poller) => Some(poller),
         }

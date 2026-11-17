@@ -23,7 +23,7 @@
 mod epoll;
 #[cfg(target_os = "macos")]
 mod kqueue;
-mod sys;
+pub(super) mod sys;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -325,7 +325,6 @@ impl Poller {
 
     /// Takes the waiter of a job that runs the entry of `user_data` on the blocking service. The
     /// job posts its completion when it returns. `waker` wakes the driver at that return.
-    #[cfg(target_os = "linux")]
     pub(crate) fn add_job(&mut self, user_data: u64, waiter: Waiter<i32>, waker: &Waker) {
         if self.waker.is_none() {
             self.waker = Some(waker.clone());
@@ -1255,6 +1254,186 @@ pub(crate) fn run_file(sqe: &Sqe) -> i32 {
         }
     };
     result.unwrap_or_else(|errno| -errno)
+}
+
+/// Runs a file entry as one blocking positional call, or two for a write that ends durable: the
+/// job of the blocking service for the entry on macOS. Gives the result that a ring posts for the
+/// entry on Linux. The entry holds the values of Linux: [`ring::RWF_DSYNC`] makes a write durable,
+/// and the modes of `fallocate` select the preallocation or the hole punch.
+///
+/// macOS refuses a count above `INT_MAX` bytes (`EINVAL`), so the job moves at most that many in
+/// one call, as Linux moves at most about 2 GiB, and the rest stays for the next call. Durable
+/// contents need `F_FULLFSYNC`: a plain `fsync` of macOS leaves the bytes in the cache of the
+/// device. So each sync, of a file or a directory, and each durable write is `F_FULLFSYNC`, and a
+/// file system with no such command gives `ENOTSUP`, never a weaker sync.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "the entry names memory that the driver keeps until the completion"
+)]
+pub(crate) fn run_file(sqe: &Sqe) -> i32 {
+    let fd = sqe.fd;
+    let memory = pointer::<core::ffi::c_void>(sqe.addr);
+    let offset = sqe.off.cast_signed();
+    let len = sqe.len.min(c_int::MAX.cast_unsigned()) as usize;
+    let count = c_int::try_from(sqe.len).unwrap_or(c_int::MAX);
+    let durable = sqe.rw_flags & ring::RWF_DSYNC != 0;
+    // SAFETY: the driver keeps the memory that the entry names until the completion of the entry,
+    // which comes after the return of this job, and the job owns its descriptor.
+    let result = unsafe {
+        match sqe.opcode {
+            ring::IORING_OP_READ => counted(sys::pread(fd, memory, len, offset)),
+            ring::IORING_OP_WRITE => {
+                counted(sys::pwrite(fd, memory, len, offset)).and_then(|written| synced(fd, written, durable))
+            }
+            ring::IORING_OP_READV => counted(sys::preadv(fd, memory.cast(), count, offset)),
+            ring::IORING_OP_WRITEV => {
+                counted(sys::pwritev(fd, memory.cast(), count, offset)).and_then(|written| synced(fd, written, durable))
+            }
+            ring::IORING_OP_FSYNC => synced(fd, 0, true),
+            ring::IORING_OP_FALLOCATE if sqe.len & ring::FALLOC_FL_PUNCH_HOLE != 0 => punch(fd, sqe.off, sqe.addr),
+            ring::IORING_OP_FALLOCATE => allocate(fd, sqe.off, sqe.addr, sqe.len & ring::FALLOC_FL_KEEP_SIZE == 0),
+            ring::IORING_OP_FTRUNCATE => status(sys::ftruncate(fd, offset)),
+            ring::IORING_OP_OPENAT => status(sys::openat(fd, memory.cast(), sqe.rw_flags.cast_signed(), sqe.len)),
+            ring::IORING_OP_STATX => status(sys::fstat(fd, pointer(sqe.off))),
+            ring::IORING_OP_RENAMEAT => status(sys::renameat(
+                fd,
+                memory.cast(),
+                sqe.len.cast_signed(),
+                pointer::<core::ffi::c_char>(sqe.off),
+            )),
+            ring::IORING_OP_UNLINKAT => status(sys::unlinkat(fd, memory.cast(), sqe.rw_flags.cast_signed())),
+            _ => Err(sys::EINVAL),
+        }
+    };
+    result.unwrap_or_else(|errno| -errno)
+}
+
+/// Gives `written` after the write of `fd` became durable when `durable` holds: its bytes and
+/// those of each write before it go to the media of the device (`F_FULLFSYNC`).
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the command takes no argument")]
+fn synced(fd: RawFd, written: i32, durable: bool) -> Result<i32, i32> {
+    if !durable {
+        return Ok(written);
+    }
+    // SAFETY: the command takes no argument.
+    supported(unsafe { sys::fcntl(fd, sys::F_FULLFSYNC) }).map(|_| written)
+}
+
+/// The result of a command of `fcntl` that a file system can lack: it then gives `ENOTTY`, and
+/// the job gives `ENOTSUP`.
+#[cfg(target_os = "macos")]
+fn supported(result: c_int) -> Result<i32, i32> {
+    status(result).map_err(unsupported)
+}
+
+/// The error of a command of `fcntl` that a file system does not have: `ENOTSUP` for `ENOTTY`, so
+/// that `std::io` reads it as `Unsupported`.
+#[cfg(target_os = "macos")]
+const fn unsupported(errno: i32) -> i32 {
+    if errno == sys::ENOTTY { sys::ENOTSUP } else { errno }
+}
+
+/// The end of the `len` bytes from `offset`, which the calls take as an `off_t`. A range of 0
+/// bytes gives `EINVAL`, and a range past the largest offset gives `EFBIG`, as `fallocate` of
+/// Linux gives them.
+#[cfg(target_os = "macos")]
+fn end(offset: u64, len: u64) -> Result<u64, i32> {
+    if len == 0 {
+        return Err(sys::EINVAL);
+    }
+    offset
+        .checked_add(len)
+        .filter(|&end| i64::try_from(end).is_ok())
+        .ok_or(sys::EFBIG)
+}
+
+/// Frees the blocks of the `len` bytes from `offset` of the file `fd`, which then read as zeros,
+/// and keeps the length, as `fallocate` of Linux with `FALLOC_FL_PUNCH_HOLE` does. `F_PUNCHHOLE`
+/// takes only whole blocks of the file system (`f_bsize` of `fstatfs`), so the job punches the
+/// whole blocks of the range, and then writes zeros into the bytes of the range in its first and
+/// last block, up to the length of the file. The punch comes first, also with no whole block, so a
+/// file system without it gives `ENOTSUP` before the job writes a byte.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the calls write only the structures of this function")]
+fn punch(fd: RawFd, offset: u64, len: u64) -> Result<i32, i32> {
+    let end = end(offset, len)?;
+    let mut stat = sys::Stat::default();
+    // SAFETY: the call writes only `stat`, which is a `struct stat`.
+    status(unsafe { sys::fstat(fd, &raw mut stat) })?;
+    let mut statfs = sys::Statfs::new();
+    // SAFETY: the call writes only `statfs`, which is a `struct statfs`.
+    status(unsafe { sys::fstatfs(fd, &raw mut statfs) })?;
+    // The start and the end of the whole blocks of the range. A block of 0 bytes gives `EINVAL`.
+    let block = u64::from(statfs.f_bsize);
+    let first = offset.checked_next_multiple_of(block).ok_or(sys::EINVAL)?;
+    let last = end - end % block;
+    let range = sys::Punchhole {
+        fp_offset: first.cast_signed(),
+        fp_length: last.saturating_sub(first).cast_signed(),
+        ..sys::Punchhole::default()
+    };
+    // SAFETY: the command reads only `range`.
+    supported(unsafe { sys::fcntl(fd, sys::F_PUNCHHOLE, &raw const range) })?;
+    let size = u64::try_from(stat.st_size).unwrap_or(0);
+    let head = first.min(end);
+    zero(fd, offset, head.min(size))?;
+    zero(fd, last.max(head), end.min(size))?;
+    Ok(0)
+}
+
+/// The zeros that a hole punch writes into the bytes of its first and last block, in pieces of
+/// at most this size.
+#[cfg(target_os = "macos")]
+static ZEROS: [u8; 16384] = [0; 16384];
+
+/// Writes zeros into the bytes from `from` to `to` of the file `fd`. Each call writes at least one
+/// byte, so the loop ends after at most `to - from` calls, fewer than the bytes of one block.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the call reads only the static zeros")]
+fn zero(fd: RawFd, mut from: u64, to: u64) -> Result<(), i32> {
+    while from < to {
+        let len = usize::try_from(to - from).map_or(ZEROS.len(), |len| len.min(ZEROS.len()));
+        // SAFETY: the call reads `len` bytes of `ZEROS`, which has them.
+        let written = counted(unsafe { sys::pwrite(fd, ZEROS.as_ptr().cast(), len, from.cast_signed()) })?;
+        match u64::try_from(written) {
+            Ok(written) if written > 0 => from += written,
+            _ => return Err(sys::EIO),
+        }
+    }
+    Ok(())
+}
+
+/// Reserves the blocks up to the end of the `len` bytes from `offset` of the file `fd`, and with
+/// `extend` makes that end the length when the length is less. `F_PREALLOCATE` allocates after the
+/// physical end of the file, so the job asks for the bytes from the allocated bytes
+/// (`st_blocks`) to the end of the range, and all of them or none (`F_ALLOCATEALL`). Then
+/// `ftruncate` changes the length. The driver runs such an allocation alone on its file
+/// (`Driver::allocate`), so no write of the driver can end between the two calls.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the calls write only the structures of this function")]
+fn allocate(fd: RawFd, offset: u64, len: u64, extend: bool) -> Result<i32, i32> {
+    let end = end(offset, len)?.cast_signed();
+    let mut stat = sys::Stat::default();
+    // SAFETY: the call writes only `stat`, which is a `struct stat`.
+    status(unsafe { sys::fstat(fd, &raw mut stat) })?;
+    let allocated = stat.st_blocks.saturating_mul(sys::S_BLKSIZE);
+    if let Some(more) = end.checked_sub(allocated).filter(|&more| more > 0) {
+        let mut store = sys::Fstore {
+            fst_flags: sys::F_ALLOCATEALL,
+            fst_posmode: sys::F_PEOFPOSMODE,
+            fst_length: more,
+            ..sys::Fstore::default()
+        };
+        // SAFETY: the command reads `store` and writes its allocated bytes.
+        supported(unsafe { sys::fcntl(fd, sys::F_PREALLOCATE, &raw mut store) })?;
+    }
+    if extend && end > stat.st_size {
+        // SAFETY: the call takes no pointer.
+        status(unsafe { sys::ftruncate(fd, end) })?;
+    }
+    Ok(0)
 }
 
 /// The ready completions of a poller, in order. Each one leaves the queue as the iterator gives

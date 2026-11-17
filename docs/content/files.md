@@ -1,8 +1,9 @@
 # Files on the driver
 
-This page is the reference for files on the io_uring driver, `rsasync::driver::Driver`: open,
-positional and vectored reads and writes, the exact read, direct I/O, length and space, durability,
-names and directories, and close. It also tells what happens when you drop a future.
+This page is the reference for files on the driver, `rsasync::driver::Driver`: open, positional and
+vectored reads and writes, the exact read, direct I/O, length and space, durability, names and
+directories, and close. It also tells what happens when you drop a future. Files run on io_uring
+and [epoll](epoll.md) on Linux, and on [kqueue](kqueue.md) on macOS, with the same API.
 [Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end the driver.
 
 Each file operation is positional, with an explicit offset. So several operations of one file can
@@ -11,14 +12,24 @@ run at one time, and the file has no position that they share.
 ## Open and use a file
 
 This example makes a file, writes to it, makes the bytes durable, reads them, closes the file, and
-removes it. `run` turns the driver until a future is ready, as in the docs of `Operation`:
+removes it. `run` turns the driver until a future is ready, as in the docs of `Operation`. On epoll
+and kqueue, each file call is a job of a [blocking service](blocking-service.md), so the example
+gives the driver one:
 
 <!-- The same text as the doctest of `rsasync::driver::File`. Edit both. -->
 ```rust
+use core::num::NonZeroU64;
+
+use rsasync::blocking::{self, Service};
 use rsasync::buffer::{Backing, Buffer as _, Lease};
+use rsasync::capacity::Budget;
 use rsasync::driver::{Config, Driver, OpenOptions, SyncMode, WriteMode};
 
 let mut driver = Driver::new(Config::new())?;
+// On epoll and kqueue, each file call is a job of a blocking service.
+let budget = Budget::new(NonZeroU64::new(16 << 20).unwrap());
+let service = Service::new(&budget, blocking::Config::new())?;
+driver.use_blocking(service.submitter());
 let path = std::env::temp_dir().join(format!("rsasync-file-{}", std::process::id()));
 
 let options = OpenOptions::new().read(true).write(true).create(true);
@@ -51,7 +62,7 @@ run(&mut driver, unlink)???;
 | `create_new(bool)` | Make the file, and fail with `AlreadyExists` if it exists. It needs `write` |
 | `truncate(bool)` | Set the length of an existing file to 0. It needs `write` |
 | `mode(u32)` | The mode of a file that the open makes, less the umask |
-| `cache(Cache)` | `Cache::Buffered`, through the page cache, or `Cache::Direct` (`O_DIRECT`). See [Direct I/O](#direct-io) |
+| `cache(Cache)` | `Cache::Buffered`, through the page cache, or `Cache::Direct` (`O_DIRECT`, and `F_NOCACHE` on macOS). See [Direct I/O](#direct-io) |
 
 The descriptor closes on `exec`. Options that no open can take, and a path with a NUL byte, give
 `InvalidInput`.
@@ -106,7 +117,8 @@ and your buffers, with no copy in the page cache. The open reads the alignment o
 `statx` (`STATX_DIOALIGN`, Linux 6.1). `File::alignment` gives it: `Alignment::memory` for the
 address of each buffer, and `Alignment::offset` for each file offset and each length. A file system
 that does not report it gets 4096 bytes for both. A file system with no direct I/O for the file
-makes the open give `Unsupported`.
+makes the open give `Unsupported`. macOS has no `O_DIRECT`: the open turns the data cache of the
+file off with `F_NOCACHE`, and the alignment is one page for both values, 16 KiB on Apple silicon.
 
 A read or write whose buffer, length, or offset does not have that alignment refuses with
 `Reason::Alignment` before the submission, and gives the buffer back. A read uses the capacity of
@@ -160,22 +172,36 @@ for it:
 - The job owns a duplicate of the descriptor. The operation ends when the job returns, as an
   operation of the ring ends at its completion, so a close and a teardown wait for it.
 
+On epoll and kqueue, each file operation is such a job, `set_file_len` too.
+
 `Driver::allocate` reserves the blocks of a range (`fallocate`), so that a later write there does
 not fail for space. `Length::Keep` keeps the length. `Length::Extend` makes the length the end of
 the range when the range ends after it. `Driver::punch_hole` frees the blocks of a range, which then
-reads as zeros, and keeps the length (`FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`). A file
-system without the operation gives `Unsupported` (`EOPNOTSUPP`), as a hole punch on ramfs does.
-The tests check both operations on ext4.
+reads as zeros, and keeps the length (`FALLOC_FL_PUNCH_HOLE` with `FALLOC_FL_KEEP_SIZE`). A block
+that the range holds only in part keeps its blocks, and the bytes of the range in it become zeros.
+A file system without the operation gives `Unsupported` (`EOPNOTSUPP`), as a hole punch on ramfs
+does, and a range of 0 bytes gives `InvalidInput`.
+
+On macOS, the calls are `F_PREALLOCATE` and `F_PUNCHHOLE`, with the same results and two limits: a
+hole inside the file stays a hole after a preallocation, and an allocation with `Length::Extend`
+runs alone on its file. exFAT and FAT32 have no hole punching there. See
+[Preallocation](kqueue.md#preallocation) and [Hole punching](kqueue.md#hole-punching).
+
+The tests check both operations on ext4 and on APFS.
 
 ## Durability
 
 The end of a write tells only that the kernel has the bytes. Durability is a separate result, as
-this table gives for Linux:
+this table gives:
 
-| Result | Call |
-| --- | --- |
-| Durable contents | `Driver::sync(&file, SyncMode::Data)` (`fdatasync`) or `SyncMode::All` (`fsync`) after the writes, or each write with `WriteMode::DataSync` (`RWF_DSYNC`) |
-| Durable namespace change | `Driver::sync_directory(&directory)` on the parent directory, after a create, a rename, or an unlink |
+| Result | Call | Linux | macOS |
+| --- | --- | --- | --- |
+| Durable contents | `Driver::sync(&file, SyncMode::Data)` or `SyncMode::All` after the writes, or each write with `WriteMode::DataSync` | `fdatasync`, `fsync`, and `RWF_DSYNC` | `F_FULLFSYNC` for each of them |
+| Durable namespace change | `Driver::sync_directory(&directory)` on the parent directory, after a create, a rename, or an unlink | `fsync` of the directory | `F_FULLFSYNC` of the directory |
+
+On macOS, a plain `fsync` leaves the bytes in the cache of the device, so the driver never uses it
+for durability. A file system with no `F_FULLFSYNC` gives `Unsupported` (see
+[Durability](kqueue.md#durability)).
 
 A sync covers the writes that ended before it. Start it after their futures are ready.
 

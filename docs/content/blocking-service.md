@@ -8,8 +8,9 @@ service. The type is `rsasync::blocking::Service`. rsasync is in development, an
 releases are on crates.io.
 
 The service needs the `std` feature (on by default) and a target where `std` starts threads. It
-needs no scheduler and no driver. The io_uring driver uses it too, for a file call that the kernel
-has no ring operation for: see [Length and space](files.md#length-and-space).
+needs no scheduler and no driver. The driver uses it too, for a file call that the kernel has no
+ring operation for, and for each file call on [epoll](epoll.md) and [kqueue](kqueue.md): see
+[Length and space](files.md#length-and-space).
 
 ## Start a service and submit a job
 

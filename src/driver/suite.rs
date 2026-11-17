@@ -17,9 +17,10 @@
 //! injection API exists.
 //!
 //! On macOS, `Backend::Kqueue` gives each completion as the kqueue poller posts it: the poller of
-//! epoll, with the kqueue selector. Only the TCP, UDP, and ownership cases run on macOS: its files,
-//! pipes, local streams, processes, and signals have no kqueue form yet. A datagram with a segment
-//! size has its own case there, because macOS has no segmentation offload.
+//! epoll, with the kqueue selector, and each file entry as a job of a blocking service of the case.
+//! Only the TCP, UDP, file, and ownership cases run on macOS: its pipes, local streams, processes,
+//! and signals have no kqueue form yet. A datagram with a segment size has its own case there,
+//! because macOS has no segmentation offload.
 //!
 //! On Windows, `Backend::Iocp` gives each completion as the completion port gives it, where each
 //! socket that passes the installed-provider check skips the packet of a call that ends at once,
@@ -68,7 +69,7 @@
 //! | Windows IoRing | No IoRing backend: the Windows file task of R5 adds it |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
 //! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. On kqueue, each case of `law::kqueue`, for example `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order` |
-//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion` |
+//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll and kqueue, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion` |
 //! | Child wait | `a_dropped_wait_and_child_leave_no_zombie_after_the_exit` |
 //!
 //! A cancel result is not a terminal event: `law::injected_only` and the table cases show it, with
@@ -90,8 +91,10 @@
 //!   - Vectored reads and writes: `vectored_writes_and_reads_keep_the_order_of_their_regions`.
 //!   - Inspect and change the length:
 //!     `a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before`.
-//!   - Preallocation: `a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks`.
-//!   - Hole punching: `a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks`.
+//!   - Preallocation: `a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks` and
+//!     `a_write_after_the_end_of_an_extending_allocation_keeps_each_byte`.
+//!   - Hole punching: `a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks` and
+//!     `an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay`.
 //!   - Sync, rename, unlink, directory open and sync, and close:
 //!     `a_rename_an_unlink_and_a_directory_sync_complete`.
 //! - TCP
@@ -152,13 +155,13 @@
 //!   - Refusals: `a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse`.
 //!   - Escalation: `escalation_at_the_second_delivery_ends_a_child_that_never_polls`.
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use core::num::NonZeroU64;
 
 use super::{Config, Driver};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::blocking::{self, Service};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::capacity::Budget;
 
 /// Where the completions of a case come from.
@@ -183,7 +186,8 @@ pub(super) enum Backend {
     /// its packet.
     #[cfg(target_os = "windows")]
     Packets,
-    /// The kqueue poller, as its nonblocking calls end.
+    /// The kqueue poller, as its nonblocking calls end. Each file operation runs on a blocking
+    /// service of the case.
     #[cfg(target_os = "macos")]
     Kqueue,
 }
@@ -192,7 +196,9 @@ pub(super) enum Backend {
 #[cfg(target_os = "macos")]
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
     let Backend::Kqueue = backend;
-    super::tests::driver(config.backend(super::Backend::Kqueue))
+    let mut driver = super::tests::driver(config.backend(super::Backend::Kqueue));
+    driver.use_blocking(service().submitter());
+    driver
 }
 
 /// A driver of `config` that takes its completions from `backend`.
@@ -221,9 +227,9 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
     driver
 }
 
-/// A blocking service for the file operations of an epoll driver. It lives until the test process
-/// ends, as the threads of the case do.
-#[cfg(target_os = "linux")]
+/// A blocking service for the file operations of an epoll or a kqueue driver. It lives until the
+/// test process ends, as the threads of the case do.
+#[cfg(unix)]
 fn service() -> &'static Service {
     let budget = Budget::new(NonZeroU64::new(64 << 20).unwrap());
     let config = blocking::Config::new().threads(4).jobs(64).stack(256 << 10);
@@ -324,7 +330,7 @@ mod law {
         // Short I/O.
         tests => a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once,
         tests => a_vectored_send_gives_its_exact_progress_across_regions,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => a_short_read_gives_its_exact_extent_and_the_exact_read_reports_incomplete_progress,
         // Failed I/O.
         tests => a_connect_to_a_port_with_no_listener_is_refused,
@@ -354,7 +360,7 @@ mod law {
         #[cfg(target_os = "linux")]
         local::tests => a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations,
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion,
         #[cfg(target_os = "linux")]
         process::tests => a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy,
@@ -486,17 +492,21 @@ mod law {
 mod operation {
     cases! {
         // File.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => a_misaligned_direct_io_buffer_refuses_before_submission,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => vectored_writes_and_reads_keep_the_order_of_their_regions,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         file::tests => a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
+        file::tests => an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay,
+        #[cfg(unix)]
+        file::tests => a_write_after_the_end_of_an_extending_allocation_keeps_each_byte,
+        #[cfg(unix)]
         file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
         // TCP.
         tests => each_socket_option_reads_back_the_value_that_was_set,

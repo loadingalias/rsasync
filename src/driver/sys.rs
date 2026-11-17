@@ -4,10 +4,9 @@
 //!
 //! Each item agrees with `sys/eventfd.h`, `poll.h`, and `fcntl.h` of glibc and musl, and with
 //! `include/uapi/asm-generic/fcntl.h` and `include/uapi/asm-generic/poll.h` of Linux 6.1, which
-//! x86_64 and aarch64 both use. The file items agree with `include/uapi/linux/fcntl.h`,
-//! `include/uapi/linux/fs.h`, `include/uapi/linux/falloc.h`, and `include/uapi/linux/stat.h` of
-//! Linux 6.1 and 7.0. Two open flags have other values on aarch64, from
-//! `arch/arm64/include/uapi/asm/fcntl.h`, and the number of `statx` comes from
+//! x86_64 and aarch64 both use. The file items agree with `include/uapi/linux/fcntl.h` and
+//! `include/uapi/linux/stat.h` of Linux 6.1 and 7.0. Two open flags have other values on aarch64,
+//! from `arch/arm64/include/uapi/asm/fcntl.h`, and the number of `statx` comes from
 //! `arch/x86/entry/syscalls/syscall_64.tbl` (x86_64) and `include/uapi/asm-generic/unistd.h`
 //! (aarch64). The items of local streams agree with `sys/socket.h`, `sys/un.h`, `sys/stat.h`, and
 //! `unistd.h` of glibc and musl, and with `include/uapi/linux/un.h`, `include/linux/socket.h`, and
@@ -82,13 +81,6 @@ pub(super) const AT_FDCWD: c_int = -100;
 pub(super) const AT_EMPTY_PATH: c_int = 0x1000;
 /// A `statx` that keeps the attributes that the kernel has, with no call to a remote server.
 pub(super) const AT_STATX_DONT_SYNC: c_int = 0x4000;
-
-/// The write flag of a data-sync write (`include/uapi/linux/fs.h`).
-pub(super) const RWF_DSYNC: c_int = 0x2;
-
-/// The modes of `fallocate` (`include/uapi/linux/falloc.h`).
-pub(super) const FALLOC_FL_KEEP_SIZE: c_int = 0x1;
-pub(super) const FALLOC_FL_PUNCH_HOLE: c_int = 0x2;
 
 /// The fields of `statx` (`include/uapi/linux/stat.h`): the length, and the alignment of direct
 /// I/O (Linux 6.1).

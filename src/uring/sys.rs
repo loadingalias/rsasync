@@ -5,8 +5,9 @@
 //! of Ubuntu 26.04. The system call numbers come from `include/uapi/asm-generic/unistd.h`
 //! (aarch64) and `arch/x86/entry/syscalls/syscall_64.tbl` (x86_64) of Linux 6.1, and they are the
 //! same on both. The mapping and error constants come from `include/uapi/asm-generic/mman.h`,
-//! `mman-common.h`, `errno-base.h`, and `errno.h`, which x86_64 and aarch64 both use. The C
-//! library, glibc or musl, gives the calls.
+//! `mman-common.h`, `errno-base.h`, and `errno.h`, which x86_64 and aarch64 both use. The flag of
+//! a write and the modes of `fallocate` in an entry come from `include/uapi/linux/fs.h` and
+//! `falloc.h`. The C library, glibc or musl, gives the calls.
 
 use core::ffi::{c_int, c_long, c_void};
 use core::mem::{offset_of, size_of};
@@ -140,6 +141,13 @@ pub(super) const SOCK_CLOEXEC: u32 = rsnetwork_udp::sys::SOCK_CLOEXEC.cast_unsig
 
 /// `IORING_FSYNC_DATASYNC`: the sync of `IORING_OP_FSYNC` is `fdatasync`, not `fsync`.
 pub(crate) const IORING_FSYNC_DATASYNC: u32 = 1 << 0;
+
+/// The flag of a data-sync write (`RWF_DSYNC`), and the modes of `fallocate`, as an entry holds
+/// them. The pollers of epoll and kqueue read the same entries, so these values exist on each
+/// target.
+pub(crate) const RWF_DSYNC: u32 = 0x2;
+pub(crate) const FALLOC_FL_KEEP_SIZE: u32 = 0x1;
+pub(crate) const FALLOC_FL_PUNCH_HOLE: u32 = 0x2;
 
 /// The command of `IORING_OP_MSG_RING` that posts `len` and `off` as a completion of the target.
 pub(super) const IORING_MSG_DATA: u64 = 0;

@@ -1,8 +1,8 @@
 //! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
 //! nonblocking turns. No scheduler runs. On Linux, the driver runs on io_uring, or on epoll where the
-//! kernel refuses io_uring. On macOS, it runs TCP and UDP on kqueue. On Windows, it runs TCP and UDP
-//! on an I/O completion port ([`Backend`]). Each backend has the same operations and the same
-//! ownership rules.
+//! kernel refuses io_uring. On macOS, it runs TCP and UDP on kqueue, and files on the blocking
+//! service. On Windows, it runs TCP and UDP on an I/O completion port ([`Backend`]). Each backend has
+//! the same operations and the same ownership rules.
 //!
 //! A [`Driver`] is the home of each operation that it accepts, from the submission to the
 //! terminal event of the operation, which releases its buffer and its charge. Its future can move
@@ -26,15 +26,16 @@
 //! a stream runs one operation at a time, and the rules for a dropped or forgotten future keep each
 //! byte and each connection: see [`TcpStream`].
 //!
-//! On Linux, files run on the driver too: `Driver::open_file` with an explicit cache mode,
-//! positional and vectored reads and writes, length, space, sync, rename, unlink, directories, and
-//! `Driver::close_file`. Several operations of one file run at one time: see `File`.
+//! On Linux and macOS, files run on the driver too: `Driver::open_file` with an explicit cache
+//! mode, positional and vectored reads and writes, length, space, sync, rename, unlink,
+//! directories, and `Driver::close_file`. Several operations of one file run at one time: see
+//! `File`.
 //!
 //! [`Driver::report`] states what the driver found and applied when it started: the backend, the
 //! features of the kernel, and the [`Route`] of each [`Call`] that depends on them. The driver
 //! starts no helper thread. A kernel with no ring operation for a file call runs that call on the
-//! blocking service of the caller, which `Driver::use_blocking` gives, and on epoll each file call
-//! runs there. [`Config::require`] makes a missing feature refuse the driver, and
+//! blocking service of the caller, which `Driver::use_blocking` gives, and on epoll and kqueue each
+//! file call runs there. [`Config::require`] makes a missing feature refuse the driver, and
 //! [`Config::backend`] a missing backend.
 //!
 //! ```no_run
@@ -55,7 +56,7 @@
 
 mod capability;
 mod completion;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod file;
 #[cfg(all(feature = "local", target_os = "linux"))]
 mod home;
@@ -125,7 +126,7 @@ use crate::uring::{Ring, SetupError};
 use queue::Queue;
 
 pub use capability::{Backend, Call, Feature, Features, Report, Route};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 #[cfg(target_os = "linux")]
 pub use local::{LocalListener, LocalStream, Peer, Stale};
@@ -364,7 +365,7 @@ pub(crate) struct Held {
     /// The home asked the kernel to cancel the operation.
     pub(crate) cancelled: bool,
     /// An error of the home that the future gives in place of the result of the kernel.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) error: Option<io::ErrorKind>,
 }
 
@@ -404,26 +405,26 @@ pub(crate) enum Payload {
     /// The datagrams of a batch, and its progress while its completions come.
     Batch { batch: udp::Batch, progress: udp::Progress },
     /// The C strings of the paths of a rename or an unlink, which the kernel reads.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Paths {
         path: std::ffi::CString,
         target: Option<std::ffi::CString>,
     },
     /// The C string of the path of an open, which the kernel reads, and the alignment of direct
     /// I/O of the file that the open gave.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Open {
         path: std::ffi::CString,
         alignment: Option<Alignment>,
     },
-    /// The structure that a `statx` of a file writes.
-    #[cfg(target_os = "linux")]
-    Stat(sys::Statx),
+    /// The structure that a `statx` of a file writes on Linux, and an `fstat` on macOS.
+    #[cfg(unix)]
+    Stat(file::Stat),
     /// The buffers of a vectored read of a file.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Buffers(Buffers),
     /// The waiter of the job of an operation that runs on the blocking service.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Job(crate::blocking::Waiter<i32>),
     /// The waiter of the job of a spawn, and the child that the home makes at the end of the job.
     #[cfg(target_os = "linux")]
@@ -493,7 +494,7 @@ pub(crate) enum Kind {
     Close,
     /// An operation of a file or a directory, which runs at the same time as the others of its
     /// file.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     File(file::Op),
     /// A spawn of a child in the child slot of the index, as a job of the blocking service.
     #[cfg(target_os = "linux")]
@@ -553,11 +554,12 @@ pub enum Reason {
     Unsupported,
     /// The buffer, the length, or the offset of a direct-I/O operation does not have the
     /// [`Alignment`] of its file.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Alignment,
-    /// The operation runs on the blocking service on this kernel ([`Route::BlockingService`]),
-    /// and the driver has no service ([`Driver::use_blocking`]), or the service refused the job.
-    #[cfg(target_os = "linux")]
+    /// The operation runs on the blocking service on this kernel or backend
+    /// ([`Route::BlockingService`]), and the driver has no service ([`Driver::use_blocking`]), or
+    /// the service refused the job.
+    #[cfg(unix)]
     Blocking,
     /// Each child slot of the driver is in use ([`Config::children`]).
     #[cfg(target_os = "linux")]
@@ -721,8 +723,12 @@ struct Owned {
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
     /// The operations of a file that run, which its close waits for.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     running: u32,
+    /// The last allocation of the file that extends its length on macOS, which runs alone on the
+    /// file while the table says that it runs.
+    #[cfg(target_os = "macos")]
+    exclusive: Option<OpId>,
     /// The port queues no packet for an operation of the socket that ends at its call
     /// (skip-on-success).
     #[cfg(target_os = "windows")]
@@ -742,7 +748,7 @@ enum Medium {
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
     Udp,
     /// A file or a directory: its operations are positional, and several run at one time.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     File,
 }
 
@@ -809,10 +815,8 @@ impl Resources {
         let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
             return Err((Reason::Resources, fd));
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let registers = medium != Medium::File;
-        #[cfg(target_os = "macos")]
-        let registers = true;
         #[cfg(unix)]
         if let Some(registrar) = &self.registrar
             && registers
@@ -871,9 +875,13 @@ impl Resources {
             .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             slot.running = 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            slot.exclusive = None;
         }
         let fd = slot.fd.take()?;
         // A socket stays associated with its port until its close, and no system call ends the
@@ -1055,11 +1063,15 @@ pub struct Driver {
     children: process::Children,
     /// The blocking service of the operations that the kernel cannot run
     /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
     /// The operations that run on the blocking service, which each turn polls.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     jobs: Vec<OpId>,
+    /// The file operations that wait for an allocation that extends their file, or that such an
+    /// allocation waits for, in start order: at most one entry for each operation.
+    #[cfg(target_os = "macos")]
+    waiting: Vec<file::Waiting>,
     /// The home of a local owner on this driver, and the wake messages that it sent.
     #[cfg(all(feature = "local", target_os = "linux"))]
     wakes: home::Wakes,
@@ -1191,6 +1203,9 @@ impl Driver {
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
+            blocking: None,
+            jobs: Vec::with_capacity(config.operations as usize),
+            waiting: Vec::with_capacity(config.operations as usize),
         })
     }
 
@@ -1394,7 +1409,7 @@ impl Driver {
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
         self.take_requests();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         self.poll_jobs();
         if let Some(selected) = &mut self.selected {
             selected.refill();
@@ -1412,6 +1427,8 @@ impl Driver {
         signal::wake(&mut self.signals);
         // Start the operations that waited for an operation that ended, and end the closes.
         self.attend();
+        #[cfg(target_os = "macos")]
+        self.start_waiting();
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
         // the descriptor already, so this turn reports it, or a later wake comes.
         #[cfg(target_os = "linux")]
@@ -1506,6 +1523,10 @@ impl Driver {
             }
         }
         // An operation that waits for the one before it never ran, so it ends now.
+        #[cfg(target_os = "macos")]
+        for waiting in mem::take(&mut self.waiting) {
+            self.complete_now(waiting.id(), -ECANCELED);
+        }
         for index in 0..self.resources.slots.len() {
             let Some(resource) = self.resources.slots.get(index).map(|owned| Resource {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -1542,13 +1563,13 @@ impl Driver {
         }
         while self.table.busy() {
             self.take_requests();
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             self.poll_jobs();
             if !self.table.busy() {
                 break;
             }
             // The wait also ends when a job of the blocking service ends, because the job wakes
-            // the interrupt descriptor.
+            // the driver: the interrupt descriptor on Linux, and the user event on macOS.
             self.wait()?;
             self.harvest(u32::MAX);
             self.attend();
@@ -1743,7 +1764,7 @@ impl Driver {
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return;
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let Some(tag) = match &outcome {
             Outcome::Ready => self.table.resources(id).copied(),
             Outcome::Abandoned(Done { resources, .. }) => *resources,
@@ -1814,6 +1835,10 @@ impl Driver {
         }
         if self.unqueue(tag, id) {
             self.complete_now(id, -ECANCELED);
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if self.unwait(id) {
             return;
         }
         let mut first = false;
@@ -1931,7 +1956,7 @@ impl Driver {
                     finish(held, tag, &cqe, abandoned, resources, selected.as_mut());
                 }
             });
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             file::ended(resources, pending, tag);
             if abandoned {
                 if let Some(held) = slot.reclaim(id) {
@@ -1971,7 +1996,7 @@ fn finish(
 ) {
     let count = usize::try_from(cqe.res);
     match tag.kind {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         Kind::File(op) => file::finish(held, op, cqe.res, abandoned, resources),
         Kind::Other
         | Kind::Send

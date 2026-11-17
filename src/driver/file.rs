@@ -20,29 +20,45 @@ use std::path::Path;
 use rsnetwork_udp::sys::IoVec;
 
 use super::tcp::{Regions, count};
+// The open flags and the structures of the file calls: the declarations of the driver on Linux,
+// and those of the poller on macOS, where only the file jobs of the poller make file calls.
+#[cfg(target_os = "macos")]
+use super::poller::sys;
+#[cfg(target_os = "linux")]
+use super::sys;
 use super::{
-    Backend, Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource,
-    Resources, Route, Tag, poller, sys,
+    Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
+    Route, Tag, poller,
 };
 use crate::blocking::{Job, Submitter};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use crate::sync::Arc;
 use crate::uring::Sqe;
+use crate::uring::sys::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, RWF_DSYNC};
 
 /// The empty path of a call on the descriptor itself.
+#[cfg(target_os = "linux")]
 const EMPTY: &core::ffi::CStr = c"";
 
-/// `EIO` (`include/uapi/asm-generic/errno-base.h`), for a job of the blocking service that gives
-/// no error number.
+/// `EIO` (`include/uapi/asm-generic/errno-base.h` of Linux, and `sys/errno.h` of macOS), for a job
+/// of the blocking service that gives no error number.
 const EIO: i32 = 5;
 /// `EINVAL`, for options or a path that no call can take.
 const EINVAL: i32 = 22;
 
 /// The alignment of direct I/O when the file system does not report it: one page.
+#[cfg(target_os = "linux")]
 const PAGE: Alignment = Alignment {
     memory: 4096,
     offset: 4096,
 };
+
+/// The structure that the length inspection of a file fills: `struct statx` on Linux, and
+/// `struct stat` on macOS.
+#[cfg(target_os = "linux")]
+pub(crate) type Stat = sys::Statx;
+#[cfg(target_os = "macos")]
+pub(crate) type Stat = sys::Stat;
 
 /// The file operation of [`Kind::File`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +73,28 @@ pub(crate) enum Op {
     /// An operation that gives only its result: a write, a sync, a change of length or space, a
     /// `statx`, a rename, or an unlink.
     Plain,
+    /// A preallocation that extends the length, on macOS ([`Length::Extend`]): it runs alone on its
+    /// file, because its length change is a second call.
+    #[cfg(target_os = "macos")]
+    Extend,
+}
+
+/// A file operation that waits on macOS until it can run, because an allocation that extends the
+/// length runs alone on its file ([`Driver::allocate`]): its operation, its file, and its job.
+#[cfg(target_os = "macos")]
+pub(super) struct Waiting {
+    id: super::OpId,
+    resource: Resource,
+    op: Op,
+    job: FileJob,
+}
+
+#[cfg(target_os = "macos")]
+impl Waiting {
+    /// The operation that waits.
+    pub(super) const fn id(&self) -> super::OpId {
+        self.id
+    }
 }
 
 /// A file that the driver owns.
@@ -86,10 +124,18 @@ pub(crate) enum Op {
 /// #     }
 /// # }
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use core::num::NonZeroU64;
+///
+/// use rsasync::blocking::{self, Service};
 /// use rsasync::buffer::{Backing, Buffer as _, Lease};
+/// use rsasync::capacity::Budget;
 /// use rsasync::driver::{Config, Driver, OpenOptions, SyncMode, WriteMode};
 ///
 /// let mut driver = Driver::new(Config::new())?;
+/// // On epoll and kqueue, each file call is a job of a blocking service.
+/// let budget = Budget::new(NonZeroU64::new(16 << 20).unwrap());
+/// let service = Service::new(&budget, blocking::Config::new())?;
+/// driver.use_blocking(service.submitter());
 /// let path = std::env::temp_dir().join(format!("rsasync-file-{}", std::process::id()));
 ///
 /// let options = OpenOptions::new().read(true).write(true).create(true);
@@ -148,7 +194,8 @@ pub struct Directory {
 
 /// The alignment that direct I/O needs, from `statx` (`STATX_DIOALIGN`, Linux 6.1).
 ///
-/// A file system that does not report it gets 4096 bytes for both values.
+/// A file system that does not report it gets 4096 bytes for both values. On macOS, both values
+/// are one page: 16 KiB on Apple silicon.
 ///
 /// A direct-I/O read into a buffer of a pool whose slots have the alignment, with `run` as in
 /// [`Operation`]:
@@ -179,6 +226,9 @@ pub struct Directory {
 /// use rsasync::driver::{Cache, Config, Driver, OpenOptions};
 ///
 /// let mut driver = Driver::new(Config::new())?;
+/// # let budget = Budget::new(NonZeroU64::new(16 << 20).unwrap());
+/// # let service = rsasync::blocking::Service::new(&budget, rsasync::blocking::Config::new())?;
+/// # driver.use_blocking(service.submitter());
 /// let path = std::env::temp_dir().join(format!("rsasync-direct-{}", std::process::id()));
 /// std::fs::write(&path, vec![7; 16384])?;
 ///
@@ -228,7 +278,8 @@ pub enum Cache {
     #[default]
     Buffered,
     /// Between the device and the buffers of the caller, with no copy in the page cache
-    /// (`O_DIRECT`). Each buffer, length, and offset has the [`Alignment`] of the file.
+    /// (`O_DIRECT`, and `F_NOCACHE` after the open on macOS). Each buffer, length, and offset has
+    /// the [`Alignment`] of the file.
     Direct,
 }
 
@@ -323,6 +374,8 @@ impl OpenOptions {
         if self.truncate {
             flags |= sys::O_TRUNC;
         }
+        // macOS has no such flag: the open turns the cache of the file off after the call.
+        #[cfg(target_os = "linux")]
         if self.cache == Cache::Direct {
             flags |= sys::O_DIRECT;
         }
@@ -336,7 +389,8 @@ impl Default for OpenOptions {
     }
 }
 
-/// What [`Driver::sync`] makes durable.
+/// What [`Driver::sync`] makes durable. On macOS, each mode is `F_FULLFSYNC`, which also writes the
+/// cache of the device to its media: a plain `fsync` of macOS leaves the bytes in that cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     /// The contents, and the metadata that a later read needs, such as the length (`fdatasync`).
@@ -351,7 +405,8 @@ pub enum WriteMode {
     /// The write ends when the kernel has the bytes. A later [`Driver::sync`] makes them durable.
     #[default]
     Plain,
-    /// The write ends when its bytes are durable, as with a `fdatasync` after it (`RWF_DSYNC`).
+    /// The write ends when its bytes are durable, as with a `fdatasync` after it (`RWF_DSYNC`). On
+    /// macOS, the job of the write makes an `F_FULLFSYNC` after it.
     DataSync,
 }
 
@@ -359,7 +414,7 @@ impl WriteMode {
     const fn flags(self) -> u32 {
         match self {
             Self::Plain => 0,
-            Self::DataSync => sys::RWF_DSYNC.cast_unsigned(),
+            Self::DataSync => RWF_DSYNC,
         }
     }
 }
@@ -528,6 +583,8 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
             }
         }
         Op::Plain => {}
+        #[cfg(target_os = "macos")]
+        Op::Extend => {}
     }
 }
 
@@ -547,6 +604,7 @@ pub(super) fn ended(resources: &mut Resources, pending: &mut Vec<Resource>, tag:
 
 /// The alignment of direct I/O of the open file `fd`. It keeps the attributes that the kernel
 /// has, so it never waits for a remote server.
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "the call writes only the structure")]
 fn alignment(fd: &OwnedFd) -> Result<Alignment, io::ErrorKind> {
     let mut stat = sys::Statx::default();
@@ -576,6 +634,42 @@ fn alignment(fd: &OwnedFd) -> Result<Alignment, io::ErrorKind> {
         memory: stat.dio_mem_align,
         offset: stat.dio_offset_align,
     })
+}
+
+/// Turns the data cache of the open file `fd` off (`F_NOCACHE`), and gives the alignment of its
+/// direct I/O: one page, as `sysconf` gives it. xnu moves a transfer whose address, offset, and
+/// length are multiples of a page between the device and the buffer, with no copy in the cache.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "the command takes one `int` argument, and `sysconf` takes no pointer"
+)]
+fn alignment(fd: &OwnedFd) -> Result<Alignment, io::ErrorKind> {
+    // SAFETY: the command takes one `int` argument.
+    if unsafe { sys::fcntl(fd.as_raw_fd(), sys::F_NOCACHE, 1_i32) } < 0 {
+        return Err(io::Error::last_os_error().kind());
+    }
+    // SAFETY: the call takes no pointer.
+    let page = u32::try_from(unsafe { sys::sysconf(sys::_SC_PAGESIZE) }).map_err(|_| io::ErrorKind::Unsupported)?;
+    Ok(Alignment {
+        memory: page,
+        offset: page,
+    })
+}
+
+/// The length of a file in the structure of its inspection.
+#[cfg(target_os = "linux")]
+fn length(stat: &Stat) -> io::Result<u64> {
+    if stat.mask & sys::STATX_SIZE == 0 {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    Ok(stat.size)
+}
+
+/// The length of a file in the structure of its inspection.
+#[cfg(target_os = "macos")]
+fn length(stat: &Stat) -> io::Result<u64> {
+    u64::try_from(stat.st_size).map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
 /// The C string of `path`, or `None` when it holds a NUL byte.
@@ -623,8 +717,18 @@ fn poll_job(held: Option<&mut Held>, cx: &Context<'_>) -> Option<i32> {
     }
 }
 
-/// The job of a file entry on the epoll backend: its entry, and the duplicate of its descriptor,
-/// which stays open until the job returns.
+/// Whether the file operation `op` can start on the file of `owned` on macOS, with `waiting` of its
+/// operations that wait: no allocation that extends the file runs, and such an allocation starts
+/// only when no other operation of the file runs.
+#[cfg(target_os = "macos")]
+fn free(owned: &super::Owned, table: &crate::table::Table<Tag>, op: Op, waiting: usize) -> bool {
+    let exclusive = owned.exclusive.is_some_and(|id| table.runs(id));
+    let others = (owned.running as usize).saturating_sub(waiting);
+    !exclusive && (op != Op::Extend || others == 0)
+}
+
+/// The job of a file entry on the epoll and kqueue backends: its entry, and the duplicate of its
+/// descriptor, which stays open until the job returns.
 struct FileJob {
     sqe: Sqe,
     _fd: Option<OwnedFd>,
@@ -879,7 +983,8 @@ impl Driver {
         }))
     }
 
-    /// The length of `file` in bytes (`IORING_OP_STATX`). A drop of the future asks for a cancel.
+    /// The length of `file` in bytes (`IORING_OP_STATX`, and `fstat` on macOS). A drop of the
+    /// future asks for a cancel.
     ///
     /// # Errors
     ///
@@ -887,9 +992,10 @@ impl Driver {
     /// system.
     pub fn file_len<'a>(&mut self, file: &'a File) -> Result<Operation<'a, io::Result<u64>>, Refused<()>> {
         let held = |()| Held {
-            payload: Payload::Stat(sys::Statx::default()),
+            payload: Payload::Stat(Stat::default()),
             ..Held::default()
         };
+        #[cfg(target_os = "linux")]
         let entry = |fd, held: &mut Held| match &mut held.payload {
             Payload::Stat(stat) => Sqe::statx(
                 fd,
@@ -900,17 +1006,18 @@ impl Driver {
             ),
             _ => Sqe::nop(),
         };
+        // The job makes an `fstat` of the descriptor of the entry into its structure.
+        #[cfg(target_os = "macos")]
+        let entry = |fd, held: &mut Held| match &mut held.payload {
+            Payload::Stat(stat) => Sqe::statx(fd, core::ptr::null(), 0, 0, (&raw mut *stat).cast()),
+            _ => Sqe::nop(),
+        };
         let completion = self.begin_file(Some(file.resource), Op::Plain, (), held, entry, true)?;
         Ok(Operation::new(completion, |result, held| {
             let Payload::Stat(stat) = held.payload else {
                 return None;
             };
-            Some(count(result).and_then(|_| {
-                if stat.mask & sys::STATX_SIZE == 0 {
-                    return Err(io::ErrorKind::Unsupported.into());
-                }
-                Ok(stat.size)
-            }))
+            Some(count(result).and_then(|_| length(&stat)))
         }))
     }
 
@@ -924,7 +1031,10 @@ impl Driver {
     /// change runs on the blocking service and the driver has none, or the service refused the
     /// job. The future gives an error of the system.
     pub fn set_file_len<'a>(&mut self, file: &'a File, len: u64) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        let completion = if self.report.route(Call::SetFileLen) == Route::Ring {
+        // The ring has the call from Linux 6.9, and on epoll and kqueue it is a file job.
+        let entry = self.report.route(Call::SetFileLen) == Route::Ring
+            || self.report.route(Call::File) == Route::BlockingService;
+        let completion = if entry {
             let entry = move |fd, _: &mut Held| Sqe::ftruncate(fd, len);
             self.begin_file(Some(file.resource), Op::Plain, (), |()| Held::default(), entry, false)?
         } else {
@@ -937,10 +1047,19 @@ impl Driver {
     /// later write there does not fail for space. With [`Length::Extend`], the length becomes the
     /// end of the range when the range ends after it. A drop of the future does not cancel it.
     ///
+    /// On macOS, `F_PREALLOCATE` reserves blocks only after the physical end of the file: the job
+    /// asks for the blocks from the allocated bytes to the end of the range, all of them or none.
+    /// A hole before the physical end stays a hole, so a later write into it can still fail for
+    /// space. Then `ftruncate` makes the length for [`Length::Extend`]. The two calls are not one
+    /// change, so such an allocation runs alone on its file: it starts when each other operation
+    /// of the file ended, and each later one waits until it ends. Another process that writes the
+    /// file at the same time is outside that order, as for each `ftruncate`.
+    ///
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation. The future gives an error of the
-    /// system, for example `Unsupported` on a file system without preallocation.
+    /// system, for example `Unsupported` on a file system without preallocation, `StorageFull`
+    /// when the space is not free, and `InvalidInput` for 0 bytes.
     pub fn allocate<'a>(
         &mut self,
         file: &'a File,
@@ -949,42 +1068,57 @@ impl Driver {
         length: Length,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let mode = match length {
-            Length::Keep => sys::FALLOC_FL_KEEP_SIZE,
+            Length::Keep => FALLOC_FL_KEEP_SIZE,
             Length::Extend => 0,
         };
-        self.fallocate(file, mode, offset, len)
+        #[cfg(target_os = "macos")]
+        let op = match length {
+            Length::Keep => Op::Plain,
+            Length::Extend => Op::Extend,
+        };
+        #[cfg(target_os = "linux")]
+        let op = Op::Plain;
+        self.fallocate(file, op, mode, offset, len)
     }
 
     /// Frees the blocks of `len` bytes from `offset` of `file`, which then read as zeros, and
     /// keeps the length (`IORING_OP_FALLOCATE` with `FALLOC_FL_PUNCH_HOLE` and
-    /// `FALLOC_FL_KEEP_SIZE`). A drop of the future does not cancel it.
+    /// `FALLOC_FL_KEEP_SIZE`). A block that the range holds only in part keeps its blocks, and the
+    /// bytes of the range in it become zeros. A drop of the future does not cancel it.
+    ///
+    /// On macOS, `F_PUNCHHOLE` frees the whole blocks of the file system in the range, and then
+    /// the job writes zeros into the bytes of the range in its first and last block, before the
+    /// end of the file.
     ///
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation. The future gives an error of the
-    /// system: `Unsupported` (`EOPNOTSUPP`) on a file system without hole punching.
+    /// system: `Unsupported` (`EOPNOTSUPP`, and `ENOTTY` on macOS) on a file system without hole
+    /// punching, before the operation changes a byte, and `InvalidInput` for 0 bytes.
     pub fn punch_hole<'a>(
         &mut self,
         file: &'a File,
         offset: u64,
         len: u64,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        self.fallocate(file, sys::FALLOC_FL_PUNCH_HOLE | sys::FALLOC_FL_KEEP_SIZE, offset, len)
+        self.fallocate(file, Op::Plain, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len)
     }
 
     /// Makes the writes of `file` that ended before it durable, as `mode` says
-    /// (`IORING_OP_FSYNC`). A drop of the future does not cancel it.
+    /// (`IORING_OP_FSYNC`, and `F_FULLFSYNC` on macOS). A drop of the future does not cancel it.
     ///
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation. The future gives an error of the
-    /// system.
+    /// system: on macOS, `Unsupported` on a file system with no `F_FULLFSYNC`. The driver never
+    /// makes a weaker sync in its place.
     pub fn sync<'a>(&mut self, file: &'a File, mode: SyncMode) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         self.fsync(file.resource, mode == SyncMode::Data)
     }
 
     /// Makes the creates, renames, and unlinks in `directory` that ended before it durable
-    /// (`IORING_OP_FSYNC` on the directory). A drop of the future does not cancel it.
+    /// (`IORING_OP_FSYNC` on the directory, and `F_FULLFSYNC` on macOS). A drop of the future does
+    /// not cancel it.
     ///
     /// # Errors
     ///
@@ -1100,6 +1234,7 @@ impl Driver {
         let cx = Context::from_waker(&waker);
         let mut index = 0;
         while let Some(&id) = self.jobs.get(index) {
+            #[cfg(target_os = "linux")]
             if let Some(&Tag {
                 kind: Kind::Spawn(child),
                 ..
@@ -1184,16 +1319,17 @@ impl Driver {
             })
     }
 
-    /// Starts a `fallocate` of `file` with `mode`.
+    /// Starts a `fallocate` of `file` with `mode`, as the file operation `op`.
     fn fallocate<'a>(
         &mut self,
         file: &'a File,
-        mode: c_int,
+        op: Op,
+        mode: u32,
         offset: u64,
         len: u64,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        let entry = move |fd, _: &mut Held| Sqe::fallocate(fd, mode.cast_unsigned(), offset, len);
-        let completion = self.begin_file(Some(file.resource), Op::Plain, (), |()| Held::default(), entry, false)?;
+        let entry = move |fd, _: &mut Held| Sqe::fallocate(fd, mode, offset, len);
+        let completion = self.begin_file(Some(file.resource), op, (), |()| Held::default(), entry, false)?;
         Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
     }
 
@@ -1250,7 +1386,7 @@ impl Driver {
                 }
             },
         };
-        if self.report.backend() == Backend::Epoll {
+        if self.report.route(Call::File) == Route::BlockingService {
             return self.begin_file_job(resource, op, value, held, entry, cancel_on_drop);
         }
         let tag = Tag {
@@ -1273,8 +1409,8 @@ impl Driver {
     }
 
     /// Starts the file operation `op` of [`Driver::begin_file`] as a job of the blocking service,
-    /// which makes the call of its entry with one positional call ([`epoll::run_file`]), because
-    /// epoll cannot wait on a file. The job owns a duplicate of the descriptor, so it never names a
+    /// which makes the call of its entry with one positional call ([`poller::run_file`]), because
+    /// epoll and kqueue cannot wait on a file. The job owns a duplicate of the descriptor, so it never names a
     /// descriptor number that the driver closed and the system gave to another file. The job
     /// posts the completion of the entry to the poller when it returns.
     fn begin_file_job<P>(
@@ -1303,6 +1439,8 @@ impl Driver {
                 value,
             });
         };
+        #[cfg(target_os = "macos")]
+        let waits = resource.is_some_and(|resource| self.waits(resource, op));
         let tag = Tag {
             resource,
             kind: Kind::File(op),
@@ -1327,6 +1465,19 @@ impl Driver {
             let raw = fd.as_ref().map_or(sys::AT_FDCWD, AsRawFd::as_raw_fd);
             slot.update(id, |held| sqe = held.as_mut().map(|held| entry(raw, held)));
         }
+        #[cfg(target_os = "macos")]
+        if let (true, Some(sqe), Some(resource)) = (waits, sqe, resource) {
+            // At most one entry for each operation, so the capacity of the list holds it.
+            self.waiting.push(Waiting {
+                id,
+                resource,
+                op,
+                job: FileJob { sqe, _fd: fd },
+            });
+            return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
+        }
+        #[cfg(target_os = "macos")]
+        self.started(resource, op, id);
         match (sqe, self.queue.poller()) {
             (Some(sqe), Some(poller)) => {
                 poller.add_job(id.user_data(), reservation.send(FileJob { sqe, _fd: fd }), &waker)
@@ -1334,6 +1485,91 @@ impl Driver {
             _ => self.complete_now(id, -EINVAL),
         }
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
+    }
+
+    /// Whether a new file operation `op` of `resource` waits on macOS: an earlier operation of the
+    /// file waits, an allocation that extends the file runs, or `op` is such an allocation and
+    /// another operation of the file runs.
+    #[cfg(target_os = "macos")]
+    fn waits(&mut self, resource: Resource, op: Op) -> bool {
+        let waiting = self
+            .waiting
+            .iter()
+            .filter(|waiting| waiting.resource == resource)
+            .count();
+        let (table, resources) = (&self.table, &mut self.resources);
+        waiting > 0
+            || resources
+                .get(resource)
+                .is_some_and(|owned| !free(owned, table, op, waiting))
+    }
+
+    /// Records that the file operation `id` of `resource` started on macOS: an allocation that
+    /// extends the file then runs alone on it.
+    #[cfg(target_os = "macos")]
+    fn started(&mut self, resource: Option<Resource>, op: Op, id: super::OpId) {
+        if op == Op::Extend
+            && let Some(owned) = resource.and_then(|resource| self.resources.get(resource))
+        {
+            owned.exclusive = Some(id);
+        }
+    }
+
+    /// Starts each waiting file operation that can run now, in the order of their starts on each
+    /// file, on macOS. A full service starts none: a job that ends wakes the driver, and a later
+    /// turn tries again. A stopped service ends each one, as it ends a job.
+    #[cfg(target_os = "macos")]
+    pub(super) fn start_waiting(&mut self) {
+        let Some((submitter, waker)) = self
+            .blocking
+            .as_ref()
+            .map(|(submitter, waker)| (submitter.clone(), waker.clone()))
+        else {
+            return;
+        };
+        let mut index = 0;
+        // Each step starts, ends, or skips one entry, and the list holds at most one entry for each
+        // operation, so the loop ends after at most `Config::operations` steps.
+        while let Some(waiting) = self.waiting.get(index) {
+            let (resource, op) = (waiting.resource, waiting.op);
+            // An earlier operation of the same file waits, and it starts first.
+            let first = !self.waiting[..index].iter().any(|earlier| earlier.resource == resource);
+            let count = self.waiting.iter().filter(|other| other.resource == resource).count();
+            let (table, resources) = (&self.table, &mut self.resources);
+            if !first
+                || resources
+                    .get(resource)
+                    .is_some_and(|owned| !free(owned, table, op, count))
+            {
+                index += 1;
+                continue;
+            }
+            let reservation = match submitter.reserve::<FileJob>() {
+                Ok(reservation) => reservation,
+                Err(crate::blocking::Reason::Ended) => {
+                    let waiting = self.waiting.remove(index);
+                    self.complete_now(waiting.id, -ECANCELED);
+                    continue;
+                }
+                Err(_) => return,
+            };
+            let waiting = self.waiting.remove(index);
+            self.started(Some(resource), op, waiting.id);
+            if let Some(poller) = self.queue.poller() {
+                poller.add_job(waiting.id.user_data(), reservation.send(waiting.job), &waker);
+            }
+        }
+    }
+
+    /// Ends the waiting file operation `id` on macOS, which never ran. Gives whether it waited.
+    #[cfg(target_os = "macos")]
+    pub(super) fn unwait(&mut self, id: super::OpId) -> bool {
+        let Some(index) = self.waiting.iter().position(|waiting| waiting.id == id) else {
+            return false;
+        };
+        drop(self.waiting.remove(index));
+        self.complete_now(id, -ECANCELED);
+        true
     }
 
     /// Starts a change of the length of the file `resource` to `len` as a job of the blocking

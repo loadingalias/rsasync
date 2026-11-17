@@ -43,9 +43,9 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 | `Call::BindUdp` (`Driver::bind_udp`) | `Bind` | `Route::SystemCall` |
 | `Call::SetFileLen` (`Driver::set_file_len`) | `Truncate` | `Route::BlockingService`: the call is a job of the service of `Driver::use_blocking`. With no service, it refuses with `Reason::Blocking` |
 | `Call::WaitChild` (the exit of a `Child`, see [child processes](processes.md)) | `ChildWait` | `Route::Poll`: the ring or epoll polls the process descriptor of the child, and when it is readable, the driver takes the status with one nonblocking `waitid` |
-| `Call::File` (each other file and directory operation, see [files](files.md)) | The io_uring backend | `Route::BlockingService`, on epoll |
+| `Call::File` (each other file and directory operation, see [files](files.md)) | The io_uring backend | `Route::BlockingService`, on epoll and kqueue |
 
-On epoll, no feature is probed, so each call takes the route of the last column.
+On epoll and kqueue, no feature is probed, so each call takes the route of the last column.
 
 ## Strict and permissive selection
 

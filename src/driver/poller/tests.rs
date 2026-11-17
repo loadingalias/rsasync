@@ -1,15 +1,12 @@
 use alloc::vec::Vec;
 use core::assert_matches;
-#[cfg(target_os = "linux")]
 use std::io;
 use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::super::tests::{drive, driver};
-use super::super::{Backend, Config, Driver, Error, TcpOptions};
-#[cfg(target_os = "linux")]
-use super::super::{Call, OpenOptions, Reason, Route};
+use super::super::{Backend, Call, Config, Driver, Error, OpenOptions, Reason, Route, TcpOptions};
 use crate::buffer::{Backing, Buffer as _, Lease};
 
 /// `ENOSPC` (`include/uapi/asm-generic/errno-base.h`): `epoll_ctl` at the limit of
@@ -141,21 +138,41 @@ fn a_refused_registration_of_an_accepted_connection_keeps_it_for_the_next_accept
     assert_eq!(&back, b"back");
 }
 
-/// A driver on macOS runs kqueue, and the report says so. A strict requirement of a backend that
-/// macOS does not have refuses before a driver exists.
+/// A driver on macOS runs kqueue, and the report says so, with each file call on the blocking
+/// service. With no service, a file operation refuses before it starts, because no file call
+/// blocks the driver. A strict requirement of a backend that macOS does not have refuses before a
+/// driver exists.
 #[test]
 #[cfg(target_os = "macos")]
 fn a_kqueue_driver_reports_its_backend_and_a_strict_other_backend_refuses() {
     for requested in [None, Some(Backend::Kqueue)] {
         let config = requested.map_or_else(Config::new, |backend| Config::new().backend(backend));
-        let report = driver(config).report();
+        let mut driver = driver(config);
+        let report = driver.report();
         assert_eq!(
             (report.requested(), report.backend(), report.fallback()),
             (requested, Backend::Kqueue, None)
         );
+        assert_eq!(report.route(Call::File), Route::BlockingService);
+        assert_eq!(report.route(Call::SetFileLen), Route::BlockingService);
+        let path = std::env::current_exe().unwrap();
+        let refused = driver.open_file(&path, OpenOptions::new()).unwrap_err();
+        assert_eq!(refused.reason(), Reason::Blocking);
     }
     for other in [Backend::IoUring, Backend::Epoll, Backend::Iocp] {
         let refused = Driver::new(Config::new().backend(other));
         assert_matches!(refused, Err(Error::Refused(_)), "{other:?} did not refuse");
     }
+}
+
+/// A file system with no hole punching, such as exFAT or FAT32, gives `ENOTTY` (25, `sys/errno.h`)
+/// for `F_PUNCHHOLE`, and the caller gets `Unsupported`. Another error keeps its kind.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_command_that_the_file_system_lacks_gives_unsupported() {
+    const ENOTTY: i32 = 25;
+    const EPERM: i32 = 1;
+    let kind = |errno| io::Error::from_raw_os_error(super::unsupported(errno)).kind();
+    assert_eq!(kind(ENOTTY), io::ErrorKind::Unsupported);
+    assert_eq!(kind(EPERM), io::ErrorKind::PermissionDenied);
 }

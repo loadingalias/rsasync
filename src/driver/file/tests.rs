@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use super::super::suite::{self, Backend};
-use super::super::tests::{Log, drive, driver, note, numbered, posted, recorded, taken};
+#[cfg(target_os = "linux")]
+use super::super::tests::driver;
+use super::super::tests::{Log, drive, note, numbered, posted, recorded, taken};
 use super::super::{Call, Config, Driver, Reason, Route};
 use super::{Buffers, Cache, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 use crate::blocking::{self, Service};
@@ -117,8 +119,10 @@ pub(in crate::driver) fn a_short_read_gives_its_exact_extent_and_the_exact_read_
 /// A direct-I/O file refuses a buffer, a length, or an offset that does not have its alignment,
 /// before the submission, and gives the buffer back. An aligned read runs.
 pub(in crate::driver) fn a_misaligned_direct_io_buffer_refuses_before_submission(backend: Backend) {
+    // 256 KiB holds a read of four blocks after the first block, also with pages of 16 KiB.
+    const LEN: usize = 1 << 18;
     let scratch = Scratch::new("direct");
-    fs::write(scratch.join("data"), numbered(0, 65536)).unwrap();
+    fs::write(scratch.join("data"), numbered(0, LEN)).unwrap();
     let mut driver = suite::driver(Config::new(), backend);
     let file = open(
         &mut driver,
@@ -146,10 +150,11 @@ pub(in crate::driver) fn a_misaligned_direct_io_buffer_refuses_before_submission
     let read = driver.read_at(&file, refused.into_inner(), offset as u64).unwrap();
     let (count, buffer) = drive(&mut driver, read).unwrap();
     assert_eq!(count.unwrap(), 4 * block);
-    assert_eq!(buffer.bytes(), &numbered(0, 65536)[offset..offset + 4 * block]);
+    assert_eq!(buffer.bytes(), &numbered(0, LEN)[offset..offset + 4 * block]);
 }
 
 /// The kernel release, as `(major, minor)`.
+#[cfg(target_os = "linux")]
 fn kernel() -> (u32, u32) {
     let release = fs::read_to_string("/proc/sys/kernel/osrelease").expect("Linux gives its release");
     let mut parts = release.trim().split(['.', '-']);
@@ -196,15 +201,22 @@ impl Drop for Hold {
 }
 
 /// A length change runs on the ring from Linux 6.9 (`IORING_OP_FTRUNCATE`), and on the blocking
-/// service before it and on epoll, and the report names the route before the first operation. On
-/// the blocking service, a driver with no service and a full service refuse. On epoll, each file
-/// operation needs the service, so the case shows only the full service.
+/// service before it, on epoll, and on kqueue, and the report names the route before the first
+/// operation. On the blocking service, a driver with no service and a full service refuse. On epoll
+/// and kqueue, each file operation needs the service, so the case shows only the full service.
 pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before(
     backend: Backend,
 ) {
     let scratch = Scratch::new("length");
     let mut driver = suite::driver(Config::new(), backend);
-    let on_service = backend == Backend::Epoll || kernel() < (6, 9);
+    // A readiness backend runs each file operation on the service of the case.
+    #[cfg(target_os = "linux")]
+    let (readiness, on_service) = (
+        backend == Backend::Epoll,
+        backend == Backend::Epoll || kernel() < (6, 9),
+    );
+    #[cfg(target_os = "macos")]
+    let (readiness, on_service) = (true, true);
     let route = driver.report().route(Call::SetFileLen);
     assert_eq!(route == Route::BlockingService, on_service);
     let file = open(&mut driver, &scratch.join("data"), writable());
@@ -212,7 +224,7 @@ pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_
     let config = blocking::Config::new().threads(1).jobs(1).stack(256 << 10);
     let service = Service::new(&budget, config).unwrap();
     if on_service {
-        if backend != Backend::Epoll {
+        if !readiness {
             let refused = driver.set_file_len(&file, 100).unwrap_err();
             assert_eq!(refused.reason(), Reason::Blocking);
         }
@@ -327,7 +339,60 @@ pub(in crate::driver) fn a_punched_hole_reads_as_zeros_keeps_the_length_and_free
     assert!(bytes[768 * KIB..].iter().all(|&byte| byte == 0xab));
 }
 
+/// A hole punch of a range that starts and ends inside blocks reads as zeros over the whole range,
+/// and each byte outside it stays. So does a range inside one block, and a range that ends after
+/// the end of the file, whose length stays.
+pub(in crate::driver) fn an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay(backend: Backend) {
+    const LEN: usize = 1 << 16;
+    let scratch = Scratch::new("unaligned");
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), writable().read(true));
+    write(&mut driver, &file, &numbered(0, LEN), 0);
+    let mut expected = numbered(0, LEN);
+    // Across whole blocks, inside one block, and after the end of the file.
+    for (offset, len) in [(1000, 20_000), (30_001, 99), (60_000, 10_000)] {
+        let punch = driver.punch_hole(&file, offset as u64, len as u64).unwrap();
+        drive(&mut driver, punch).unwrap().unwrap();
+        expected[offset..(offset + len).min(LEN)].fill(0);
+    }
+    assert_eq!(file_len(&mut driver, &file), LEN as u64);
+    let read = driver
+        .read_at(&file, Backing::from(Vec::with_capacity(LEN)), 0)
+        .unwrap();
+    let (count, buffer) = drive(&mut driver, read).unwrap();
+    assert_eq!(count.unwrap(), LEN);
+    assert_eq!(buffer.bytes(), expected);
+}
+
+/// A write that ends after the end of an allocation that extends the file, and that starts while
+/// the allocation runs, keeps each of its bytes. On macOS, the allocation is a preallocation and
+/// then a length change, so it runs alone on its file, and the write waits for it.
+pub(in crate::driver) fn a_write_after_the_end_of_an_extending_allocation_keeps_each_byte(backend: Backend) {
+    const MIB: u64 = 1 << 20;
+    let scratch = Scratch::new("extend");
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), writable());
+    // A large allocation runs long, and the small write after it ends 4 KiB after its end.
+    let allocate = driver.allocate(&file, 0, 64 * MIB, Length::Extend).unwrap();
+    let bytes = numbered(0, 8192);
+    let write = driver
+        .write_at(&file, Lease::from(bytes.clone()), 64 * MIB - 4096, WriteMode::Plain)
+        .unwrap();
+    let (written, _lease) = drive(&mut driver, write).unwrap();
+    assert_eq!(written.unwrap(), 8192);
+    drive(&mut driver, allocate).unwrap().unwrap();
+
+    assert_eq!(file_len(&mut driver, &file), 64 * MIB + 4096);
+    let read = driver
+        .read_at(&file, Backing::from(Vec::with_capacity(8192)), 64 * MIB - 4096)
+        .unwrap();
+    let (count, buffer) = drive(&mut driver, read).unwrap();
+    assert_eq!(count.unwrap(), 8192);
+    assert_eq!(buffer.bytes(), bytes);
+}
+
 /// On ramfs, which has no `fallocate`, a hole punch gives `Unsupported`. A mount needs root.
+#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "mounts a ramfs, which only root can do"]
 fn a_file_system_without_hole_punching_refuses_with_unsupported() {

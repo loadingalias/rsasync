@@ -26,6 +26,7 @@ pub enum Backend {
     /// offload and no coalesced receive: a send with a segment size gives
     /// `datagram::Refused::NoSegmentation` with no call, and the `gro` option of a UDP socket gives
     /// `Unsupported`. A caller learns it as on each system, from the send of a `datagram::Probe`.
+    /// Each file operation runs on the blocking service ([`Route::BlockingService`]), as on epoll.
     Kqueue,
 }
 
@@ -145,7 +146,7 @@ pub enum Call {
     Bind,
     /// `Driver::bind_udp`, on Linux: a bind of a UDP socket.
     BindUdp,
-    /// `Driver::set_file_len`, on Linux: a change of the length of a file.
+    /// `Driver::set_file_len`, on Linux and macOS: a change of the length of a file.
     SetFileLen,
     /// The exit of a `Child`, on Linux: the reap of the child and its status.
     WaitChild,
@@ -162,8 +163,8 @@ pub enum Route {
     Ring,
     /// System calls on the thread of the driver, which end at once.
     SystemCall,
-    /// A job of the blocking service that `Driver::use_blocking` gives, on Linux. With no service,
-    /// the call refuses with `Reason::Blocking`.
+    /// A job of the blocking service that `Driver::use_blocking` gives, on Linux and macOS. With no
+    /// service, the call refuses with `Reason::Blocking`.
     BlockingService,
     /// A poll of a descriptor on the ring or the poller, then one nonblocking system call on the
     /// thread of the driver when the descriptor is readable.
