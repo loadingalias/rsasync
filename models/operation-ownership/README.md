@@ -2,16 +2,16 @@
 
 This is the design model of task R000. It checks the rules that the operation table (R203), the
 TCP rules (R206), and zero-copy close (R603, R604) build on, before that code exists. The sources
-are in the local design `docs/specs/dual-async-runtime.md`: Driver Topology and Operation Home,
-Completion I/O and Buffers (the terminal-event table and the cancel rule), Future and Wake Contract
-(generations), and Startup, Shutdown, and Failures. The Design Models section of
-`docs/specs/family-policy.md` sets the acceptance.
+are in the local design `docs/specs/dual-async-runtime.md`: Driver Topology and Operation Home
+(with the kept receive error of 2026-11-14 and the IOCP abort of 2026-11-17), Completion I/O and
+Buffers (the terminal-event table and the cancel rule), Future and Wake Contract (generations), and
+Startup, Shutdown, and Failures. The Design Models section of `docs/specs/family-policy.md` sets the
+acceptance.
 
-**Status (2026-11-11): all 55 profiles pass at the current inputs.** The model checks
-conservation of the received prefix, both missing and duplicate progress reports, and every
-detached notice. The 12 positive searches complete; all 16 fault variants and 27 witnesses
-produce their required violations. See [Evidence record](#evidence-record). The design decisions
-of 2026-11-07 and 2026-11-08 stay below; this change strengthens their checks.
+**Status (2026-11-17): the inputs changed, and the 59 profiles have no result yet.** This
+change adds the kept receive error and the IOCP abort. The [evidence record](#evidence-record)
+holds the last result, of the earlier inputs. The design decisions of 2026-11-07 and 2026-11-08
+stay below.
 
 ## The promise and a concrete failure
 
@@ -19,11 +19,12 @@ The promise: an operation has one home driver from its accepted submission to it
 release. The consumer of the operation can move to another worker, drop its future, forget it, or
 cancel it, and the runtime can close the resource or shut down. The driver releases each buffer
 and charge exactly once, and only after the kernel can no longer use it. A stream gives each byte
-to the caller once and in order. A zero-copy send frees its direction at its send result, and
+to the caller once and in order, and it gives the error of a failed stream before the end of the
+stream. A report of send progress gives a count only when the count is exact. A zero-copy send frees its direction at its send result, and
 each notice releases its own backing once. Close never waits on a peer. Shutdown waits on a peer
 for no longer than its grace period. Detached debt ends while the runtime runs.
 
-Four concrete failures:
+Six concrete failures:
 
 - A receive future drops while its kernel request is in flight, and the runtime frees the buffer
   at the drop. The kernel then writes into freed memory.
@@ -33,6 +34,11 @@ Four concrete failures:
   2026-11-07 (`ZcWait_bad`).
 - The driver releases a zero-copy buffer at the send result, before the notice, and the kernel
   then reads freed pages (`ZcEarlyRelease_bad`).
+- A receive whose future dropped gets the error of a reset. The kernel reports that error once, so
+  if the stream does not keep it, the next receive reads the end of the stream. The caller then
+  takes a reset connection for a complete one (`DropRxError_bad`).
+- On IOCP, a cancel aborts the connection during a send, and the packet gives no count. A report
+  of a count then names bytes that the peer perhaps never got (`AbortCount_bad`).
 
 ## Run it
 
@@ -72,11 +78,11 @@ Each profile is a TLC configuration of `OperationOwnership.tla`. The xtask passe
 | Consumer | One task, alive until `EndTask`. It moves between the workers, so an operation's home is the worker where it was submitted. While the task is alive, both workers run and no step reads a home, so `EndTask` selects the home of each held slot. The first held slot gets one fixed worker (`W0`); this removes only mirror images |
 | Resources | One stream (`rx` receive, `tx` send) and one listener (`ac` accept). One slot for each direction, so at most one outstanding operation for each direction |
 | Operations | `MaxOps = 2` submissions. `Submissions = "resource"` (declared): two on each resource, so the receive and the send share the two of the stream. `"direction"`: two on each direction. The generation `gen[c]` names the operation in slot `c` |
-| Kernel | `k[c]`: `fly` (an event that the peer controls), `cxl` (the terminal event after a cancel that found its target), `tail` (the IOCP packet after an immediate return, whose result is known), or `none` |
+| Kernel | `k[c]`: `fly` (an event that the peer controls), `cxl` (the terminal event after a cancel that found its target), `tail` (the IOCP packet after an immediate return, whose result is known), or `none`. `ks`: the kernel's stream. `open`; `fail` (an IOCP abort: the next receive result is the error); `end` (the kernel reported the error, and each later receive result is the end of the stream) |
 | Requests | `rq` holds the request entries `<<c, g>>`. A cancel from the consumer or from close travels to the home of operation `g`, and the home takes it in a later step |
 | Backings | `bk[c][g]`: the buffer and charge of operation `g`. `own`, `held` (received bytes that the stream keeps), `zc` (the driver keeps it for the zero-copy notice of send `g`), `out` (released), or `dbl` (released twice) |
-| Stream bytes | `Bytes = 3` from the peer. `rbuf` is the buffer of the receive, `held` the bytes that the stream keeps, and `got` the bytes that the caller received |
-| Send progress | `tp`: `part` (partial or failed) or `full`. `wd` is the write direction, `required` records which send results require a report, and `rep[g]` counts the reports of send `g` |
+| Stream bytes | `Bytes = 3` from the peer. `rbuf` is the buffer of the receive, `held` the bytes that the stream keeps, and `got` the bytes that the caller received. `ro` is the kind of the result of the receive: `ok` (bytes, or a cancel that took effect), `err`, or `end`. `re`: the stream keeps the error of an abandoned receive. `ce`: the first result with no bytes, other than a cancel, that the caller received |
+| Send progress | `tp`: `part` (partial or failed) or `full`. `wd` is the write direction: `ok`, `owe` (a report with the count is owed), `lost` (a report with no count is owed), or `failed`. `required` records which send results require a report, and `rep[g]` counts the reports of send `g`. `ab`: on IOCP, a cancel aborted the connection |
 | Pending notices | `pn`: the sends whose result had `IORING_CQE_F_MORE` and whose notice has not arrived. `nh[g]`: the home of the notice of send `g`, selected when the task ends, as for a slot. The submissions bound the set, as each send's charge bounds it in the design |
 | Connections | `Conns = 1` connection waits on the listener. `ar` is in the accept, `hc` is held by the listener, and `uc` is with the caller |
 | Waker | `wake`: the waker of the latest poll of the receive future. `woke[c]`: the latest waker of the future in slot `c` is woken |
@@ -94,6 +100,8 @@ uses. The model gives fairness only to a step that a physical cause forces. Sour
 | TCP frees sent pages only when the peer acknowledges them, so a zero-copy notice waits for the peer. A peer can keep its window closed forever while it answers probes, and a peer that acknowledges late adds its delayed-acknowledgement time to each notice | Linux v6.1 `net/ipv4/tcp_input.c` ("Remove acknowledged frames from the retransmission queue"); v6.1 `io_uring/notif.c` (the notice is queued when the last reference to the pages drops); `Documentation/networking/msg_zerocopy.rst` ("the kernel returns a completion notification when it releases its hold on the shared pages"); RFC 1122 sections 4.2.2.17 (a sender stays open indefinitely while the receiver answers zero-window probes) and 4.2.3.2 (delayed acknowledgement) | None before a reset. `Notice(g)` is fair only with `pg` |
 | A reset purges the send queue of the connection. Every pending notice then comes from the kernel and the device, with no peer | connect(2): a TCP socket "may dissolve the association by connecting to an address with the sa_family member of sockaddr set to AF_UNSPEC"; Linux v6.1 `net/ipv4/af_inet.c` (`__inet_stream_connect` calls `disconnect` for `AF_UNSPEC`) and `net/ipv4/tcp.c` (`tcp_disconnect` sends a reset and calls `tcp_write_queue_purge`) | Weak fairness on `Notice(g)` for each pending notice once `pg` holds |
 | After a cancel that finds its target, the kernel posts the target's own completion. An IOCP packet that the system queued after an immediate return arrives | io_uring_prep_cancel(3), NOTES; Microsoft Learn, "CancelIoEx" and "I/O Completion Ports" | Weak fairness on `Complete(c)` for `cxl` and `tail` |
+| The kernel reports the error of a failed stream, such as a reset, to one receive. Each later receive gets the end of the stream. Bytes that came before the error come first | Linux v6.1 `include/net/sock.h` (`sock_error` takes `sk_err` with `xchg(&sk->sk_err, 0)`) and `net/ipv4/tcp.c` (`tcp_recvmsg_locked` returns `sock_error` once, then breaks at `RCV_SHUTDOWN`, which `tcp_done` sets at a reset) | None: the peer controls the reset. The reset is part of the receive result that reports it (reduction 14) |
+| On IOCP, `CancelIoEx` of a running send aborts the connection. The packet of the send has an error status and 0 bytes (Win32 995, `ERROR_OPERATION_ABORTED`). The next send fails at once with `WSAECONNABORTED` (10053), and its status is still `STATUS_PENDING`, so no packet follows. A later receive fails | R507 probe run `20261115T084548Z-91515` (aws-windows-x64, Windows Server 2025); `a_cancel_of_a_send_that_runs_aborts_the_connection_and_gives_no_count` in run `20261115T092057Z-52931`. No run records the raw NT status: the code proves an error status with 0 bytes, and 995 is the Win32 code of `STATUS_CANCELLED` | The abort is a branch of the fair `Complete("tx")` after a cancel. The send that follows ends at its return |
 | Every cancel result waits for the target's own terminal event. A current cancel finds each socket operation in flight, because no socket operation runs in io-wq. No cancel ends a pending notice: its send has ended | io_uring_prep_cancel(3); kernel commits `8aa0e5db4845` and `fe6ca13c98b1` (2026-10-15, for Linux 7.4; both defects need io-wq); v6.1 `io_uring/cancel.c` (`io_cancel_req_match` matches only its own ring) | `Process` makes `fly` into `cxl`, and it changes nothing else ("not found"). It is fair because the home keeps running |
 | A timer that the runtime owns fires, because its home worker keeps running and its monotonic clock advances. The timers close at grace expiry | The design: "The home is driven until that release, including while it has no runnable task" (Driver Topology); "timer closure" is a distinct error (Startup, Shutdown, and Failures); clock_gettime(2), `CLOCK_MONOTONIC` | The drain limit is weak fairness on `Reset` while `life = "run"`. Grace expiry is weak fairness on `Reset` and on `EndTask` while `life = "down"` |
 | The peer, the consumer, and the shutdown request are free | RFC 9293 (the peer controls its window and its data); the design gives the caller no obligation | None. `fly` events, every consumer step, `Shutdown`, and a reset under budget pressure have no fairness |
@@ -168,7 +176,12 @@ is the check that no reduction hid a failure.
 9. The domains. One connection keeps each accept rule; a second multishot item repeats the same
    step. The send direction has only partial and full progress, because its rules depend only on
    that. Three bytes give a prefix, a remainder, and a later byte. These are argued, not proven,
-   so each one has a raise-by-one profile for the evidence host.
+   so each one has a raise-by-one profile for the evidence host. A receive result has three
+   kinds: bytes or a cancel (`ok`), the error, and the end of the stream. The peer never ends the
+   stream itself. A peer's end of the stream keeps nothing at the abandoned rule
+   (`tcp::abandon` keeps no result of 0 bytes), and each later receive gets the end again. That
+   is the state after a reported error, with no error to keep, so it adds no rule. With no
+   peer end, `NoFalseEnd` can require that the caller never gets the end first.
 10. The drain limit, the pressure reset, and grace expiry are one `Reset` step, and it purges
     every pending notice of the connection at once, as the kernel's purge of the send queue does.
     The model has no time and no budget. `Reset` can come at any time while `dt` holds (budget
@@ -185,6 +198,34 @@ is the check that no reduction hid a failure.
     charge, so `pn` has at most `MaxOps` members. Witnesses: `TwoPending_reach` and
     `DetachTwo_reach`.
 
+13. A waiting operation is a later `Begin`. While an operation of a direction runs, a new
+    operation of that direction waits in the driver behind it, in start order (`Driver::enqueue`,
+    `src/driver/tcp.rs`; selected on 2026-11-14). A waiting operation owns no kernel resource:
+    `begin_entries` pushes no entry for it, and `start` pushes an entry only after its room
+    check, so a start that finds no room waits again (`wait_first`). It holds only its operation
+    slot and its buffer in the driver. A cancel of it ends it at its home with `ECANCELED` and no
+    kernel cancel (`Driver::cancel` through `unqueue`), and so do close (`close_resource`) and
+    teardown (`Driver::teardown`). So the model starts it with `Begin` after the slot frees. A
+    consumer step has no fairness, so the model has each start, and each operation that never
+    starts because of a drop, a cancel, or a close while it waits. A dropped send that still runs
+    is `Begin` and then `Drop`. A start during the grace period is a start before `Shutdown`, by
+    reduction 4. The reduction hides the order of several waiting operations, because the model
+    has one operation for each direction. `two_dropped_sends_and_a_third_send_run_in_start_order`
+    (`src/driver/tests.rs:1002`) checks that order. On Windows,
+    `an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usable`
+    (`src/driver/tests.rs:1039`) cancels a send that waits in the driver.
+    `close_ends_a_waiting_send_unsent_and_releases_its_lease_once` and
+    `teardown_ends_a_waiting_send_unsent_and_releases_its_lease_once` (`src/driver/tests.rs`)
+    check the premise at close and at teardown: the waiting send never runs, and its lease
+    returns once.
+14. A reset from the peer is part of the receive result that reports it. Before that result, no
+    step reads the reset: a send result is a free choice in each case, and only the driver's
+    `Reset` makes a zero-copy notice come from the kernel. A reset from the peer also purges the
+    send queue, so the model leaves out notices that it makes certain; this removes no behavior.
+    After the reported error, no bytes come. An IOCP abort is not a peer event: the send result
+    that reports it sets `ks = "fail"`, so a receive in flight then gets the error. Known-bad:
+    `DropRxError_bad`.
+
 ## Correspondence
 
 Each action is one atomic step. The rule column names the design rule that the action implements.
@@ -197,25 +238,40 @@ which R520 and R521 extend for their backends. R603 adds its transitions when it
 
 | Action | Design rule | Atomicity | R203 transition | R204 transition | R206 transition | R219 transition |
 | --- | --- | --- | --- | --- | --- | --- |
-| `BeginRx` | Driver Topology: one outstanding operation for each direction; the next receive returns held data before it submits, as a prefix with one copy, and keeps the rest. Each operation future borrows its direction exclusively, so no earlier future of the direction exists | One poll: the check of held data, or the submission and the return of the initiating call | R206 | — | `Driver::recv` and `Driver::recv_selected` through `begin`: `forgo` ends the interest of the earlier operations of the direction. While one of them runs, or an operation waits, the new operation waits behind them in start order (`Driver::enqueue`), and `attend` starts the first at that end. `start` gives the kept bytes, with one copy that `Driver::copied` counts, or submits | — |
+| `BeginRx` | Driver Topology: one outstanding operation for each direction; the next receive returns held data before it submits, as a prefix with one copy, and keeps the rest. Each operation future borrows its direction exclusively, so no earlier future of the direction exists | One poll: the check of held data, or the submission and the return of the initiating call | R206 | — | `Driver::recv` and `Driver::recv_selected` through `begin`: `forgo` ends the interest of the earlier operations of the direction. While one of them runs, or an operation waits, the new operation waits behind them in start order (`Driver::enqueue`), and `attend` starts the first at that end. `start` gives the kept bytes, with one copy that `Driver::copied` counts, then a kept error (`Kept::Error`), or submits. Reduction 13 maps the operations that wait | — |
 | `BeginTx` | Driver Topology: after a partial or failed abandoned send, the next send returns a typed error with the transferred count. A next send that succeeds shows that each earlier abandoned send transferred all its bytes | One poll | R206 | — | `Driver::send` through `begin` and `start`: a direction that owes its count (`Sent::Owe`) gives `WriteFailed` with the count, then with no count (`Sent::Reported`). Otherwise `start` submits | — |
 | `BeginAc` | Driver Topology: the next accept returns a connection that the listener holds before it submits | One poll | R206 | — | `Driver::accept` through `begin` and `start`: the listener gives its kept connection (`Kept::Connection`), or `start` submits | — |
 | `Submit` (in `Begin*`) | Completion I/O: accepted submission gives the backing to the driver. Terminal-event table: an io_uring request waits for its completion; IOCP classifies the NT status of the return (pending, `NT_ERROR`, other, skip-on-success) | The submission and the return of the initiating call are one step | `Table::begin` records the resources and the `Shape` before the push. A refused push takes them back with `Table::withdraw` | — | `Driver::open` records the operation and its resources; `start` pushes its entry (`Driver::push`). An operation that waits pushes at the end of the one before it | `Driver::spawn` and `Driver::adopt_child` begin the exit operation of the child (`Kind::Exit`). `Driver::register` pushes its entry at the end of the spawn job: `IORING_OP_WAITID`, or a poll of the process descriptor. The wait is a single-completion operation |
 | `Repoll` | Future and Wake Contract: a pending poll gives a new waker, and the future honors the latest one | One poll | R204 | `Completion::poll` registers the waker of each poll (`Entry::poll_take`, through `Waiter::poll_wait`), so the wake goes to the latest waker | — | — |
 | `Claim` | Future and Wake Contract: the owned result and the slot return exactly once each. The claim of a zero-copy send returns its progress; its notice releases the backing | One step for both returns | `Table::claim`: the result and the resources, once. A zero-copy send gives its result, and `Table::complete` gives its resources at the notice | `Completion::poll` takes the result and the resources once (`Entry`: `READY` to `TAKEN`), then posts `Request::EndInterest`, so that the home frees the slot | `tcp::taken`: a send result that a future took ends the unreported count of the direction | `Wait::poll` takes the status once and keeps it in the `Child`, so a later wait takes no second result |
-| `Cancel` | Driver Topology: an explicit cancellation returns the original buffer with its exact progress; a send direction stays usable | Posts one request entry | `Requests::post` with `Request::Cancel` | — | `Operation::cancel` posts `Request::Cancel`. An operation that waits ends at the home with `ECANCELED` (`Driver::unqueue`). A running one gets one kernel cancel (`Held::cancelled`) | A kill is a cancel request: `Driver::cancel` of an exit operation kills the child by its `End`, through the process descriptor, and pushes no kernel cancel. The operation ends when the child ends |
+| `Cancel` | Driver Topology: an explicit cancellation returns the original buffer with its exact progress; a send direction stays usable. On IOCP, a cancel that reaches a running send aborts the connection, and the send gives no count (selected on 2026-11-17) | Posts one request entry | `Requests::post` with `Request::Cancel` | — | `Operation::cancel` posts `Request::Cancel`. An operation that waits ends at the home with `ECANCELED` (`Driver::unqueue`). A running one gets one kernel cancel (`Held::cancelled`). The IOCP abort is in the backend table below | A kill is a cancel request: `Driver::cancel` of an exit operation kills the child by its `End`, through the process descriptor, and pushes no kernel cancel. The operation ends when the child ends |
 | `Drop` | Driver Topology: a dropped future ends interest, not the operation. A receive and an accept ask their home to cancel; a send is not cancelled. A terminal result goes by the abandoned rule | Posts at most one request entry | `Requests::post` with `Request::EndInterest`, and with `Request::Cancel` for a receive or an accept (R206) | `Completion::drop` posts `Request::EndInterest`, and `Request::Cancel` with a wake for an operation that asks for it | A send future asks no cancel (`cancel_on_drop` is false for `Kind::Send`) | A drop of a `Child` posts `Request::EndInterest`, and `Request::Cancel` (a kill) only with `End::Kill`. The exit operation runs on, and the home reaps the child at its end |
 | `Forget` | Driver Topology: a forgotten future ends interest with no destructor, so no request; `mem::forget` ends the exclusive borrow | One step | `Table::end_interest` when the next operation of the direction starts (R206) | No step: the result waits in its `Entry` until `Driver::teardown` releases it | `forgo` in `begin`: `Table::end_interest` on each earlier operation of the direction, then the abandoned rule (`claimed`), or a cancel of a receive or an accept that runs | — |
-| `Complete` | Terminal-event table: one event at the home. Single completion; multishot item with `IORING_CQE_F_MORE` and its final completion; IOCP packet. A zero-copy send result ends the send and frees its direction (selected on 2026-11-08); with `IORING_CQE_F_MORE`, its backing joins the pending notices. With no waiting future, the abandoned rule applies | The kernel posts the event and the home harvests it in one step | `Table::complete` with the `Event` of the backend (`Cqe::event`): `Outcome::Item`, `Ready`, or `Abandoned`. A zero-copy result with `more` keeps the resources for the notice | `Driver::turn` gives up to its bound of completions to `Table::complete`, then publishes each result (`Entry::publish`) or drops the resources of an abandoned operation (`Entry::reclaim`) | `tcp::abandon` at an abandoned terminal event: kept bytes (`Kept::Bytes`) or a kept receive error, a kept connection, or a failed write direction (`Sent::Owe`) with the count of the bytes that went | `harvest` gives the completion of an exit operation to `Children::exited` before `Table::complete`: the reap and the status, with one nonblocking `waitid` after a poll. A poll with no status yet is pushed again and is no event of the table. An exit before the start is an immediate completion |
+| `Complete` | Terminal-event table: one event at the home. Single completion; multishot item with `IORING_CQE_F_MORE` and its final completion; IOCP packet. A zero-copy send result ends the send and frees its direction (selected on 2026-11-08); with `IORING_CQE_F_MORE`, its backing joins the pending notices. With no waiting future, the abandoned rule applies | The kernel posts the event and the home harvests it in one step | `Table::complete` with the `Event` of the backend (`Cqe::event`): `Outcome::Item`, `Ready`, or `Abandoned`. A zero-copy result with `more` keeps the resources for the notice | `Driver::turn` gives up to its bound of completions to `Table::complete`, then publishes each result (`Entry::publish`) or drops the resources of an abandoned operation (`Entry::reclaim`) | `tcp::abandon` at an abandoned terminal event: kept bytes (`Kept::Bytes`) or a kept receive error (`Kept::Error`; a cancel and a result of 0 bytes keep nothing), a kept connection, or a failed write direction: `Sent::Owe` with the count of the bytes that went, or, after an IOCP abort, `Sent::Lost` with no count | `harvest` gives the completion of an exit operation to `Children::exited` before `Table::complete`: the reap and the status, with one nonblocking `waitid` after a poll. A poll with no status yet is pushed again and is no event of the table. An exit before the start is an immediate completion |
 | `Process` | Driver Topology: the request travels to the home through its entry, and close cancels each operation by its own `user_data`. Future and Wake Contract: the generation check rejects a stale identity. Completion I/O: a cancel result is not a terminal event; "done" and "already running" make the target's own event certain; "not found" changes nothing | One step at the home | `Table::take_requests`: the generation check, then `Taken::Cancel` for a running target. The backend cancels it by its own user data (`Sqe::cancel` with `OpId::cancel_user_data`), and the result is `Outcome::CancelResult`, which changes nothing | `Driver::turn` takes the requests first in each turn | `Driver::cancel`: one kernel cancel for each operation, by its own user data, once | — |
 | `TakeOver` | Driver Topology: close takes each result that a dropped future left, by the abandoned rule | One step | R206 | — | `close_resource`: `Table::end_interest` on each operation of the resource, then `claimed` for one that ended, and `Driver::cancel` for one that runs | — |
-| `CloseDone` | Driver Topology: close waits for the terminal event of each operation, releases the data that no receive took, reports each owed and each cancelled send's progress, and closes each connection that no accept took. It does not wait for the pending notices: it half-closes, returns, and turns every pending notice of the stream into detached debt | One step after the last terminal event | R206 | — | `close_if_idle`: when no operation of the resource runs, it reports `Closed::sent` if the direction owes the count, releases the kept bytes and connections and the descriptor (`Resources::release`), and completes the close | — |
+| `CloseDone` | Driver Topology: close waits for the terminal event of each operation, releases the data that no receive took, reports each owed and each cancelled send's progress, and closes each connection that no accept took. It does not wait for the pending notices: it half-closes, returns, and turns every pending notice of the stream into detached debt | One step after the last terminal event | R206 | — | `close_if_idle`: when no operation of the resource runs, it reports `Closed::sent` if the direction owes the count (`None` after an IOCP abort), releases the kept bytes and connections and the descriptor (`Resources::release`), and completes the close | — |
 | `Reset` | Driver Topology: `connect` with `AF_UNSPEC` at the drain limit, under budget pressure, or at grace expiry | One step: the purge of the send queue, for every pending notice of the connection | R603 | — | — | — |
 | `Notice(g)` | Terminal-event table: the zero-copy notice of send `g` releases its own buffer and charge, once. After the last notice of detached debt, the descriptor closes | The kernel posts the notice and the home of `g` harvests it in one step | `Table::complete` with `notice`: `Outcome::Released` | — | — | — |
 | `Shutdown` | Startup, Shutdown, and Failures: shutdown closes ingress, and grace expiry escalates | The request and grace expiry are one step | — | — | — | — |
 | `EndTask` | Startup, Shutdown, and Failures: the task returns, or grace expiry cancels it. Its futures drop. Driver Topology: close first cancels each outstanding operation, a dropped send included. Each held slot and each pending notice gets the home of its submission | One step for the drops and the closes | — | Driver-only: `Driver::teardown` cancels each running operation by its own user data | Driver-only: `Driver::teardown` first ends each operation that waits, with `ECANCELED` | `Driver::teardown` waits for each spawn job, kills each child with `End::Kill`, and cancels the exit operation of each child with `End::Keep`, which `Teardown::kept` counts |
-| `Exit` | Driver Topology: a worker with live operations or pending notices cannot exit until they reach terminal release. Startup, Shutdown, and Failures: no worker exits while a task of the runtime remains | One step | — | Driver-only: `Driver::teardown` drives until `Table::busy` is false, then closes each resource | — | — |
+| `Exit` | Driver Topology: a worker with live operations or pending notices cannot exit until they reach terminal release. Startup, Shutdown, and Failures: no worker exits while a task of the runtime remains. `block_on` returns only after each operation that its driver homes reaches terminal release (selected on 2026-11-11) | One step | — | Driver-only: `Driver::teardown` drives until `Table::busy` is false, then closes each resource. The worker exit is R304 and R305. The return of `block_on` is `RingOwner::block_on` (`src/task/ring.rs`): it returns when its tasks end and does not yet drive its driver to terminal release (found on 2026-11-17). R305 makes that side true | — | — |
 | `Terminated` | None. The end state stutters, so deadlock checking stays on | One step | — | — | — | — |
+
+The backends. The R507 column names the IOCP transitions (`src/driver/iocp.rs`), and the
+R503 and R505 column names the transitions of the readiness poller (`src/driver/poller.rs`), with
+the epoll selector on Linux and the kqueue selector on macOS. Each backend takes the submission
+entries of the driver and posts the completions that a ring posts, so the other columns apply to
+each backend. The readiness backends run under the io_uring profiles: each of their events is an
+io_uring event with no `IORING_CQE_F_MORE` and no multishot item, and a cancel that finds its
+entry ends it at once, which is `Process` and then `Complete`.
+
+| Action | R507 transition (IOCP) | R503 and R505 transition (epoll and kqueue) |
+| --- | --- | --- |
+| `Submit` | `Port::call` runs one overlapped call, and `terminal` classifies its return by the NT status: pending; an error, or a status that is still `STATUS_PENDING` (no packet); success or a warning, with skip-on-success (no packet) or without it (a packet) | `Poller::run`: one nonblocking call when the direction is ready. `EAGAIN` waits in the list of the direction until the next edge |
+| `Complete` | `Port::poll` takes each packet, reads its NT status, and gives the result to `Port::ended`. After a cancel, the packet of a send with an error status and 0 bytes gives `WSAECONNABORTED`: the abort | The return of the nonblocking call is the terminal event (`Poller::post`) |
+| `Process` | `Port::cancel`: `CancelIoEx` with the `OVERLAPPED` of the target, which ends at its own packet | `Poller::cancel` takes the waiting entry out of its list and posts `ECANCELED` at once |
+| The abort (`CompleteTx` with `abort`) | `tcp::abandon` sets `Sent::Lost` for an abort that no future took. `WriteFailed::sent` and `Closed::sent` then give `None` | — |
 
 ## Properties
 
@@ -226,6 +282,8 @@ which R520 and R521 extend for their backends. R603 adds its transitions when it
 | `InOrderOnce` | The caller receives each byte once and in order across abandoned receives | Invariant |
 | `NoStaleEffect` | A stale identity never changes a reused slot | Invariant |
 | `ReportOnce` | Each abandoned send that fails or transfers only part of its bytes, and each send that close cancels, has its progress reported exactly once | Invariant |
+| `ExactCount` | After an IOCP abort, no report of send progress gives a count | Invariant |
+| `NoFalseEnd` | A receive never gives the end of the stream in place of the error of a failed stream: the first result with no bytes that the caller gets, other than a cancel, is the error | Invariant |
 | `CloseReturns` | Close returns | `[]<>`, equal to `closing ~> closed` |
 | `ShutdownJoins` | Shutdown joins every worker | `[]<>`, equal to `down ~> Done` |
 | `DetachedReleased` | While the runtime runs, also with no shutdown request, each detached buffer is released. Detached debt ends only when its last pending notice releases its backing, so this covers each pending backing | `[]<>`, equal to `dt ~> ~dt` |
@@ -255,6 +313,13 @@ the write direction has failed or close has returned. A full abandoned send repo
 unless close cancelled it. `ReleaseOnce` also checks `debt = pn` after close; a Boolean flag cannot
 show that close omitted one of several notices.
 
+`ExactCount` reads `wd`: after an abort, an owed report must be `lost`, which reports no count.
+When the abort comes, the send runs, so the direction has no earlier owed report: a send starts
+only from `wd = "ok"`. `NoFalseEnd` reads `ce`, the first result with no bytes that the caller
+got. The peer of the model never ends the stream (reduction 9), so each end that the kernel gives
+comes after the kernel reported an error. An end that the caller gets first therefore hides that
+error.
+
 ## Bounds, faults, and fairness
 
 The declared bounds: two workers, one moving consumer, one stream and one listener, two operation
@@ -266,7 +331,10 @@ the evidence host.
 The faults and free choices:
 
 - The kernel selects each result from the terminal-event table of the backend. A receive takes
-  0 to all remaining bytes; 0 is an error or a cancel. A send is partial (or failed) or full. An
+  1 to all remaining bytes, or the error of a failed stream (a reset from the peer), or after that
+  error the end of the stream. A cancel that took effect gives no bytes and no error. A send is
+  partial (or failed) or full. On IOCP, a cancel that finds a send running can abort the
+  connection. An
   accept gets the connection or an error. On io_uring, a send result can have
   `IORING_CQE_F_MORE` (a zero-copy notice follows), and an accept can give a multishot item. On
   IOCP the return is `STATUS_PENDING`, `NT_ERROR`, or another status, with or without
@@ -304,6 +372,8 @@ bounds of reduction 11.
 | `ZcEarlyRelease_bad` | The mirror error of the rule of 2026-11-08: the driver releases a zero-copy backing at its send result, not at its notice | `ReleaseOnce` |
 | `NoDrainLimit_bad` | Option C as first proposed: no drain limit | `DetachedReleased` |
 | `NoGraceReset_bad` | Grace expiry does not reset detached debt | `ShutdownJoins` |
+| `AbortCount_bad` | After an IOCP abort, the driver takes the abort as an ordinary cancel and owes the count of the send | `ExactCount` |
+| `DropRxError_bad` | The design before 2026-11-14: the abandoned rule keeps no error, so the next receive submits and reads the end of the stream | `NoFalseEnd` |
 
 The counterexamples, as actions and observations:
 
@@ -322,6 +392,13 @@ The counterexamples, as actions and observations:
 - `ZcEarlyRelease_bad` (`ReleaseOnce`): `BeginTx`; `Shutdown`; `EndTask`; `Complete("tx")` (a
   result with `IORING_CQE_F_MORE`, and the variant releases the backing). The notice is still
   pending while the backing is released.
+- `AbortCount_bad` (`ExactCount`): `BeginTx` on IOCP (pending); `EndTask` (close cancels the
+  dropped send); `Process("tx", 1)`; `Complete("tx")` (the abort, no future). The variant owes
+  the count (`wd = "owe"`) of a send whose progress is unknown.
+- `DropRxError_bad` (`NoFalseEnd`): `BeginRx`; `Complete("rx")` (the error of a reset);
+  `Drop("rx")` (the abandoned rule, and the variant keeps no error); `BeginRx`;
+  `Complete("rx")` (the end of the stream); `Claim("rx")`. The caller gets the end of the
+  stream, and the reset is lost.
 - For example, `DropRelease_bad` is `BeginRx`, `Drop("rx")`, and the drop releases the receive
   buffer while the receive is in flight. Each current trace is retained in
   `target/model/operation-ownership/<profile>/<run>/trace.json`.
@@ -349,6 +426,8 @@ Each witness profile must reach its target.
 | `HeldConn_reach` | io_uring | The next accept returns a held connection | Abandoned accept |
 | `CloseReport_reach` | io_uring | Close returns and reports an abandoned send's progress | Close with an abandoned send |
 | `CancelledData_reach` | io_uring | An explicit cancellation returns received bytes in the original buffer | Explicit cancellation |
+| `KeptError_reach` | io_uring | The next receive returns the error that an abandoned receive kept | Abandoned receive with an error |
+| `IocpAbort_reach` | IOCP | A cancel of a running send aborts the connection | The IOCP abort |
 | `CloseLive_reach` | io_uring | The stream closes with a live receive and a live send | Close with live operations |
 | `ShutdownCross_reach` | io_uring | After shutdown, a close request waits at one home while the other home holds a live operation | Shutdown with live operations across workers |
 | `DetachedClose_reach` | io_uring | Close returns with a zero-copy notice pending | Detached debt |
@@ -366,8 +445,9 @@ The model does not cover these items. Each one is outside the task, or a later t
 
 - Datagrams: the receive metadata and the truncation rule. Multishot receive, provided buffer
   rings, and bundles. Positional file operations.
-- The epoll, kqueue, Windows IoRing, Registered I/O, and blocking-service rows of the
-  terminal-event table have no profile of their own. Their shapes are modeled shapes: a return
+- The Windows IoRing, Registered I/O, and blocking-service rows of the terminal-event table have
+  no profile of their own, and epoll and kqueue run under the io_uring profiles (the backend
+  table of [Correspondence](#correspondence)). Their shapes are modeled shapes: a return
   that is terminal, or a release event after a known result. The epoll `MSG_ZEROCOPY` notice has
   the shape of the io_uring notice, and the same rules: the call's return ends the send, and the
   notice releases the buffer.
@@ -386,6 +466,10 @@ The model does not cover these items. Each one is outside the task, or a later t
   submitted the operation, as on io_uring.
 - Skip-on-success is a choice for each operation, not for each handle, and a stream receive can
   return a warning status. Both choices only add behaviors.
+- The order of several operations that wait in one direction (reduction 13). A test checks it.
+- After an IOCP abort, the result of a receive that was in flight has no run evidence. The model
+  gives it the error. No run shows whether a later receive on Windows gets the error again or the
+  end of the stream. The model gives the end, which `NoFalseEnd` reads as the stricter case.
 - After a cancel, the terminal event can carry any progress, also on io_uring "done". This only
   adds behaviors.
 - The send direction has no byte identities: its rules depend only on a partial or a full

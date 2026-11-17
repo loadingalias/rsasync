@@ -44,6 +44,27 @@ stateDiagram-v2
   Released --> [*]
 ```
 
+## The receive side of the stream
+
+The kernel's stream (`ks`) and the error that the stream keeps (`re`). The kernel reports the
+error of a failed stream to one receive, and each later receive gets the end of the stream.
+
+```mermaid
+stateDiagram-v2
+  state Kernel {
+    [*] --> Open
+    Open --> Ended: Complete or Submit (a receive gets the error of a reset)
+    Open --> Failed: CompleteTx (IOCP: a cancel aborts a running send)
+    Failed --> Ended: Complete or Submit (a receive gets the error)
+    Ended --> Ended: Complete (a receive gets the end of the stream)
+    --
+    [*] --> Clear
+    Clear --> Kept: Complete, Drop, Forget, or TakeOver (the abandoned rule keeps the error)
+    Kept --> Clear: BeginRx (the next receive returns the error before it submits)
+    Kept --> Clear: CloseDone (close drops the error)
+  }
+```
+
 ## Runtime, task, resources, and workers
 
 The four regions run at the same time.
@@ -80,8 +101,9 @@ stateDiagram-v2
   backing that a notice releases.
 - The request entries (`rq`), the cancel flag (`cx`), and the generation check are not shown. A
   stale request removes itself and changes nothing.
-- The data is not shown: the received bytes (`rbuf`, `held`, `got`), the send progress (`tp`,
-  `wd`, `required`, `rep`), the connections (`kc`, `ar`, `hc`, `uc`), each backing (`bk`), and the home of
+- The data is not shown: the received bytes (`rbuf`, `held`, `got`), the kind of the receive
+  result (`ro`), the first result with no bytes that the caller got (`ce`), the send progress
+  (`tp`, `wd`, `required`, `rep`), the IOCP abort (`ab`), the connections (`kc`, `ar`, `hc`, `uc`), each backing (`bk`), and the home of
   each pending notice (`nh`).
 - The futures (`fut`) and the waker (`wake`, `woke`) are not shown. `Repoll` changes only the
   waker.

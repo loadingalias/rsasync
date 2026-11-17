@@ -17,7 +17,7 @@ one version of each tool under `~/.local/opt/<name>/<version>/`:
 | Name | Version of the recorded evidence | Source | Path that the command uses |
 | --- | --- | --- | --- |
 | `temurin-jre` | 21.0.13+9 | [Eclipse Temurin](https://adoptium.net/temurin/releases/?version=21) JRE 21 | `bin/java` (on macOS, `Contents/Home/bin/java`) |
-| `tla2tools` | 1.8.0 (TLC2 Version 2026.11.06.222357, rev d8fb231) | [TLA+ release v1.8.0](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0) | `tla2tools.jar` |
+| `tla2tools` | 1.8.0 (TLC2 Version 2026.11.15.002146, rev bc1b506) | [TLA+ release v1.8.0](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0) | `tla2tools.jar` |
 | `apalache` | 0.62.4 | [Apalache release v0.62.4](https://github.com/apalache-mc/apalache/releases/tag/v0.62.4), `apalache-0.62.4.tgz` without its top directory | `bin/apalache-mc` |
 
 Compare each download with the SHA-256 that its release publishes. The TLA+ project builds the

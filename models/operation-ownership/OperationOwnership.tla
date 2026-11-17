@@ -18,6 +18,12 @@
 (* Close does not wait for the notices: it leaves the set to the driver as *)
 (* detached debt, and a reset at the drain limit, under budget pressure,   *)
 (* or at grace expiry ends the wait (selected on 2026-11-07).              *)
+(*                                                                         *)
+(* The kernel reports the error of a failed stream, such as a reset, to    *)
+(* one receive, and then it gives the end of the stream. An abandoned      *)
+(* receive keeps that error for the next receive (selected on 2026-11-14). *)
+(* On IOCP, a cancel that reaches a running send aborts the connection,    *)
+(* and its result gives no count (selected on 2026-11-17).                 *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 
@@ -37,7 +43,8 @@ ASSUME Submissions \in {"resource", "direction"}
 ASSUME Bug \in {"none", "dropRelease", "win32", "exitLive", "submitFirst",
                 "closeNoCancel", "noGeneration", "reportTwice", "staleWaker",
                 "zcWait", "noDrainLimit", "noGraceReset", "zcEarlyRelease",
-                "dropRxTail", "omitReport", "omitDebt"}
+                "dropRxTail", "omitReport", "omitDebt", "abortCount",
+                "dropRxError"}
 
 Ch == {"rx", "tx", "ac"}            \* One operation slot for each direction.
 Res == {"s", "l"}                   \* The stream and the listener.
@@ -72,10 +79,21 @@ VARIABLES
   rbuf,   \* The bytes in the buffer of the receive in slot "rx".
   held,   \* The bytes that the stream holds for the next receive.
   got,    \* The bytes that the caller received, in order of delivery.
+  ks,     \* The kernel's stream: "open"; "fail" (an IOCP abort: the next
+          \* receive result is the error); or "end" (the kernel reported the
+          \* error, and each later receive result is the end of the stream).
+  ro,     \* The kind of the result in slot "rx": "ok" (bytes, or a cancel
+          \* that took effect), "err" (the error), or "end".
+  re,     \* The stream keeps the error of an abandoned receive.
+  ce,     \* The first result with no bytes that the caller received, other
+          \* than a cancel: "none", "err", or "end".
   tp,     \* The progress of the send in slot "tx": "none", "part", or "full".
-  wd,     \* The write direction: "ok", "owe" (failed, a report is owed), "failed".
+  wd,     \* The write direction: "ok", "owe" (failed, a report with the
+          \* count is owed), "lost" (failed, a report with no count is
+          \* owed), or "failed".
   rep,    \* rep[g]: the progress reports of abandoned send g.
   required, \* The sends whose abandoned terminal result requires a report.
+  ab,     \* IOCP: a cancel of a running send aborted the connection.
   kc,     \* The connections that the kernel has not yet accepted.
   ar,     \* The connections that the accept in slot "ac" accepted.
   hc,     \* The connections that the listener holds for the next accept.
@@ -93,8 +111,8 @@ VARIABLES
 lifeVars == <<life, wk, alive, cl>>
 futVars == <<fut, wake, woke>>
 opVars == <<gen, st, home, k, cx, rq, bk>>
-rxVars == <<rxk, rbuf, held, got>>
-txVars == <<tp, wd, rep, required>>
+rxVars == <<rxk, rbuf, held, got, ks, ro, re, ce>>
+txVars == <<tp, wd, rep, required, ab>>
 acVars == <<kc, ar, hc, uc>>
 zcVars == <<debt, pg, pn, nh>>
 dt == debt # {}
@@ -119,10 +137,15 @@ TypeOK ==
   /\ rbuf \in BSeq(1..Bytes, Bytes)
   /\ held \in BSeq(1..Bytes, Bytes)
   /\ got \in BSeq(1..Bytes, Bytes)
+  /\ ks \in {"open", "fail", "end"}
+  /\ ro \in {"ok", "err", "end"}
+  /\ re \in BOOLEAN
+  /\ ce \in {"none", "err", "end"}
   /\ tp \in {"none", "part", "full"}
-  /\ wd \in {"ok", "owe", "failed"}
+  /\ wd \in {"ok", "owe", "lost", "failed"}
   /\ rep \in [Gens -> 0..2]
   /\ required \subseteq Gens
+  /\ ab \in BOOLEAN
   /\ {kc, ar, hc, uc} \subseteq 0..Conns
   /\ debt \subseteq Gens
   /\ pg \in BOOLEAN
@@ -176,24 +199,38 @@ Ask(s) ==
 
 Avail == Bytes + 1 - rxk
 
+\* The receive results that the kernel can give now, as <<bytes, kind>>.
+\* Bytes come only while the stream is open. The kernel reports the error
+\* of a failed stream to one receive: a reset from the peer, or an IOCP
+\* abort. After that error, each result is the end of the stream. A cancel
+\* that took effect gives no bytes and no error.
+RxResults(cancel) ==
+  (IF ks = "open" THEN {<<n, "ok">> : n \in 1..Avail} ELSE {})
+  \cup (IF ks = "end" THEN {<<0, "end">>} ELSE {<<0, "err">>})
+  \cup (IF cancel THEN {<<0, "ok">>} ELSE {})
+
 \* The progress that a result carries. Each operator sets all channel data.
-RxTakes(n) ==
-  /\ rbuf' = [i \in 1..n |-> rxk + i - 1]
-  /\ rxk' = rxk + n
-  /\ UNCHANGED <<held, got, txVars, acVars>>
-TxTakes(t) == tp' = t /\ UNCHANGED <<rxVars, wd, rep, acVars, required>>
+\* A receive takes the bytes and the kind of result x.
+RxTakes(x) ==
+  /\ rbuf' = [i \in 1..x[1] |-> rxk + i - 1]
+  /\ rxk' = rxk + x[1]
+  /\ ro' = x[2]
+  /\ ks' = IF x[2] = "err" THEN "end" ELSE ks
+  /\ UNCHANGED <<held, got, re, ce, txVars, acVars>>
+TxTakes(t) == tp' = t /\ UNCHANGED <<rxVars, wd, rep, acVars, required, ab>>
 AcTakes(m) == kc' = kc - m /\ ar' = ar + m /\ UNCHANGED <<rxVars, txVars, hc, uc>>
 NoData == UNCHANGED <<rxVars, txVars, acVars>>
 
-\* A result with progress: bytes, a send count, or a connection.
+\* A result of a call that succeeds: bytes or the end of the stream, a send
+\* count, or a connection.
 Some(c) ==
-  CASE c = "rx" -> \E n \in 1..Avail : RxTakes(n)
+  CASE c = "rx" -> \E x \in RxResults(FALSE) : x[2] # "err" /\ RxTakes(x)
     [] c = "tx" -> \E t \in {"part", "full"} : TxTakes(t)
     [] c = "ac" -> kc > 0 /\ AcTakes(1)
-\* A result with no progress: an error, or a cancel that took effect.
-\* A failed send is a partial send.
+\* A result of a call that fails: an error with no progress. A failed send
+\* is a partial send.
 Nothing(c) ==
-  CASE c = "rx" -> RxTakes(0)
+  CASE c = "rx" -> \E x \in RxResults(FALSE) : x[2] = "err" /\ RxTakes(x)
     [] c = "tx" -> TxTakes("part")
     [] c = "ac" -> AcTakes(0)
 
@@ -212,26 +249,33 @@ EndSlot(c) ==
          /\ UNCHANGED <<home, cx>>
     ELSE FreeSlot(c) /\ UNCHANGED woke
 
-\* The final result of a slot: b received bytes, t send progress, or m
-\* accepted connections. A future takes it (att), or the abandoned rule
-\* applies. Received bytes stay with the stream, in the receive's own
-\* buffer and charge. A partial or cancelled send owes a progress report.
-\* Accepted connections stay with the listener.
-EndRx(b, att) ==
-  IF att THEN rbuf' = b /\ UNCHANGED <<held, bk>>
+\* The final result of a slot: b received bytes of kind r, t send
+\* progress, or m accepted connections. A future takes it (att), or the
+\* abandoned rule applies. Received bytes stay with the stream, in the
+\* receive's own buffer and charge. The error stays with the stream for
+\* the next receive; the "dropRxError" variant keeps no error. A partial
+\* or cancelled send owes a progress report: with no count after an IOCP
+\* abort (lost), else with the count. The "abortCount" variant owes the
+\* count also after an abort. Accepted connections stay with the listener.
+EndRx(b, att, r) ==
+  IF att THEN rbuf' = b /\ ro' = r /\ UNCHANGED <<held, bk, re>>
   ELSE /\ rbuf' = <<>>
+       /\ ro' = "ok"
        /\ held' = IF Bug = "dropRxTail" THEN held ELSE held \o b
+       /\ re' = (re \/ (r = "err" /\ Bug # "dropRxError"))
        /\ bk' = [bk EXCEPT !["rx"][gen["rx"]] = IF b = <<>> THEN Rel(@) ELSE Hold(@)]
 \* A zero-copy result (zc) ends the send, and its backing stays with the
 \* driver ("zc") until its notice. The claim and the abandoned rule release
 \* only a backing that the send still owns. The "zcEarlyRelease" variant
 \* releases the backing at the send result.
-EndTx(t, att, zc) ==
+EndTx(t, att, zc, lost) ==
   /\ required' = IF ~att /\ (t = "part" \/ cx["tx"])
                     THEN required \cup {gen["tx"]} ELSE required
   /\ IF att THEN tp' = t /\ UNCHANGED wd
      ELSE /\ tp' = "none"
-          /\ wd' = IF t = "part" \/ cx["tx"] THEN "owe" ELSE wd
+          /\ wd' = IF t = "part" \/ cx["tx"]
+                     THEN IF lost /\ Bug # "abortCount" THEN "lost" ELSE "owe"
+                     ELSE wd
   /\ bk' = [bk EXCEPT !["tx"][gen["tx"]] =
               CASE zc /\ Bug = "zcEarlyRelease" -> Rel(@)
                 [] zc -> "zc"
@@ -245,8 +289,8 @@ EndAc(m, att) ==
 
 \* The abandoned rule for the result that slot c holds.
 Abandon(c) ==
-  CASE c = "rx" -> EndRx(rbuf, FALSE) /\ UNCHANGED <<rxk, got, txVars, acVars>>
-    [] c = "tx" -> EndTx(tp, FALSE, FALSE) /\ UNCHANGED <<rxVars, rep, acVars>>
+  CASE c = "rx" -> EndRx(rbuf, FALSE, ro) /\ UNCHANGED <<rxk, got, ks, ce, txVars, acVars>>
+    [] c = "tx" -> EndTx(tp, FALSE, FALSE, ab) /\ UNCHANGED <<rxVars, rep, ab, acVars>>
     [] c = "ac" -> EndAc(ar, FALSE) /\ UNCHANGED <<rxVars, txVars, kc, uc>>
 
 -----------------------------------------------------------------------------
@@ -254,6 +298,8 @@ Abandon(c) ==
 
 \* The initiating call returns. On io_uring the request waits for its
 \* completion. On IOCP the driver classifies the NT status of the return.
+\* After an IOCP abort, a send fails at once: the status is still
+\* STATUS_PENDING, so no packet follows.
 Submit(c) ==
   /\ gen' = [gen EXCEPT ![c] = @ + 1]
   /\ cx' = [cx EXCEPT ![c] = FALSE]
@@ -261,7 +307,8 @@ Submit(c) ==
   /\ fut' = [fut EXCEPT ![c] = "att"]
   /\ FirstWaker(c)
   /\ UNCHANGED <<lifeVars, home, rq, zcVars>>
-  /\ \/ /\ st' = [st EXCEPT ![c] = "live"]     \* SQE, or STATUS_PENDING
+  /\ \/ /\ ~(ab /\ c = "tx")
+        /\ st' = [st EXCEPT ![c] = "live"]     \* SQE, or STATUS_PENDING
         /\ k' = [k EXCEPT ![c] = "fly"]
         /\ woke' = [woke EXCEPT ![c] = FALSE]
         /\ NoData
@@ -270,7 +317,7 @@ Submit(c) ==
         /\ k' = [k EXCEPT ![c] = "none"]
         /\ woke' = [woke EXCEPT ![c] = TRUE]
         /\ Nothing(c)
-     \/ /\ Backend = "iocp"                     \* success or a warning status
+     \/ /\ Backend = "iocp" /\ ~(ab /\ c = "tx") \* success or a warning status
         /\ Some(c)
         /\ \E warning, skip \in BOOLEAN :
              \/ /\ skip                         \* skip-on-success: no packet
@@ -303,8 +350,8 @@ Returns(c) ==
   /\ woke' = [woke EXCEPT ![c] = FALSE]
 
 \* A receive first returns a prefix of the held bytes, with one copy, and
-\* keeps the rest. With no held bytes, it submits. The "submitFirst"
-\* variant submits before it returns the held bytes.
+\* keeps the rest. Then it returns a kept error. With neither, it submits.
+\* The "submitFirst" variant submits before it returns the held bytes.
 BeginRx ==
   /\ CanBegin("rx")
   /\ \/ /\ held # <<>>
@@ -314,21 +361,29 @@ BeginRx ==
              /\ bk' = IF p = Len(held) THEN [bk EXCEPT !["rx"] = ReleaseHeld(@)]
                       ELSE bk
         /\ Returns("rx")
-        /\ UNCHANGED <<lifeVars, gen, st, home, k, cx, rq, rxk, rbuf,
-                       txVars, acVars, zcVars>>
-     \/ /\ held = <<>> \/ Bug = "submitFirst"
+        /\ UNCHANGED <<lifeVars, gen, st, home, k, cx, rq, rxk, rbuf, ks, ro,
+                       re, ce, txVars, acVars, zcVars>>
+     \/ /\ held = <<>> /\ re
+        /\ re' = FALSE
+        /\ ce' = IF ce = "none" THEN "err" ELSE ce
+        /\ Returns("rx")
+        /\ UNCHANGED <<lifeVars, opVars, rxk, rbuf, held, got, ks, ro, txVars,
+                       acVars, zcVars>>
+     \/ /\ (held = <<>> /\ ~re) \/ Bug = "submitFirst"
         /\ CanSubmit("rx")
         /\ Submit("rx")
 
 \* A send on a direction that failed returns the typed error. The first
-\* such send reports the count of the abandoned send.
+\* such send reports the progress of the abandoned send: its count, or no
+\* count after an IOCP abort.
 BeginTx ==
   /\ CanBegin("tx")
-  /\ \/ /\ wd = "owe"
+  /\ \/ /\ wd \in {"owe", "lost"}
         /\ wd' = "failed"
         /\ rep' = [rep EXCEPT ![gen["tx"]] = IF Bug = "omitReport" THEN @ ELSE @ + 1]
         /\ Returns("tx")
-        /\ UNCHANGED <<lifeVars, opVars, rxVars, tp, acVars, zcVars, required>>
+        /\ UNCHANGED <<lifeVars, opVars, rxVars, tp, acVars, zcVars, required,
+                       ab>>
      \/ /\ wd = "ok"
         /\ CanSubmit("tx")
         /\ Submit("tx")
@@ -374,10 +429,12 @@ Claim(c) ==
   /\ CASE c = "rx" ->
             /\ got' = got \o rbuf
             /\ rbuf' = <<>>
-            /\ UNCHANGED <<rxk, held, txVars, acVars>>
+            /\ ce' = IF ce = "none" /\ ro # "ok" THEN ro ELSE ce
+            /\ ro' = "ok"
+            /\ UNCHANGED <<rxk, held, ks, re, txVars, acVars>>
        [] c = "tx" ->
             /\ tp' = "none"
-            /\ UNCHANGED <<rxVars, wd, rep, acVars, required>>
+            /\ UNCHANGED <<rxVars, wd, rep, acVars, required, ab>>
        [] c = "ac" ->
             /\ uc' = uc + ar
             /\ ar' = 0
@@ -385,6 +442,8 @@ Claim(c) ==
 
 \* An explicit cancellation of a receive or a send. The future keeps its
 \* interest and later receives the original buffer with its exact progress.
+\* On IOCP, a cancel that finds a running send can abort the connection
+\* (CompleteTx): the send then gives no count.
 Cancel(c) ==
   /\ Runs
   /\ c # "ac"
@@ -435,28 +494,36 @@ CompleteRx ==
   /\ k' = [k EXCEPT !["rx"] = "none"]
   /\ EndSlot("rx")
   /\ IF k["rx"] = "tail"
-       THEN EndRx(rbuf, fut["rx"] = "att") /\ UNCHANGED rxk
-       ELSE \E n \in 0..Avail :
-              /\ rxk' = rxk + n
-              /\ EndRx([i \in 1..n |-> rxk + i - 1], fut["rx"] = "att")
-  /\ UNCHANGED <<lifeVars, fut, wake, gen, rq, got, txVars, acVars, zcVars>>
+       THEN EndRx(rbuf, fut["rx"] = "att", ro) /\ UNCHANGED <<rxk, ks>>
+       ELSE \E x \in RxResults(k["rx"] = "cxl") :
+              /\ rxk' = rxk + x[1]
+              /\ ks' = IF x[2] = "err" THEN "end" ELSE ks
+              /\ EndRx([i \in 1..x[1] |-> rxk + i - 1], fut["rx"] = "att", x[2])
+  /\ UNCHANGED <<lifeVars, fut, wake, gen, rq, got, ce, txVars, acVars, zcVars>>
 
 \* The send result is the terminal event of the send (selected on
 \* 2026-11-08). On io_uring a result with IORING_CQE_F_MORE (zc) also has a
 \* zero-copy notice to come: the send ends, its slot frees, and its backing
 \* joins the pending notices with the home of the send. A failed send is a
 \* partial send, and it can also have IORING_CQE_F_MORE. On IOCP, "tail" is
-\* the packet after an immediate return.
+\* the packet after an immediate return. On IOCP, a cancel that finds the
+\* send running can abort the connection (selected on 2026-11-17): the
+\* packet gives an error and no count, so the send fails with unknown
+\* progress. The next receive result is then the error (ks = "fail").
 CompleteTx ==
   /\ st["tx"] = "live" /\ Driven("tx") /\ k["tx"] # "none"
   /\ k' = [k EXCEPT !["tx"] = "none"]
   /\ EndSlot("tx")
-  /\ UNCHANGED <<lifeVars, fut, wake, gen, rq, rxVars, rep, acVars, debt, pg>>
+  /\ UNCHANGED <<lifeVars, fut, wake, gen, rq, rxk, rbuf, held, got, ro, re, ce,
+                 rep, acVars, debt, pg>>
   /\ IF k["tx"] = "tail"
-       THEN EndTx(tp, fut["tx"] = "att", FALSE) /\ UNCHANGED <<pn, nh>>
-       ELSE \E t \in {"part", "full"}, zc \in BOOLEAN :
+       THEN EndTx(tp, fut["tx"] = "att", FALSE, ab) /\ UNCHANGED <<pn, nh, ab, ks>>
+       ELSE \E t \in {"part", "full"}, zc \in BOOLEAN, abort \in BOOLEAN :
               /\ zc => Backend = "uring"
-              /\ EndTx(t, fut["tx"] = "att", zc)
+              /\ abort => Backend = "iocp" /\ k["tx"] = "cxl" /\ t = "part"
+              /\ ab' = (ab \/ abort)
+              /\ ks' = IF abort /\ ks = "open" THEN "fail" ELSE ks
+              /\ EndTx(t, fut["tx"] = "att", zc, ab \/ abort)
               /\ IF zc
                    THEN /\ pn' = pn \cup {gen["tx"]}
                         /\ nh' = [nh EXCEPT ![gen["tx"]] = home["tx"]]
@@ -517,8 +584,9 @@ TakeOver(c) ==
 CloseCancels(sl) == IF Bug = "closeNoCancel" THEN {} ELSE sl
 
 \* Close then waits for the terminal event of each operation, and returns.
-\* It releases the bytes that no receive took, reports the owed send
-\* progress, and closes each connection that no accept took. It does not
+\* It releases the bytes that no receive took, drops a kept error, reports
+\* the owed send progress (with no count after an IOCP abort), and closes
+\* each connection that no accept took. It does not
 \* wait for the pending notices: it half-closes the write side and leaves
 \* them to the driver as detached debt. Each send result came before this
 \* step, so its progress is final. The "reportTwice" variant also reports
@@ -530,19 +598,20 @@ CloseDone(r) ==
   /\ Bug = "zcWait" /\ r = "s" => pn = {}
   /\ cl' = [cl EXCEPT ![r] = "closed"]
   /\ UNCHANGED <<life, wk, alive, futVars, gen, st, home, k, cx, rq, rxk,
-                 rbuf, got, tp, kc, ar, uc, pg, pn, nh, required>>
+                 rbuf, got, ks, ro, ce, tp, kc, ar, uc, pg, pn, nh, required, ab>>
   /\ IF r = "s"
        THEN /\ held' = <<>>
+            /\ re' = FALSE
             /\ bk' = [bk EXCEPT !["rx"] = ReleaseHeld(@)]
             /\ debt' = IF Bug = "omitDebt" /\ (\E g, h \in pn : g # h)
                          THEN pn \ {CHOOSE g \in pn : TRUE} ELSE pn
-            /\ IF wd = "owe" \/ (Bug = "reportTwice" /\ wd = "failed")
+            /\ IF wd \in {"owe", "lost"} \/ (Bug = "reportTwice" /\ wd = "failed")
                  THEN /\ rep' = [rep EXCEPT ![gen["tx"]] = IF Bug = "omitReport" THEN @ ELSE @ + 1]
                       /\ wd' = "failed"
                  ELSE UNCHANGED <<rep, wd>>
             /\ UNCHANGED hc
        ELSE /\ hc' = 0
-            /\ UNCHANGED <<held, bk, rep, wd, debt>>
+            /\ UNCHANGED <<held, re, bk, rep, wd, debt>>
 
 \* A reset ends the kernel's hold of the stream's queued bytes: connect
 \* with AF_UNSPEC purges the send queue, so every pending notice of the
@@ -651,10 +720,15 @@ Init ==
   /\ rbuf = <<>>
   /\ held = <<>>
   /\ got = <<>>
+  /\ ks = "open"
+  /\ ro = "ok"
+  /\ re = FALSE
+  /\ ce = "none"
   /\ tp = "none"
   /\ wd = "ok"
   /\ rep = [g \in Gens |-> 0]
   /\ required = {}
+  /\ ab = FALSE
   /\ kc = Conns
   /\ ar = 0
   /\ hc = 0
@@ -747,7 +821,17 @@ ReportOnce ==
   /\ \A g \in Gens : rep[g] <= IF g \in required THEN 1 ELSE 0
   /\ wd = "failed" \/ cl["s"] = "closed" =>
        \A g \in required : rep[g] = 1
-  /\ Done => wd # "owe"
+  /\ Done => wd \notin {"owe", "lost"}
+
+\* After an IOCP abort, no report claims a count: the progress of the send
+\* is unknown, and a count would be false.
+ExactCount == ab => wd # "owe"
+
+\* A receive never gives the end of the stream in place of its error. The
+\* peer of the model never ends the stream: it resets it, or it keeps it
+\* open. So the first result with no bytes that the caller receives, other
+\* than a cancel, is the error. An end of the stream first hides the error.
+NoFalseEnd == ce # "end"
 
 (* Progress properties. Each one is a []<> form, which TLC checks with no *)
 (* tableau. Each form is equal to the leads-to form in its comment;       *)
@@ -813,7 +897,8 @@ UnreachedZcNoNotice == [][~ReachZcNoNotice]_vars
 ReachIocpPending == st["rx"] = "live" /\ k["rx"] \in {"fly", "cxl"} /\ st'["rx"] # "live"
 UnreachedIocpPending == [][~ReachIocpPending]_vars
 \* IOCP: an immediate NT_ERROR return is terminal.
-ReachIocpError == gen'["rx"] = gen["rx"] + 1 /\ st'["rx"] = "term" /\ rbuf' = <<>>
+ReachIocpError ==
+  gen'["rx"] = gen["rx"] + 1 /\ st'["rx"] = "term" /\ rbuf' = <<>> /\ ro' = "err"
 UnreachedIocpError == [][~ReachIocpError]_vars
 \* IOCP: after an immediate success, the packet is terminal.
 ReachIocpOtherPacket == st["rx"] = "live" /\ k["rx"] = "tail" /\ st'["rx"] # "live"
@@ -841,6 +926,12 @@ UnreachedHeldBytes == [][~ReachHeldBytes]_vars
 \* The next send reports the progress of an abandoned send.
 ReachSendError == wd = "owe" /\ wd' = "failed" /\ cl["s"] = "open"
 UnreachedSendError == [][~ReachSendError]_vars
+\* The next receive returns the error that an abandoned receive kept.
+ReachKeptError == re /\ ~re' /\ ce' = "err" /\ cl["s"] = "open"
+UnreachedKeptError == [][~ReachKeptError]_vars
+\* IOCP: a cancel of a running send aborts the connection.
+ReachIocpAbort == ~ab /\ ab'
+UnreachedIocpAbort == [][~ReachIocpAbort]_vars
 \* The next accept returns a connection that the listener holds.
 ReachHeldConn == hc > 0 /\ uc' = uc + 1
 UnreachedHeldConn == [][~ReachHeldConn]_vars

@@ -27,7 +27,9 @@
 //! its packet. Only the TCP and UDP cases run on Windows: its files, pipes, local streams,
 //! processes, and signals have no IOCP form yet. The cases whose kernel facts differ on Windows state the
 //! difference beside their bodies: a send there goes whole or fails, so a send goes in part only at
-//! a reset of its connection, and a cancel of a send that runs aborts the connection.
+//! a reset of its connection, and a cancel of a send that runs aborts the connection. The two cases
+//! of a send that waits in the driver at close and at teardown run only on Linux: the wait queue
+//! is in the driver core, and a waiting operation reaches no backend.
 //!
 //! The suites use only the driver-only surface, because no other surface has I/O types yet. The
 //! local I/O types (R307) and the movable I/O types (R403) each add a surface parameter and run both
@@ -342,6 +344,11 @@ mod law {
         tests => a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds,
         tests => a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count,
         tests => two_dropped_sends_and_a_third_send_run_in_start_order,
+        // A send that waits in the driver at close and at teardown.
+        #[cfg(target_os = "linux")]
+        tests => close_ends_a_waiting_send_unsent_and_releases_its_lease_once,
+        #[cfg(target_os = "linux")]
+        tests => teardown_ends_a_waiting_send_unsent_and_releases_its_lease_once,
         #[cfg(target_os = "linux")]
         pipe::tests => a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer,
         #[cfg(target_os = "linux")]

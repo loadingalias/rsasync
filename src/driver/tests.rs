@@ -40,7 +40,7 @@ use super::{
     UdpOptions, UdpSocket, WriteFailed,
 };
 #[cfg(target_os = "linux")]
-use super::{Call, Completion, Error, Feature, Features, Held, Medium, Route, eventfd, probe, sys};
+use super::{Call, Completion, Ended, Error, Feature, Features, Held, Medium, Route, eventfd, probe, sys};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
 #[cfg(target_os = "linux")]
@@ -1094,6 +1094,63 @@ pub(in crate::driver) fn two_dropped_sends_and_a_third_send_run_in_start_order(b
         reader.join().unwrap() == numbered(0, filled + 3 * 4096),
         "the peer read other bytes"
     );
+}
+
+/// A lease of 4096 numbered bytes from `start`, whose release records "released" in `log`.
+#[cfg(target_os = "linux")]
+fn recorded_lease(log: &Log, start: usize) -> Lease {
+    let mut loan = WriteLoan::new(recorded(log, 4096));
+    assert_eq!(loan.fill_from(&numbered(start, 4096)), 4096);
+    Lease::from(loan.into_inner())
+}
+
+/// A dropped send that waits in the driver behind a send in the kernel never runs when the close
+/// comes first: the close ends it with no submission, and its lease returns once, through its
+/// release hook, before the close returns. The peer reads none of its bytes.
+#[cfg(target_os = "linux")]
+pub(in crate::driver) fn close_ends_a_waiting_send_unsent_and_releases_its_lease_once(backend: Backend) {
+    let log = Log::default();
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let filled = fill(&mut driver, &mut stream);
+    drop(driver.send(&mut stream, Lease::from(numbered(filled, 4096))).unwrap());
+    driver.turn().unwrap();
+    drop(driver.send(&mut stream, recorded_lease(&log, filled + 4096)).unwrap());
+    assert_eq!(driver.queue.unsubmitted(), 0, "the waiting send submitted");
+
+    let close = driver.close(stream).unwrap();
+    assert_eq!(
+        driver.queue.unsubmitted(),
+        1,
+        "the close did not push exactly the cancel of the send in the kernel"
+    );
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), Some(0));
+    assert_eq!(taken(&log), ["released"]);
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert!(
+        received == numbered(0, filled),
+        "the peer read bytes of a cancelled send"
+    );
+}
+
+/// A send that waits in the driver behind a send in the kernel never runs when teardown comes
+/// first: teardown ends it with no submission and cancels only the send in the kernel. The lease
+/// of the waiting send returns once, through its release hook, and its future gives `Ended`.
+#[cfg(target_os = "linux")]
+pub(in crate::driver) fn teardown_ends_a_waiting_send_unsent_and_releases_its_lease_once(backend: Backend) {
+    let log = Log::default();
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, _peer) = connected(&mut driver, "127.0.0.1:0");
+    let filled = fill(&mut driver, &mut stream);
+    drop(driver.send(&mut stream, Lease::from(numbered(filled, 4096))).unwrap());
+    driver.turn().unwrap();
+    let waiting = driver.send(&mut stream, recorded_lease(&log, filled + 4096)).unwrap();
+    assert_eq!(driver.queue.unsubmitted(), 0, "the waiting send submitted");
+
+    assert_eq!(driver.teardown().unwrap().cancelled(), 1);
+    assert_eq!(taken(&log), ["released"]);
+    assert_matches!(block_on(waiting), Err(Ended));
 }
 
 /// An explicit cancel of a send that waits for room gives its lease and its progress, and the
