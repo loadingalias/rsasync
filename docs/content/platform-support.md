@@ -115,6 +115,17 @@ On 2026-11-17, these runs passed on an aarch64 Mac (MacBookPro18,3, Apple M1 Pro
 - In the same tree, a C build of the macOS 27.2 SDK headers showed that the 57 checked values and
   layouts and the 18 checked signatures of the new macOS declarations of the driver and
   `rsnetwork-udp` match them.
+- At revision `9a90403`, `cargo xtask test -j 2` ran the 208 tests of the whole workspace, and
+  `cargo test --locked --doc --workspace` ran the 27, 1, and 9 doctests. The tests include the file
+  cases of the driver suites on kqueue, on APFS: reads, writes, direct I/O, length, preallocation,
+  hole punching, names, and directory sync.
+- In the same tree, a C build of the macOS 27.2 SDK headers showed that the 47 checked values and
+  layouts and the 12 checked signatures of the macOS file declarations of the driver match them.
+  Revision `f8ea665` is `9a90403` on a later `main`, whose change is only in `models/` and the
+  design-models page.
+- A probe on exFAT and FAT32 disk images (`hdiutil`, with no root) showed that `F_PUNCHHOLE` gives
+  `ENOTTY` there, which the driver gives as `Unsupported`, and that `F_PREALLOCATE` and
+  `F_FULLFSYNC` work there.
 
 On the same Mac, the tests of `rsnetwork-udp` pass with each of these commands:
 
