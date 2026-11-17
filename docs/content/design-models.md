@@ -5,7 +5,7 @@ rsasync has two TLA+ models of its design rules:
 | Model | What it checks |
 | --- | --- |
 | [`models/operation-ownership/`](../../models/operation-ownership/README.md) | An operation keeps one home driver from its submission to its terminal release while its consumer moves between workers, drops, forgets, or cancels its future. Close, shutdown, and the detached debt of a zero-copy send, with the kernel events of io_uring and IOCP |
-| [`models/task-lifecycle/`](../../models/task-lifecycle/README.md) | A spawn reserves a task slot before it admits the task. One owner polls a task, and a local task stays on its home. A wake from any thread, also from a signal handler, reaches its task, and a stale wake has no effect. Cancellation at a poll boundary, block_on, and shutdown |
+| [`models/task-lifecycle/`](../../models/task-lifecycle/README.md) | A spawn reserves a task slot before it admits the task. One owner polls a task, and a local task stays on its home. A wake from any thread reaches its task, also from a signal handler or through the outbox of a worker, and a stale wake has no effect. A home parks with the deadline of its next timer. Cancellation at a poll boundary, block_on, and shutdown |
 
 A model checks the design, not the Rust code. Change a model when you change one of its rules.
 
@@ -119,19 +119,20 @@ model proves, or an inductive proof. Each such change needs a known-bad variant 
 under it. A smaller bound must still reach each failure that the model names, and it needs a
 profile with that bound raised by one.
 
-The task-lifecycle gate has 27 profiles. Its 23 fault and witness checks take about 45 seconds of
-checker time on the development Mac, and its declared profile about one minute. Its three-slot
-profile is too large for that Mac; it has this result on a quiet EC2 c8g.4xlarge (16 vCPUs,
-32 GiB, 2026-11-12):
+The task-lifecycle gate has 31 profiles. Its 27 fault and witness checks take about 17 seconds of
+checker time on a quiet EC2 c8g.4xlarge, and its declared profile about 24 seconds. Its largest
+profile has this result on that host (16 vCPUs, 32 GiB, 2026-11-17):
 
 | Profile | Distinct states | Time |
 | --- | --- | --- |
-| `TaskLifecycle.Slots3.cfg` | 9,177,449 | 19.1 minutes |
+| `TaskLifecycle.Slots3.cfg` | 32,271,537 | 55.5 minutes |
 
-The [model evidence record](../../models/task-lifecycle/README.md#evidence-record) gives every
-positive profile and its host. The model does not check a shutdown request during block_on, join
-handles and their outcomes, a task with more than one event, operations and I/O, or time. Its
-[limits](../../models/task-lifecycle/README.md#limits) give the full list.
+This profile is close to the limit of one hour. A dev-machines run of it needs a lease above 60
+minutes, for example `DEV_MACHINE_MAX_LEASE_MINUTES=90`, because setup and collection come on top
+of the check. The [model evidence record](../../models/task-lifecycle/README.md#evidence-record)
+gives every positive profile and its host. The model does not check a shutdown request during
+block_on, join handles and their outcomes, a task with more than one event, operations and I/O,
+or durations. Its [limits](../../models/task-lifecycle/README.md#limits) give the full list.
 
 On a smaller host, select the profiles that your change touches, and run the whole model before
 you record evidence.
