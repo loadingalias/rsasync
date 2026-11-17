@@ -859,11 +859,13 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
 /// not read, and gives the count that went. On macOS, the loopback delivers the segments of a send
 /// after its return, so the window of the peer fills after the send, and the send buffer has room
 /// again. Each next send of 4 MiB takes that room, until one send finds no room for 200 ms. Its
-/// cancel then ends it with no byte sent.
+/// cancel then ends it with no byte sent. The socket buffers of macOS hold at most 8 MiB
+/// (`kern.ipc.maxsockbuf`) on each side, so `SENDS_MAX` sends of 4 MiB are more than they hold.
 #[cfg(target_os = "macos")]
 fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
+    const SENDS_MAX: usize = 64;
     let mut filled = 0;
-    'fill: loop {
+    'fill: for _ in 0..SENDS_MAX {
         let mut send = driver
             .send(stream, Lease::from(numbered(filled, 4 << 20)))
             .expect("the test driver has room");
@@ -886,6 +888,7 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
             }
         }
     }
+    panic!("the socket took {SENDS_MAX} sends of 4 MiB while its peer did not read");
 }
 
 /// A send of 64 MiB that waits in the kernel, because the peer does not read and the socket has no

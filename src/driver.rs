@@ -1721,7 +1721,7 @@ impl Driver {
             // of `id`, and nothing changes the variant of their payload before it. The caller keeps
             // the descriptor open. The queue has room.
             let pushed = unsafe { self.queue.push(&sqe.with_user_data(id.user_data()), token) }.is_ok();
-            debug_assert!(pushed, "the queue has room for the entry");
+            assert!(pushed, "the queue has room for the entry");
         }
     }
 
