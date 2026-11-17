@@ -75,7 +75,8 @@ call it. rsasync changes the disposition of no other signal.
 The handler does only async-signal-safe work: it counts the signal, writes the wake descriptors of
 the homes of its streams, and at a stated escalation restores the default action and raises the
 signal again. It takes no lock, allocates nothing, and keeps `errno` of the code that it interrupts.
-A system call that the handler interrupts restarts, because the handler uses `SA_RESTART`.
+The handler uses `SA_RESTART`, so a system call that it interrupts restarts where the kernel allows
+it. A wait in io_uring or epoll never restarts, so `Driver::wait()` returns early.
 
 ## Refusals
 

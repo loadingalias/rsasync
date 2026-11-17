@@ -1448,7 +1448,7 @@ impl Driver {
 
     /// Blocks in the kernel until a completion is ready, or a request or wake from another thread
     /// came. The kernel runs its deferred work during the wait, so the wait does not depend on a
-    /// signal of the wake descriptor for that work.
+    /// signal of the wake descriptor for that work. A handled signal also ends the wait.
     ///
     /// # Errors
     ///
@@ -1483,17 +1483,17 @@ impl Driver {
                 Err(error) => return Err(error),
             }
         }
-        loop {
-            let entered = match timeout {
-                #[cfg(all(feature = "local", target_os = "linux"))]
-                Some(timeout) => self.queue.submit_timeout(1, timeout),
-                _ => self.queue.submit(1),
-            };
-            match entered {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if !retryable(&error) => return Err(error),
-                _ => return Ok(()),
-            }
+        let entered = match timeout {
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            Some(timeout) => self.queue.submit_timeout(1, timeout),
+            _ => self.queue.submit(1),
+        };
+        // A handled signal ends the wait with `Interrupted`, also under `SA_RESTART`. The wait
+        // then returns: a second entry with the same `timeout` would wait the whole time again,
+        // so signals that come faster than `timeout` would keep it past its end.
+        match entered {
+            Err(error) if !retryable(&error) => Err(error),
+            _ => Ok(()),
         }
     }
 

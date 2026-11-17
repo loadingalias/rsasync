@@ -110,7 +110,7 @@ it.
 | `Driver::report()` | What the driver found and applied when it started: the [capability report](capability-report.md) |
 | `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and takes up to `Config::completions_per_turn` completions from the ring. It gives the completion of each operation to its future. The bound and `Turn::completed()` also count the completions of the driver itself, such as cancel results |
 | `Turn::more()` | Work remains. Turn again before you wait |
-| `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. The kernel runs its deferred work during the wait |
+| `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. A handled signal also ends the wait, with no completion. The kernel runs its deferred work during the wait |
 | The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread. Some kernels signal deferred work only one time; see [Drive it from another reactor](#drive-it-from-another-reactor) |
 | `Driver::wake_handle()` | A `WakeHandle` that any thread can use to make the wake descriptor readable and to end a wait |
 | `Driver::teardown()` | Cancels each running operation, drives until each terminal event, closes each resource, and reports the cancelled operations |

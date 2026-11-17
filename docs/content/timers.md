@@ -75,6 +75,8 @@ loop run the timers.
 - The operating system then wakes the owner thread, and its wake delay comes on top of the
   coarsening. The runtime does not bound that delay: on a host with a heavy load, a timer can fire
   later.
+- On a home with a driver, a handled signal, such as the `SIGPROF` of a profiler, does not make
+  the park longer. A wait that a signal ends early waits again for the time that remains.
 - A drop of the timer cancels it. Its place is free for the next timer, and its deadline wakes no
   task.
 

@@ -182,10 +182,10 @@ all of them, each known-bad variant still fails its own property (see the eviden
     task arms its timer only in a poll on the signal home, so no timer starts during a park. So
     the model can read the deadline from `tm` at each step. The end of a stolen task can leave a
     park with no timer. In the code, that park ends at its old deadline and finds no work, and the
-    next park is a state of the model. So the model has no wake at a deadline with no timer. The arm and the registration of the waker are one step:
-    the poll of a timer is the handshake of reduction 10 (`Waiter::poll_wait`). A turn fires at
-    most 64 timers, which is more than the slots, and a turn with more due timers does not park.
-    Known-bad: `NoDeadline_bad`.
+    next park is a state of the model. So the model has no wake at a deadline with no timer. The
+    arm and the registration of the waker are one step: the poll of a timer is the handshake of
+    reduction 10 (`Waiter::poll_wait`). A turn fires at most 64 timers, which is more than the
+    slots, and a turn with more due timers does not park. Known-bad: `NoDeadline_bad`.
 14. A sender that signals at once pushes and writes the descriptor in one step. In the code,
     `Shared::push` changes the head, and then `Shared::signal` writes the descriptor or unparks the
     thread, with no wait between. Only `Unpark` reads `sig`, and a parked home takes no other step.

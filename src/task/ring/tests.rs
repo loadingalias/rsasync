@@ -3,12 +3,15 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::assert_matches;
 use core::cell::Cell;
+use core::ffi::c_int;
 use core::future::{Future, poll_fn};
 use core::num::NonZeroU64;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Poll, Waker};
 use core::time::Duration;
 use std::io::{self, Write as _};
 use std::os::fd::OwnedFd;
+use std::os::unix::thread::{JoinHandleExt as _, RawPthread};
 use std::sync::mpsc;
 use std::thread;
 
@@ -16,7 +19,7 @@ use super::RingOwner;
 use crate::blocking::{self, Service};
 use crate::buffer::{Backing, Buffer as _};
 use crate::capacity::Budget;
-use crate::driver::{Config, Driver};
+use crate::driver::{Backend, Config, Driver};
 use crate::table::tests::allocations;
 use crate::task::tests::yield_once;
 use crate::task::{Outcome, spawn_local};
@@ -229,4 +232,83 @@ fn a_timer_never_fires_early_and_wakes_its_owner_from_its_ring() {
     for late in lateness {
         assert!(late < core::time::Duration::from_secs(1), "{late:?}");
     }
+}
+
+/// Handled signals that come faster than the timeout of a park, such as the `SIGPROF` of a
+/// profiler, do not keep a parked owner past the deadline of its timer. Each signal ends the wait
+/// in the kernel with `EINTR`, also under `SA_RESTART`, and the next park takes the time that
+/// remains. The check of lateness is only for a missed wake, as in
+/// `a_timer_never_fires_early_and_wakes_its_owner_from_its_ring`.
+fn signals_do_not_delay_the_timer_of_a_parked_owner(backend: Backend) {
+    /// `SIGUSR1` on x86_64 and aarch64 Linux.
+    const SIGUSR1: c_int = 10;
+    /// The time from the park to the deadline: many intervals of the signals.
+    const TIMEOUT: Duration = Duration::from_millis(100);
+    const MISSED_WAKE: Duration = Duration::from_secs(1);
+    static HANDLED: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn handle(_signal: c_int) {
+        HANDLED.fetch_add(1, Ordering::Relaxed);
+    }
+    #[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+    unsafe extern "C" {
+        /// `sighandler_t signal(int sig, sighandler_t handler)`. glibc and musl install the
+        /// handler with `SA_RESTART`. `SIG_ERR` is `-1`.
+        fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> isize;
+        /// `int pthread_kill(pthread_t thread, int sig)`.
+        fn pthread_kill(thread: RawPthread, sig: c_int) -> c_int;
+    }
+
+    // SAFETY: the handler only adds to an atomic counter, which is async-signal-safe.
+    #[expect(unsafe_code, reason = "the handler is async-signal-safe")]
+    let installed = unsafe { signal(SIGUSR1, handle) };
+    assert_ne!(installed, -1);
+    let (ready, started) = mpsc::channel();
+    let parked = thread::spawn(move || {
+        let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+        let (clock, timers) = crate::task::tests::timed(&budget, 1, Duration::from_millis(1));
+        let coarsening = timers.max_coarsening();
+        let driver = Driver::new(Config::new().backend(backend)).expect("the test host has the backend");
+        let mut owner = RingOwner::new(&budget, 1, driver).unwrap();
+        owner.use_timers(timers, clock).unwrap();
+        ready.send(()).unwrap();
+        let late = owner
+            .block_on(async move {
+                let deadline = clock.now().checked_add(TIMEOUT).unwrap();
+                crate::task::timer(crate::time::Deadline::at(deadline))
+                    .unwrap()
+                    .await
+                    .unwrap();
+                clock
+                    .now()
+                    .duration_since(deadline)
+                    .expect("a timer never fires before its deadline")
+            })
+            .unwrap();
+        (late, coarsening)
+    });
+    started.recv().unwrap();
+    // A signal each millisecond until the owner ends. A park that takes its whole timeout again
+    // at each signal ends only after the last signal, long after the bound.
+    let start = std::time::Instant::now();
+    while !parked.is_finished() && start.elapsed() < TIMEOUT + 2 * MISSED_WAKE {
+        // SAFETY: the thread is not joined, so its handle is valid.
+        #[expect(unsafe_code, reason = "the handle names a thread that is not joined")]
+        unsafe {
+            pthread_kill(parked.as_pthread_t(), SIGUSR1);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (late, coarsening) = parked.join().unwrap();
+    assert_ne!(HANDLED.load(Ordering::Relaxed), 0, "the signals reach the owner");
+    assert!(late < coarsening + MISSED_WAKE, "{late:?}");
+}
+
+#[test]
+fn signals_do_not_delay_the_timer_of_a_parked_owner_on_io_uring() {
+    signals_do_not_delay_the_timer_of_a_parked_owner(Backend::IoUring);
+}
+
+#[test]
+fn signals_do_not_delay_the_timer_of_a_parked_owner_on_epoll() {
+    signals_do_not_delay_the_timer_of_a_parked_owner(Backend::Epoll);
 }
