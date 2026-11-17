@@ -1,9 +1,9 @@
 //! A pool of slots that return to their home with no allocation, no lock, and no epoch.
 
-use alloc::alloc::{alloc, dealloc};
+use alloc::alloc::Global;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::alloc::Layout;
+use core::alloc::{Allocator, Layout};
 use core::fmt;
 use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
@@ -167,20 +167,17 @@ impl core::error::Error for PoolEmpty {}
 impl Pool {
     /// Makes a pool of `slots` slots, each with the size and the alignment of `slot`. It charges
     /// all of the slots to `budget`, at their rounded size, before it allocates.
-    #[expect(
-        unsafe_code,
-        reason = "the pool allocates its arena with the layout that it frees it with"
-    )]
     pub fn new(budget: &Budget, slots: NonZeroU32, slot: Layout) -> Result<Self, PoolRefused> {
         let count = slots.get();
         if slot.size() == 0 || count == NONE {
             return Err(PoolRefused::Layout);
         }
-        let stride = slot.pad_to_align().size();
-        let arena_layout = stride
-            .checked_mul(count as usize)
-            .and_then(|size| Layout::from_size_align(size, slot.align()).ok())
-            .ok_or(PoolRefused::Layout)?;
+        // Each slot takes its rounded size, also the last slot. `repeat` adds no padding after its
+        // last copy, so it gets the rounded layout.
+        let (arena_layout, stride) = slot
+            .pad_to_align()
+            .repeat(count as usize)
+            .map_err(|_| PoolRefused::Layout)?;
         let charge = u64::try_from(arena_layout.size()).map_err(|_| PoolRefused::Layout)?;
         let charge = budget.reserve(charge).map_err(PoolRefused::Budget)?;
 
@@ -193,8 +190,10 @@ impl Pool {
             count: AtomicU64::new(0),
             next: AtomicU32::new(if next == count { NONE } else { next }),
         }));
-        // SAFETY: the size of `arena_layout` is not zero: the slot size and the count are not zero.
-        let arena = NonNull::new(unsafe { alloc(arena_layout) }).ok_or(PoolRefused::Allocation)?;
+        let arena = Global
+            .allocate(arena_layout)
+            .map_err(|_| PoolRefused::Allocation)?
+            .cast();
 
         Ok(Self {
             shared: Arc::new(Shared {
@@ -273,9 +272,9 @@ impl Shared {
 impl Drop for Shared {
     #[expect(unsafe_code, reason = "the pool frees its arena when no slot is in use")]
     fn drop(&mut self) {
-        // SAFETY: `Pool::new` allocated the arena with `arena_layout`. Each slot in use keeps a
-        // reference to the pool, so no slot is in use now.
-        unsafe { dealloc(self.arena.as_ptr(), self.arena_layout) };
+        // SAFETY: `Pool::new` allocated the arena from `Global` with `arena_layout`. Each slot in
+        // use keeps a reference to the pool, so no slot is in use now.
+        unsafe { Global.deallocate(self.arena, self.arena_layout) };
     }
 }
 

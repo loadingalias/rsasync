@@ -179,7 +179,7 @@ impl Wheel {
         }
         // The highest bit in which the ticks differ. A difference above the top level, which a
         // tick of the next turn of the ring has, stays at the top level.
-        let bit = u64::BITS - 1 - (tick ^ self.elapsed).leading_zeros();
+        let bit = (tick ^ self.elapsed).ilog2();
         let level = (bit / SLOT_BITS).min(LEVELS - 1);
         level * SLOTS + slot(tick, level)
     }

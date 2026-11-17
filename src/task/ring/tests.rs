@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::assert_matches;
 use core::cell::Cell;
 use core::future::{Future, poll_fn};
 use core::num::NonZeroU64;
@@ -77,7 +78,7 @@ fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
                 assert_eq!(allocations, 0);
                 assert_eq!(home.take_interrupts(), 1);
                 for task in tasks {
-                    assert!(matches!(task.join().await, Outcome::Completed(())));
+                    assert_matches!(task.join().await, Outcome::Completed(()));
                 }
             }
         })
@@ -104,7 +105,7 @@ fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {
                 wakers.send(receiver.try_iter().collect()).unwrap();
                 // The owner waits in its ring until the wakes come.
                 for task in tasks {
-                    assert!(matches!(task.join().await, Outcome::Completed(())));
+                    assert_matches!(task.join().await, Outcome::Completed(()));
                 }
                 home.take_interrupts()
             })
@@ -154,7 +155,7 @@ fn a_wake_from_a_blocking_service_thread_reaches_its_home() {
             task.join().await
         })
         .unwrap();
-    assert!(matches!(outcome, Outcome::Completed(Ok(5))));
+    assert_matches!(outcome, Outcome::Completed(Ok(5)));
     service.teardown();
 }
 
@@ -190,7 +191,7 @@ fn a_busy_owner_completes_a_burst_and_a_close_while_its_task_runs() {
                 let (done, rounds) = (Rc::clone(&done), Rc::clone(&rounds));
                 async move {
                     while !done.get() && rounds.get() < ROUNDS {
-                        rounds.set(rounds.get() + 1);
+                        rounds.update(|rounds| rounds + 1);
                         yield_once().await;
                     }
                 }
@@ -203,7 +204,7 @@ fn a_busy_owner_completes_a_burst_and_a_close_while_its_task_runs() {
             let (burst, close) = (burst.await.unwrap(), close.await.unwrap());
             let at = rounds.get();
             done.set(true);
-            assert!(matches!(busy.join().await, Outcome::Completed(())));
+            assert_matches!(busy.join().await, Outcome::Completed(()));
             ((burst.0.unwrap(), burst.1.bytes().to_vec(), close.0.unwrap()), at)
         })
         .unwrap();

@@ -8,6 +8,7 @@
 #![cfg(feature = "local")]
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::assert_matches;
 use core::cell::Cell;
 use core::fmt::{self, Write as _};
 use core::future::{pending, poll_fn};
@@ -63,7 +64,7 @@ fn a_refused_spawn_allocates_nothing() {
         let before = ALLOCATIONS.get();
         let refused = spawn_local(pending::<()>()).unwrap_err();
         assert_eq!(ALLOCATIONS.get(), before);
-        assert!(matches!(refused.reason(), Reason::Budget(_)));
+        assert_matches!(refused.reason(), Reason::Budget(_));
         drop(rest);
 
         // No free slot.
@@ -96,7 +97,7 @@ fn a_wake_from_another_thread_allocates_nothing() {
             Poll::Pending
         }))
         .unwrap();
-        assert!(matches!(task.join().await, Outcome::Completed(0)));
+        assert_matches!(task.join().await, Outcome::Completed(0));
     });
 }
 
@@ -130,7 +131,7 @@ fn a_refusal_report_completes_under_an_allocator_that_refuses_each_request() {
     let made = LocalOwner::new(&budget, 4);
     let written = made.as_ref().err().map(|refused| write!(text, "{refused} {refused:?}"));
     REFUSE.set(false);
-    assert!(matches!(made, Err(Refused::Allocation)));
+    assert_matches!(made, Err(Refused::Allocation));
     assert_eq!(written, Some(Ok(())));
 
     let mut owner = LocalOwner::new(&budget, 1).unwrap();
@@ -147,7 +148,7 @@ fn a_refusal_report_completes_under_an_allocator_that_refuses_each_request() {
             .err()
             .map(|refused| write!(text, "{refused} {refused:?} {}", refused.reason()));
         REFUSE.set(false);
-        assert!(matches!(&spawned, Err(refused) if refused.reason() == Reason::NoSlot));
+        assert_matches!(&spawned, Err(refused) if refused.reason() == Reason::NoSlot);
         assert_eq!(written, Some(Ok(())));
     });
 }

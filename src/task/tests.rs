@@ -2,6 +2,7 @@ use alloc::format;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::assert_matches;
 use core::cell::{Cell, RefCell};
 use core::future::{Future, pending, poll_fn};
 use core::num::NonZeroU64;
@@ -46,7 +47,7 @@ fn construction_refuses_with_a_typed_reason() {
     assert_eq!(LocalOwner::new(&budget, 0).unwrap_err(), Refused::Zero);
     assert_eq!(LocalOwner::new(&budget, (1 << 16) + 1).unwrap_err(), Refused::TooLarge);
     let small = Budget::new(NonZeroU64::new(16).unwrap());
-    assert!(matches!(LocalOwner::new(&small, 1).unwrap_err(), Refused::Budget(_)));
+    assert_matches!(LocalOwner::new(&small, 1).unwrap_err(), Refused::Budget(_));
 }
 
 #[test]
@@ -61,7 +62,7 @@ fn a_refused_spawn_gives_the_future_back_with_its_reason() {
         // Too few free units for the task.
         let rest = budget.reserve(budget.available()).unwrap();
         let refused = spawn_local(async { 7 }).unwrap_err();
-        assert!(matches!(refused.reason(), Reason::Budget(_)));
+        assert_matches!(refused.reason(), Reason::Budget(_));
         drop(rest);
         let _second = spawn_local(pending::<()>()).unwrap();
         // No free slot. The future comes back, and it still runs.
@@ -83,8 +84,8 @@ fn the_waiting_form_spawns_after_a_slot_frees() {
         // The first task ends, and its slot goes to the waiting spawn.
         sender.send(()).unwrap();
         let second = waiting.await.unwrap();
-        assert!(matches!(first.join().await, Outcome::Completed(())));
-        assert!(matches!(second.join().await, Outcome::Completed(2)));
+        assert_matches!(first.join().await, Outcome::Completed(()));
+        assert_matches!(second.join().await, Outcome::Completed(2));
     });
 }
 
@@ -161,7 +162,7 @@ fn a_cancel_from_another_thread_drops_the_future_at_a_poll_boundary() {
             cancel.cancel();
             cancel_done.send(()).unwrap();
         });
-        assert!(matches!(task.join().await, Outcome::Cancelled));
+        assert_matches!(task.join().await, Outcome::Cancelled);
         canceller.join().unwrap();
     });
     assert!(!dropped_in_poll.load(Ordering::SeqCst));
@@ -202,9 +203,9 @@ fn each_outcome_is_reported() {
         let cancelled = spawn_local(pending::<()>()).unwrap();
         cancelled.cancel_handle().cancel();
         let panicked = spawn_local(async { panic!("the task panics") }).unwrap();
-        assert!(matches!(completed.join().await, Outcome::Completed(2)));
-        assert!(matches!(cancelled.join().await, Outcome::Cancelled));
-        assert!(matches!(panicked.join().await, Outcome::Panicked(_)));
+        assert_matches!(completed.join().await, Outcome::Completed(2));
+        assert_matches!(cancelled.join().await, Outcome::Cancelled);
+        assert_matches!(panicked.join().await, Outcome::Panicked(_));
     });
 
     // The root panics while a task is live.
@@ -217,7 +218,7 @@ fn each_outcome_is_reported() {
     }));
     assert!(ended.is_err());
     let task = kept.take().unwrap();
-    assert!(matches!(task.join_blocking(), Outcome::OwnerFailed(OwnerFailure)));
+    assert_matches!(task.join_blocking(), Outcome::OwnerFailed(OwnerFailure));
     // The owner runs again after the failure.
     assert_eq!(owner.block_on(async { 3 }), 3);
 }
@@ -234,12 +235,12 @@ fn a_stale_wake_after_slot_reuse_does_not_poll_the_new_task() {
             Poll::Ready(())
         }))
         .unwrap();
-        assert!(matches!(first.join().await, Outcome::Completed(())));
+        assert_matches!(first.join().await, Outcome::Completed(()));
         // The second task takes the one slot, with the next generation.
         let polls = Rc::new(Cell::new(0));
         let count = Rc::clone(&polls);
         let _second = spawn_local(poll_fn(move |_| {
-            count.set(count.get() + 1);
+            count.update(|count| count + 1);
             Poll::<()>::Pending
         }))
         .unwrap();
@@ -275,7 +276,7 @@ fn block_on_cancels_each_live_task_before_it_returns() {
         .unwrap()
     });
     assert!(dropped.get());
-    assert!(matches!(task.join_blocking(), Outcome::Cancelled));
+    assert_matches!(task.join_blocking(), Outcome::Cancelled);
 }
 
 #[test]
@@ -286,7 +287,7 @@ fn a_wake_from_another_thread_reaches_a_local_task() {
         let (sender, mut receiver) = oneshot::channel::<u32>(&budget).unwrap();
         let task = spawn_local(async move { receiver.recv().await.unwrap() }).unwrap();
         let other = std::thread::spawn(move || sender.send(5));
-        assert!(matches!(task.join().await, Outcome::Completed(5)));
+        assert_matches!(task.join().await, Outcome::Completed(5));
         other.join().unwrap().unwrap();
     });
 }
@@ -331,16 +332,16 @@ fn a_destructor_that_enters_the_owner_again_does_not_deadlock() {
         // The future drops after its output, in the poll of its task.
         let victim = spawn_local(pending::<()>()).unwrap();
         let task = spawn_local(reenters(true, Some(victim.cancel_handle()))).unwrap();
-        assert!(matches!(task.join().await, Outcome::Completed(())));
-        assert!(matches!(victim.join().await, Outcome::Cancelled));
+        assert_matches!(task.join().await, Outcome::Completed(()));
+        assert_matches!(victim.join().await, Outcome::Cancelled);
 
         // The future drops at its cancel, at the start of its next poll.
         let victim = spawn_local(pending::<()>()).unwrap();
         let task = spawn_local(reenters(false, Some(victim.cancel_handle()))).unwrap();
         yield_once().await;
         task.cancel_handle().cancel();
-        assert!(matches!(task.join().await, Outcome::Cancelled));
-        assert!(matches!(victim.join().await, Outcome::Cancelled));
+        assert_matches!(task.join().await, Outcome::Cancelled);
+        assert_matches!(victim.join().await, Outcome::Cancelled);
 
         // The future drops at the cancel at the end of `block_on`.
         drop(spawn_local(reenters(false, None)).unwrap());
@@ -395,9 +396,9 @@ fn a_panic_in_the_drop_of_one_task_does_not_skip_the_others() {
         tasks
     });
     let [first, panicked, last] = tasks.map(JoinHandle::join_blocking);
-    assert!(matches!(first, Outcome::Cancelled));
-    assert!(matches!(panicked, Outcome::Panicked(_)));
-    assert!(matches!(last, Outcome::Cancelled));
+    assert_matches!(first, Outcome::Cancelled);
+    assert_matches!(panicked, Outcome::Panicked(_));
+    assert_matches!(last, Outcome::Cancelled);
     drop(panicked);
     assert_eq!(budget.available(), free);
 
@@ -416,7 +417,7 @@ fn a_panic_in_the_drop_of_one_task_does_not_skip_the_others() {
     }));
     assert!(failed.is_err());
     for task in kept.take() {
-        assert!(matches!(task.join_blocking(), Outcome::OwnerFailed(OwnerFailure)));
+        assert_matches!(task.join_blocking(), Outcome::OwnerFailed(OwnerFailure));
     }
     assert_eq!(budget.available(), free);
 }
@@ -427,7 +428,7 @@ fn the_debug_of_a_panic_holds_no_payload() {
     let mut owner = LocalOwner::new(&budget, 1).unwrap();
     let outcome = owner.block_on(async { spawn_local(async { panic!("secret 7f3a") }).unwrap().join().await });
     let debug = format!("{outcome:?}");
-    assert!(matches!(outcome, Outcome::Panicked(_)));
+    assert_matches!(outcome, Outcome::Panicked(_));
     assert!(!debug.contains("7f3a"), "{debug}");
 }
 
@@ -455,16 +456,16 @@ fn a_task_that_loops_on_ready_channel_operations_yields_at_its_budget() {
                             break;
                         }
                         sender.send(round).await.unwrap();
-                        completed.set(completed.get() + 1);
+                        completed.update(|completed| completed + 1);
                         assert_eq!(receiver.recv().await, Ok(round));
-                        completed.set(completed.get() + 1);
+                        completed.update(|completed| completed + 1);
                     }
                 }
             })
             .unwrap();
             let second = spawn_local(async move { seen.set(Some(completed.get())) }).unwrap();
-            assert!(matches!(looper.join().await, Outcome::Completed(())));
-            assert!(matches!(second.join().await, Outcome::Completed(())));
+            assert_matches!(looper.join().await, Outcome::Completed(()));
+            assert_matches!(second.join().await, Outcome::Completed(()));
         }
     });
     assert_eq!(seen.get(), Some(BUDGET));
@@ -526,7 +527,7 @@ struct Record {
 }
 
 impl super::owner::Park for Record {
-    type Error = core::convert::Infallible;
+    type Error = !;
 
     fn drive(&mut self, _local: &super::owner::Local) -> Result<bool, Self::Error> {
         Ok(false)
@@ -609,7 +610,7 @@ fn a_cancelled_timer_frees_its_place_and_wakes_nothing() {
         let task = spawn_local({
             let polls = Rc::clone(&polls);
             poll_fn(move |cx| {
-                polls.set(polls.get() + 1);
+                polls.update(|polls| polls + 1);
                 if polls.get() == 1 {
                     let mut timer = super::timer(soon(2)).unwrap();
                     assert!(Pin::new(&mut timer).poll(cx).is_pending());
@@ -624,6 +625,6 @@ fn a_cancelled_timer_frees_its_place_and_wakes_nothing() {
         super::timer(soon(6)).unwrap().await.unwrap();
         assert_eq!(polls.get(), 1);
         task.cancel_handle().cancel();
-        assert!(matches!(task.join().await, Outcome::Cancelled));
+        assert_matches!(task.join().await, Outcome::Cancelled);
     });
 }

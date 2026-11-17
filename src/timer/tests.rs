@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::assert_matches;
 use core::future::Future;
 use core::num::{NonZeroU32, NonZeroU64};
 use core::pin::Pin;
@@ -316,8 +317,8 @@ fn the_storage_charges_its_memory_until_its_last_timer_drops() {
     drop(timer);
     assert_eq!(budget.available(), bound);
     let small = Budget::new(NonZeroU64::new(memory - 1).unwrap());
-    assert!(matches!(
+    assert_matches!(
         Timers::new(capacity, Duration::from_nanos(MS), at(0), &small),
         Err(Invalid::Exhausted(_))
-    ));
+    );
 }

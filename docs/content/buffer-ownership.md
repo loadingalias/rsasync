@@ -215,7 +215,7 @@ The call is unsafe. The library makes sure of these conditions:
 This example puts one page, aligned to the page, in a backing that can receive 1000 bytes:
 
 ```rust
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::{Allocator, Global, Layout, handle_alloc_error};
 use std::ptr::{self, NonNull};
 
 use rsasync::buffer::{Backing, Buffer, BufferMut, Release};
@@ -231,17 +231,16 @@ const PAGE: Layout = Layout::new::<Page>();
 ///
 /// `ptr` is from `page`, and nothing uses it after this call.
 unsafe fn free_page(_: *const (), ptr: NonNull<u8>, _: usize) {
-    // SAFETY: `page` allocated `ptr` with `PAGE`.
-    unsafe { dealloc(ptr.as_ptr(), PAGE) };
+    // SAFETY: `page` allocated `ptr` from `Global` with `PAGE`.
+    unsafe { Global.deallocate(ptr, PAGE) };
 }
 
 /// A backing of 1000 writable bytes in one page.
 fn page() -> Backing {
-    // SAFETY: the size of `PAGE` is not zero.
-    let Some(ptr) = NonNull::new(unsafe { alloc(PAGE) }) else { handle_alloc_error(PAGE) };
+    let Ok(page) = Global.allocate(PAGE) else { handle_alloc_error(PAGE) };
     // SAFETY: the page is valid for reads and writes of 4096 bytes. Only the backing uses
     // it, and `free_page` frees it on any thread.
-    unsafe { Backing::from_raw_parts(ptr, 1000, 0, PAGE.size(), Release::new(ptr::null(), free_page)) }
+    unsafe { Backing::from_raw_parts(page.cast(), 1000, 0, PAGE.size(), Release::new(ptr::null(), free_page)) }
 }
 
 let buf = page();

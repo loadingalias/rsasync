@@ -22,7 +22,7 @@ std::thread_local! {
 // SAFETY: each method gives its call to `System` with the same arguments, and only counts it.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.with(|count| count.set(count.get() + 1));
+        ALLOCATIONS.with(|count| count.update(|count| count + 1));
         // SAFETY: the caller gives a layout that `GlobalAlloc::alloc` accepts.
         unsafe { System.alloc(layout) }
     }

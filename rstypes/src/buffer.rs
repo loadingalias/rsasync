@@ -43,7 +43,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
-use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::slice::SliceIndex;
 
@@ -361,7 +360,7 @@ unsafe fn release_vec(_: *const (), ptr: NonNull<u8>, capacity: usize) {
     // SAFETY: the caller gives the pointer and the capacity of a `Vec<u8>` that nothing dropped.
     // The `Vec` documentation says that its reported capacity "can even be used to manually free
     // the memory allocated by a `Vec`". A length of zero drops no element.
-    drop(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, capacity) });
+    drop(unsafe { Vec::from_parts(ptr, 0, capacity) });
 }
 
 impl From<Vec<u8>> for Backing {
@@ -370,23 +369,12 @@ impl From<Vec<u8>> for Backing {
         reason = "the backing takes the heap block of a Vec that it does not drop"
     )]
     fn from(vec: Vec<u8>) -> Self {
-        let mut vec = ManuallyDrop::new(vec);
-        // SAFETY: `Vec::as_mut_ptr` is never null. Without an allocation it gives a dangling
-        // pointer, which is not null.
-        let ptr = unsafe { NonNull::new_unchecked(vec.as_mut_ptr()) };
-        // SAFETY: the `Vec` owns `capacity` bytes at `ptr`, and the first `len` of them are
-        // initialized (the `Vec` documentation, "Guarantees"). `ManuallyDrop` keeps the `Vec` from
-        // freeing them, so only the backing uses them. `release_vec` frees them with the pointer
-        // and the capacity of that `Vec`, and the global allocator allows this on any thread.
-        unsafe {
-            Self::from_raw_parts(
-                ptr,
-                vec.capacity(),
-                vec.len(),
-                vec.capacity(),
-                Release::new(ptr::null(), release_vec),
-            )
-        }
+        let (ptr, len, capacity) = vec.into_parts();
+        // SAFETY: the `Vec` owned `capacity` bytes at `ptr`, and the first `len` of them are
+        // initialized (the `Vec` documentation, "Guarantees"). `into_parts` gave them up, so only
+        // the backing uses them. `release_vec` frees them with the pointer and the capacity of that
+        // `Vec`, and the global allocator allows this on any thread.
+        unsafe { Self::from_raw_parts(ptr, capacity, len, capacity, Release::new(ptr::null(), release_vec)) }
     }
 }
 

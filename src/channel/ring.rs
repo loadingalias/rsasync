@@ -179,7 +179,7 @@ impl Places {
             // Ordering: `Relaxed`: the exchange below checks the value.
             let mut bits = word.load(Ordering::Relaxed);
             while bits != u32::MAX {
-                let bit = !bits & bits.wrapping_add(1);
+                let bit = (!bits).isolate_lowest_one();
                 // Ordering: `Acquire` reads the release of the last endpoint of the place, so its
                 // use of the waiter happens before the use of the new endpoint.
                 match word.compare_exchange_weak(bits, bits | bit, Ordering::Acquire, Ordering::Relaxed) {

@@ -16,6 +16,8 @@ use core::task::{Context, Poll};
 
 #[cfg(feature = "local")]
 use core::cell::Cell;
+#[cfg(feature = "local")]
+use core::mem::DropGuard;
 
 #[cfg(feature = "local")]
 use crate::sync::thread_local;
@@ -45,7 +47,7 @@ pub(crate) fn poll<T>(cx: &mut Context<'_>, poll: impl FnOnce(&mut Context<'_>) 
     let polled = poll(cx);
     #[cfg(feature = "local")]
     if polled.is_ready() {
-        LEFT.with(|left| left.set(left.get().map(|units| units.saturating_sub(1))));
+        LEFT.with(|left| left.update(|left| left.map(|units| units.saturating_sub(1))));
     }
     polled
 }
@@ -54,15 +56,7 @@ pub(crate) fn poll<T>(cx: &mut Context<'_>, poll: impl FnOnce(&mut Context<'_>) 
 /// before it, also when `f` panics.
 #[cfg(feature = "local")]
 pub(crate) fn with_budget<R>(units: u32, f: impl FnOnce() -> R) -> R {
-    /// Restores the budget before the call at its drop.
-    struct Restore(Option<u32>);
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LEFT.with(|left| left.set(self.0));
-        }
-    }
-
-    let _restore = Restore(LEFT.with(|left| left.replace(Some(units))));
+    let before = LEFT.with(|left| left.replace(Some(units)));
+    let _restore = DropGuard::new(before, |before| LEFT.with(|left| left.set(before)));
     f()
 }

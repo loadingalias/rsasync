@@ -7,6 +7,7 @@
 //! In each model, the owner runs in a spawned thread, and the main thread only joins: see the loom
 //! join note in `src/wait/explore.rs`.
 
+use core::assert_matches;
 use core::cell::Cell;
 use core::future::{pending, poll_fn};
 use core::num::NonZeroU64;
@@ -115,10 +116,10 @@ fn a_stale_wake_from_another_thread_does_not_poll_a_reused_slot() {
                     Poll::Ready(())
                 }))
                 .unwrap();
-                assert!(matches!(first.join().await, Outcome::Completed(())));
+                assert_matches!(first.join().await, Outcome::Completed(()));
                 // The second task takes the one slot, with the next generation.
                 let _second = spawn_local(async move {
-                    count.set(count.get() + 1);
+                    count.update(|count| count + 1);
                     pending::<()>().await;
                 })
                 .unwrap();

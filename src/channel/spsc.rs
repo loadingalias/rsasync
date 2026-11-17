@@ -592,7 +592,7 @@ impl<T> Reservation<'_, T> {
     /// send fails: the channel drops the written values and gives [`Aborted`].
     pub fn publish(self) -> Result<(), Aborted> {
         let mut this = ManuallyDrop::new(self);
-        if this.settle(true) { Ok(()) } else { Err(Aborted) }
+        this.settle(true).ok_or(Aborted)
     }
 
     /// Ends the reservation: publishes the written values if `publish` is true, and otherwise

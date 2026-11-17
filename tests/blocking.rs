@@ -2,6 +2,7 @@
 //! outside the crate. The waits use no scheduler, as in driver-only use.
 #![cfg(feature = "std")]
 
+use core::assert_matches;
 use core::future::Future;
 use core::num::NonZeroU64;
 use core::pin::pin;
@@ -77,7 +78,7 @@ fn each_refusal_returns_the_job_with_its_reason() {
 
     let rest = budget.reserve(budget.available()).unwrap();
     let Refused { reason, job } = submitter.submit(Lookup("budget.example".into())).unwrap_err();
-    assert!(matches!(reason, Reason::Budget(_)));
+    assert_matches!(reason, Reason::Budget(_));
     assert_eq!(job.0, "budget.example");
     drop(rest);
 

@@ -1,3 +1,4 @@
+use core::assert_matches;
 use core::future::Future;
 use core::num::{NonZeroU32, NonZeroU64};
 use core::pin::pin;
@@ -109,7 +110,7 @@ fn a_wait_for_zero_units_ends_at_once_and_a_wait_above_the_bound_is_refused() {
     assert!(wait.as_mut().poll(&mut cx).is_pending());
     // A waiter is first, and no unit is free. A wait for zero units does not wait behind it.
     let zero = pin!(second.acquire(0).unwrap()).poll(&mut cx);
-    assert!(matches!(zero, Poll::Ready(permit) if permit.amount() == 0));
+    assert_matches!(zero, Poll::Ready(permit) if permit.amount() == 0);
     assert_eq!(
         second.acquire(11).unwrap_err(),
         AboveBound {

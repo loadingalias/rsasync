@@ -1,3 +1,4 @@
+use core::assert_matches;
 use std::thread;
 use std::vec::Vec;
 
@@ -104,10 +105,7 @@ fn the_probe_reads_the_opcode_table_and_leaves_the_ring_empty() {
 #[test]
 fn an_invalid_ring_is_a_failure_and_not_a_refusal() {
     let result = Ring::new(0, 0);
-    assert!(
-        matches!(&result, Err(SetupError::Failed(error)) if error.raw_os_error() == Some(EINVAL)),
-        "{result:?}"
-    );
+    assert_matches!(&result, Err(SetupError::Failed(error)) if error.raw_os_error() == Some(EINVAL));
 }
 
 /// With `kernel.io_uring_disabled` set to 2 (Linux 6.6), creation is the typed refusal that
@@ -118,8 +116,5 @@ fn a_disabled_kernel_refuses_creation() {
     let setting = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled").unwrap();
     assert_eq!(setting.trim(), "2", "run this test with kernel.io_uring_disabled=2");
     let result = Ring::new(ENTRIES, 2 * ENTRIES);
-    assert!(
-        matches!(&result, Err(SetupError::Refused(error)) if error.raw_os_error() == Some(sys::EPERM)),
-        "{result:?}"
-    );
+    assert_matches!(&result, Err(SetupError::Refused(error)) if error.raw_os_error() == Some(sys::EPERM));
 }

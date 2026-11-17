@@ -657,7 +657,7 @@ impl<T> Reservation<'_, T> {
     /// written. The publication can come after [`Receiver::close`]. If the receivers aborted the
     /// channel, the send fails: the channel drops the written values and gives [`Aborted`].
     pub fn publish(mut self) -> Result<(), Aborted> {
-        if self.settle(true) { Ok(()) } else { Err(Aborted) }
+        self.settle(true).ok_or(Aborted)
     }
 
     /// Ends each slot that is not ended yet: publishes the written values if `publish` is true,

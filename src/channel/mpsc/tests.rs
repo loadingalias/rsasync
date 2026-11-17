@@ -1,3 +1,4 @@
+use core::assert_matches;
 use core::sync::atomic::Ordering;
 use core::task::{Poll, Waker};
 
@@ -22,10 +23,7 @@ fn construction_refuses_with_a_typed_reason_and_keeps_no_charge() {
         Refused::TooLarge
     );
     // 2^17 slots of 16 bytes need more than the 2^20 units of the budget.
-    assert!(matches!(
-        channel::<u64>(&budget, 1 << 17, 1).unwrap_err(),
-        Refused::Budget(_)
-    ));
+    assert_matches!(channel::<u64>(&budget, 1 << 17, 1).unwrap_err(), Refused::Budget(_));
     assert_eq!(budget.available(), BOUND);
 }
 
@@ -221,10 +219,7 @@ fn an_abort_drops_the_values_and_a_later_publication_fails_and_drops_its_values_
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     assert_eq!(reservation.publish(), Err(Aborted));
     assert_eq!(drops.load(Ordering::Relaxed), 3);
-    assert!(matches!(
-        second.try_send(make(4)),
-        Err(TrySendError::Closed(Counted(4, _)))
-    ));
+    assert_matches!(second.try_send(make(4)), Err(TrySendError::Closed(Counted(4, _))));
     drop((first, second));
     assert_eq!(drops.load(Ordering::Relaxed), 4);
 }

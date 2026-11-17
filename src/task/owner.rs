@@ -12,7 +12,6 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::cell::{Cell, RefCell};
-use core::convert::Infallible;
 use core::future::Future;
 use core::panic::AssertUnwindSafe;
 use core::pin::{Pin, pin};
@@ -171,13 +170,13 @@ impl Until {
 pub(super) struct Thread;
 
 impl Park for Thread {
-    type Error = Infallible;
+    type Error = !;
 
-    fn drive(&mut self, _local: &Local) -> Result<bool, Infallible> {
+    fn drive(&mut self, _local: &Local) -> Result<bool, Self::Error> {
         Ok(false)
     }
 
-    fn park(&mut self, _local: &Local, until: Option<Until>) -> Result<(), Infallible> {
+    fn park(&mut self, _local: &Local, until: Option<Until>) -> Result<(), Self::Error> {
         match until {
             // The verification form has no timed park, and its models make no timer.
             #[cfg(not(all(test, loom)))]
@@ -325,7 +324,7 @@ impl Local {
         });
         self.shared.start(slot);
         self.entries[slot as usize].set(Some(Entry { task, waker }));
-        self.live.set(self.live.get() + 1);
+        self.live.update(|live| live + 1);
         self.queue.borrow_mut().push_back(slot);
         Ok(JoinHandle {
             receiver,
@@ -375,7 +374,7 @@ impl Local {
         self.shared.end(slot);
         drop(entry);
         self.free.borrow_mut().push(slot);
-        self.live.set(self.live.get() - 1);
+        self.live.update(|live| live - 1);
         self.waiting.wake_first();
     }
 
@@ -453,7 +452,7 @@ impl Local {
                 // A panic of the drop of one future does not stop the drop of the others.
                 discard(entry);
                 self.free.borrow_mut().push(slot);
-                self.live.set(self.live.get() - 1);
+                self.live.update(|live| live - 1);
             }
         }
         self.closed.set(false);

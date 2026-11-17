@@ -1,4 +1,5 @@
 use alloc::task::Wake;
+use core::assert_matches;
 use core::task::{Context, Poll, Waker};
 
 use super::{Entry, Gone};
@@ -69,6 +70,6 @@ fn a_driver_that_ends_wakes_its_consumer_and_one_of_the_two_takes_the_resources(
         entry.publish(id, 5);
         entry.close();
         let taken = consumer.join().expect("the consumer ends");
-        assert!(matches!(taken, Ok((5, 7)) | Err(Gone)), "{taken:?}");
+        assert_matches!(taken, Ok((5, 7)) | Err(Gone));
     });
 }

@@ -1,5 +1,6 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::assert_matches;
 use core::cell::RefCell;
 use core::num::NonZeroU64;
 
@@ -170,7 +171,7 @@ fn each_cancel_result_waits_for_the_completion_of_its_target() {
             // A dropped receive ends its interest and asks for a cancel.
             table.requests().post(id, Request::EndInterest);
             table.requests().post(id, Request::Cancel);
-            assert!(matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id));
+            assert_matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id);
             let cancel_result = Event {
                 result,
                 more: false,
@@ -243,13 +244,13 @@ fn each_shape_releases_its_resources_once_at_its_terminal_event() {
     let id = begin(&mut table, Shape::ZeroCopy);
     apply(table.complete(id.user_data(), more(64)), &log);
     apply(table.complete(id.user_data(), NOTICE), &log);
-    assert!(matches!(
+    assert_matches!(
         table.claim(id),
         Some(Ended {
             result: 64,
             resources: None
         })
-    ));
+    );
     let id = begin(&mut table, Shape::ZeroCopy);
     assert!(table.end_interest(id).is_none());
     apply(table.complete(id.user_data(), more(-1)), &log);
@@ -262,13 +263,13 @@ fn each_shape_releases_its_resources_once_at_its_terminal_event() {
     // A zero-copy result without `more` is terminal: no notice follows.
     let id = begin(&mut table, Shape::ZeroCopy);
     apply(table.complete(id.user_data(), done(-22)), &log);
-    assert!(matches!(
+    assert_matches!(
         table.claim(id),
         Some(Ended {
             result: -22,
             resources: Some(_)
         })
-    ));
+    );
 
     // A single completion with `more` has no row; the real completion still ends it.
     let id = begin(&mut table, Shape::Single);
@@ -301,6 +302,7 @@ fn a_dropped_table_leaks_the_resources_that_the_kernel_can_still_use() {
 pub(crate) mod allocations {
     use alloc::vec::Vec;
     use core::alloc::{GlobalAlloc, Layout};
+    use core::assert_matches;
     use core::cell::Cell;
     use std::alloc::System;
     use std::thread;
@@ -366,7 +368,7 @@ pub(crate) mod allocations {
         .join()
         .unwrap();
         assert_eq!((counted, allocations), (1, 0));
-        assert!(matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id));
+        assert_matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id);
         assert!(table.claim(id).is_none(), "the end of interest applied");
         apply(table.complete(id.user_data(), done(0)), &log);
         assert_eq!(log.take(), ["abandoned", "released"]);
