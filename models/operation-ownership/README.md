@@ -211,20 +211,26 @@ is the check that no reduction hid a failure.
     is `Begin` and then `Drop`. A start during the grace period is a start before `Shutdown`, by
     reduction 4. The reduction hides the order of several waiting operations, because the model
     has one operation for each direction. `two_dropped_sends_and_a_third_send_run_in_start_order`
-    (`src/driver/tests.rs:1002`) checks that order. On Windows,
+    (`src/driver/tests.rs:1070`) checks that order. On Windows,
     `an_explicit_cancel_of_a_send_gives_its_progress_and_keeps_the_direction_usable`
-    (`src/driver/tests.rs:1039`) cancels a send that waits in the driver.
-    `close_ends_a_waiting_send_unsent_and_releases_its_lease_once` and
+    (`src/driver/tests.rs:1164`) cancels a send that waits in the driver. The reduction also hides
+    a waiting operation that never starts, because the model has no step for it. Its end can
+    change a report: a waiting send that close ends takes the abandoned rule (`close_resource`
+    ends it with `ECANCELED` after its interest ended), so the write direction owes a count, and
+    the close reports one. `close_ends_a_waiting_send_unsent_and_releases_its_lease_once` and
     `teardown_ends_a_waiting_send_unsent_and_releases_its_lease_once` (`src/driver/tests.rs`)
-    check the premise at close and at teardown: the waiting send never runs, and its lease
-    returns once.
+    check that end at close and at teardown: the waiting send never runs, its lease returns once,
+    and the close reports a count of 0.
 14. A reset from the peer is part of the receive result that reports it. Before that result, no
     step reads the reset: a send result is a free choice in each case, and only the driver's
     `Reset` makes a zero-copy notice come from the kernel. A reset from the peer also purges the
     send queue, so the model leaves out notices that it makes certain; this removes no behavior.
     After the reported error, no bytes come. An IOCP abort is not a peer event: the send result
-    that reports it sets `ks = "fail"`, so a receive in flight then gets the error. Known-bad:
-    `DropRxError_bad`.
+    that reports it sets `ks = "fail"`, so a receive in flight then gets the error. The design
+    says that each later receive on the stream also ends with an error. The model gives the error
+    to one receive and then the end of the stream. No property reads a result after the first
+    error that the caller gets: `NoFalseEnd` reads only `ce`, the first result with no bytes. So
+    the reduction hides no checked behavior. Known-bad: `DropRxError_bad`.
 
 ## Correspondence
 
@@ -250,7 +256,7 @@ which R520 and R521 extend for their backends. R603 adds its transitions when it
 | `Complete` | Terminal-event table: one event at the home. Single completion; multishot item with `IORING_CQE_F_MORE` and its final completion; IOCP packet. A zero-copy send result ends the send and frees its direction (selected on 2026-11-08); with `IORING_CQE_F_MORE`, its backing joins the pending notices. With no waiting future, the abandoned rule applies | The kernel posts the event and the home harvests it in one step | `Table::complete` with the `Event` of the backend (`Cqe::event`): `Outcome::Item`, `Ready`, or `Abandoned`. A zero-copy result with `more` keeps the resources for the notice | `Driver::turn` gives up to its bound of completions to `Table::complete`, then publishes each result (`Entry::publish`) or drops the resources of an abandoned operation (`Entry::reclaim`) | `tcp::abandon` at an abandoned terminal event: kept bytes (`Kept::Bytes`) or a kept receive error (`Kept::Error`; a cancel and a result of 0 bytes keep nothing), a kept connection, or a failed write direction: `Sent::Owe` with the count of the bytes that went, or, after an IOCP abort, `Sent::Lost` with no count | `harvest` gives the completion of an exit operation to `Children::exited` before `Table::complete`: the reap and the status, with one nonblocking `waitid` after a poll. A poll with no status yet is pushed again and is no event of the table. An exit before the start is an immediate completion |
 | `Process` | Driver Topology: the request travels to the home through its entry, and close cancels each operation by its own `user_data`. Future and Wake Contract: the generation check rejects a stale identity. Completion I/O: a cancel result is not a terminal event; "done" and "already running" make the target's own event certain; "not found" changes nothing | One step at the home | `Table::take_requests`: the generation check, then `Taken::Cancel` for a running target. The backend cancels it by its own user data (`Sqe::cancel` with `OpId::cancel_user_data`), and the result is `Outcome::CancelResult`, which changes nothing | `Driver::turn` takes the requests first in each turn | `Driver::cancel`: one kernel cancel for each operation, by its own user data, once | — |
 | `TakeOver` | Driver Topology: close takes each result that a dropped future left, by the abandoned rule | One step | R206 | — | `close_resource`: `Table::end_interest` on each operation of the resource, then `claimed` for one that ended, and `Driver::cancel` for one that runs | — |
-| `CloseDone` | Driver Topology: close waits for the terminal event of each operation, releases the data that no receive took, reports each owed and each cancelled send's progress, and closes each connection that no accept took. It does not wait for the pending notices: it half-closes, returns, and turns every pending notice of the stream into detached debt | One step after the last terminal event | R206 | — | `close_if_idle`: when no operation of the resource runs, it reports `Closed::sent` if the direction owes the count (`None` after an IOCP abort), releases the kept bytes and connections and the descriptor (`Resources::release`), and completes the close | — |
+| `CloseDone` | Driver Topology: close waits for the terminal event of each operation, releases the data that no receive took, reports each owed and each cancelled send's progress, and closes each connection that no accept took. It does not wait for the pending notices: it half-closes, returns, and turns every pending notice of the stream into detached debt | One step after the last terminal event | R206 | — | `close_if_idle`: when no operation of the resource runs, it reports `Closed::sent`, the count that the direction owes (`SendCount::Unknown` after an IOCP abort), releases the kept bytes and connections and the descriptor (`Resources::release`), and completes the close | — |
 | `Reset` | Driver Topology: `connect` with `AF_UNSPEC` at the drain limit, under budget pressure, or at grace expiry | One step: the purge of the send queue, for every pending notice of the connection | R603 | — | — | — |
 | `Notice(g)` | Terminal-event table: the zero-copy notice of send `g` releases its own buffer and charge, once. After the last notice of detached debt, the descriptor closes | The kernel posts the notice and the home of `g` harvests it in one step | `Table::complete` with `notice`: `Outcome::Released` | — | — | — |
 | `Shutdown` | Startup, Shutdown, and Failures: shutdown closes ingress, and grace expiry escalates | The request and grace expiry are one step | — | — | — | — |
@@ -271,7 +277,7 @@ entry ends it at once, which is `Process` and then `Complete`.
 | `Submit` | `Port::call` runs one overlapped call, and `terminal` classifies its return by the NT status: pending; an error, or a status that is still `STATUS_PENDING` (no packet); success or a warning, with skip-on-success (no packet) or without it (a packet) | `Poller::run`: one nonblocking call when the direction is ready. `EAGAIN` waits in the list of the direction until the next edge |
 | `Complete` | `Port::poll` takes each packet, reads its NT status, and gives the result to `Port::ended`. After a cancel, the packet of a send with an error status and 0 bytes gives `WSAECONNABORTED`: the abort | The return of the nonblocking call is the terminal event (`Poller::post`) |
 | `Process` | `Port::cancel`: `CancelIoEx` with the `OVERLAPPED` of the target, which ends at its own packet | `Poller::cancel` takes the waiting entry out of its list and posts `ECANCELED` at once |
-| The abort (`CompleteTx` with `abort`) | `tcp::abandon` sets `Sent::Lost` for an abort that no future took. `WriteFailed::sent` and `Closed::sent` then give `None` | — |
+| The abort (`CompleteTx` with `abort`) | `tcp::abandon` sets `Sent::Lost` for an abort that no future took. `WriteFailed::sent` and `Closed::sent` then give `SendCount::Unknown` | — |
 
 ## Properties
 

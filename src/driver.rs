@@ -136,7 +136,9 @@ pub use pipe::{PipeReader, PipeWriter};
 pub use process::{Child, ChildOptions, End, SignalChildError, Wait};
 #[cfg(target_os = "linux")]
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
-pub use tcp::{Closed, ReadHalf, Regions, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf};
+pub use tcp::{
+    Closed, ReadHalf, Regions, SendCount, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf,
+};
 pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
 
 use crate::completion::Entry;

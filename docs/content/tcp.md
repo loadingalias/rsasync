@@ -146,9 +146,15 @@ copy.
 
 After a dropped send fails or sends only part of its bytes, you no longer know the framing of your
 stream. The next send does not submit. It gives an `io::Error` whose payload is `WriteFailed`, with
-`WriteFailed::sent()`: the bytes that the dropped sends sent, from the first byte of the first send
-whose result no future took. Each later send gives `WriteFailed` with `sent()` of `None`. Close the
-stream.
+`WriteFailed::sent()`: a `SendCount`, the count of the bytes that the dropped sends sent, from the
+first byte of the first send whose result no future took. Each later send gives `WriteFailed` with
+`SendCount::Settled`. Close the stream.
+
+| `SendCount` | Meaning for you |
+| --- | --- |
+| `Settled` | No count is owed: each dropped send sent all its bytes, or an earlier result gave the count |
+| `Sent(n)` | The dropped sends sent `n` bytes, and the peer can have read them |
+| `Unknown` | The kernel gave no count, so you cannot know which bytes reached the peer. Only on [IOCP](iocp.md), after a cancel of a send that ran aborted the connection |
 
 A next send that succeeds shows that each earlier dropped send sent all its bytes.
 
@@ -162,7 +168,7 @@ let (result, _lease) = run(&mut driver, next)??;
 match result {
     Ok(_) => {} // Each earlier dropped send sent all its bytes.
     Err(error) => match WriteFailed::of(&error) {
-        // `failed.sent()` bytes of the dropped sends went to the peer. Close the stream.
+        // `failed.sent()` gives the count of the bytes of the dropped sends. Close the stream.
         Some(failed) => eprintln!("{failed}"),
         None => return Err(error.into()),
     },
@@ -182,10 +188,10 @@ match result {
    while the peer neither reads nor sends.
 3. Releases the bytes that no receive took, and closes the socket.
 
-Its future gives `Closed`. `Closed::sent()` gives the bytes that the dropped sends sent, from the
-first byte of the first send whose result no future took, when a send that the close cancelled, or
-a failed send, owes that count. It gives `None` when no send owes it, also when a send already gave
-the count with `WriteFailed`.
+Its future gives `Closed`. `Closed::sent()` gives the `SendCount` of the dropped sends:
+`SendCount::Sent(n)` when a send that the close cancelled, or a failed send, owes that count, and
+`SendCount::Unknown` when the close aborted a send on IOCP. It gives `SendCount::Settled` when no
+send owes a count, also when a send already gave the count with `WriteFailed`.
 
 `Driver::close_listener` cancels the accept that runs, waits until it ends, closes each connection
 that no accept took, and closes the socket.

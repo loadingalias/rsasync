@@ -103,7 +103,8 @@ impl TcpListener {
 ///   of an abandoned receive also stays, and the next receive gives it.
 /// - A send is not cancelled. If a dropped send fails, sends only part of its bytes, or was
 ///   cancelled, the write direction fails: the next send gives an error with [`WriteFailed`] and
-///   the count of the bytes that went, and each later send gives [`WriteFailed`] with no count. A
+///   the count of the bytes that went, and each later send gives [`WriteFailed`] with
+///   [`SendCount::Settled`]. A
 ///   dropped send that sends all its bytes reports nothing, so a next send that succeeds shows
 ///   that each earlier dropped send sent all its bytes.
 /// - [`Operation::cancel`] keeps the interest: the future gives the original buffer with its exact
@@ -369,7 +370,7 @@ impl TcpOptions {
 /// match result {
 ///     Ok(_) => {} // Each earlier dropped send sent all its bytes.
 ///     Err(error) => match WriteFailed::of(&error) {
-///         // `failed.sent()` bytes of the dropped sends went to the peer. Close the stream.
+///         // `failed.sent()` gives the count of the bytes of the dropped sends. Close the stream.
 ///         Some(failed) => eprintln!("{failed}"),
 ///         None => return Err(error.into()),
 ///     },
@@ -582,16 +583,15 @@ impl From<Vec<Lease>> for Regions {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteFailed {
-    sent: Option<usize>,
+    sent: SendCount,
 }
 
 impl WriteFailed {
-    /// The bytes that the dropped sends sent, from the first byte of the first send whose result
-    /// no future took. The first send after the failure gives the count, and each later send gives
-    /// `None`. On Windows, each send gives `None` after a cancel of a send that ran: the cancel
-    /// aborts the connection, and the kernel gives no count.
+    /// The count of the bytes that the dropped sends sent. The first send after the failure gives
+    /// [`SendCount::Sent`], or [`SendCount::Unknown`] after an abort on Windows, and each later
+    /// send gives [`SendCount::Settled`].
     #[must_use]
-    pub const fn sent(self) -> Option<usize> {
+    pub const fn sent(self) -> SendCount {
         self.sent
     }
 
@@ -605,11 +605,14 @@ impl WriteFailed {
 impl fmt::Display for WriteFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.sent {
-            Some(sent) => write!(
+            SendCount::Sent(sent) => write!(
                 f,
                 "the write direction failed after a dropped send, which sent {sent} bytes"
             ),
-            None => f.write_str("the write direction failed after a dropped send"),
+            SendCount::Unknown => f.write_str(
+                "the write direction failed after a dropped send, and the kernel gave no count of its bytes",
+            ),
+            SendCount::Settled => f.write_str("the write direction failed after a dropped send"),
         }
     }
 }
@@ -619,19 +622,32 @@ impl core::error::Error for WriteFailed {}
 /// What a close did, after each operation of its socket ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Closed {
-    sent: Option<usize>,
+    sent: SendCount,
 }
 
 impl Closed {
-    /// The bytes that the dropped sends sent, from the first byte of the first send whose result
-    /// no future took, when a send that the close cancelled, or a failed send, owes that count.
-    /// `None` when no send owes it, also when a send already gave it with [`WriteFailed`]. On
-    /// Windows, also `None` when the close cancelled a send that ran: the cancel aborts the
-    /// connection, and the kernel gives no count.
+    /// The count of the bytes that the dropped sends sent, when a send that the close cancelled,
+    /// or a failed send, owes it: [`SendCount::Sent`], or [`SendCount::Unknown`] when the close
+    /// aborted a send on Windows. [`SendCount::Settled`] when no send owes it, also when a send
+    /// already gave it with [`WriteFailed`].
     #[must_use]
-    pub const fn sent(self) -> Option<usize> {
+    pub const fn sent(self) -> SendCount {
         self.sent
     }
+}
+
+/// The count of the bytes that the dropped sends of a stream sent, which [`WriteFailed::sent`] and
+/// [`Closed::sent`] give one time, from the first byte of the first send whose result no future
+/// took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendCount {
+    /// No count is owed: each dropped send sent all its bytes, or an earlier result gave the count.
+    Settled,
+    /// The dropped sends sent this many bytes, and the peer can have read them.
+    Sent(usize),
+    /// The kernel gave no count, so you cannot know which bytes reached the peer: this occurs only
+    /// on IOCP, after a cancel of a send that ran aborted the connection.
+    Unknown,
 }
 
 /// One direction of a stream, or the accepts of a listener: the operation that runs or ran last,
@@ -695,6 +711,16 @@ pub(super) struct Directions {
 }
 
 impl Directions {
+    /// The count that the write direction owes.
+    const fn count(&self) -> SendCount {
+        match self.sent {
+            Sent::Ok | Sent::Reported => SendCount::Settled,
+            Sent::Owe => SendCount::Sent(self.unreported),
+            #[cfg(target_os = "windows")]
+            Sent::Lost => SendCount::Unknown,
+        }
+    }
+
     /// The direction of an operation of `kind`.
     fn direction(&mut self, kind: Kind) -> Option<&mut Direction> {
         match kind {
@@ -800,9 +826,14 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
         Kind::Send | Kind::Vectored | Kind::Shutdown => {
             if let Some(failed) = held.failed {
                 // The future did not take the failure: the next send gives it.
-                if let Some(sent) = failed.sent {
-                    directions.unreported = directions.unreported.saturating_add(sent);
-                    directions.sent = Sent::Owe;
+                match failed.sent {
+                    SendCount::Sent(sent) => {
+                        directions.unreported = directions.unreported.saturating_add(sent);
+                        directions.sent = Sent::Owe;
+                    }
+                    #[cfg(target_os = "windows")]
+                    SendCount::Unknown => directions.sent = Sent::Lost,
+                    _ => {}
                 }
                 return;
             }
@@ -1682,9 +1713,9 @@ impl Driver {
                     Sent::Owe if !self.table.interest(id) => Some(-ECANCELED),
                     #[cfg(target_os = "windows")]
                     Sent::Lost if !self.table.interest(id) => Some(-ECANCELED),
-                    sent => {
+                    _ => {
                         let failed = WriteFailed {
-                            sent: (sent == Sent::Owe).then_some(directions.unreported),
+                            sent: directions.count(),
                         };
                         directions.sent = Sent::Reported;
                         directions.unreported = 0;
@@ -1977,7 +2008,7 @@ impl Driver {
             return;
         }
         let closed = Closed {
-            sent: (directions.sent == Sent::Owe).then_some(directions.unreported),
+            sent: directions.count(),
         };
         // The release drops the kept bytes and connections, and the descriptor.
         drop(self.resources.release(resource));

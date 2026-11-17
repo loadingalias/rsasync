@@ -15,7 +15,7 @@ use rsasync::blocking::{self, Service};
 use rsasync::buffer::{Backing, Buffer as _, BufferMut as _, Lease};
 use rsasync::capacity::Budget;
 use rsasync::driver::{
-    Call, Config, Datagram, Driver, Incomplete, OpenOptions, SyncMode, TcpOptions, UdpOptions, WriteMode,
+    Call, Config, Datagram, Driver, Incomplete, OpenOptions, SendCount, SyncMode, TcpOptions, UdpOptions, WriteMode,
 };
 
 /// The error number of an operation that a cancel ended, on Linux.
@@ -194,7 +194,7 @@ fn tcp(driver: &mut Driver, out: &mut impl Write) -> Result<(), Box<dyn Error>> 
     drive(driver, &waiter, close)??;
     writeln!(out, "tcp: closed the listener after a dropped accept")?;
     // No dropped send owes a count of sent bytes.
-    let mut sent = [None; 2];
+    let mut sent = [SendCount::Settled; 2];
     for (stream, sent) in [server, client].into_iter().zip(&mut sent) {
         let close = driver.close(stream)?;
         *sent = drive(driver, &waiter, close)??.sent();

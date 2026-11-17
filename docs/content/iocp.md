@@ -115,9 +115,10 @@ The driver starts no thread, and `report().helper_threads()` gives 0.
   the send, as on Linux.
 - A cancel of a send that runs in the kernel aborts the connection, and its packet gives no count of
   the bytes that went. So the driver never reports a count for it: an explicit cancel gives the
-  error `WSAECONNABORTED` with the whole lease, and the read direction fails too. When close or
-  teardown cancels a dropped send that runs, the write direction fails with no count:
-  `WriteFailed::sent` and `Closed::sent` give `None`. A send that waits behind another send in the
+  error `WSAECONNABORTED` with the whole lease, and the read direction fails too. When a cancel
+  aborts a dropped send that runs, at close or before its future dropped, the write direction
+  fails with no count: the next send gives `WriteFailed` and the close gives `Closed`, whose
+  `sent()` is `SendCount::Unknown`. A send that waits behind another send in the
   driver has not started, so its cancel gives the lease back with `ERROR_OPERATION_ABORTED`, and
   the direction stays usable.
 - `TcpOptions::reuse_port` has no Windows option: a value gives the error `WSAENOPROTOOPT` (10042),

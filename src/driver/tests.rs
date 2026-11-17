@@ -36,8 +36,8 @@ use rsnetwork_udp::{Ecn, Received};
 
 use super::suite::{self, Backend};
 use super::{
-    Arrivals, Config, Datagram, Datagrams, Driver, ECANCELED, Reason, Refused, TcpListener, TcpOptions, TcpStream,
-    UdpOptions, UdpSocket, WriteFailed,
+    Arrivals, Config, Datagram, Datagrams, Driver, ECANCELED, Reason, Refused, SendCount, TcpListener, TcpOptions,
+    TcpStream, UdpOptions, UdpSocket, WriteFailed,
 };
 #[cfg(target_os = "linux")]
 use super::{Call, Completion, Ended, Error, Feature, Features, Held, Medium, Route, eventfd, probe, sys};
@@ -567,7 +567,7 @@ pub(in crate::driver) fn a_request_into_an_owned_buffer_and_a_response_from_a_le
     assert_eq!(sent.unwrap(), 19);
     assert_eq!(response.as_ptr(), response_address);
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
     let (client_address, bytes) = client.join().unwrap();
     assert_eq!(peer, client_address);
     assert_eq!(bytes, b"HTTP/1.1 200 OK\r\n\r\n");
@@ -1024,12 +1024,18 @@ pub(in crate::driver) fn a_dropped_partial_send_fails_the_write_direction_and_re
 
     let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
     let failed = drive(&mut driver, next).unwrap().0.unwrap_err();
-    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+    assert_eq!(
+        WriteFailed::of(&failed).map(WriteFailed::sent),
+        Some(SendCount::Sent(sent))
+    );
     let later = driver.send(&mut stream, Lease::from(b"later".to_vec())).unwrap();
     let failed = drive(&mut driver, later).unwrap().0.unwrap_err();
-    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(None));
+    assert_eq!(
+        WriteFailed::of(&failed).map(WriteFailed::sent),
+        Some(SendCount::Settled)
+    );
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
 
     #[cfg(unix)]
     {
@@ -1051,7 +1057,7 @@ pub(in crate::driver) fn a_dropped_send_that_sends_all_its_bytes_reports_nothing
     let next = driver.send(&mut stream, Lease::from(numbered(1000, 1000))).unwrap();
     assert_eq!(drive(&mut driver, next).unwrap().0.unwrap(), 1000);
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
 
     let mut received = Vec::new();
     peer.read_to_end(&mut received).unwrap();
@@ -1089,7 +1095,7 @@ pub(in crate::driver) fn two_dropped_sends_and_a_third_send_run_in_start_order(b
     });
     assert_eq!(drive(&mut driver, third).unwrap().0.unwrap(), 4096);
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
     assert!(
         reader.join().unwrap() == numbered(0, filled + 3 * 4096),
         "the peer read other bytes"
@@ -1124,7 +1130,7 @@ pub(in crate::driver) fn close_ends_a_waiting_send_unsent_and_releases_its_lease
         1,
         "the close did not push exactly the cancel of the send in the kernel"
     );
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), Some(0));
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Sent(0));
     assert_eq!(taken(&log), ["released"]);
     let mut received = Vec::new();
     peer.read_to_end(&mut received).unwrap();
@@ -1176,7 +1182,7 @@ pub(in crate::driver) fn an_explicit_cancel_of_a_send_gives_its_progress_and_kee
     let next = driver.send(&mut stream, lease).unwrap();
     assert_eq!(drive(&mut driver, next).unwrap().0.unwrap(), 4096);
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
     assert!(
         reader.join().unwrap() == numbered(0, filled + 4096),
         "the peer read other bytes"
@@ -1268,11 +1274,11 @@ pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request
         "a cancel missed its target"
     );
     // On Windows, the dropped send in the kernel is the send of `fill`, and its cancel aborts the
-    // connection: it gives the abort and no count, and so does the close.
+    // connection: it gives the abort and no count, and the close reports the unknown count.
     #[cfg(unix)]
-    let (ends, sent) = ([-ECANCELED, -ECANCELED], Some(0));
+    let (ends, sent) = ([-ECANCELED, -ECANCELED], SendCount::Sent(0));
     #[cfg(target_os = "windows")]
-    let (ends, sent) = ([-WSAECONNABORTED, -ECANCELED], None);
+    let (ends, sent) = ([-WSAECONNABORTED, -ECANCELED], SendCount::Unknown);
     let mut results_of_targets: Vec<i32> = targets.iter().map(|target| target.res).collect();
     results_of_targets.sort_unstable();
     assert_eq!(results_of_targets, ends);
@@ -1294,7 +1300,8 @@ const WSAECONNABORTED: i32 = 10053;
 
 /// On Windows, a cancel of a send that runs in the kernel aborts the connection, and the kernel
 /// gives no count, also when bytes went. So the send gives the abort with its whole lease and no
-/// count, and the read direction fails too.
+/// count, and the read direction fails too. When the future of the aborted send dropped, the next
+/// send gives `WriteFailed` with the unknown count.
 #[cfg(target_os = "windows")]
 pub(in crate::driver) fn a_cancel_of_a_send_that_runs_aborts_the_connection_and_gives_no_count(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
@@ -1313,6 +1320,22 @@ pub(in crate::driver) fn a_cancel_of_a_send_that_runs_aborts_the_connection_and_
     let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
     let (received, _) = drive(&mut driver, receive).unwrap();
     assert!(received.is_err(), "the read direction did not fail: {received:?}");
+
+    let (mut stream, _peer) = connected(&mut driver, "127.0.0.1:0");
+    unbuffered(&mut driver, &stream);
+    let send = driver.send(&mut stream, Lease::from(numbered(0, 64 << 20))).unwrap();
+    for _ in 0..10 {
+        driver.turn().unwrap();
+    }
+    assert!(driver.queue.peek().is_empty(), "the second send did not wait");
+    send.cancel();
+    drop(send);
+    let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
+    let failed = drive(&mut driver, next).unwrap().0.unwrap_err();
+    assert_eq!(
+        WriteFailed::of(&failed).map(WriteFailed::sent),
+        Some(SendCount::Unknown)
+    );
 }
 
 /// On Windows, a buffer stays owned after `CancelIoEx` until the packet of its operation: the
@@ -1491,7 +1514,7 @@ fn send_the_rest(driver: &mut Driver, mut stream: TcpStream, mut peer: std::net:
         rest.advance(more.unwrap());
     }
     let close = driver.close(stream).unwrap();
-    assert_eq!(drive(driver, close).unwrap().sent(), None);
+    assert_eq!(drive(driver, close).unwrap().sent(), SendCount::Settled);
     assert!(
         reader.join().unwrap() == numbered(0, 3000 + (64 << 20)),
         "the peer read other bytes"
@@ -1517,7 +1540,10 @@ pub(in crate::driver) fn a_dropped_partial_vectored_send_fails_the_write_directi
     driver.turn().unwrap();
     let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
     let failed = drive(&mut driver, next).unwrap().0.unwrap_err();
-    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+    assert_eq!(
+        WriteFailed::of(&failed).map(WriteFailed::sent),
+        Some(SendCount::Sent(sent))
+    );
     let close = driver.close(stream).unwrap();
     drive(&mut driver, close).unwrap();
     #[cfg(unix)]
@@ -1634,7 +1660,10 @@ pub(in crate::driver) fn a_half_close_on_a_failed_write_direction_sends_no_end_o
     driver.turn().unwrap();
     let shutdown = driver.shutdown_write(&mut stream).unwrap();
     let failed = drive(&mut driver, shutdown).unwrap().unwrap_err();
-    assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
+    assert_eq!(
+        WriteFailed::of(&failed).map(WriteFailed::sent),
+        Some(SendCount::Sent(sent))
+    );
     // On Windows, the reset peer cannot show that no end of the stream came.
     #[cfg(unix)]
     no_end_of_stream_after(peer, sent);

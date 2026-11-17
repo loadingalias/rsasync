@@ -9,7 +9,7 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::super::suite::{self, Backend};
 use super::super::tests::{budget, drive, driver, numbered, posted};
-use super::super::{Config, Driver, Reason, sys};
+use super::super::{Config, Driver, Reason, SendCount, sys};
 use super::{PipeReader, PipeWriter};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool};
 
@@ -58,7 +58,7 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_a
     let kept = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
     drop(receive);
     let close = driver.close_writer(writer).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
 
     assert_eq!(receive_all(&mut driver, &mut reader, 300), numbered(0, 2000));
     assert_eq!(driver.copied(), u64::try_from(kept).unwrap());
@@ -117,7 +117,7 @@ pub(in crate::driver) fn a_close_returns_while_the_other_end_is_idle_and_reports
         driver.turn().unwrap();
     }
     let close = driver.close_writer(writer).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), Some(capacity));
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Sent(capacity));
     let mut received = Vec::new();
     read.read_to_end(&mut received).unwrap();
     assert!(received == numbered(0, capacity), "the reader read other bytes");
@@ -127,7 +127,7 @@ pub(in crate::driver) fn a_close_returns_while_the_other_end_is_idle_and_reports
     drop(driver.recv(&mut reader, Backing::from(Vec::with_capacity(64))).unwrap());
     driver.turn().unwrap();
     let close = driver.close_reader(reader).unwrap();
-    assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
+    assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);
     drop(write);
 }
 

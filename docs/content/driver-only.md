@@ -76,7 +76,7 @@ tcp: the cancelled receive gave ECANCELED and its buffer back
 tcp: the same buffer then received "again"
 tcp: after a dropped receive, the next receive gave "late"
 tcp: closed the listener after a dropped accept
-tcp: closed both streams; Closed::sent() gives [None, None]
+tcp: closed both streams; Closed::sent() gives [Settled, Settled]
 udp: a receive into 4 bytes gave "ping", truncated: true
 udp: the same buffer then received "pong", truncated: false
 udp: after a dropped receive, the next receive gave "late"
