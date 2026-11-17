@@ -203,13 +203,12 @@ impl Refused {
     /// The error of a send, with its [`Refused`] payload when it has one. `segmented` is whether
     /// the send had a segment size. A completion backend that makes its own send gives the same
     /// error as [`send`].
-    #[cfg_attr(
-        target_os = "macos",
-        expect(unused_variables, reason = "macOS refuses a segment size before the call")
-    )]
     #[must_use]
     pub fn of_send(error: io::Error, segmented: bool) -> io::Error {
         match error.raw_os_error() {
+            // macOS has no segmentation offload, so a send with a segment size fails before its call.
+            #[cfg(target_os = "macos")]
+            _ if segmented => io::Error::new(io::ErrorKind::Unsupported, Self::NoSegmentation),
             Some(EMSGSIZE) => io::Error::new(io::ErrorKind::InvalidInput, Self::TooLarge),
             #[cfg(target_os = "linux")]
             Some(sys::EIO) if segmented => io::Error::new(io::ErrorKind::Unsupported, Self::NoSegmentation),

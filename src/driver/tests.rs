@@ -1,6 +1,8 @@
 #[cfg(target_os = "linux")]
 use alloc::task::Wake;
 use core::alloc::Layout;
+#[cfg(unix)]
+use core::assert_matches;
 #[cfg(target_os = "linux")]
 use core::ffi::c_int;
 use core::future::Future;
@@ -16,13 +18,15 @@ use core::task::{Context, Poll, Waker};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 use std::io::{ErrorKind, Read as _, Write as _};
+#[cfg(unix)]
+use std::os::fd::{AsFd as _, AsRawFd as _};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(target_os = "linux")]
 use std::thread::Thread;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::time::Instant;
 use std::vec::Vec;
 
@@ -52,10 +56,31 @@ unsafe extern "C" {
     fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
 }
 
+/// `struct pollfd` and `poll` of macOS (`sys/poll.h` of the macOS 27.2 SDK), with `nfds_t` an
+/// `unsigned int`: the reactor of a host in `wait_readable`.
+#[cfg(target_os = "macos")]
+mod sys {
+    use core::ffi::{c_int, c_short, c_uint};
+
+    #[repr(C)]
+    pub(super) struct PollFd {
+        pub(super) fd: c_int,
+        pub(super) events: c_short,
+        pub(super) revents: c_short,
+    }
+
+    pub(super) const POLLIN: c_short = 0x1;
+
+    #[expect(unsafe_code, reason = "libSystem of macOS gives this function")]
+    unsafe extern "C" {
+        pub(super) fn poll(fds: *mut PollFd, nfds: c_uint, timeout: c_int) -> c_int;
+    }
+}
+
 /// Blocks until the wake descriptor of `driver` is readable, as the reactor of a host waits for
 /// it.
 #[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn wait_readable(driver: &Driver) {
     let mut fd = sys::PollFd {
         fd: driver.as_fd().as_raw_fd(),
@@ -298,7 +323,7 @@ fn a_turn_stops_at_its_bound_and_reports_the_remaining_work() {
         [(2, true), (1, false)]
     );
     for future in futures {
-        assert!(matches!(block_on(future), Ok((0, _))));
+        assert_matches!(block_on(future), Ok((0, _)));
     }
 }
 
@@ -318,7 +343,7 @@ fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     assert!(driver.queue.ring().unwrap().task_run_pending());
     assert_eq!(driver.queue.unsubmitted(), 0);
     assert_eq!(driver.turn().unwrap().completed(), 1);
-    assert!(matches!(block_on(future), Ok((1, _))));
+    assert_matches!(block_on(future), Ok((1, _)));
 }
 
 /// A wake from another thread ends a wait of the home that has no completion to wait for, also
@@ -354,7 +379,7 @@ fn a_completion_during_a_wait_adds_no_other_completion() {
         }
     }
     assert_eq!(completed, 1);
-    assert!(matches!(block_on(future), Ok((1, _))));
+    assert_matches!(block_on(future), Ok((1, _)));
 }
 
 /// Teardown cancels a read that gets no data, returns after the completion of the read, closes
@@ -371,7 +396,7 @@ pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_an
     assert_eq!(taken(&log), ["released"]);
     assert_eq!(budget.available(), 100);
     assert_eq!(writer.write(b"x").unwrap_err().kind(), ErrorKind::BrokenPipe);
-    assert!(matches!(block_on(future), Err(Gone)));
+    assert_matches!(block_on(future), Err(Gone));
 }
 
 /// A driver that drops with a running read ends the future with `Gone`, and it keeps the buffer
@@ -386,7 +411,7 @@ pub(in crate::driver) fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers
     let future = read(&mut driver, reader, held(&log, &budget));
     driver.turn().unwrap();
     drop(driver);
-    assert!(matches!(block_on(future), Err(Gone)));
+    assert_matches!(block_on(future), Err(Gone));
     assert!(taken(&log).is_empty());
     assert_eq!(budget.available(), 90);
 }
@@ -444,10 +469,7 @@ fn a_submission_completes_after_the_requests_that_it_takes_fill_the_queue() {
     let waiting = read(&mut driver, reader, held(&log, &budget));
     driver.turn().unwrap();
     let ready = Pin::new(&mut done).poll(&mut Context::from_waker(Waker::noop()));
-    assert!(
-        matches!(ready, Poll::Ready(Ok((0, _)))),
-        "the first no-op did not complete"
-    );
+    assert_matches!(ready, Poll::Ready(Ok((0, _))), "the first no-op did not complete");
     // Seven entries wait in the queue of eight, and nine operations fill the table.
     let queued: Vec<Completion> = (0..7).map(|_| nop(&mut driver)).collect();
     // The ended no-op gives its slot back, and the cancel of the read takes the last entry.
@@ -455,7 +477,7 @@ fn a_submission_completes_after_the_requests_that_it_takes_fill_the_queue() {
     drop(waiting);
     let last = nop(&mut driver);
     for future in queued.into_iter().chain([last]) {
-        assert!(matches!(drive(&mut driver, future), Ok((0, _))));
+        assert_matches!(drive(&mut driver, future), Ok((0, _)));
     }
 }
 
@@ -602,9 +624,11 @@ pub(in crate::driver) fn a_selected_buffer_is_decrypted_in_place_and_returns_to_
     client.join().unwrap();
 }
 
-/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`).
+/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`, and `sys/errno.h` of macOS).
 #[cfg(target_os = "linux")]
 const ENOBUFS: i32 = 105;
+#[cfg(target_os = "macos")]
+const ENOBUFS: i32 = 55;
 #[cfg(target_os = "windows")]
 const ENOBUFS: i32 = 10055;
 
@@ -647,7 +671,7 @@ pub(in crate::driver) fn a_selecting_receive_with_no_free_buffer_gives_enobufs(b
 
 /// Turns the driver each time that its wake descriptor is readable, as the reactor of a host does,
 /// and polls `future` after each turn, until it gives its output. It never calls `Driver::wait`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn drive_from_reactor<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
     loop {
@@ -663,9 +687,9 @@ fn drive_from_reactor<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> 
 
 /// A reactor that waits only for the wake descriptor sees each of two selecting receives that wait
 /// for their data. On a kernel with the eventfd defect of `probe`, the second receive completes
-/// only because the driver registers the descriptor again.
+/// only because the driver registers the descriptor again. On macOS, the descriptor is the kqueue.
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
     let budget = budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
@@ -831,6 +855,39 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
     sent
 }
 
+/// Sends a numbered stream from 0 until the socket buffers hold no more bytes while the peer does
+/// not read, and gives the count that went. On macOS, the loopback delivers the segments of a send
+/// after its return, so the window of the peer fills after the send, and the send buffer has room
+/// again. Each next send of 4 MiB takes that room, until one send finds no room for 200 ms. Its
+/// cancel then ends it with no byte sent.
+#[cfg(target_os = "macos")]
+fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
+    let mut filled = 0;
+    'fill: loop {
+        let mut send = driver
+            .send(stream, Lease::from(numbered(filled, 4 << 20)))
+            .expect("the test driver has room");
+        let start = Instant::now();
+        while start.elapsed() < core::time::Duration::from_millis(200) {
+            driver.turn().expect("a turn of the test driver works");
+            if let Poll::Ready(output) = Pin::new(&mut send).poll(&mut Context::from_waker(Waker::noop())) {
+                filled += output.expect("the driver runs").0.expect("the send works");
+                continue 'fill;
+            }
+            thread::sleep(core::time::Duration::from_millis(1));
+        }
+        send.cancel();
+        match drive(driver, send).expect("the driver runs").0 {
+            // Room came at the end of the wait, before the cancel.
+            Ok(sent) => filled += sent,
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(ECANCELED), "the send failed");
+                return filled;
+            }
+        }
+    }
+}
+
 /// A send of 64 MiB that waits in the kernel, because the peer does not read and the socket has no
 /// send buffer (`unbuffered`), and whose future drops. A dropped send is not cancelled: it holds the
 /// write direction until the peer reads each of its bytes, so each later send waits behind it.
@@ -881,9 +938,11 @@ pub(in crate::driver) fn a_dropped_receive_leaves_its_bytes_to_the_next_receives
     assert_eq!(driver.copied(), u64::try_from(kept).unwrap());
 }
 
-/// `ECONNRESET` (`include/uapi/asm-generic/errno.h`).
+/// `ECONNRESET` (`include/uapi/asm-generic/errno.h`, and `sys/errno.h` of macOS).
 #[cfg(target_os = "linux")]
 const ECONNRESET: i32 = 104;
+#[cfg(target_os = "macos")]
+const ECONNRESET: i32 = 54;
 #[cfg(target_os = "windows")]
 const ECONNRESET: i32 = 10054;
 
@@ -969,7 +1028,7 @@ pub(in crate::driver) fn a_dropped_partial_send_fails_the_write_direction_and_re
     let close = driver.close(stream).unwrap();
     assert_eq!(drive(&mut driver, close).unwrap().sent(), None);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let mut peer = peer;
         let mut received = Vec::new();
@@ -1150,7 +1209,7 @@ pub(in crate::driver) fn close_cancels_each_dropped_operation_by_its_own_request
     );
     // On Windows, the dropped send in the kernel is the send of `fill`, and its cancel aborts the
     // connection: it gives the abort and no count, and so does the close.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let (ends, sent) = ([-ECANCELED, -ECANCELED], Some(0));
     #[cfg(target_os = "windows")]
     let (ends, sent) = ([-WSAECONNABORTED, -ECANCELED], None);
@@ -1250,7 +1309,7 @@ pub(in crate::driver) fn idle_connections_with_a_waiting_selecting_receive_hold_
 }
 
 /// Turns the driver until no operation runs and no event can come, for at most 1000 turns.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn settle(driver: &mut Driver) {
     for _ in 0..1000 {
         if !driver.table.busy() {
@@ -1265,11 +1324,17 @@ fn settle(driver: &mut Driver) {
     assert!(!driver.table.busy(), "an operation still runs after 1000 turns");
 }
 
-/// The descriptors that this process has open.
-#[cfg(target_os = "linux")]
+/// The descriptors that this process has open: Linux lists them in `/proc/self/fd`, and macOS in
+/// `/dev/fd`.
+#[cfg(unix)]
 fn descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .expect("Linux lists the descriptors of a process")
+    let directory = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    std::fs::read_dir(directory)
+        .expect("the system lists the descriptors of a process")
         .count()
 }
 
@@ -1287,7 +1352,7 @@ pub(in crate::driver) fn a_connect_to_a_port_with_no_listener_is_refused(backend
 
 /// A connect whose future drops after the kernel connected leaves no descriptor open after its
 /// terminal event: the driver closes the connection, and the peer reads the end of the stream.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(in crate::driver) fn a_dropped_connect_that_completes_closes_its_connection(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1346,13 +1411,13 @@ pub(in crate::driver) fn a_vectored_send_gives_its_exact_progress_across_regions
     rest.advance(sent);
     assert_eq!(rest.total(), 3000 + (64 << 20) - sent);
     // On Windows, the reset connection takes no more bytes.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     send_the_rest(&mut driver, stream, peer, rest);
 }
 
 /// Sends `rest` of a numbered stream of the regions `[1000, 2000, 64 MiB]` on `stream` until each
 /// byte went, closes it, and checks that `peer` read the whole numbered stream.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn send_the_rest(driver: &mut Driver, mut stream: TcpStream, mut peer: std::net::TcpStream, mut rest: super::Regions) {
     let reader = thread::spawn(move || {
         let mut received = Vec::new();
@@ -1395,7 +1460,7 @@ pub(in crate::driver) fn a_dropped_partial_vectored_send_fails_the_write_directi
     assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
     let close = driver.close(stream).unwrap();
     drive(&mut driver, close).unwrap();
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let mut peer = peer;
         let mut received = Vec::new();
@@ -1407,10 +1472,12 @@ pub(in crate::driver) fn a_dropped_partial_vectored_send_fails_the_write_directi
 /// Each option reads back the value that the caller set, on a listener that set them before its
 /// bind and on a stream that sets them after its accept. Linux doubles the buffer sizes.
 pub(in crate::driver) fn each_socket_option_reads_back_the_value_that_was_set(backend: Backend) {
-    // Linux doubles each buffer size for its own bookkeeping, and Windows keeps it. Windows has no
-    // `SO_REUSEPORT`, so the option reads `None` there.
+    // Linux doubles each buffer size for its own bookkeeping, and macOS and Windows keep it.
+    // Windows has no `SO_REUSEPORT`, so the option reads `None` there.
     #[cfg(target_os = "linux")]
     let (scale, reuse_port) = (2, |off| Some(off));
+    #[cfg(target_os = "macos")]
+    let (scale, reuse_port) = (1, |off| Some(off));
     #[cfg(target_os = "windows")]
     let (scale, reuse_port) = (1, |_| None);
     let mut driver = suite::driver(Config::new(), backend);
@@ -1509,12 +1576,12 @@ pub(in crate::driver) fn a_half_close_on_a_failed_write_direction_sends_no_end_o
     let failed = drive(&mut driver, shutdown).unwrap().unwrap_err();
     assert_eq!(WriteFailed::of(&failed).map(WriteFailed::sent), Some(Some(sent)));
     // On Windows, the reset peer cannot show that no end of the stream came.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     no_end_of_stream_after(peer, sent);
 }
 
 /// `peer` reads the `sent` bytes of a numbered stream, and then no end of the stream.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn no_end_of_stream_after(mut peer: std::net::TcpStream, sent: usize) {
     let mut received = std::vec![0; sent];
     peer.read_exact(&mut received).unwrap();
@@ -1523,8 +1590,9 @@ fn no_end_of_stream_after(mut peer: std::net::TcpStream, sent: usize) {
         .unwrap();
     let mut byte = [0];
     let wait = peer.read(&mut byte).unwrap_err();
-    assert!(
-        matches!(wait.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+    assert_matches!(
+        wait.kind(),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut,
         "the peer read the end of the stream"
     );
 }
@@ -1592,6 +1660,7 @@ fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Rec
 /// One send with a segment size sends one datagram for each segment, all of them, and its report
 /// counts them. A receiver with no GRO gets each segment as a datagram; a receiver with GRO gets
 /// them in one receive, with their segment size. On IPv4 and IPv6.
+#[cfg(not(target_os = "macos"))]
 pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size(
     backend: Backend,
 ) {
@@ -1626,15 +1695,121 @@ pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesc
     }
 }
 
+/// macOS has no segmentation offload. A send with a segment size gives
+/// `Refused::NoSegmentation` and sends nothing, and the bind of a socket with the GRO option gives
+/// `Unsupported`. A batch sends its datagrams before its first datagram with a segment size, and
+/// its report counts them: that datagram and each one after it stay unsent, and no part of them
+/// arrives. The next batch, which starts with that datagram, gives `NoSegmentation`. On IPv4 and
+/// IPv6.
+#[cfg(target_os = "macos")]
+pub(in crate::driver) fn a_segment_size_gives_no_segmentation_and_a_batch_sends_only_the_datagrams_before_it(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let no_segmentation = |error: std::io::Error| rsnetwork_udp::Refused::of(&error);
+    for address in ["127.0.0.1:0", "[::1]:0"] {
+        let gro = UdpOptions {
+            gro: true,
+            ..UdpOptions::default()
+        };
+        let bind = driver.bind_udp(address.parse().unwrap(), gro).unwrap();
+        assert_eq!(
+            drive(&mut driver, bind).unwrap().unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        let mut sender = udp(&mut driver, address, UdpOptions::default());
+        let mut receiver = udp(&mut driver, address, UdpOptions::default());
+        let segmented = |start, to| Datagram {
+            segment_size: Some(1000),
+            ..Datagram::new(Lease::from(numbered(start, 4000)), to)
+        };
+        let send = driver
+            .send_to(&mut sender, segmented(0, receiver.local_addr()))
+            .unwrap();
+        let (sent, _) = drive(&mut driver, send).unwrap();
+        assert_eq!(
+            sent.map_err(no_segmentation).unwrap_err(),
+            Some(rsnetwork_udp::Refused::NoSegmentation)
+        );
+
+        let mut batch = Datagrams::with_capacity(3);
+        batch.push(Datagram::new(Lease::from(numbered(0, 100)), receiver.local_addr()));
+        batch.push(segmented(100, receiver.local_addr()));
+        batch.push(Datagram::new(Lease::from(numbered(4100, 300)), receiver.local_addr()));
+        let send = driver.send_batch(&mut sender, batch).unwrap();
+        let (sent, mut rest) = drive(&mut driver, send).unwrap();
+        assert_eq!(sent.unwrap(), 1);
+        rest.advance(1);
+        let send = driver.send_batch(&mut sender, rest).unwrap();
+        let (sent, rest) = drive(&mut driver, send).unwrap();
+        assert_eq!(
+            sent.map_err(no_segmentation).unwrap_err(),
+            Some(rsnetwork_udp::Refused::NoSegmentation)
+        );
+        assert_eq!(rest.len(), 2);
+
+        let (received, bytes) = receive(&mut driver, &mut receiver, 8000);
+        assert!(
+            received.len == 100 && bytes == numbered(0, 100),
+            "the first datagram differs"
+        );
+        let receive = driver
+            .recv_from(&mut receiver, Backing::from(Vec::with_capacity(8000)))
+            .unwrap();
+        driver.turn().unwrap();
+        receive.cancel();
+        let (more, _) = drive(&mut driver, receive).unwrap();
+        assert_eq!(
+            more.unwrap_err().raw_os_error(),
+            Some(ECANCELED),
+            "an unsent datagram arrived"
+        );
+    }
+}
+
+/// A batch that sends no datagram gives the error of its first datagram, read with the segment
+/// size of that datagram. On Linux, `EIO` on a send with a segment size means that the device
+/// cannot segment it, so the batch gives `Refused::NoSegmentation`. The injection gives the `EIO`
+/// of the first datagram, because the loopback device segments each datagram.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_batch_that_fails_at_its_first_segmented_datagram_gives_no_segmentation() {
+    let mut driver = suite::driver(Config::new(), Backend::Injected);
+    let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let receiver = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
+    let mut batch = Datagrams::with_capacity(2);
+    batch.push(Datagram {
+        segment_size: Some(1000),
+        ..Datagram::new(Lease::from(numbered(0, 4000)), receiver.local_addr())
+    });
+    batch.push(Datagram::new(Lease::from(numbered(4000, 100)), receiver.local_addr()));
+    let send = driver.send_batch(&mut sender, batch).unwrap();
+    let id = driver.table.running().next().expect("the batch runs");
+    driver
+        .queue
+        .ring()
+        .unwrap()
+        .replace(id.user_data(), -rsnetwork_udp::sys::EIO);
+    let (sent, rest) = drive(&mut driver, send).unwrap();
+    let refused = sent.unwrap_err();
+    assert_eq!(
+        rsnetwork_udp::Refused::of(&refused),
+        Some(rsnetwork_udp::Refused::NoSegmentation),
+        "{refused}"
+    );
+    assert_eq!(rest.len(), 2);
+}
+
 /// The receiver reports the local destination address and the ECN codepoint that the sender set,
 /// and the source address that the sender chose. On IPv4, with a source that is not the address
 /// of the route, and on IPv6.
 pub(in crate::driver) fn send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
-    // Windows has one IPv4 loopback address, so the source there is that address.
+    // macOS has one IPv4 loopback address unless an administrator adds more, and so does
+    // Windows, so the source there is that address.
     #[cfg(target_os = "linux")]
     let ipv4 = "127.0.0.2";
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     let ipv4 = "127.0.0.1";
     for (any, receiver, source) in [("0.0.0.0:0", "127.0.0.1:0", ipv4), ("[::]:0", "[::1]:0", "::1")] {
         let mut sender = udp(&mut driver, any, UdpOptions::default());
@@ -1859,7 +2034,7 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
     let mut sender = udp(&mut driver, "127.0.0.1:0", UdpOptions::default());
     let mut receiver = udp(&mut driver, "127.0.0.1:0", METADATA);
     // Windows refuses to send the CE codepoint (`WSAEINVAL`).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     let codepoints = [Ecn::Ect0, Ecn::Ect1, Ecn::Ce];
     #[cfg(target_os = "windows")]
     let codepoints = [Ecn::Ect0, Ecn::Ect1, Ecn::Ect0];
@@ -1871,6 +2046,8 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
         let send = driver.send_to(&mut sender, datagram).unwrap();
         drive(&mut driver, send).unwrap().0.unwrap();
     }
+    #[cfg(target_os = "macos")]
+    wait_datagrams(&mut driver, &mut receiver, 3);
     let receive = driver.recv_batch(&mut receiver, Arrivals::with_capacity(4)).unwrap();
     let (count, mut arrivals) = drive(&mut driver, receive).unwrap();
     assert_eq!(count.unwrap(), 3);
@@ -1881,6 +2058,37 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
         );
         assert_eq!(received.metadata.ecn, Some(codepoints[index]));
         assert_eq!(received.source, sender.local_addr());
+    }
+}
+
+/// Waits until `count` datagrams wait in `socket` (`SO_NUMRCVPKT` of `sys/socket.h`), for at most
+/// 5 seconds. The loopback of macOS can deliver a datagram after its send returns, so a case whose
+/// receive takes only the datagrams that wait first waits for them here.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the kernel writes one `int` that lives during the call")]
+fn wait_datagrams(driver: &mut Driver, socket: &mut UdpSocket, count: core::ffi::c_int) {
+    const SO_NUMRCVPKT: core::ffi::c_int = 0x1112;
+    let read: &mut super::ReadHalf = socket.as_mut();
+    let fd = driver.fd(read.resource).expect("the driver owns the socket");
+    let start = Instant::now();
+    loop {
+        let (mut waiting, mut len): (core::ffi::c_int, u32) = (0, 4);
+        // SAFETY: `waiting` is an `int` that lives during the call, and `len` is its size.
+        let result = unsafe {
+            rsnetwork_udp::sys::getsockopt(
+                fd,
+                rsnetwork_udp::sys::SOL_SOCKET,
+                SO_NUMRCVPKT,
+                (&raw mut waiting).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(result, 0, "the socket gives its datagram count");
+        if waiting >= count {
+            return;
+        }
+        assert!(start.elapsed().as_secs() < 5, "the datagrams did not arrive");
+        thread::sleep(core::time::Duration::from_millis(1));
     }
 }
 

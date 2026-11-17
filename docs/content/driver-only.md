@@ -13,10 +13,11 @@ files, and child processes. The other operations come in later changes. [TCP on 
 [Child processes on the driver](processes.md) are the references for each operation and its
 results.
 
-The driver needs the `std` feature, and Linux on x86_64 or aarch64 or Windows on x86_64. On Linux,
-it runs on io_uring, and on [epoll](epoll.md) where the kernel refuses io_uring, with the same
-operations. On Windows, it runs TCP and UDP on an [I/O completion port](iocp.md), and the other
-operations of this page have no Windows form yet. It does not need
+The driver needs the `std` feature, and Linux on x86_64 or aarch64, macOS on aarch64, or Windows on
+x86_64. On Linux, it runs on io_uring, and on [epoll](epoll.md) where the kernel refuses io_uring,
+with the same operations. On macOS, it runs TCP and UDP on [kqueue](kqueue.md), and on Windows on
+an [I/O completion port](iocp.md). The other operations of this page have no macOS or Windows form
+yet. It does not need
 the `local` feature, which holds the local tasks of `rsasync::task`, a scheduler. It starts no helper
 thread. Before Linux 6.9, a change of the length of a file runs on your
 [blocking service](blocking-service.md). `Driver::report` gives the features of the kernel and the
@@ -138,8 +139,8 @@ turn gives them. So a turn always returns soon, and your loop can do other work 
 
 ## Drive it from another reactor
 
-On Linux, register the wake descriptor (`driver.as_fd()`) for readability with the reactor of your host, for
-example epoll or the reactor of another runtime. When it reports the descriptor readable,
+On Linux and macOS, register the wake descriptor (`driver.as_fd()`) for readability with the
+reactor of your host, for example epoll, kqueue, or the reactor of another runtime. When it reports the descriptor readable,
 turn the driver, and turn it again while `Turn::more()` gives `true`. The turn clears the
 descriptor, so the reactor reports it again only for new work.
 

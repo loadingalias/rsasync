@@ -5,7 +5,8 @@ operation, its result, the batch report, the truncation rule, and what happens w
 forget a future. [Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end
 the driver. For datagram I/O on a socket of another runtime, with no driver, see
 [Datagram I/O on any socket](datagram-io.md): both use the same metadata and the same control
-messages. The same operations run on Windows, on the [IOCP backend](iocp.md#udp).
+messages. The same operations run on macOS, on the [kqueue backend](kqueue.md), which has no
+segmentation offload, and on Windows, on the [IOCP backend](iocp.md#udp).
 
 ## Operations
 
@@ -68,10 +69,10 @@ the kernel has the bind operation (Linux 6.11 and later), and as a system call e
 
 | Field | Effect |
 | --- | --- |
-| `only_v6`, `send_buffer`, `receive_buffer`, `reuse_port` | As in `TcpOptions`. Linux doubles the buffer sizes |
+| `only_v6`, `send_buffer`, `receive_buffer`, `reuse_port` | As in `TcpOptions`. Linux doubles the buffer sizes, and macOS and Windows keep them |
 | `metadata` | Each receive reports the ECN codepoint and the local destination address |
 | `dont_fragment` | A datagram above the path MTU is refused with `Refused::TooLarge`, which path MTU discovery needs |
-| `gro` | One receive can give several datagrams of one peer, with their segment size |
+| `gro` | One receive can give several datagrams of one peer, with their segment size. macOS has no coalesced receive, so there the bind gives `Unsupported` |
 
 ## Send a datagram
 
@@ -82,7 +83,9 @@ With a `segment_size`, the datagram is a batch of segments: the kernel or the de
 datagram for each segment, the last one can be shorter. The send is accepted or refused as a
 whole, so the count is each segment or an error. A path that cannot segment gives
 `Refused::NoSegmentation`, and none of the segments went: send them as separate datagrams with
-`Driver::send_batch`, and use no segment size on that path again.
+`Driver::send_batch`, and use no segment size on that path again. macOS has no segmentation offload,
+so there each send with a segment size gives `NoSegmentation`, and a batch ends before its first
+datagram with a segment size ([the kqueue backend](kqueue.md#udp-has-no-segmentation-offload)).
 
 ## Batches
 

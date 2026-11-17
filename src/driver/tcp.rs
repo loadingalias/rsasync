@@ -8,15 +8,15 @@
 
 use alloc::vec::Vec;
 use core::ffi::c_int;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use core::ffi::c_void;
 use core::net::SocketAddr;
 use core::{fmt, ptr};
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use rsnetwork_udp::sys::{self, IoVec, IoVec as Region, MsgHdr};
 use rsnetwork_udp::{AF_INET6, Received, SaFamily, SockAddrStorage};
 
@@ -32,25 +32,30 @@ use crate::sync::Arc;
 use crate::table::OpId;
 use crate::uring::Sqe;
 
-/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`), on Windows `WSAENOBUFS` (`winerror.h`): a
-/// selecting receive found no free buffer, and the data stays in the socket.
+/// `ENOBUFS` (`include/uapi/asm-generic/errno.h`, and `sys/errno.h` of macOS), on Windows
+/// `WSAENOBUFS` (`winerror.h`): a selecting receive found no free buffer, and the data stays in
+/// the socket.
 #[cfg(target_os = "linux")]
 const ENOBUFS: i32 = 105;
+#[cfg(target_os = "macos")]
+const ENOBUFS: i32 = 55;
 #[cfg(target_os = "windows")]
 pub(super) const ENOBUFS: i32 = 10055;
 /// `EAGAIN`, on Windows `WSAEWOULDBLOCK`: a receive with no wait found no datagram.
 #[cfg(target_os = "linux")]
 pub(super) const EAGAIN: i32 = 11;
+#[cfg(target_os = "macos")]
+pub(super) const EAGAIN: i32 = 35;
 #[cfg(target_os = "windows")]
 pub(super) const EAGAIN: i32 = 10035;
 /// `ENOMEM`, on Windows `ERROR_NOT_ENOUGH_MEMORY`: each resource slot of the driver is in use. It
 /// reads as `OutOfMemory`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const ENOMEM: i32 = 12;
 #[cfg(target_os = "windows")]
 const ENOMEM: i32 = 8;
 /// `EINVAL`, on Windows `WSAEINVAL`: an option value that the kernel cannot take.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const EINVAL: i32 = 22;
 #[cfg(target_os = "windows")]
 const EINVAL: i32 = 10022;
@@ -274,7 +279,7 @@ impl TcpOptions {
             (self.no_delay, sys::IPPROTO_TCP, sys::TCP_NODELAY),
             (self.keepalive, sys::SOL_SOCKET, sys::SO_KEEPALIVE),
             (self.only_v6, sys::IPPROTO_IPV6, sys::IPV6_V6ONLY),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             (self.reuse_port, sys::SOL_SOCKET, sys::SO_REUSEPORT),
         ];
         for (value, level, name) in flags {
@@ -315,7 +320,7 @@ impl TcpOptions {
             },
             send_buffer: size(sys::SO_SNDBUF)?,
             receive_buffer: size(sys::SO_RCVBUF)?,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             reuse_port: flag(sys::SOL_SOCKET, sys::SO_REUSEPORT)?,
             #[cfg(target_os = "windows")]
             reuse_port: None,
@@ -379,12 +384,12 @@ pub struct Regions {
     /// before each submission. Its capacity is at least the number of leases.
     vectors: Vec<Region>,
     /// The message header that names `vectors`, which the home writes before each submission.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     header: MsgHdr,
 }
 
 /// A message header with no address, no region, and no control message.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const EMPTY_HEADER: MsgHdr = MsgHdr {
     msg_name: ptr::null_mut(),
     msg_namelen: 0,
@@ -415,7 +420,7 @@ impl Regions {
         Self {
             leases: Vec::with_capacity(regions),
             vectors: Vec::with_capacity(regions),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             header: EMPTY_HEADER,
         }
     }
@@ -480,12 +485,16 @@ impl Regions {
 
     /// The header of a message of each region, for a submission. Its capacity holds the array, so
     /// it allocates nothing.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn message(&mut self) -> *const MsgHdr {
         self.vectors();
         self.header = MsgHdr {
             msg_iov: self.vectors.as_mut_ptr(),
+            #[cfg(target_os = "linux")]
             msg_iovlen: self.vectors.len(),
+            // The kernel refuses a count above `IOV_MAX`, also one above `int`.
+            #[cfg(target_os = "macos")]
+            msg_iovlen: c_int::try_from(self.vectors.len()).unwrap_or(c_int::MAX),
             ..EMPTY_HEADER
         };
         &raw const self.header
@@ -495,7 +504,7 @@ impl Regions {
     /// array, so it allocates nothing.
     pub(super) fn vectors(&mut self) -> (*const Region, u32) {
         self.vectors.clear();
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         self.vectors.extend(self.leases.iter().map(|lease| IoVec {
             iov_base: lease.as_ptr().cast_mut().cast::<c_void>(),
             iov_len: lease.initialized(),
@@ -520,7 +529,7 @@ impl From<Vec<Lease>> for Regions {
         Self {
             vectors: Vec::with_capacity(leases.len()),
             leases,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             header: EMPTY_HEADER,
         }
     }
@@ -733,7 +742,7 @@ pub(super) fn count(result: i32) -> io::Result<usize> {
 pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: Held) {
     #[cfg(target_os = "linux")]
     let closes = matches!(tag.kind, Kind::Connect | Kind::Bind | Kind::File(_));
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     let closes = matches!(tag.kind, Kind::Connect | Kind::Bind);
     if closes {
         // No caller holds the socket or the file, so the home closes it: the peer of a connection
@@ -1545,8 +1554,8 @@ impl Driver {
         };
         #[cfg(target_os = "linux")]
         let pipe = owned.medium == Medium::Pipe;
-        // On Windows, the driver owns no pipe end.
-        #[cfg(target_os = "windows")]
+        // On macOS and Windows, the driver owns no pipe end yet.
+        #[cfg(not(target_os = "linux"))]
         let pipe = false;
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return true;
@@ -1691,6 +1700,19 @@ impl Driver {
             self.complete_now(id, result);
             return true;
         }
+        // macOS has no segmentation offload: a send with a segment size ends with no call.
+        #[cfg(target_os = "macos")]
+        if kind == Kind::SendTo {
+            let mut segmented = false;
+            self.hold(id, |held| {
+                segmented =
+                    matches!(&held.payload, Payload::SendTo { datagram, .. } if datagram.segment_size.is_some());
+            });
+            if segmented {
+                self.complete_now(id, udp::UNSEGMENTED);
+                return true;
+            }
+        }
         if kind.batch() {
             return self.start_batch(id, fd);
         }
@@ -1724,7 +1746,7 @@ impl Driver {
                 let (vectors, count) = regions.vectors();
                 Sqe::writev(fd, vectors, count)
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             (Kind::Vectored, Payload::Regions(regions), _) => Sqe::send_message(fd, regions.message()),
             // The port sends the `WSABUF` array of a vectored write with one `WSASend`.
             #[cfg(target_os = "windows")]
@@ -1732,7 +1754,7 @@ impl Driver {
                 let (vectors, count) = regions.vectors();
                 Sqe::writev(fd, vectors, count)
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SHUT_WR),
             #[cfg(target_os = "windows")]
             (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SD_SEND),
@@ -1764,18 +1786,25 @@ impl Driver {
     /// next, in one kernel entry. A batch receive waits only in its first entry. Gives `false`, and
     /// changes nothing, when the queue has no room for each entry.
     fn start_batch(&mut self, id: OpId, fd: i32) -> bool {
-        let mut entries = 0;
+        let mut entries = Ok(0);
         self.hold(id, |held| {
             entries = match held.payload.batch() {
-                Some(Batch::Send(datagrams)) => datagrams.len(),
-                Some(Batch::Receive(arrivals)) => arrivals.capacity(),
-                None => 0,
+                Some(Batch::Send(datagrams)) => datagrams.sendable(),
+                Some(Batch::Receive(arrivals)) => Ok(arrivals.capacity()),
+                None => Ok(0),
             };
         });
-        if entries == 0 {
-            self.complete_now(id, 0);
-            return true;
-        }
+        let entries = match entries {
+            Ok(0) => {
+                self.complete_now(id, 0);
+                return true;
+            }
+            Ok(entries) => entries,
+            Err(result) => {
+                self.complete_now(id, result);
+                return true;
+            }
+        };
         if !self.room(u32::try_from(entries).unwrap_or(u32::MAX)) {
             return false;
         }
@@ -1793,7 +1822,7 @@ impl Driver {
                         // datagrams that wait.
                         // On Windows, the port takes the receives after the first of a chain with
                         // no wait.
-                        #[cfg(target_os = "linux")]
+                        #[cfg(unix)]
                         let flags = if index == 0 {
                             0
                         } else {
@@ -1990,14 +2019,14 @@ fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, rec
     len
 }
 
-/// Whether operations of the file of `owned` run, which its close waits for. Windows has no file
-/// resource yet.
+/// Whether operations of the file of `owned` run, which its close waits for. macOS and Windows have
+/// no file resource yet.
 #[cfg(target_os = "linux")]
 const fn running(owned: &super::Owned) -> bool {
     owned.running > 0
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 const fn running(_: &super::Owned) -> bool {
     false
 }
@@ -2012,27 +2041,32 @@ fn errno(error: &io::Error) -> i32 {
 pub(super) use super::iocp::{bind_now, int, local_address, new_socket, set_int};
 
 /// The size of an `int`, as a `socklen_t`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const INT_LEN: u32 = 4;
 
 const _: () = assert!(size_of::<c_int>() == 4);
 
-/// A new nonblocking socket of `family` and `kind`, `SOCK_STREAM` or `SOCK_DGRAM`.
-#[cfg(target_os = "linux")]
+/// A new nonblocking socket of `family` and `kind`, `SOCK_STREAM` or `SOCK_DGRAM`, which closes
+/// at an exec.
+#[cfg(unix)]
 #[expect(unsafe_code, reason = "the C library gives a new descriptor")]
 pub(super) fn new_socket(family: SaFamily, kind: c_int) -> io::Result<Handle> {
+    #[cfg(target_os = "linux")]
     let kind = kind | sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC;
     // SAFETY: the call takes no pointer.
     let fd = unsafe { sys::socket(c_int::from(family), kind, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // macOS has no flags of `socket` for the two properties.
+    #[cfg(target_os = "macos")]
+    let fd = super::poller::prepare(fd).map_err(io::Error::from_raw_os_error)?;
     // SAFETY: the C library gave a new descriptor that nothing else owns.
     Ok(unsafe { Handle::from_raw_fd(fd) })
 }
 
 /// Sets the option `name` of `level` of `socket` to the `int` `value`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[expect(unsafe_code, reason = "the call reads one `int` that lives during the call")]
 fn set_int(socket: Borrowed<'_>, level: c_int, name: c_int, value: c_int) -> io::Result<()> {
     // SAFETY: `value` is an `int` that lives during the call, and `INT_LEN` is its size.
@@ -2045,7 +2079,7 @@ fn set_int(socket: Borrowed<'_>, level: c_int, name: c_int, value: c_int) -> io:
 }
 
 /// The `int` option `name` of `level` of `socket`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[expect(unsafe_code, reason = "the kernel writes one `int` that lives during the call")]
 fn int(socket: Borrowed<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
     let (mut value, mut len): (c_int, u32) = (0, INT_LEN);
@@ -2060,7 +2094,7 @@ fn int(socket: Borrowed<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
 }
 
 /// The local address of `socket`, and its length.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[expect(
     unsafe_code,
     reason = "the kernel writes the address into storage that lives during the call"
@@ -2075,7 +2109,7 @@ pub(super) fn local_address(socket: impl std::os::fd::AsFd) -> Option<(SockAddrS
 
 /// Binds `socket` to the address of `len` bytes in `address`, and with `listen` listens on it,
 /// with system calls.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[expect(unsafe_code, reason = "the call reads the address, which lives during the call")]
 fn bind_now(socket: Borrowed<'_>, address: &SockAddrStorage, len: u32, listen: bool) -> io::Result<()> {
     // SAFETY: `address` holds an address of `len` bytes during the call.

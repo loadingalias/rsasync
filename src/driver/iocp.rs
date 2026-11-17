@@ -401,8 +401,9 @@ impl Port {
         self.full
     }
 
-    /// The ready completions, which stay for the driver.
-    #[cfg(test)]
+    /// The ready completions, which stay for the driver. Only the driver tests read them, and the
+    /// loom build has none.
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn peek(&self) -> Vec<Cqe> {
         self.completions.iter().copied().collect()
     }

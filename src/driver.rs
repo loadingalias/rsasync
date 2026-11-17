@@ -1,7 +1,8 @@
 //! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
 //! nonblocking turns. No scheduler runs. On Linux, the driver runs on io_uring, or on epoll where the
-//! kernel refuses io_uring. On Windows, it runs TCP on an I/O completion port ([`Backend`]). Each
-//! backend has the same operations and the same ownership rules.
+//! kernel refuses io_uring. On macOS, it runs TCP and UDP on kqueue. On Windows, it runs TCP and UDP
+//! on an I/O completion port ([`Backend`]). Each backend has the same operations and the same
+//! ownership rules.
 //!
 //! A [`Driver`] is the home of each operation that it accepts, from the submission to the
 //! terminal event of the operation, which releases its buffer and its charge. Its future can move
@@ -14,8 +15,8 @@
 //!   [`Config::completions_per_turn`]. [`Turn::more`] says that work remains.
 //! - [`Driver::wait`] blocks in the kernel until work comes: a completion, or a request or wake
 //!   from another thread. The kernel runs its deferred work during the wait.
-//! - On Linux, the wake descriptor, `AsFd` of the driver, becomes readable when work comes, so a
-//!   host's reactor can wait for it.
+//! - On Linux and macOS, the wake descriptor, `AsFd` of the driver, becomes readable when work
+//!   comes, so a host's reactor can wait for it.
 //! - [`Driver::teardown`] cancels each running operation, drives until each terminal event, and
 //!   closes each resource. Its [`Teardown`] reports the cancelled operations.
 //!
@@ -55,8 +56,6 @@
 mod capability;
 mod completion;
 #[cfg(target_os = "linux")]
-mod epoll;
-#[cfg(target_os = "linux")]
 mod file;
 #[cfg(all(feature = "local", target_os = "linux"))]
 mod home;
@@ -66,6 +65,8 @@ mod iocp;
 mod local;
 #[cfg(target_os = "linux")]
 mod pipe;
+#[cfg(unix)]
+mod poller;
 #[cfg(target_os = "linux")]
 mod probe;
 #[cfg(target_os = "linux")]
@@ -100,10 +101,12 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
-// The descriptor of a resource, as the platform names it: a file descriptor on Linux, and a socket
-// handle on Windows, where the driver owns only sockets.
-#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd, FromRawFd as _, OwnedFd};
+// The descriptor of a resource, as the platform names it: a file descriptor on Linux and macOS,
+// and a socket handle on Windows, where the driver owns only sockets.
+#[cfg(unix)]
 use std::os::fd::{BorrowedFd as Borrowed, OwnedFd as Handle};
 #[cfg(target_os = "windows")]
 use std::os::windows::io::{BorrowedSocket as Borrowed, OwnedSocket as Handle};
@@ -344,7 +347,7 @@ pub(crate) struct Held {
     /// The loan of the buffer that a receive or a read fills.
     pub(crate) loan: Option<WriteLoan<Backing>>,
     #[cfg_attr(
-        any(not(test), loom, target_os = "windows"),
+        any(not(test), loom, not(target_os = "linux")),
         expect(dead_code, reason = "no operation takes a charge yet; the tests of Linux do")
     )]
     pub(crate) charge: Option<Permit>,
@@ -564,9 +567,9 @@ pub enum Reason {
     #[cfg(target_os = "linux")]
     Exited,
     /// The backend did not take the descriptor: on epoll, `epoll_ctl` failed, for example at the
-    /// limit of `fs.epoll.max_user_watches`. On IOCP, the association of the socket with the port
-    /// failed (`CreateIoCompletionPort`), or the socket handle has significant bits above the low
-    /// 32.
+    /// limit of `fs.epoll.max_user_watches`. On kqueue, `kevent` refused a registration, for
+    /// example with no kernel memory. On IOCP, the association of the socket with the port failed
+    /// (`CreateIoCompletionPort`), or the socket handle has significant bits above the low 32.
     Register,
 }
 
@@ -749,9 +752,9 @@ struct Resources {
     slots: Box<[Owned]>,
     /// The free slots that spawns keep for the pipe ends of their children.
     reserved: u32,
-    /// The registrations in the poller, on the epoll backend.
-    #[cfg(target_os = "linux")]
-    registrar: Option<epoll::Registrar>,
+    /// The registrations in the poller, on the epoll and kqueue backends.
+    #[cfg(unix)]
+    registrar: Option<poller::Registrar>,
     /// The associations with the port.
     #[cfg(target_os = "windows")]
     registrar: iocp::Registrar,
@@ -799,21 +802,32 @@ impl Resources {
         u32::try_from(free).unwrap_or(u32::MAX)
     }
 
-    /// Takes `fd` into the first free slot, and registers it in the poller on the epoll backend,
-    /// or associates it with the port on IOCP. A file has no readiness, so it has no registration.
+    /// Takes `fd` into the first free slot, and registers it in the poller on the epoll and kqueue
+    /// backends, or associates it with the port on IOCP. A file has no readiness, so it has no
+    /// registration.
     fn take(&mut self, fd: Handle, medium: Medium) -> Result<Resource, (Reason, Handle)> {
         let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
             return Err((Reason::Resources, fd));
         };
         #[cfg(target_os = "linux")]
+        let registers = medium != Medium::File;
+        #[cfg(target_os = "macos")]
+        let registers = true;
+        #[cfg(unix)]
         if let Some(registrar) = &self.registrar
-            && medium != Medium::File
+            && registers
         {
-            let token = epoll::Token {
+            let token = poller::Token {
                 index,
                 generation: slot.generation,
             };
-            if registrar.add(fd.as_fd(), token, medium == Medium::Pipe).is_err() {
+            // A pipe end gets `O_NONBLOCK` first, because a read or a write that waits would stop
+            // the driver. A failure changes nothing but that flag.
+            #[cfg(target_os = "linux")]
+            if medium == Medium::Pipe && !pipe::set_nonblocking(fd.as_fd(), true) {
+                return Err((Reason::Register, fd));
+            }
+            if registrar.add(fd.as_fd(), token).is_err() {
                 return Err((Reason::Register, fd));
             }
         }
@@ -849,7 +863,7 @@ impl Resources {
     /// Ends `resource` and its registration, and gives its descriptor. The identity is stale from
     /// now on.
     fn release(&mut self, resource: Resource) -> Option<Handle> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let registrar = self.registrar.as_ref();
         let slot = self
             .slots
@@ -864,7 +878,7 @@ impl Resources {
         let fd = slot.fd.take()?;
         // A socket stays associated with its port until its close, and no system call ends the
         // association.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let Some(registrar) = registrar {
             registrar.delete(fd.as_fd());
         }
@@ -967,6 +981,10 @@ struct Shared {
     /// The wake of the port: a packet that another thread posts, which ends a wait.
     #[cfg(target_os = "windows")]
     wake: iocp::Wake,
+    /// The wake of the kqueue: a user event that another thread triggers, which ends a wait and
+    /// makes the kqueue readable.
+    #[cfg(target_os = "macos")]
+    wake: poller::Wake,
 }
 
 impl Shared {
@@ -978,7 +996,7 @@ impl Shared {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "linux"))]
     fn wake(&self) {
         self.wake.post();
     }
@@ -1065,8 +1083,8 @@ impl Driver {
     /// Starts a driver with the limits of `config`. It allocates here, one time. On io_uring, it
     /// opens three descriptors: the ring, the wake descriptor, and the interrupt descriptor. With
     /// the `local` feature, it also opens a duplicate of the ring, the target of the wake messages
-    /// of local tasks. On epoll, the epoll descriptor takes the place of the ring. On Windows, it
-    /// opens one completion port.
+    /// of local tasks. On epoll, the epoll descriptor takes the place of the ring. On macOS, it
+    /// opens one kqueue, and on Windows one completion port.
     ///
     /// # Errors
     ///
@@ -1130,6 +1148,52 @@ impl Driver {
         })
     }
 
+    /// Starts the kqueue poller of a valid `config` with room for `completions` operations in
+    /// flight.
+    #[cfg(target_os = "macos")]
+    fn start_backend(config: Config, completions: u32) -> Result<Self, Error> {
+        // kqueue is the one backend of macOS, and a feature is a feature of io_uring.
+        if config.backend.is_some_and(|backend| backend != Backend::Kqueue) {
+            return Err(Error::Refused(io::ErrorKind::Unsupported.into()));
+        }
+        if !config.required.is_empty() {
+            return Err(Error::Unsupported(config.required));
+        }
+        let selection = capability::Selection {
+            requested: config.backend,
+            backend: Backend::Kqueue,
+            fallback: None,
+        };
+        let poller = poller::Poller::new(config.submissions, completions, config.resources, config.operations)
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::InvalidInput => Error::Config,
+                _ => Error::System(error),
+            })?;
+        let (wake, registrar) = (poller.wake(), poller.registrar());
+        let table = Table::new(config.operations);
+        let shared = Arc::new(Shared {
+            entries: (0..config.operations).map(|_| Entry::new()).collect(),
+            requests: table.requests(),
+            wake,
+        });
+        Ok(Self {
+            queue: Queue::Poller(poller),
+            table,
+            shared,
+            resources: Resources {
+                slots: (0..config.resources).map(|_| Owned::default()).collect(),
+                reserved: 0,
+                registrar: Some(registrar),
+            },
+            taken: Vec::with_capacity(config.operations as usize * 2),
+            pending: Vec::with_capacity(config.resources as usize),
+            copied: 0,
+            selected: None,
+            report: Report::new(selection, config.required, Features::NONE, false),
+            completions_per_turn: config.completions_per_turn,
+        })
+    }
+
     /// Starts the backend of a valid `config` with room for `completions` completions: io_uring,
     /// or epoll where the kernel refuses io_uring.
     #[cfg(target_os = "linux")]
@@ -1176,7 +1240,7 @@ impl Driver {
                 if !config.required.is_empty() {
                     return Err(Error::Unsupported(config.required));
                 }
-                let poller = epoll::Poller::new(
+                let poller = poller::Poller::new(
                     config.submissions,
                     completions,
                     config.resources,
@@ -1518,9 +1582,11 @@ impl Driver {
     }
 
     /// The descriptor of `resource`, while the driver owns it.
-    #[cfg(all(test, not(loom), target_os = "linux"))]
+    #[cfg(all(test, not(loom), unix))]
     pub(crate) fn fd(&mut self, resource: Resource) -> Option<std::os::fd::RawFd> {
-        Some(self.resources.get(resource)?.fd.as_ref()?.as_raw_fd())
+        Some(std::os::fd::AsRawFd::as_raw_fd(
+            self.resources.get(resource)?.fd.as_ref()?,
+        ))
     }
 
     /// Submits an operation of no direction on `resource` with the resources that `held` makes
@@ -1642,8 +1708,8 @@ impl Driver {
         slot.update(id, |held| sqe = held.as_mut().map(entry));
         if let Some(sqe) = sqe {
             let resource = self.table.resources(id).and_then(|tag| tag.resource);
-            #[cfg(target_os = "linux")]
-            let token = resource.map(|resource| epoll::Token {
+            #[cfg(unix)]
+            let token = resource.map(|resource| poller::Token {
                 index: resource.index,
                 generation: resource.generation,
             });
@@ -1883,10 +1949,12 @@ impl Driver {
 }
 
 /// The error of an operation that a cancel ended: `ECANCELED` (`include/uapi/asm-generic/errno.h`)
-/// on Linux, and `ERROR_OPERATION_ABORTED` (`winerror.h`), which is also `WSA_OPERATION_ABORTED`,
-/// on Windows.
+/// on Linux, `ECANCELED` (`sys/errno.h`) on macOS, and `ERROR_OPERATION_ABORTED` (`winerror.h`),
+/// which is also `WSA_OPERATION_ABORTED`, on Windows.
 #[cfg(target_os = "linux")]
 pub(crate) const ECANCELED: i32 = 125;
+#[cfg(target_os = "macos")]
+pub(crate) const ECANCELED: i32 = 89;
 #[cfg(target_os = "windows")]
 pub(crate) const ECANCELED: i32 = 995;
 
@@ -2016,12 +2084,12 @@ fn finish(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl AsFd for Driver {
     /// The wake descriptor. It becomes readable when a completion is ready, when the kernel has
     /// deferred work for the driver, and when another thread posts a request or a wake. Turn the
-    /// driver when it is readable. On epoll, it is the epoll descriptor, which is readable when an
-    /// event of a resource or a wake waits.
+    /// driver when it is readable. On epoll and kqueue, it is the epoll descriptor or the kqueue,
+    /// which is readable when an event of a resource or a wake waits.
     ///
     /// A Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c` signals the
     /// descriptor for deferred work only one time in each registration, for example Ubuntu 26.04
@@ -2030,7 +2098,10 @@ impl AsFd for Driver {
     /// becomes readable for each completion and each deferred work. A kernel with no defect makes
     /// no extra system call.
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.queue.readable(self.shared.wake.as_fd())
+        #[cfg(target_os = "linux")]
+        return self.queue.readable(self.shared.wake.as_fd());
+        #[cfg(target_os = "macos")]
+        return self.queue.readable();
     }
 }
 
@@ -2112,7 +2183,7 @@ fn eventfd() -> io::Result<OwnedFd> {
 }
 
 /// The borrowed descriptor of `handle`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn borrow(handle: &Handle) -> Borrowed<'_> {
     handle.as_fd()
 }
@@ -2124,9 +2195,9 @@ fn borrow(handle: &Handle) -> Borrowed<'_> {
 }
 
 /// The number of `handle` in a submission entry: its descriptor.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn number(handle: Borrowed<'_>) -> i32 {
-    handle.as_raw_fd()
+    std::os::fd::AsRawFd::as_raw_fd(&handle)
 }
 
 /// The number of `handle` in a submission entry: the low 32 bits of the socket handle, its
@@ -2147,7 +2218,7 @@ fn number(handle: Borrowed<'_>) -> i32 {
 /// # Safety
 ///
 /// `number` is a new descriptor that nothing else owns.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[expect(unsafe_code, reason = "the caller gives a new descriptor")]
 unsafe fn owned(number: i32) -> Handle {
     // SAFETY: the caller's contract.

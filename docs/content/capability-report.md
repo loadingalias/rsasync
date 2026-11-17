@@ -24,10 +24,10 @@ println!("{report:#?}");
 | Part | Method | What it gives |
 | --- | --- | --- |
 | Requested | `requested()` | The backend of `Config::backend`, or `None` for the permissive selection |
-| Resolved | `backend()` | The backend that runs: `Backend::IoUring` or `Backend::Epoll` ([the epoll backend](epoll.md)) on Linux, and `Backend::Iocp` ([the IOCP backend](iocp.md)) on Windows |
+| Resolved | `backend()` | The backend that runs: `Backend::IoUring` or `Backend::Epoll` ([the epoll backend](epoll.md)) on Linux, `Backend::Kqueue` ([the kqueue backend](kqueue.md)) on macOS, and `Backend::Iocp` ([the IOCP backend](iocp.md)) on Windows. The report states no segmentation offload: check each path with `datagram::Probe` ([validate segmentation offload](datagram-io.md#validate-segmentation-offload)). On `Backend::Kqueue`, the send of the probe gives `Refused::NoSegmentation` |
 | Resolved | `fallback()` | The error number of the ring creation (`EPERM` or `ENOSYS`) when the permissive selection runs epoll for that reason, else `None` |
 | Requested | `required()` | The features of `Config::require`. The driver has each of them |
-| Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing. On epoll, no probe runs, and the set is empty |
+| Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing. On epoll, kqueue, and IOCP, no probe runs, and the set is empty |
 | Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring`, `Route::SystemCall`, `Route::BlockingService`, or `Route::Poll` |
 | Applied | `helper_threads()` | The threads that the driver starts: 0. A call on `Route::BlockingService` runs on a thread of your service |
 | Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws`. It also does so when a deferred signal came late during the probe of the kernel |

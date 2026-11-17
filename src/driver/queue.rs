@@ -1,17 +1,17 @@
 //! The submission and completion queues of a driver: the io_uring ring, or the epoll poller, on
-//! Linux, and the completion port on Windows. The poller and the port take the entries of a ring and
-//! post the completions that a ring posts for them.
+//! Linux, the kqueue poller on macOS, and the completion port on Windows. The pollers and the port
+//! take the entries of a ring and post the completions that a ring posts for them.
 
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
 #[cfg(all(feature = "local", target_os = "linux"))]
 use std::os::fd::OwnedFd;
 
-#[cfg(target_os = "linux")]
-use super::epoll::{self, Poller, Token};
 #[cfg(target_os = "windows")]
 use super::iocp::{self, Port, Token};
+#[cfg(unix)]
+use super::poller::{self, Poller, Token};
 #[cfg(target_os = "linux")]
 use crate::uring::Ring;
 use crate::uring::{BufferRing, Cqe, Sqe};
@@ -21,7 +21,7 @@ use crate::uring::{BufferRing, Cqe, Sqe};
 pub(crate) enum Queue {
     #[cfg(target_os = "linux")]
     Ring(Ring),
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Poller(Poller),
     #[cfg(target_os = "windows")]
     Port(Port),
@@ -31,8 +31,8 @@ pub(crate) enum Queue {
 pub(crate) enum Completions<'a> {
     #[cfg(target_os = "linux")]
     Ring(crate::uring::Completions<'a>),
-    #[cfg(target_os = "linux")]
-    Poller(epoll::Completions<'a>),
+    #[cfg(unix)]
+    Poller(poller::Completions<'a>),
     #[cfg(target_os = "windows")]
     Port(iocp::Completions<'a>),
 }
@@ -44,7 +44,7 @@ impl Iterator for Completions<'_> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(completions) => completions.next(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(completions) => completions.next(),
             #[cfg(target_os = "windows")]
             Self::Port(completions) => completions.next(),
@@ -64,7 +64,7 @@ impl Queue {
             // SAFETY: the caller's contract.
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => unsafe { ring.push(entry) }.map_err(drop),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.push(entry, token).map_err(drop),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.push(entry, token).map_err(drop),
@@ -77,7 +77,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.submit(wait),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.submit(wait),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.submit(wait),
@@ -91,7 +91,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.submit_timeout(wait, timeout),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.submit_timeout(wait, timeout),
         }
     }
@@ -102,7 +102,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.needs_enter(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(_) => true,
             #[cfg(target_os = "windows")]
             Self::Port(_) => true,
@@ -115,7 +115,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.needs_enter(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.more(),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.more(),
@@ -126,7 +126,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.entries(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.entries(),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.entries(),
@@ -137,7 +137,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.room(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.room(),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.room(),
@@ -148,7 +148,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.unsubmitted(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.unsubmitted(),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.unsubmitted(),
@@ -159,7 +159,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.ready(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.ready(),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.ready(),
@@ -170,7 +170,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => Completions::Ring(ring.completions()),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => Completions::Poller(poller.completions()),
             #[cfg(target_os = "windows")]
             Self::Port(port) => Completions::Port(port.completions()),
@@ -187,6 +187,13 @@ impl Queue {
         }
     }
 
+    /// The descriptor that a host reactor waits for: the kqueue.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn readable(&self) -> BorrowedFd<'_> {
+        let Self::Poller(poller) = self;
+        poller.fd()
+    }
+
     /// A new descriptor of the backend, the target of the wake messages of local tasks. A message
     /// to the descriptor of a poller fails, and the home is then woken by its interrupt descriptor.
     #[cfg(all(feature = "local", target_os = "linux"))]
@@ -197,8 +204,9 @@ impl Queue {
         }
     }
 
-    /// The descriptor number of the backend.
-    #[cfg(all(test, target_os = "linux"))]
+    /// The descriptor number of the backend, for the driver tests, which the loom build does not
+    /// have.
+    #[cfg(all(test, not(loom), target_os = "linux"))]
     pub(crate) fn fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd as _;
         match self {
@@ -212,7 +220,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => BufferRing::register(ring, entries, group),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => {
                 let buffers = BufferRing::unregistered(entries, group)?;
                 poller.provide_group(buffers.base(), entries);
@@ -233,7 +241,7 @@ impl Queue {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => buffers.unregister(ring),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => {
                 poller.release_group();
                 buffers.free();
@@ -248,13 +256,14 @@ impl Queue {
         }
     }
 
-    /// The ready completions, which stay for the driver.
-    #[cfg(test)]
+    /// The ready completions, which stay for the driver, for the driver tests, which the loom build
+    /// does not have.
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn peek(&self) -> alloc::vec::Vec<Cqe> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.peek(),
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Self::Poller(poller) => poller.peek(),
             #[cfg(target_os = "windows")]
             Self::Port(port) => port.peek(),

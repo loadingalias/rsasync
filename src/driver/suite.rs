@@ -16,6 +16,11 @@
 //! and the stream rules run as in production. The seam exists only in the tests, and no public
 //! injection API exists.
 //!
+//! On macOS, `Backend::Kqueue` gives each completion as the kqueue poller posts it: the poller of
+//! epoll, with the kqueue selector. Only the TCP, UDP, and ownership cases run on macOS: its files,
+//! pipes, local streams, processes, and signals have no kqueue form yet. A datagram with a segment
+//! size has its own case there, because macOS has no segmentation offload.
+//!
 //! On Windows, `Backend::Iocp` gives each completion as the completion port gives it, where each
 //! socket that passes the installed-provider check skips the packet of a call that ends at once,
 //! and `Backend::Packets` gives it with no skip, so each call that does not fail at once ends at
@@ -31,7 +36,9 @@
 //! # Forms of a case
 //!
 //! The body of a case stays beside the code of its surface, and this index gives each body its
-//! tests: `<suite>::kernel::<case>`, `<suite>::injected::<case>`, and `<suite>::epoll::<case>`. A case runs once, as
+//! tests: `<suite>::kernel::<case>`, `<suite>::injected::<case>`, and `<suite>::epoll::<case>` on
+//! Linux, `<suite>::kqueue::<case>` on macOS, and `<suite>::iocp::<case>` and
+//! `<suite>::packets::<case>` on Windows. A case runs once, as
 //! `<suite>::once::<case>`, when the seam can change none of its inputs: a refusal makes no
 //! completion, and a signal reaches its stream through the wake descriptor of the driver, not
 //! through a completion. Two cases run only under injection, as `law::injected_only::<case>`,
@@ -58,7 +65,7 @@
 //! | IOCP, immediate return with any other status | On Windows, with skip-on-success in `law::iocp` and with a packet in `law::packets`: `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order`, whose receive ends at once with its bytes. The warning status of an oversized datagram comes in the packet of `an_oversized_datagram_gives_the_truncation_outcome`: on Windows Server 2025, the receive of a datagram that waits returns pending, so no case makes the warning at once |
 //! | Windows IoRing | No IoRing backend: the Windows file task of R5 adds it |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
-//! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. No kqueue backend: R505 adds it |
+//! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. On kqueue, each case of `law::kqueue`, for example `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order` |
 //! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion` |
 //! | Child wait | `a_dropped_wait_and_child_leave_no_zombie_after_the_exit` |
 //!
@@ -174,6 +181,16 @@ pub(super) enum Backend {
     /// its packet.
     #[cfg(target_os = "windows")]
     Packets,
+    /// The kqueue poller, as its nonblocking calls end.
+    #[cfg(target_os = "macos")]
+    Kqueue,
+}
+
+/// A driver of `config` that takes its completions from `backend`.
+#[cfg(target_os = "macos")]
+pub(super) fn driver(config: Config, backend: Backend) -> Driver {
+    let Backend::Kqueue = backend;
+    super::tests::driver(config.backend(super::Backend::Kqueue))
 }
 
 /// A driver of `config` that takes its completions from `backend`.
@@ -212,8 +229,8 @@ fn service() -> &'static Service {
 }
 
 /// Gives each case a test on each backend of the target: on Linux, the kernel, the injection, and
-/// epoll; on Windows, the port with and with no skip-on-success. A case with a `cfg` runs only
-/// where it holds, for example a case of files or pipes only on Linux.
+/// epoll; on macOS, kqueue; on Windows, the port with and with no skip-on-success. A case with a
+/// `cfg` runs only where it holds, for example a case of files or pipes only on Linux.
 macro_rules! cases {
     ($($(#[$meta:meta])* $($module:ident)::+ => $case:ident),* $(,)?) => {
         #[cfg(target_os = "linux")]
@@ -267,6 +284,17 @@ macro_rules! cases {
                 #[test]
                 fn $case() {
                     crate::driver::$($module::)+$case(crate::driver::suite::Backend::Packets);
+                }
+            )*
+        }
+
+        #[cfg(target_os = "macos")]
+        mod kqueue {
+            $(
+                $(#[$meta])*
+                #[test]
+                fn $case() {
+                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Kqueue);
                 }
             )*
         }
@@ -328,7 +356,7 @@ mod law {
         // An abandoned accept.
         tests => a_dropped_accept_leaves_its_connection_to_the_next_accept,
         // A late completion: it comes after the end of the interest in it.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         tests => a_dropped_connect_that_completes_closes_its_connection,
         // Cancel while running.
         tests => an_explicit_cancel_of_a_receive_gives_its_buffer_and_bytes_with_no_copy,
@@ -480,7 +508,10 @@ mod operation {
         local::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,
         // UDP.
         tests => send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports,
+        #[cfg(not(target_os = "macos"))]
         tests => a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size,
+        #[cfg(target_os = "macos")]
+        tests => a_segment_size_gives_no_segmentation_and_a_batch_sends_only_the_datagrams_before_it,
         tests => an_oversized_datagram_gives_the_truncation_outcome,
         tests => a_selected_datagram_arrives_in_the_slot_of_the_pool_which_returns_at_its_drop,
         tests => a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it,

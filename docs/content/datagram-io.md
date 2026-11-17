@@ -201,6 +201,10 @@ path whose two ends you control, for example loopback or a paired endpoint, with
    verdict.
 3. At your own deadline, call `probe.expired()`. The probe has no clock.
 
+When the send of step 1 gives `Refused::NoSegmentation`, the path has no segmentation offload: fall
+back at once, with no receive. On macOS, the send of each probe gives it, with no system call, and
+macOS has no coalesced receive to turn on.
+
 `Verdict::Valid` means that each segment arrived once with its boundaries, as its own datagram or in
 a coalesced receive with its segment size. `Verdict::Fallback` names the fault:
 `Reason::NoSegmentSize`, `Reason::Lost`, or `Reason::Altered`. Then fall back on that path: send no
@@ -215,9 +219,10 @@ and `MsgHdrX` on macOS with the `macos-private-batch` feature, or `WsaMsg` and `
 Windows), the packet information, and the
 constants of the calls and of the control messages, each with the values and the layout of the
 target system. With the `std` feature, it also declares the socket calls that the networking
-family and its runtimes share: `setsockopt`, `getsockopt`, and `getsockname`; on Linux `socket`,
-`bind`, and `listen`, with the TCP socket options; and on Windows `bind`, `getpeername`, `WSAIoctl`,
-`WSASendMsg`, and `WSAPROTOCOL_INFOW`. The drivers of rsasync make their sockets with them. `Control` is the one
+family and its runtimes share: `setsockopt`, `getsockopt`, and `getsockname`; on Linux and macOS
+`socket`, `bind`, `listen`, `sendmsg`, and `recvmsg`, with the TCP socket options, and on Linux also
+`sendmmsg` and `recvmmsg`; and on Windows `bind`, `getpeername`, `WSAIoctl`, `WSASendMsg`, and
+`WSAPROTOCOL_INFOW`. The drivers of rsasync make their sockets with them. `Control` is the one
 encoding of the control messages: `Control::encode` writes those of a `Transmit`, and
 `Control::decode` reads those of a received datagram. They need only `core`, so a completion
 backend, such as the io_uring driver of rsasync, builds its messages with them. The calls need the

@@ -35,6 +35,7 @@ pub mod channel;
     all(
         any(
             all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "windows", target_arch = "x86_64")
         ),
         feature = "std"
@@ -44,6 +45,7 @@ pub mod channel;
     not(all(
         any(
             all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(target_os = "macos", target_arch = "aarch64"),
             all(target_os = "windows", target_arch = "x86_64")
         ),
         feature = "std"
@@ -74,10 +76,12 @@ pub mod clock;
 pub mod task;
 pub mod timer;
 
-/// Driver-only use of the driver: on io_uring or epoll on Linux, and on IOCP on Windows.
+/// Driver-only use of the driver: on io_uring or epoll on Linux, on kqueue on macOS, and on IOCP on
+/// Windows.
 #[cfg(all(
     any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64")
     ),
     feature = "std"
@@ -85,21 +89,22 @@ pub mod timer;
 pub mod driver;
 
 // The io_uring declarations are checked against the kernel headers of these two architectures
-// only. Another architecture has different constants, so it gets no ring. On Windows, the IOCP
-// backend takes the same submission entries and posts the same completions, so it uses only those
-// types of the module.
+// only. Another architecture has different constants, so it gets no ring. On macOS and Windows, the
+// kqueue and IOCP backends take the same submission entries and post the same completions, so they
+// use only those types of the module.
 #[cfg(all(
     any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64")
     ),
     feature = "std"
 ))]
 #[cfg_attr(
-    any(not(all(test, not(loom))), target_os = "windows"),
+    any(not(all(test, not(loom))), not(target_os = "linux")),
     expect(
         dead_code,
-        reason = "the driver uses only some items. The tests of the ring and the driver use the others, and the loom build leaves those tests out. On Windows, the driver uses only the entries"
+        reason = "the driver uses only some items. The tests of the ring and the driver use the others, and the loom build leaves those tests out. On macOS and Windows, the driver uses only the entries"
     )
 )]
 mod uring;

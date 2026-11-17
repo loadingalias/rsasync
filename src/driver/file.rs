@@ -22,7 +22,7 @@ use rsnetwork_udp::sys::IoVec;
 use super::tcp::{Regions, count};
 use super::{
     Backend, Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource,
-    Resources, Route, Tag, epoll, sys,
+    Resources, Route, Tag, poller, sys,
 };
 use crate::blocking::{Job, Submitter};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
@@ -634,7 +634,7 @@ impl Job for FileJob {
     type Output = i32;
 
     fn run(self) -> i32 {
-        epoll::run_file(&self.sqe)
+        poller::run_file(&self.sqe)
     }
 }
 

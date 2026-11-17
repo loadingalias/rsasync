@@ -31,6 +31,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 #[cfg(all(feature = "local", target_os = "linux"))]
 use core::time::Duration;
 use std::io;
+#[cfg(target_os = "macos")]
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 /// The descriptor number of an entry. On Windows it holds the low 32 bits of a socket handle, which
@@ -39,8 +41,8 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 type RawFd = i32;
 
 /// One region of a vectored entry, and the message header of a message entry: `struct iovec` and
-/// `struct msghdr` on Linux, `WSABUF` and `WSAMSG` on Windows.
-#[cfg(target_os = "linux")]
+/// `struct msghdr` on Linux and macOS, `WSABUF` and `WSAMSG` on Windows.
+#[cfg(unix)]
 use rsnetwork_udp::sys::{IoVec as Region, MsgHdr as Message};
 #[cfg(target_os = "windows")]
 use rsnetwork_udp::sys::{WsaBuf as Region, WsaMsg as Message};
@@ -497,15 +499,15 @@ impl Sqe {
     }
 }
 
-/// A shared mapping of a ring descriptor. It unmaps on drop. On Windows, it is only the memory of
-/// a buffer ring that no kernel ring reads, and it frees on drop.
+/// A shared mapping of a ring descriptor. It unmaps on drop. On macOS and Windows, it is only the
+/// memory of a buffer ring that no kernel ring reads, and it frees on drop.
 #[derive(Debug)]
 struct Mapping {
     base: core::ptr::NonNull<u8>,
     len: usize,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 impl Mapping {
     /// The alignment of the memory: a page, as a mapping has on Linux.
     const PAGE: usize = 4096;
@@ -526,7 +528,7 @@ impl Mapping {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 impl Drop for Mapping {
     #[expect(unsafe_code, reason = "the memory ends with its owner")]
     fn drop(&mut self) {

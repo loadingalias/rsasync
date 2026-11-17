@@ -1,7 +1,8 @@
 //! The declarations of the datagram calls, their message headers, and their control messages on macOS.
 //!
 //! Each item agrees with the macOS 27.2 SDK (`MacOSX27.2.sdk`) on aarch64: `usr/include/sys/socket.h`,
-//! `sys/_types/_iovec_t.h`, `netinet/in.h`, `netinet6/in6.h` with `__APPLE_USE_RFC_3542`, and `sys/errno.h`.
+//! `sys/_types/_iovec_t.h`, `netinet/in.h`, `netinet/tcp.h`, `netinet6/in6.h` with `__APPLE_USE_RFC_3542`, and
+//! `sys/errno.h`.
 //! The SDK does not declare the private calls `sendmsg_x` and `recvmsg_x` and their `struct msghdr_x`. They agree
 //! with `bsd/sys/socket_private.h` of xnu-12377.121.6, the newest published xnu source, and
 //! `usr/lib/system/libsystem_kernel.tbd` of the SDK exports both calls.
@@ -82,6 +83,31 @@ const _: () = {
     assert!(offset_of!(In6PktInfo, ipi6_ifindex) == 16);
 };
 
+/// `SOCK_STREAM`: a byte stream, such as TCP.
+pub const SOCK_STREAM: c_int = 1;
+/// `SOCK_DGRAM`: datagrams, such as UDP.
+pub const SOCK_DGRAM: c_int = 2;
+/// `SHUT_WR`: end the write side of a stream; the peer reads the end of the stream after the bytes that came
+/// before.
+pub const SHUT_WR: c_int = 1;
+
+/// `SOL_SOCKET`, the level of the socket options.
+pub const SOL_SOCKET: c_int = 0xffff;
+/// `SO_REUSEADDR`: a listener can bind an address whose earlier connections still wait.
+pub const SO_REUSEADDR: c_int = 0x0004;
+/// `SO_KEEPALIVE`: the stack probes an idle connection.
+pub const SO_KEEPALIVE: c_int = 0x0008;
+/// `SO_REUSEPORT`: sockets can bind the same address and port.
+pub const SO_REUSEPORT: c_int = 0x0200;
+/// `SO_SNDBUF`: the send buffer size.
+pub const SO_SNDBUF: c_int = 0x1001;
+/// `SO_RCVBUF`: the receive buffer size.
+pub const SO_RCVBUF: c_int = 0x1002;
+/// `IPPROTO_TCP`, the level of the TCP options (`netinet/in.h`).
+pub const IPPROTO_TCP: c_int = 6;
+/// `TCP_NODELAY`: send small segments at once, with no wait to coalesce them (`netinet/tcp.h`).
+pub const TCP_NODELAY: c_int = 0x01;
+
 /// `IPPROTO_IP`, the level of the IPv4 options.
 pub const IPPROTO_IP: c_int = 0;
 /// `IPPROTO_IPV6`, the level of the IPv6 options.
@@ -130,15 +156,21 @@ pub const EMSGSIZE: c_int = 40;
 #[expect(unsafe_code, reason = "the C library of macOS gives these functions")]
 unsafe extern "C" {
     /// `ssize_t sendmsg(int, const struct msghdr *, int)`.
-    pub(crate) fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
+    pub fn sendmsg(sockfd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     /// `ssize_t recvmsg(int, struct msghdr *, int)`.
-    pub(crate) fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
+    pub fn recvmsg(sockfd: c_int, msg: *mut MsgHdr, flags: c_int) -> isize;
     /// `int setsockopt(int, int, int, const void *, socklen_t)`.
     pub fn setsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *const c_void, optlen: u32) -> c_int;
     /// `int getsockopt(int, int, int, void *restrict, socklen_t *restrict)`.
     pub fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *mut c_void, optlen: *mut u32) -> c_int;
     /// `int getsockname(int, struct sockaddr *restrict, socklen_t *restrict)`.
     pub fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    /// `int socket(int, int, int)`.
+    pub fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+    /// `int bind(int, const struct sockaddr *, socklen_t)`.
+    pub fn bind(sockfd: c_int, addr: *const c_void, addrlen: u32) -> c_int;
+    /// `int listen(int, int)`.
+    pub fn listen(sockfd: c_int, backlog: c_int) -> c_int;
 }
 
 /// `struct msghdr_x`: one datagram of a batch of `sendmsg_x` or `recvmsg_x`. A receive writes the length of

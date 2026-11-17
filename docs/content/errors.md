@@ -97,7 +97,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 
 | Error | When | Recovery |
 | --- | --- | --- |
-| `Error::Refused(io::Error)` | The kernel or its policy refuses io_uring (`EPERM` or `ENOSYS`), and `Config::backend` requires `Backend::IoUring`. On Windows, `Config::backend` requires a backend other than `Backend::Iocp`, and the error has the kind `Unsupported` | Allow io_uring for the process, for example in the seccomp profile of the container or in `kernel.io_uring_disabled`, or remove the requirement: the driver then runs [epoll](epoll.md). On Windows, require `Backend::Iocp` or no backend |
+| `Error::Refused(io::Error)` | The kernel or its policy refuses io_uring (`EPERM` or `ENOSYS`), and `Config::backend` requires `Backend::IoUring`. On macOS, `Config::backend` requires a backend other than `Backend::Kqueue`, and on Windows one other than `Backend::Iocp`. The error then has the kind `Unsupported` | Allow io_uring for the process, for example in the seccomp profile of the container or in `kernel.io_uring_disabled`, or remove the requirement: the driver then runs [epoll](epoll.md). On macOS, require `Backend::Kqueue` or no backend, and on Windows `Backend::Iocp` or no backend |
 | `Error::Config` | A limit of `Config` is 0 or above what the kernel takes | Give each limit a value in its range |
 | `Error::System(io::Error)` | Another failure of the system | Read the `io::Error` |
 | `Error::Unsupported(Features)` | The kernel has no feature of these, which `Config::require` required | Run on a kernel with each feature, or remove the requirement and use the route that `Driver::report` gives |
@@ -109,7 +109,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::NotPipe`, `Reason::Direction` | The descriptor is not a pipe, or its direction is wrong | Give a pipe end with the direction of the adoption |
 | `Refused` with `Reason::Unsupported` | The operation does not apply to the resource | Use an operation of that resource |
 | `Refused` with `Reason::Alignment` | A direct-I/O buffer, length, or offset is not aligned | Align each one to the `Alignment` of the file |
-| `Refused` with `Reason::Register` | epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. On Windows, the association of a socket with the [port](iocp.md) failed | The refusal gives the descriptor back, open. Close other resources, or raise the limit |
+| `Refused` with `Reason::Register` | epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. On macOS, [kqueue](kqueue.md) refused the registration. On Windows, the association of a socket with the [port](iocp.md) failed | The refusal gives the descriptor back, open. Close other resources, or raise the limit |
 | `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`. `Driver::report` gives the route of each call |
 | `Ended` | The driver ended before the operation gave its result | Keep the driver driven until each future takes its result |
 | `SignalError::Fault`, `Uncatchable`, `Invalid` | No stream can take the signal | Use another signal |

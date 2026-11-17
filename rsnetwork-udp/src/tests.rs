@@ -501,10 +501,15 @@ fn a_batch_reports_the_datagrams_before_a_refused_one() {
 }
 
 /// macOS has no segmentation offload. A segment size is refused with a typed error, alone or in a
-/// batch, and nothing of it goes out; a batch sends the datagrams before it.
+/// batch, and nothing of it goes out; a batch sends the datagrams before it. So the send of a
+/// `Probe`, the first step of its validation, gives the typed error on each macOS path.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_segment_size_is_refused_and_sends_nothing() {
+    use core::num::{NonZeroU8, NonZeroU16};
+
+    use crate::Probe;
+
     tokio(async {
         let (sender, receiver) = (bind("127.0.0.1:0").await, bind("127.0.0.1:0").await);
         let destination = receiver.local_addr().unwrap();
@@ -513,7 +518,8 @@ fn a_segment_size_is_refused_and_sends_nothing() {
             segment_size: Some(1000),
             ..datagram(destination, &contents)
         };
-        let refused = send(sender.handle(), &segmented).unwrap_err();
+        let probe = Probe::new(NonZeroU8::new(3).unwrap(), NonZeroU16::new(1000).unwrap());
+        let refused = send(sender.handle(), &probe.transmit(Some(destination))).unwrap_err();
         assert_eq!(Refused::of(&refused), Some(Refused::NoSegmentation));
         let sent = sender
             .async_io(Interest::WRITABLE, || {

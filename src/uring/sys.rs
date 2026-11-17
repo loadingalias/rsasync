@@ -125,9 +125,12 @@ pub(super) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
 
 /// `POLLIN` (`include/uapi/asm-generic/poll.h`): the descriptor is readable.
 pub(super) const POLLIN: u32 = 0x1;
-/// `MSG_NOSIGNAL` (`include/linux/socket.h`): a send to a closed peer gives `EPIPE` and raises no
-/// `SIGPIPE`.
+/// `MSG_NOSIGNAL` (`include/linux/socket.h`, and `sys/socket.h` of the macOS 27.2 SDK): a send to a
+/// closed peer gives `EPIPE` and raises no `SIGPIPE`.
+#[cfg(not(target_os = "macos"))]
 pub(super) const MSG_NOSIGNAL: u32 = 0x4000;
+#[cfg(target_os = "macos")]
+pub(super) const MSG_NOSIGNAL: u32 = 0x8_0000;
 /// The flags of a new descriptor, from their declarations in `rsnetwork_udp::sys`, as the `u32`
 /// flags of an entry.
 #[cfg(target_os = "linux")]

@@ -1,7 +1,9 @@
-//! The epoll backend: a poller that takes the submission entries of the driver, as a ring does,
-//! and runs each one as one nonblocking call when its descriptor is ready. It posts the
-//! completion that a ring posts for the same entry, so the operation table, the stream rules,
-//! close, and teardown run in the same way on both backends.
+//! The readiness backends, epoll on Linux and kqueue on macOS: a poller that takes the submission
+//! entries of the driver, as a ring does, and runs each one as one nonblocking call when its
+//! descriptor is ready. It posts the completion that a ring posts for the same entry, so the
+//! operation table, the stream rules, close, and teardown run in the same way on each backend.
+//! Only the selector, the kernel interface that reports the ready descriptors, is different for
+//! each system: the `epoll` module on Linux and the `kqueue` module on macOS.
 //!
 //! The driver registers each resource one time, at its adoption, edge-triggered for reads and
 //! writes, with the index and the generation of its slot as the data ([`Registrar`]). An entry
@@ -9,26 +11,39 @@
 //! ready, and the entry waits in the list of that direction until the next edge. A poll of a
 //! descriptor that is not a resource, such as a process descriptor, has a one-shot registration.
 //! A linked chain of datagram sends or receives, the batch of the driver, is one `sendmmsg` or
-//! `recvmmsg`, through `rsnetwork-udp`.
+//! `recvmmsg` on Linux, and one `sendmsg` or `recvmsg` for each datagram on macOS, through
+//! `rsnetwork-udp`.
 //!
 //! The terminal event of each readiness operation is the return of its nonblocking call. After
 //! that return, the kernel keeps no reference to the buffer. Files have no readiness, so their
 //! entries run as jobs of the blocking service ([`run_file`]), and each job posts its completion
 //! here when it returns.
 
+#[cfg(target_os = "linux")]
+mod epoll;
+#[cfg(target_os = "macos")]
+mod kqueue;
 mod sys;
 
 use alloc::collections::VecDeque;
-use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::ffi::c_int;
 use core::ptr::NonNull;
 use core::task::{Context, Waker};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, RawFd};
 use std::time::Instant;
 
-use rsnetwork_udp::sys::{IoVec, MmsgHdr, MsgHdr};
+#[cfg(target_os = "linux")]
+use epoll::{Event, Selector, decode};
+#[cfg(target_os = "macos")]
+pub(crate) use kqueue::Wake;
+#[cfg(target_os = "macos")]
+use kqueue::{Event, Selector, decode};
+
+#[cfg(target_os = "linux")]
+use rsnetwork_udp::sys::MmsgHdr;
+use rsnetwork_udp::sys::{IoVec, MSG_DONTWAIT, MsgHdr};
 
 use crate::blocking::Waiter;
 use crate::uring::sys as ring;
@@ -40,14 +55,21 @@ const WAKE: u64 = u64::MAX;
 /// The bit of the data of a one-shot registration, with the index of its slot in the low bits.
 const ONE_SHOT: u64 = 1 << 63;
 
-/// The events of a resource: each edge of its reads and its writes.
-const RESOURCE_EVENTS: u32 = sys::EPOLLIN | sys::EPOLLOUT | sys::EPOLLRDHUP | sys::EPOLLET;
+/// The `poll` bits of the events that a selector reports (`include/uapi/asm-generic/poll.h` of
+/// Linux, and `sys/poll.h` of the macOS SDK, which has no `POLLRDHUP`). They are the event bits of
+/// epoll, and the kqueue selector reports its filters with them.
+const POLLIN: u32 = 0x1;
+const POLLPRI: u32 = 0x2;
+const POLLOUT: u32 = 0x4;
+const POLLERR: u32 = 0x8;
+const POLLHUP: u32 = 0x10;
+const POLLRDHUP: u32 = 0x2000;
 
 /// The events that make the read direction ready.
-const READABLE: u32 = sys::EPOLLIN | sys::EPOLLPRI | sys::EPOLLRDHUP | sys::EPOLLHUP | sys::EPOLLERR;
+const READABLE: u32 = POLLIN | POLLPRI | POLLRDHUP | POLLHUP | POLLERR;
 
 /// The events that make the write direction ready.
-const WRITABLE: u32 = sys::EPOLLOUT | sys::EPOLLHUP | sys::EPOLLERR;
+const WRITABLE: u32 = POLLOUT | POLLHUP | POLLERR;
 
 /// The events that one wait takes at most.
 const EVENTS: usize = 128;
@@ -81,54 +103,32 @@ impl Token {
 /// The registrations of the resources of a driver in its poller.
 #[derive(Debug)]
 pub(crate) struct Registrar {
-    epoll: Rc<OwnedFd>,
+    selector: Selector,
     /// The test seam of a failed registration: the next registration fails with this error.
     #[cfg(test)]
     pub(crate) fail: core::cell::Cell<Option<i32>>,
 }
 
 impl Registrar {
-    /// Registers the resource `fd` of `token`, edge-triggered for reads and writes. A pipe end gets
-    /// `O_NONBLOCK` first, because a read or a write that waits would stop the driver.
+    /// Registers the resource `fd` of `token`, edge-triggered for reads and writes.
     ///
     /// # Errors
     ///
-    /// The error of `fcntl` or of `epoll_ctl`. Nothing changed then, except `O_NONBLOCK`.
-    pub(crate) fn add(&self, fd: BorrowedFd<'_>, token: Token, pipe: bool) -> io::Result<()> {
-        if pipe && !super::pipe::set_nonblocking(fd, true) {
-            return Err(io::Error::last_os_error());
-        }
-        // The test seam gives the error of `epoll_ctl` in place of the call.
+    /// The error of the registration. Nothing changed then.
+    pub(crate) fn add(&self, fd: BorrowedFd<'_>, token: Token) -> io::Result<()> {
+        // The test seam gives the error of the registration in place of the call.
         #[cfg(test)]
         if let Some(errno) = self.fail.take() {
             return Err(io::Error::from_raw_os_error(errno));
         }
-        control(
-            &self.epoll,
-            sys::EPOLL_CTL_ADD,
-            fd.as_raw_fd(),
-            RESOURCE_EVENTS,
-            token.data(),
-        )
+        self.selector.add(fd.as_raw_fd(), token.data())
     }
 
     /// Ends the registration of `fd`, before its close. The poller then reports no event of it,
     /// also when another descriptor still refers to its file.
     pub(crate) fn delete(&self, fd: BorrowedFd<'_>) {
-        // A descriptor with no registration, such as a file, gives `ENOENT`, and nothing changes.
-        drop(control(&self.epoll, sys::EPOLL_CTL_DEL, fd.as_raw_fd(), 0, 0));
+        self.selector.delete(fd.as_raw_fd());
     }
-}
-
-/// One `epoll_ctl`.
-#[expect(unsafe_code, reason = "the call reads one event that lives during the call")]
-fn control(epoll: &OwnedFd, op: c_int, fd: RawFd, events: u32, data: u64) -> io::Result<()> {
-    let mut event = sys::EpollEvent { events, data };
-    // SAFETY: `event` is valid for reads during the call.
-    if unsafe { sys::epoll_ctl(epoll.as_raw_fd(), op, fd, &raw mut event) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// The submission queue is full.
@@ -173,7 +173,7 @@ enum Step {
 
 /// A poller of one driver.
 pub(crate) struct Poller {
-    epoll: Rc<OwnedFd>,
+    selector: Selector,
     /// The entries that the driver pushed, with their resources, which the next submit takes.
     queue: VecDeque<(Sqe, Option<Token>)>,
     entries: u32,
@@ -189,43 +189,39 @@ pub(crate) struct Poller {
     /// The jobs of the blocking service that run file entries, and the waker of the driver.
     jobs: Vec<(u64, Waiter<i32>)>,
     waker: Option<Waker>,
-    events: Vec<sys::EpollEvent>,
+    events: Vec<Event>,
     /// The last wait filled the event array, so events can remain.
     full: bool,
 }
 
 impl Poller {
     /// A poller with `entries` submission entries, rounded up to a power of two as a ring does, room
-    /// for `completions` entries in flight, `resources` resource slots, and `jobs` file jobs. The
-    /// wake descriptor `wake` stays registered, so a wake from another thread ends a wait.
+    /// for `completions` entries in flight, `resources` resource slots, and `jobs` file jobs. On
+    /// Linux, the wake descriptor `wake` stays registered, so a wake from another thread ends a
+    /// wait. On macOS, the wake is an event of the kqueue itself ([`Poller::wake`]).
     ///
     /// # Errors
     ///
-    /// The error of `epoll_create1` or of the registration of `wake`, or `InvalidInput` for 0
-    /// entries.
-    #[expect(unsafe_code, reason = "the C library returns a new descriptor")]
+    /// The error of the creation of the selector or of the registration of the wake, or
+    /// `InvalidInput` for 0 entries.
     pub(crate) fn new(
         entries: u32,
         completions: u32,
         resources: u32,
         jobs: u32,
-        wake: BorrowedFd<'_>,
+        #[cfg(target_os = "linux")] wake: BorrowedFd<'_>,
     ) -> io::Result<Self> {
         let entries = entries
             .checked_next_power_of_two()
             .filter(|&entries| entries > 0)
             .ok_or(io::ErrorKind::InvalidInput)?;
-        // SAFETY: the call takes no pointer.
-        let fd = unsafe { sys::epoll_create1(sys::EPOLL_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the C library returned a new descriptor that nothing else owns.
-        let epoll = Rc::new(unsafe { OwnedFd::from_raw_fd(fd) });
-        control(&epoll, sys::EPOLL_CTL_ADD, wake.as_raw_fd(), sys::EPOLLIN, WAKE)?;
+        #[cfg(target_os = "linux")]
+        let selector = Selector::new(wake)?;
+        #[cfg(target_os = "macos")]
+        let selector = Selector::new()?;
         let completions = completions.max(entries);
         Ok(Self {
-            epoll,
+            selector,
             queue: VecDeque::with_capacity(entries as usize),
             entries,
             slots: alloc::vec![None; completions as usize],
@@ -244,7 +240,7 @@ impl Poller {
             chain: Vec::with_capacity(entries as usize),
             jobs: Vec::with_capacity(jobs as usize),
             waker: None,
-            events: alloc::vec![sys::EpollEvent::default(); EVENTS],
+            events: alloc::vec![Event::default(); EVENTS],
             full: false,
         })
     }
@@ -252,16 +248,21 @@ impl Poller {
     /// The registrations of the resources in this poller.
     pub(crate) fn registrar(&self) -> Registrar {
         Registrar {
-            epoll: Rc::clone(&self.epoll),
+            selector: self.selector.clone(),
             #[cfg(test)]
             fail: core::cell::Cell::new(None),
         }
     }
 
-    /// The epoll descriptor: it is readable when an event waits.
+    /// The descriptor of the selector, epoll or kqueue: it is readable when an event waits.
     pub(crate) fn fd(&self) -> BorrowedFd<'_> {
-        use std::os::fd::AsFd as _;
-        self.epoll.as_fd()
+        self.selector.fd()
+    }
+
+    /// The wake of the poller, which another thread posts to end a wait.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn wake(&self) -> Wake {
+        self.selector.wake()
     }
 
     /// Copies `entry` of the resource `token` to the submission queue. The next submit takes it.
@@ -299,8 +300,9 @@ impl Poller {
         self.full
     }
 
-    /// The ready completions, which stay for the driver.
-    #[cfg(test)]
+    /// The ready completions, which stay for the driver. Only the driver tests read them, and the
+    /// loom build has none.
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn peek(&self) -> Vec<Cqe> {
         self.completions.iter().copied().collect()
     }
@@ -323,6 +325,7 @@ impl Poller {
 
     /// Takes the waiter of a job that runs the entry of `user_data` on the blocking service. The
     /// job posts its completion when it returns. `waker` wakes the driver at that return.
+    #[cfg(target_os = "linux")]
     pub(crate) fn add_job(&mut self, user_data: u64, waiter: Waiter<i32>, waker: &Waker) {
         if self.waker.is_none() {
             self.waker = Some(waker.clone());
@@ -337,14 +340,14 @@ impl Poller {
     ///
     /// # Errors
     ///
-    /// An error of `epoll_wait`, such as `Interrupted`.
+    /// An error of the wait of the selector, such as `Interrupted`.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
         self.enter(wait, None)
     }
 
     /// Submits as [`submit`](Self::submit) does, and waits at most for `timeout`. The end of the
     /// time is no error.
-    #[cfg(feature = "local")]
+    #[cfg(all(feature = "local", target_os = "linux"))]
     pub(crate) fn submit_timeout(&mut self, wait: u32, timeout: core::time::Duration) -> io::Result<u32> {
         self.enter(wait, Some(Instant::now() + timeout))
     }
@@ -353,17 +356,16 @@ impl Poller {
     fn enter(&mut self, wait: u32, deadline: Option<Instant>) -> io::Result<u32> {
         let taken = self.take();
         self.poll_jobs();
-        let mut woke = self.poll(0)?;
+        let mut woke = self.poll(Some(core::time::Duration::ZERO))?;
         while wait > 0 && !woke && self.completions.len() < wait as usize {
             let timeout = match deadline {
-                None => -1,
+                None => None,
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         break;
                     }
-                    // Rounded up, so the wait does not end before the deadline.
-                    c_int::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(c_int::MAX)
+                    Some(left)
                 }
             };
             woke = self.poll(timeout)?;
@@ -456,7 +458,7 @@ impl Poller {
                     Step::Done(result, flags) => self.post(index, result, flags),
                     Step::Posted => {}
                     Step::Wait(waiting) => {
-                        let events = if direction == READ { sys::EPOLLIN } else { sys::EPOLLOUT };
+                        let events = if direction == READ { POLLIN } else { POLLOUT };
                         self.arm(waiting, events);
                     }
                 },
@@ -505,13 +507,7 @@ impl Poller {
         let Some(slot) = self.slots[index as usize] else {
             return;
         };
-        let (fd, data) = (slot.sqe.fd, ONE_SHOT | u64::from(index));
-        let events = events | sys::EPOLLONESHOT;
-        // A descriptor keeps its one-shot registration after its event, disabled, so the next
-        // wait changes it.
-        let armed = control(&self.epoll, sys::EPOLL_CTL_MOD, fd, events, data)
-            .or_else(|_| control(&self.epoll, sys::EPOLL_CTL_ADD, fd, events, data));
-        match armed {
+        match self.selector.arm(slot.sqe.fd, events, ONE_SHOT | u64::from(index)) {
             Ok(()) => {}
             Err(error) => self.post(index, -error.raw_os_error().unwrap_or(sys::EINVAL), 0),
         }
@@ -611,24 +607,18 @@ impl Poller {
                     next = after;
                 }
             }
-            _ => drop(control(&self.epoll, sys::EPOLL_CTL_DEL, slot.sqe.fd, 0, 0)),
+            _ => self.selector.disarm(slot.sqe.fd, interest(&slot)),
         }
     }
 
-    /// Waits up to `timeout` milliseconds for events, and runs the entries that they make ready.
-    /// Gives whether the wake descriptor was readable.
-    #[expect(unsafe_code, reason = "the kernel writes the event array")]
-    fn poll(&mut self, timeout: c_int) -> io::Result<bool> {
-        let capacity = c_int::try_from(self.events.len()).unwrap_or(c_int::MAX);
-        // SAFETY: the array has `capacity` events, and the kernel writes at most that many.
-        let count = unsafe { sys::epoll_wait(self.epoll.as_raw_fd(), self.events.as_mut_ptr(), capacity, timeout) };
-        let Ok(count) = usize::try_from(count) else {
-            return Err(io::Error::last_os_error());
-        };
+    /// Waits at most for `timeout`, or with no limit, for events, and runs the entries that they
+    /// make ready. Gives whether a wake came.
+    fn poll(&mut self, timeout: Option<core::time::Duration>) -> io::Result<bool> {
+        let count = self.selector.wait(&mut self.events, timeout)?;
         self.full = count == self.events.len();
         let mut woke = false;
         for event in 0..count {
-            let sys::EpollEvent { events, data } = self.events[event];
+            let (data, events) = decode(self.events[event]);
             if data == WAKE {
                 woke = true;
             } else if data & ONE_SHOT != 0 {
@@ -661,14 +651,7 @@ impl Poller {
         match self.step(index) {
             Step::Done(result, flags) => self.post(index, result, flags),
             Step::Posted => {}
-            Step::Wait(waiting) => {
-                let events = if direction(slot.sqe.opcode) == Some(READ) {
-                    sys::EPOLLIN
-                } else {
-                    sys::EPOLLOUT
-                };
-                self.arm(waiting, events);
-            }
+            Step::Wait(waiting) => self.arm(waiting, interest(&slot)),
         }
     }
 
@@ -782,24 +765,17 @@ impl Poller {
             let (chain, fd, flags) = self.chain(index);
             // SAFETY: each entry names a message header of its batch, which the driver keeps until
             // its completion.
-            let count = unsafe {
-                rsnetwork_udp::sys::sendmmsg(
-                    fd,
-                    self.batch.as_mut_ptr(),
-                    u32::try_from(self.batch.len()).unwrap_or(u32::MAX),
-                    flags | sys::MSG_DONTWAIT,
-                )
-            };
-            let Ok(count) = usize::try_from(count) else {
-                self.chain = chain;
-                return match errno() {
-                    sys::EAGAIN => Step::Wait(index),
-                    // The entry that failed is the first of the rest, and the rest ends with it.
-                    errno => {
-                        self.post(index, -errno, 0);
-                        Step::Posted
+            let count = match unsafe { send_messages(fd, &mut self.batch, flags) } {
+                Ok(count) => count,
+                Err(errno) => {
+                    self.chain = chain;
+                    if errno == sys::EAGAIN {
+                        return Step::Wait(index);
                     }
-                };
+                    // The entry that failed is the first of the rest, and the rest ends with it.
+                    self.post(index, -errno, 0);
+                    return Step::Posted;
+                }
             };
             let rest = self.post_batch(&chain, count, false);
             self.chain = chain;
@@ -810,7 +786,7 @@ impl Poller {
         }
     }
 
-    /// The datagrams of the chain from `index`, in one `recvmmsg` into selected buffers. Each
+    /// The datagrams of the chain from `index`, in one receive into selected buffers. Each
     /// datagram that came posts its completion, with its buffer. The first entry waits for a
     /// datagram. The entry after the last datagram ends with `EAGAIN`, or with `ENOBUFS` when no
     /// buffer remains, and the rest of the chain ends with it.
@@ -839,21 +815,17 @@ impl Poller {
             return Step::Done(-sys::ENOBUFS, 0);
         }
         // SAFETY: as above, and the first `buffers` headers each name a free selected buffer.
-        let count = unsafe {
-            rsnetwork_udp::sys::recvmmsg(
-                fd,
-                self.batch.as_mut_ptr(),
-                u32::from(buffers),
-                flags | sys::MSG_DONTWAIT,
-                core::ptr::null_mut(),
-            )
-        };
-        let Ok(count) = usize::try_from(count) else {
-            self.chain = chain;
-            return match errno() {
-                sys::EAGAIN => Step::Wait(index),
-                errno => Step::Done(-errno, 0),
-            };
+        let received = unsafe { recv_messages(fd, &mut self.batch[..usize::from(buffers)], flags) };
+        let count = match received {
+            Ok(count) => count,
+            Err(errno) => {
+                self.chain = chain;
+                return if errno == sys::EAGAIN {
+                    Step::Wait(index)
+                } else {
+                    Step::Done(-errno, 0)
+                };
+            }
         };
         let rest = self.post_batch(&chain, count, true);
         self.chain = chain;
@@ -898,7 +870,7 @@ impl Poller {
             next = slot.link;
         }
         // The later receives of a batch take only the datagrams that wait.
-        (chain, fd, flags & !rsnetwork_udp::sys::MSG_DONTWAIT)
+        (chain, fd, flags & !MSG_DONTWAIT)
     }
 
     /// Posts the completions of the first `count` datagrams of `chain`. For a receive, it writes
@@ -993,6 +965,16 @@ const fn direction(opcode: u8) -> Option<usize> {
     }
 }
 
+/// The `poll` bits that the one-shot registration of the entry of `slot` waits for: the bits of a
+/// poll, or the readiness of the direction of its call.
+const fn interest(slot: &Slot) -> u32 {
+    match direction(slot.sqe.opcode) {
+        _ if slot.sqe.opcode == ring::IORING_OP_POLL_ADD => slot.sqe.rw_flags,
+        Some(READ) => POLLIN,
+        _ => POLLOUT,
+    }
+}
+
 /// The pointer of the address `value` of an entry, with the provenance that the driver exposed
 /// when it made the entry.
 fn pointer<T>(value: u64) -> *mut T {
@@ -1000,6 +982,7 @@ fn pointer<T>(value: u64) -> *mut T {
 }
 
 /// The result of a system call that returns a count, a descriptor, or 0, or -1.
+#[cfg(target_os = "linux")]
 fn long(result: core::ffi::c_long) -> Result<i32, i32> {
     if result < 0 {
         return Err(errno());
@@ -1043,6 +1026,88 @@ fn pending_error(fd: RawFd) -> i32 {
     if result < 0 { errno() } else { error }
 }
 
+/// Sends the datagrams of `batch` in order, with no wait. Gives the number that went, or the error
+/// of the first one: one `sendmmsg`.
+///
+/// # Safety
+///
+/// Each header of `batch` names memory that the driver keeps until the completions of the batch.
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "the kernel reads the messages that the headers name")]
+unsafe fn send_messages(fd: RawFd, batch: &mut [MmsgHdr], flags: c_int) -> Result<usize, i32> {
+    let len = u32::try_from(batch.len()).unwrap_or(u32::MAX);
+    // SAFETY: the caller's contract, and the array has `len` headers.
+    let count = unsafe { rsnetwork_udp::sys::sendmmsg(fd, batch.as_mut_ptr(), len, flags | MSG_DONTWAIT) };
+    usize::try_from(count).map_err(|_| errno())
+}
+
+/// Receives datagrams into the headers of `batch`, with no wait. Gives the number that came, or
+/// the error of the first receive: one `recvmmsg`.
+///
+/// # Safety
+///
+/// Each header of `batch` names memory that the driver keeps until the completions of the batch.
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "the kernel writes the messages that the headers name")]
+unsafe fn recv_messages(fd: RawFd, batch: &mut [MmsgHdr], flags: c_int) -> Result<usize, i32> {
+    let len = u32::try_from(batch.len()).unwrap_or(u32::MAX);
+    // SAFETY: the caller's contract, and the array has `len` headers.
+    let count = unsafe {
+        rsnetwork_udp::sys::recvmmsg(fd, batch.as_mut_ptr(), len, flags | MSG_DONTWAIT, core::ptr::null_mut())
+    };
+    usize::try_from(count).map_err(|_| errno())
+}
+
+/// One datagram of a batch, and the length that its call gave, as `struct mmsghdr` of Linux.
+/// macOS has no `sendmmsg` or `recvmmsg`, so the poller makes one call for each datagram.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MmsgHdr {
+    msg_hdr: MsgHdr,
+    msg_len: u32,
+}
+
+/// Sends the datagrams of `batch` in order, with no wait: one `sendmsg` for each, as `sendmmsg` of
+/// Linux does. Gives the number that went, or the error of the first one. An error after the
+/// first stops the batch, and the next call sends the rest again.
+///
+/// # Safety
+///
+/// Each header of `batch` names memory that the driver keeps until the completions of the batch.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the kernel reads the messages that the headers name")]
+unsafe fn send_messages(fd: RawFd, batch: &mut [MmsgHdr], flags: c_int) -> Result<usize, i32> {
+    for (sent, message) in batch.iter_mut().enumerate() {
+        // SAFETY: the caller's contract.
+        match counted(unsafe { rsnetwork_udp::sys::sendmsg(fd, &raw const message.msg_hdr, flags | MSG_DONTWAIT) }) {
+            Ok(len) => message.msg_len = len.cast_unsigned(),
+            Err(errno) if sent == 0 => return Err(errno),
+            Err(_) => return Ok(sent),
+        }
+    }
+    Ok(batch.len())
+}
+
+/// Receives datagrams into the headers of `batch`, with no wait: one `recvmsg` for each, as
+/// `recvmmsg` of Linux does. Gives the number that came, or the error of the first receive.
+///
+/// # Safety
+///
+/// Each header of `batch` names memory that the driver keeps until the completions of the batch.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the kernel writes the messages that the headers name")]
+unsafe fn recv_messages(fd: RawFd, batch: &mut [MmsgHdr], flags: c_int) -> Result<usize, i32> {
+    for (received, message) in batch.iter_mut().enumerate() {
+        // SAFETY: the caller's contract.
+        match counted(unsafe { rsnetwork_udp::sys::recvmsg(fd, &raw mut message.msg_hdr, flags | MSG_DONTWAIT) }) {
+            Ok(len) => message.msg_len = len.cast_unsigned(),
+            Err(errno) if received == 0 => return Err(errno),
+            Err(_) => return Ok(received),
+        }
+    }
+    Ok(batch.len())
+}
+
 /// Runs the nonblocking call of a readiness entry on the thread of the driver, into the selected
 /// buffer `buffer` when it has one. Gives the result of the call, or its `errno`.
 #[expect(
@@ -1062,7 +1127,7 @@ fn call(sqe: &Sqe, buffer: Option<(u64, u32, u16)>) -> Result<i32, i32> {
     };
     let count = c_int::try_from(sqe.len).unwrap_or(c_int::MAX);
     let size = u32::try_from(sqe.off).unwrap_or(0);
-    let flags = sqe.rw_flags.cast_signed() | sys::MSG_DONTWAIT;
+    let flags = sqe.rw_flags.cast_signed() | MSG_DONTWAIT;
     // SAFETY: the driver keeps the memory that the entry names, and its descriptor, until the
     // completion of the entry, and nothing else uses the memory that the call writes until then.
     unsafe {
@@ -1087,20 +1152,48 @@ fn call(sqe: &Sqe, buffer: Option<(u64, u32, u16)>) -> Result<i32, i32> {
                 }
                 counted(rsnetwork_udp::sys::recvmsg(fd, header, flags))
             }
+            #[cfg(target_os = "linux")]
             ring::IORING_OP_ACCEPT => status(sys::accept4(fd, memory, pointer(sqe.off), sqe.rw_flags.cast_signed())),
+            #[cfg(target_os = "macos")]
+            ring::IORING_OP_ACCEPT => status(sys::accept(fd, memory, pointer(sqe.off))).and_then(prepare),
+            #[cfg(target_os = "linux")]
             ring::IORING_OP_CONNECT => status(super::sys::connect(fd, memory, size)),
+            #[cfg(target_os = "macos")]
+            ring::IORING_OP_CONNECT => status(sys::connect(fd, memory, size)),
             ring::IORING_OP_SHUTDOWN => status(sys::shutdown(fd, sqe.len.cast_signed())),
             ring::IORING_OP_BIND => status(rsnetwork_udp::sys::bind(fd, memory, size)),
             ring::IORING_OP_LISTEN => status(rsnetwork_udp::sys::listen(fd, sqe.len.cast_signed())),
             // A cross-ring message has no ring here, as for a descriptor that is not a ring.
+            #[cfg(target_os = "linux")]
             ring::IORING_OP_MSG_RING => Err(sys::EBADFD),
             _ => Err(sys::EINVAL),
         }
     }
 }
 
+/// Sets `FD_CLOEXEC` and `O_NONBLOCK` on the new socket `fd`, and gives it, or closes it and gives
+/// the error: macOS has no flags of `socket` and `accept` for them. Another thread that forks
+/// between the calls can give the socket to its child, as for the sockets of the standard library
+/// on macOS.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the commands take one `int` argument")]
+pub(crate) fn prepare(fd: RawFd) -> Result<RawFd, i32> {
+    // SAFETY: each command takes one `int` argument.
+    let prepared = unsafe {
+        sys::fcntl(fd, sys::F_SETFD, sys::FD_CLOEXEC) >= 0 && sys::fcntl(fd, sys::F_SETFL, sys::O_NONBLOCK) >= 0
+    };
+    if prepared {
+        return Ok(fd);
+    }
+    let errno = errno();
+    // SAFETY: the descriptor is new, and nothing else owns it.
+    drop(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+    Err(errno)
+}
+
 /// Runs a file entry as one blocking positional call: the job of the blocking service for the
 /// entry on this backend. Gives the result that a ring posts for the entry.
+#[cfg(target_os = "linux")]
 #[expect(
     unsafe_code,
     reason = "the entry names memory that the driver keeps until the completion"

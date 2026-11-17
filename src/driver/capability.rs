@@ -21,6 +21,12 @@ pub enum Backend {
     /// IOCP, on Windows: each socket operation is one overlapped call, and its completion packet
     /// or the return of the call ends it, by the NT status of the call.
     Iocp,
+    /// kqueue, on macOS: the driver runs each socket operation as one nonblocking call on its own
+    /// thread when kqueue reports its descriptor ready, as on epoll. UDP has no segmentation
+    /// offload and no coalesced receive: a send with a segment size gives
+    /// `datagram::Refused::NoSegmentation` with no call, and the `gro` option of a UDP socket gives
+    /// `Unsupported`. A caller learns it as on each system, from the send of a `datagram::Probe`.
+    Kqueue,
 }
 
 /// A feature of the kernel that the driver probes on its ring when it starts. A probe runs the

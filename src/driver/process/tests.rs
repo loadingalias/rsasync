@@ -3,6 +3,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::assert_matches;
 use core::cell::RefCell;
 use core::ffi::c_int;
 use core::future::Future;
@@ -197,7 +198,7 @@ pub(in crate::driver) fn a_child_exit_status_is_reported_once_with_no_sigchld_ha
     assert_eq!(status.code(), Some(3));
     assert_eq!(state(child.id()), State::Reaped);
     let again = poll_ready(pin!(child.wait()), &mut Context::from_waker(Waker::noop()));
-    assert!(matches!(again, Some(Ok(Ok(again))) if again == status));
+    assert_matches!(again, Some(Ok(Ok(again))) if again == status);
     assert_eq!(threads(), before);
     assert!(!sigchld_changed());
 }
@@ -313,7 +314,7 @@ pub(in crate::driver) fn a_kill_ends_the_child_and_a_signal_after_the_reap_refus
     let status = drive(&mut driver, child.wait()).expect("the driver runs");
     assert_eq!(status.expect("the wait works").signal(), Some(9));
     let signal = driver.signal_child(&child, Signal::TERMINATE);
-    assert!(matches!(signal, Err(SignalChildError::Reaped)), "{signal:?}");
+    assert_matches!(signal, Err(SignalChildError::Reaped));
 }
 
 /// A tree kill ends each process of the group of the child, also a grandchild. A tree signal
@@ -344,7 +345,7 @@ pub(in crate::driver) fn a_tree_kill_ends_a_grandchild_and_a_tree_signal_after_t
         Err(error) => assert_eq!(error.raw_os_error(), Some(ESRCH), "the grandchild ended already"),
     }
     let signal = driver.signal_tree(&child, Signal::TERMINATE);
-    assert!(matches!(signal, Err(SignalChildError::Reaped)), "{signal:?}");
+    assert_matches!(signal, Err(SignalChildError::Reaped));
 }
 
 /// The input and both outputs are separate pipe ends, so the caller writes the input while both

@@ -14,9 +14,9 @@ use core::net::{IpAddr, SocketAddr};
 use core::ptr;
 use std::io;
 
-// The message header of one datagram and its region: `struct msghdr` and `struct iovec` on Linux,
-// `WSAMSG` and `WSABUF` on Windows.
-#[cfg(target_os = "linux")]
+// The message header of one datagram and its region: `struct msghdr` and `struct iovec` on Linux
+// and macOS, `WSAMSG` and `WSABUF` on Windows.
+#[cfg(unix)]
 use rsnetwork_udp::sys::{IoVec as Region, MsgHdr as Header};
 #[cfg(target_os = "windows")]
 use rsnetwork_udp::sys::{WsaBuf as Region, WsaMsg as Header};
@@ -135,9 +135,20 @@ pub struct UdpOptions {
     /// (`datagram::set_dont_fragment`). Such a send gives `Refused::TooLarge`.
     pub dont_fragment: bool,
     /// Deliver coalesced datagrams of one peer in one receive, with their segment size (GRO, and
-    /// URO on Windows).
+    /// URO on Windows). macOS has no coalesced receive, so there the bind gives `Unsupported`
+    /// (`ENOTSUP`).
     pub gro: bool,
 }
+
+/// `ENOTSUP` (`sys/errno.h` of macOS): the system has no such operation.
+#[cfg(target_os = "macos")]
+const ENOTSUP: i32 = 45;
+
+/// The result of a send that the system refuses before its call, because the datagram has a
+/// segment size: macOS has no segmentation offload. `datagram::Refused::of_send` gives
+/// `Refused::NoSegmentation` for it.
+#[cfg(target_os = "macos")]
+pub(super) const UNSEGMENTED: i32 = -ENOTSUP;
 
 impl UdpOptions {
     /// Sets the options on the new socket `socket`.
@@ -163,6 +174,10 @@ impl UdpOptions {
         #[cfg(target_os = "windows")]
         if self.gro {
             rsnetwork_udp::set_uro(socket, true)?;
+        }
+        #[cfg(target_os = "macos")]
+        if self.gro {
+            return Err(io::Error::from_raw_os_error(ENOTSUP));
         }
         Ok(())
     }
@@ -247,7 +262,7 @@ impl Default for Message {
 }
 
 /// A region of no bytes.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const EMPTY_REGION: Region = Region {
     iov_base: ptr::null_mut(),
     iov_len: 0,
@@ -270,7 +285,7 @@ const EMPTY_HEADER: Header = Header {
 };
 
 /// A message header with no address, no region, and no control message.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const EMPTY_HEADER: Header = Header {
     msg_name: ptr::null_mut(),
     msg_namelen: 0,
@@ -354,7 +369,7 @@ impl Message {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Message {
     /// The header of a send of `datagram`.
     pub(super) fn send(&mut self, datagram: &Datagram) -> *const Header {
@@ -382,7 +397,10 @@ impl Message {
             } else {
                 self.control.as_mut_ptr().cast()
             },
+            #[cfg(target_os = "linux")]
             msg_controllen: control_len,
+            #[cfg(target_os = "macos")]
+            msg_controllen: u32::try_from(control_len).unwrap_or(u32::MAX),
             msg_flags: 0,
         };
         &raw const self.header
@@ -403,7 +421,10 @@ impl Message {
             msg_iov: &raw mut self.region,
             msg_iovlen: 1,
             msg_control: self.control.as_mut_ptr().cast(),
+            #[cfg(target_os = "linux")]
             msg_controllen: Control::LEN,
+            #[cfg(target_os = "macos")]
+            msg_controllen: u32::try_from(Control::LEN).unwrap_or(u32::MAX),
             msg_flags: 0,
         };
         &raw mut self.header
@@ -416,7 +437,10 @@ impl Message {
             self.header.msg_namelen,
             self.header.msg_flags,
             &self.control,
+            #[cfg(target_os = "linux")]
             self.header.msg_controllen,
+            #[cfg(target_os = "macos")]
+            usize::try_from(self.header.msg_controllen).unwrap_or(usize::MAX),
             len,
         )
     }
@@ -476,6 +500,23 @@ impl Datagrams {
     /// Takes away each datagram.
     pub fn clear(&mut self) {
         self.datagrams.clear();
+    }
+
+    /// The number of datagrams from the first that one batch sends. On macOS, which has no
+    /// segmentation offload, a batch ends before its first datagram with a segment size, and a
+    /// batch that starts with one sends none: the error is then the result of the batch.
+    pub(super) fn sendable(&self) -> Result<usize, i32> {
+        #[cfg(target_os = "macos")]
+        match self
+            .datagrams
+            .iter()
+            .position(|datagram| datagram.segment_size.is_some())
+        {
+            Some(0) => return Err(UNSEGMENTED),
+            Some(first) => return Ok(first),
+            None => {}
+        }
+        Ok(self.datagrams.len())
     }
 
     /// The header of the message of datagram `index`, for a submission.
@@ -694,6 +735,8 @@ impl Driver {
     /// linked submission for each, in order. A datagram that fails ends the batch, and the datagrams
     /// after it do not go. The future gives the number of datagrams that went, from the first, and
     /// the batch: [`Datagrams::advance`] then keeps the rest, which never joins another datagram.
+    /// On macOS, a batch ends before its first datagram with a segment size, and a batch that
+    /// starts with one gives `datagram::Refused::NoSegmentation`.
     ///
     /// # Errors
     ///
@@ -705,7 +748,7 @@ impl Driver {
         writer: &'a mut W,
         datagrams: Datagrams,
     ) -> Result<Operation<'a, (io::Result<usize>, Datagrams)>, Refused<Datagrams>> {
-        let entries = u32::try_from(datagrams.len()).unwrap_or(u32::MAX);
+        let entries = u32::try_from(datagrams.sendable().unwrap_or(0)).unwrap_or(u32::MAX);
         let held = |datagrams| Held {
             payload: Payload::Batch {
                 batch: Batch::Send(datagrams),
@@ -725,7 +768,12 @@ impl Driver {
             else {
                 return None;
             };
-            let sent = super::tcp::count(result).map_err(|error| rsnetwork_udp::Refused::of_send(error, false));
+            // A batch that sent no datagram gives the error of its first one.
+            let segmented = datagrams
+                .datagrams()
+                .first()
+                .is_some_and(|datagram| datagram.segment_size.is_some());
+            let sent = super::tcp::count(result).map_err(|error| rsnetwork_udp::Refused::of_send(error, segmented));
             Some((sent, datagrams))
         }))
     }
