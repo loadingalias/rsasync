@@ -19,8 +19,9 @@ use rsasync::capacity::Budget;
 
 const STACK: usize = 256 << 10;
 
-/// The longest wait of a test for a job that returns with no waiter to show it.
-const RETURN_WAIT: Duration = Duration::from_secs(10);
+/// The longest wait of a test for an event that no waiter shows: a job that returns, the stop of
+/// the admission, or the end of a thread.
+const WAIT: Duration = Duration::from_secs(10);
 
 fn budget() -> Budget {
     Budget::new(NonZeroU64::new(64 << 20).unwrap())
@@ -168,17 +169,21 @@ fn teardown_waits_for_the_running_job_drops_the_queue_and_joins_each_thread() {
     let mut queued = [submitter.submit(|| 2).unwrap(), submitter.submit(|| 3).unwrap()];
     start.recv().unwrap();
 
-    // The gate opens only after the teardown stopped the admission.
+    // The gate opens only after the teardown stopped the admission, at most after `WAIT`. It
+    // opens before a failure too, so a failure never leaves the teardown waiting for the job.
     let opener = thread::spawn(move || {
-        loop {
+        let deadline = Instant::now() + WAIT;
+        let stopped = loop {
             match submitter.submit(|| 0) {
-                Err(refused) if refused.reason == Reason::Ended => break,
-                Err(refused) => assert_eq!(refused.reason, Reason::Full),
-                Ok(_) => panic!("each job slot is occupied"),
+                Err(refused) if refused.reason == Reason::Ended => break Ok(()),
+                Err(refused) if refused.reason != Reason::Full => break Err(format!("{:?}", refused.reason)),
+                Ok(_) => break Err("an admitted job, while each job slot is occupied".to_owned()),
+                Err(_) if Instant::now() >= deadline => break Err(format!("no stop in {WAIT:?}")),
+                Err(_) => thread::yield_now(),
             }
-            thread::yield_now();
-        }
+        };
         gate.open();
+        stopped.unwrap();
     });
     let report = service.teardown();
     assert!(returned.load(Ordering::SeqCst));
@@ -219,8 +224,10 @@ fn a_drop_with_no_teardown_keeps_the_charge_of_a_running_thread_until_it_ends() 
     gate.open();
     assert_eq!(waiter.wait_blocking(), Ok(5));
     drop(waiter);
-    // The thread ends after its job, and the charge of its stack then ends.
+    // The thread ends after its job, and the charge of its stack then ends, at most after `WAIT`.
+    let deadline = Instant::now() + WAIT;
     while budget.available() != budget.bound() {
+        assert!(Instant::now() < deadline, "the stack charge did not end in {WAIT:?}");
         thread::yield_now();
     }
 }
@@ -271,8 +278,8 @@ fn a_panic_in_the_drop_of_an_abandoned_result_does_not_end_the_thread() {
     );
     gate.open();
     // The one thread still runs the next job. No waiter shows when the job returns and its slot
-    // ends, so the test submits until the service admits the job, at most for `RETURN_WAIT`.
-    let deadline = Instant::now() + RETURN_WAIT;
+    // ends, so the test submits until the service admits the job, at most for `WAIT`.
+    let deadline = Instant::now() + WAIT;
     let mut next = loop {
         match submitter.submit(|| 7) {
             Ok(waiter) => break waiter,
@@ -280,7 +287,7 @@ fn a_panic_in_the_drop_of_an_abandoned_result_does_not_end_the_thread() {
         }
         assert!(
             Instant::now() < deadline,
-            "the job with no waiter did not return in {RETURN_WAIT:?}"
+            "the job with no waiter did not return in {WAIT:?}"
         );
         thread::yield_now();
     };
