@@ -62,7 +62,7 @@ mod file;
 mod home;
 #[cfg(target_os = "windows")]
 mod iocp;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod local;
 #[cfg(target_os = "linux")]
 mod pipe;
@@ -128,7 +128,7 @@ use queue::Queue;
 pub use capability::{Backend, Call, Feature, Features, Report, Route};
 #[cfg(unix)]
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use local::{LocalListener, LocalStream, Peer, Stale};
 #[cfg(target_os = "linux")]
 pub use pipe::{PipeReader, PipeWriter};
@@ -735,6 +735,9 @@ struct Owned {
     /// (skip-on-success).
     #[cfg(target_os = "windows")]
     skips: bool,
+    /// The lock file of a local listener, whose lock lives while the socket lives.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    lock: Option<OwnedFd>,
 }
 
 /// What a resource of the driver is.
@@ -884,6 +887,10 @@ impl Resources {
         #[cfg(target_os = "macos")]
         {
             slot.exclusive = None;
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            slot.lock = None;
         }
         let fd = slot.fd.take()?;
         // A socket stays associated with its port until its close, and no system call ends the

@@ -141,8 +141,7 @@ impl Features {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Call {
-    /// [`Driver::bind`](super::Driver::bind), and on Linux `Driver::bind_local`: a bind and a
-    /// listen of a TCP or a local listener.
+    /// [`Driver::bind`](super::Driver::bind): a bind and a listen of a TCP listener.
     Bind,
     /// `Driver::bind_udp`, on Linux: a bind of a UDP socket.
     BindUdp,

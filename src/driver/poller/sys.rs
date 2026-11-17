@@ -68,7 +68,7 @@ unsafe extern "C" {
     /// `int accept(int, struct sockaddr *restrict, socklen_t *restrict)`.
     pub(super) fn accept(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
     /// `int connect(int, const struct sockaddr *, socklen_t)`.
-    pub(super) fn connect(sockfd: c_int, addr: *const c_void, addrlen: u32) -> c_int;
+    pub(in crate::driver) fn connect(sockfd: c_int, addr: *const c_void, addrlen: u32) -> c_int;
     /// `int fcntl(int, int, ...)`.
     pub(in crate::driver) fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
 }

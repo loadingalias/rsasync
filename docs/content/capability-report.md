@@ -39,7 +39,7 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 
 | Call | `Route::Ring` when the kernel has | Else |
 | --- | --- | --- |
-| `Call::Bind` (`Driver::bind`, `Driver::bind_local`) | `Bind` and `Listen` | `Route::SystemCall`: the bind and the listen are system calls, and the future is ready at once |
+| `Call::Bind` (`Driver::bind`) | `Bind` and `Listen` | `Route::SystemCall`: the bind and the listen are system calls, and the future is ready at once |
 | `Call::BindUdp` (`Driver::bind_udp`) | `Bind` | `Route::SystemCall` |
 | `Call::SetFileLen` (`Driver::set_file_len`) | `Truncate` | `Route::BlockingService`: the call is a job of the service of `Driver::use_blocking`. With no service, it refuses with `Reason::Blocking` |
 | `Call::WaitChild` (the exit of a `Child`, see [child processes](processes.md)) | `ChildWait` | `Route::Poll`: the ring or epoll polls the process descriptor of the child, and when it is readable, the driver takes the status with one nonblocking `waitid` |

@@ -1,24 +1,29 @@
 use alloc::vec::Vec;
-use core::mem;
+use core::ffi::c_int;
+use core::{mem, ptr};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 
 use super::super::suite::{self, Backend};
-use super::super::tests::{drive, driver, numbered, posted};
+use super::super::tests::{drive, numbered, posted};
 use super::super::{Config, Driver, Regions};
 use super::{LocalListener, LocalStream, Stale};
 use crate::buffer::{Backing, Buffer as _, Lease};
 
-/// The user and the group `nobody` of Debian and Ubuntu, the second OS user of the tests that run
-/// as root.
+/// The user and the group `nobody`, the second OS user of the tests that run as root: 65534 on
+/// Debian and Ubuntu, and -2 on macOS.
+#[cfg(target_os = "linux")]
 const NOBODY: u32 = 65_534;
+#[cfg(target_os = "macos")]
+const NOBODY: u32 = 4_294_967_294;
 
 /// A directory for socket files in the temporary directory, which each user can enter. Its path
 /// is short, because a socket path has at most 107 bytes.
@@ -171,10 +176,118 @@ pub(in crate::driver) fn a_bind_refuses_a_live_listener_path_and_replaces_only_a
     assert_eq!(fs::read(&file).unwrap(), b"data");
 }
 
+/// A bind of the path of a live listener gives `AddrInUse` while the listener holds the lock of
+/// the path, also with `Stale::Replace` after its socket file is gone. The lock file has mode
+/// 0600, and the close of the listener keeps it, as it keeps the socket file. A bind then takes
+/// the lock.
+pub(in crate::driver) fn a_bind_refuses_while_a_listener_holds_the_lock_of_its_path(backend: Backend) {
+    let scratch = Scratch::new("lock");
+    let path = scratch.join("socket");
+    let lock = scratch.join("socket.lock");
+    let mut driver = suite::driver(Config::new(), backend);
+    let listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
+    assert_eq!(fs::symlink_metadata(&lock).unwrap().mode() & 0o7777, 0o600);
+    fs::remove_file(&path).unwrap();
+    for stale in [Stale::Refuse, Stale::Replace] {
+        let error = bind(&mut driver, &path, stale).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{stale:?}");
+    }
+    let close = driver.close_local_listener(listener).unwrap();
+    drive(&mut driver, close).unwrap();
+    assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_file());
+    let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
+}
+
+/// A bind with `Stale::Replace` on the socket file of a live listener of another program, which
+/// holds no lock of the path, gives `AddrInUse` and keeps the file.
+pub(in crate::driver) fn a_bind_does_not_replace_the_socket_file_of_a_live_listener_with_no_lock(backend: Backend) {
+    let scratch = Scratch::new("other");
+    let path = scratch.join("socket");
+    let other = UnixListener::bind(&path).unwrap();
+    let mut driver = suite::driver(Config::new(), backend);
+    let error = bind(&mut driver, &path, Stale::Replace).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    let _peer = UnixStream::connect(&path).unwrap();
+    other.accept().unwrap();
+}
+
+/// A listener of the test at `path` whose queue holds one connection that waits for an accept: a
+/// socket, a bind, and a listen with the backlog 1.
+#[expect(unsafe_code, reason = "the calls read the address, which lives during them")]
+fn small_listener(path: &Path) -> OwnedFd {
+    let (address, len) = super::unix_address(path).unwrap();
+    // SAFETY: the call takes no pointer.
+    let fd =
+        unsafe { rsnetwork_udp::sys::socket(c_int::from(super::sys::AF_UNIX), rsnetwork_udp::sys::SOCK_STREAM, 0) };
+    assert!(fd >= 0);
+    // SAFETY: the C library gave a new descriptor that nothing else owns.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `address` holds an address of `len` bytes during the call.
+    let bound = unsafe { rsnetwork_udp::sys::bind(fd, ptr::from_ref(&address).cast(), len) };
+    assert_eq!(bound, 0);
+    // SAFETY: the call takes no pointer.
+    assert_eq!(unsafe { rsnetwork_udp::sys::listen(fd, 1) }, 0);
+    socket
+}
+
+/// Takes the lock of the listener at `path` in its lock file, the path with `.lock` after it, as a
+/// live listener of the driver holds it.
+#[expect(unsafe_code, reason = "the call takes no pointer")]
+fn hold_lock(path: &Path) -> fs::File {
+    let mut lock = std::ffi::OsString::from(path.as_os_str());
+    lock.push(".lock");
+    let file = fs::File::create(lock).unwrap();
+    // SAFETY: the call takes no pointer.
+    let locked = unsafe { super::sys::flock(file.as_raw_fd(), super::sys::LOCK_EX | super::sys::LOCK_NB) };
+    assert_eq!(locked, 0);
+    file
+}
+
+/// A connect to a live listener whose queue of connections that wait for an accept is full gives
+/// `ResourceBusy`. After the listener closes and its lock ends, a connect gives
+/// `ConnectionRefused`. macOS refuses both connects with one error, and the lock of the listener
+/// tells them apart.
+pub(in crate::driver) fn a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused(backend: Backend) {
+    /// More connects than a queue of one connection takes: two on Linux, and one on macOS.
+    const CONNECTS_MAX: usize = 8;
+    let scratch = Scratch::new("busy");
+    let path = scratch.join("socket");
+    let mut driver = suite::driver(Config::new(), backend);
+    let listener = small_listener(&path);
+    let lock = hold_lock(&path);
+    let mut streams = Vec::new();
+    let busy = loop {
+        assert!(
+            streams.len() < CONNECTS_MAX,
+            "the queue took {CONNECTS_MAX} connections"
+        );
+        let connect = driver.connect_local(&path).unwrap();
+        match drive(&mut driver, connect).unwrap() {
+            Ok(stream) => streams.push(stream),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(busy.kind(), io::ErrorKind::ResourceBusy);
+    assert!(
+        !streams.is_empty(),
+        "the listener took a connection before its queue was full"
+    );
+    drop((listener, lock));
+    let connect = driver.connect_local(&path).unwrap();
+    let error = drive(&mut driver, connect).unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+}
+
 /// A path that the kernel would change gives `InvalidInput` and makes no socket: an empty path,
-/// which would bind an abstract name with no file and no permission, a path with a NUL byte, and a
-/// path of 108 bytes, which has no room for the NUL byte. A path of 107 bytes binds.
+/// which would bind an abstract name with no file and no permission on Linux, a path with a NUL
+/// byte, and a path that fills the path array of `struct sockaddr_un`, which then has no room for
+/// the NUL byte. A path one byte shorter binds.
 pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid_input(backend: Backend) {
+    /// The size of `sun_path`: `include/uapi/linux/un.h` of Linux, and `sys/un.h` of macOS.
+    #[cfg(target_os = "linux")]
+    const SUN_PATH: usize = 108;
+    #[cfg(target_os = "macos")]
+    const SUN_PATH: usize = 104;
     let scratch = Scratch::new("path");
     let mut driver = suite::driver(Config::new(), backend);
     let base = scratch.join("").into_os_string().into_vec();
@@ -186,7 +299,7 @@ pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid
     for path in [
         PathBuf::new(),
         PathBuf::from(OsStr::from_bytes(b"/tmp/a\0b")),
-        long(108),
+        long(SUN_PATH),
     ] {
         let error = bind(&mut driver, &path, Stale::Refuse).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
@@ -194,7 +307,7 @@ pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid
         let error = drive(&mut driver, connect).unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
     }
-    let path = long(107);
+    let path = long(SUN_PATH - 1);
     let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     UnixStream::connect(&path).unwrap();
 }
@@ -213,46 +326,75 @@ pub(in crate::driver) fn an_accepted_stream_reports_the_user_group_and_process_o
     let owner = fs::symlink_metadata(&path).unwrap();
     assert_eq!(
         (peer.user(), peer.group(), peer.process()),
-        (owner.uid(), owner.gid(), std::process::id())
+        (owner.uid(), owner.gid(), Some(std::process::id()))
     );
 }
 
-/// Starts a process as the user and the group `nobody` that connects a socket to `path`, and gives
-/// its process ID. The connect runs in the new process before it runs `/bin/true`, so a failure of
-/// the connect is the error of the start.
+/// A process of the user and the group `nobody` that holds a socket connected to a listener. Its
+/// drop ends the process.
+#[derive(Debug)]
+struct Connected(Child);
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        drop(self.0.kill());
+        drop(self.0.wait());
+    }
+}
+
+/// An accepted stream whose peer closed its socket before the accept still reports the user and
+/// the group of the peer. Linux also reports its process, and macOS reports none, because macOS
+/// has no process for a peer that closed its socket.
+pub(in crate::driver) fn an_accepted_stream_of_a_closed_peer_reports_its_user_and_group(backend: Backend) {
+    let scratch = Scratch::new("closed");
+    let path = scratch.join("socket");
+    let mut driver = suite::driver(Config::new(), backend);
+    let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
+    drop(UnixStream::connect(&path).unwrap());
+    let accept = driver.accept_local(&mut listener).unwrap();
+    let stream = drive(&mut driver, accept).unwrap().unwrap();
+    let peer = driver.local_peer(&stream).unwrap();
+    let owner = fs::symlink_metadata(&path).unwrap();
+    #[cfg(target_os = "linux")]
+    let process = Some(std::process::id());
+    #[cfg(target_os = "macos")]
+    let process = None;
+    assert_eq!(
+        (peer.user(), peer.group(), peer.process()),
+        (owner.uid(), owner.gid(), process)
+    );
+}
+
+/// Starts a process as the user and the group `nobody` that connects a socket to `path`, and then
+/// waits in `/bin/sleep` with the connection open: macOS reports the process of a live peer only.
+/// The connect runs in the new process before the exec, so a failure of the connect is the error
+/// of the start.
 #[expect(unsafe_code, reason = "the hook of the new process makes only system calls")]
-fn connect_as_nobody(path: &Path) -> io::Result<u32> {
+fn connect_as_nobody(path: &Path) -> io::Result<Connected> {
     let (address, len) = super::unix_address(path).ok_or(io::ErrorKind::InvalidInput)?;
-    let mut command = Command::new("/bin/true");
-    command.uid(NOBODY).gid(NOBODY);
+    let mut command = Command::new("/bin/sleep");
+    command.arg("60").uid(NOBODY).gid(NOBODY);
     // SAFETY: the hook allocates nothing and takes no lock: it makes a socket and connects it with
-    // system calls, in the new process. The address is a copy that the hook owns.
+    // system calls, in the new process. The address is a copy that the hook owns. The socket has
+    // no close-on-exec flag, so `sleep` keeps the connection.
     unsafe {
         command.pre_exec(move || {
-            let socket = super::super::tcp::new_socket(super::sys::AF_UNIX, rsnetwork_udp::sys::SOCK_STREAM)?;
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&socket);
-            if super::sys::connect(fd, core::ptr::from_ref(&address).cast(), len) < 0 {
+            let fd = rsnetwork_udp::sys::socket(c_int::from(super::sys::AF_UNIX), rsnetwork_udp::sys::SOCK_STREAM, 0);
+            if fd < 0 || super::sys::connect(fd, core::ptr::from_ref(&address).cast(), len) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
-    let process = child.id();
-    if !child.wait()?.success() {
-        return Err(io::Error::other("`/bin/true` failed"));
-    }
-    Ok(process)
+    command.spawn().map(Connected)
 }
 
 /// A connect of a second OS user to the socket file of a listener gives `PermissionDenied`: the
 /// mode 0600 refuses it, in a directory that each user can enter.
-#[test]
-#[ignore = "starts a process as a second OS user, which only root can do"]
-fn a_connect_of_a_second_os_user_is_refused() {
+pub(in crate::driver) fn a_connect_of_a_second_os_user_is_refused(backend: Backend) {
     let scratch = Scratch::new("second-user");
     let path = scratch.join("socket");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let error = connect_as_nobody(&path).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -260,32 +402,31 @@ fn a_connect_of_a_second_os_user_is_refused() {
 
 /// An accepted stream reports the user, the group, and the process ID of the process that
 /// connected, not those of the listener, which runs as root here.
-#[test]
-#[ignore = "starts a process as a second OS user, which only root can do"]
-fn an_accepted_stream_reports_the_user_group_and_process_of_its_peer() {
+pub(in crate::driver) fn an_accepted_stream_reports_the_user_group_and_process_of_its_peer(backend: Backend) {
     let scratch = Scratch::new("peer");
     let path = scratch.join("socket");
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     // Only the test opens the socket file to the second user.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
-    let process = connect_as_nobody(&path).unwrap();
+    let connected = connect_as_nobody(&path).unwrap();
     let accept = driver.accept_local(&mut listener).unwrap();
     let stream = drive(&mut driver, accept).unwrap().unwrap();
     let peer = driver.local_peer(&stream).unwrap();
-    assert_eq!((peer.user(), peer.group(), peer.process()), (NOBODY, NOBODY, process));
+    assert_eq!(
+        (peer.user(), peer.group(), peer.process()),
+        (NOBODY, NOBODY, Some(connected.0.id()))
+    );
 }
 
 /// A bind with `Stale::Replace` on a stale socket file of another user gives `PermissionDenied`
 /// and keeps the file.
-#[test]
-#[ignore = "changes the owner of a file to a second OS user, which only root can do"]
-fn a_bind_does_not_replace_a_stale_socket_file_of_another_user() {
+pub(in crate::driver) fn a_bind_does_not_replace_a_stale_socket_file_of_another_user(backend: Backend) {
     let scratch = Scratch::new("foreign");
     let path = scratch.join("socket");
     drop(UnixListener::bind(&path).unwrap());
     std::os::unix::fs::chown(&path, Some(NOBODY), Some(NOBODY)).unwrap();
-    let mut driver = driver(Config::new());
+    let mut driver = suite::driver(Config::new(), backend);
     let error = bind(&mut driver, &path, Stale::Replace).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert_eq!(fs::symlink_metadata(&path).unwrap().uid(), NOBODY);

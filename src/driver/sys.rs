@@ -1,6 +1,6 @@
 //! The declarations of the wake descriptor, `eventfd`, of `poll`, which the probe of the
 //! descriptor uses, of `fcntl`, which the adoption of a pipe end uses, of the file calls, and of
-//! the calls of local streams, from the C library, glibc or musl.
+//! `connect`, which the poller and local streams use, from the C library, glibc or musl.
 //!
 //! Each item agrees with `sys/eventfd.h`, `poll.h`, and `fcntl.h` of glibc and musl, and with
 //! `include/uapi/asm-generic/fcntl.h` and `include/uapi/asm-generic/poll.h` of Linux 6.1, which
@@ -8,9 +8,7 @@
 //! `include/uapi/linux/stat.h` of Linux 6.1 and 7.0. Two open flags have other values on aarch64,
 //! from `arch/arm64/include/uapi/asm/fcntl.h`, and the number of `statx` comes from
 //! `arch/x86/entry/syscalls/syscall_64.tbl` (x86_64) and `include/uapi/asm-generic/unistd.h`
-//! (aarch64). The items of local streams agree with `sys/socket.h`, `sys/un.h`, `sys/stat.h`, and
-//! `unistd.h` of glibc and musl, and with `include/uapi/linux/un.h`, `include/linux/socket.h`, and
-//! `include/uapi/asm-generic/socket.h` of Linux 6.1 and 7.0, which x86_64 and aarch64 both use.
+//! (aarch64). `connect` agrees with `sys/socket.h` of glibc and musl.
 
 use core::ffi::{c_int, c_long, c_short, c_uint, c_ulong};
 
@@ -119,45 +117,10 @@ unsafe extern "C" {
     pub(super) fn syscall(number: c_long, ...) -> c_long;
 }
 
-/// The family of Unix-domain sockets (`include/linux/socket.h`).
-pub(super) const AF_UNIX: rsnetwork_udp::SaFamily = 1;
-/// The credentials of the peer of a Unix-domain socket (`include/uapi/asm-generic/socket.h`, which
-/// x86_64 and aarch64 both use).
-pub(super) const SO_PEERCRED: c_int = 17;
-
-/// `struct sockaddr_un` (`include/uapi/linux/un.h`): the family, and a path of at most 107 bytes
-/// and its NUL byte.
-#[repr(C)]
-pub(super) struct SockAddrUn {
-    pub(super) sun_family: u16,
-    pub(super) sun_path: [u8; 108],
-}
-
-/// `struct ucred` (`include/linux/socket.h`): the process, user, and group of a peer.
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub(super) struct Ucred {
-    pub(super) pid: c_int,
-    pub(super) uid: c_uint,
-    pub(super) gid: c_uint,
-}
-
-/// The size of `struct ucred`, as a `socklen_t`.
-pub(super) const UCRED_LEN: c_uint = 12;
-
-const _: () = {
-    assert!(size_of::<SockAddrUn>() == 110);
-    assert!(size_of::<Ucred>() == UCRED_LEN as usize);
-};
-
-#[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+#[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
 unsafe extern "C" {
     /// `int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.
     pub(super) fn connect(sockfd: c_int, addr: *const core::ffi::c_void, addrlen: c_uint) -> c_int;
-    /// `int fchmod(int fd, mode_t mode)`, with `mode_t` an `unsigned int`.
-    pub(super) fn fchmod(fd: c_int, mode: c_uint) -> c_int;
-    /// `uid_t geteuid(void)`, with `uid_t` an `unsigned int`.
-    pub(super) fn geteuid() -> c_uint;
 }
 
 /// `pidfd_open` and `pidfd_send_signal` (`include/uapi/asm-generic/unistd.h` and

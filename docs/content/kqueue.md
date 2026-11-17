@@ -29,10 +29,10 @@ kqueue reports its socket ready.
 
 | Operations | On kqueue |
 | --- | --- |
-| TCP: accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket is ready. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
+| TCP and [local streams](local-streams.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket is ready. A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
 | UDP: one datagram, with its metadata and truncation | One nonblocking `sendmsg` or `recvmsg`, with the control messages of [datagram I/O](datagram-io.md) |
 | UDP batches: `send_batch` and `recv_batch` | One `sendmsg` or `recvmsg` for each datagram, in order. A batch stops at the first datagram that the kernel does not take, and its report counts the datagrams before it |
-| Bind and listen (`Call::Bind`, `Call::BindUdp`) | System calls on the thread of the driver (`Route::SystemCall`) |
+| Bind and listen (`Call::Bind`, `Call::BindUdp`, and `Driver::bind_local`) | System calls on the thread of the driver (`Route::SystemCall`) |
 | Files and directories (`Call::File`, `Call::SetFileLen`) | A job of your [blocking service](blocking-service.md), with positional calls, because kqueue cannot wait on a regular file (`Route::BlockingService`). See [Files](#files) |
 
 macOS has no flags of `socket` and `accept` for a close at `exec` and for no blocking. So the driver
@@ -164,7 +164,7 @@ waits or another thread wakes the driver, so a host reactor watches it, for exam
 
 ## Limits
 
-- Only TCP, UDP, and files. Pipes, local streams, child processes, and signals have no macOS form
+- Only TCP, UDP, local streams, and files. Pipes, child processes, and signals have no macOS form
   yet.
 - A hole inside a file stays a hole after a preallocation, and another process can write a file
   during an allocation with `Length::Extend` (see [Preallocation](#preallocation)).

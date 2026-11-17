@@ -61,7 +61,7 @@ const EINVAL: i32 = 22;
 const EINVAL: i32 = 10022;
 
 /// The backlog of a listener: the most that the kernel takes, `net.core.somaxconn`.
-const BACKLOG: c_int = c_int::MAX;
+pub(super) const BACKLOG: c_int = c_int::MAX;
 
 /// A listening TCP socket that a driver owns.
 ///
@@ -965,8 +965,8 @@ impl Driver {
     }
 
     /// Makes a socket of the family of the address `storage` of `len` bytes, sets it up with
-    /// `setup`, binds it, and with `listen` listens on it: a TCP or local listener, or a UDP socket
-    /// with no `listen`. The ring runs the bind, and the listen linked to it, where the kernel has
+    /// `setup`, binds it, and with `listen` listens on it: a TCP listener, or a UDP socket with no
+    /// `listen`. The ring runs the bind, and the listen linked to it, where the kernel has
     /// those operations; elsewhere the driver makes the system calls, and the operation ends at
     /// once. Its resources then hold the socket and its local address.
     pub(super) fn bind_socket(
@@ -1074,7 +1074,7 @@ impl Driver {
 
     /// Makes a stream socket of the family of the address `storage` of `len` bytes, sets it up with
     /// `setup`, and connects it to that address on the ring. Its resources then hold the socket.
-    pub(super) fn connect_socket(
+    fn connect_socket(
         &mut self,
         (storage, len): (SockAddrStorage, u32),
         setup: impl FnOnce(Borrowed<'_>) -> io::Result<()>,
@@ -1227,7 +1227,7 @@ impl Driver {
     }
 
     /// Changes the resources of the running operation `id`, at the home.
-    fn hold(&self, id: OpId, change: impl FnOnce(&mut Held)) {
+    pub(super) fn hold(&self, id: OpId, change: impl FnOnce(&mut Held)) {
         if let Some(slot) = self.shared.entries.get(id.index() as usize) {
             slot.update(id, |held| {
                 if let Some(held) = held {

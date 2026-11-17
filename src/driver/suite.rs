@@ -18,7 +18,7 @@
 //!
 //! On macOS, `Backend::Kqueue` gives each completion as the kqueue poller posts it: the poller of
 //! epoll, with the kqueue selector, and each file entry as a job of a blocking service of the case.
-//! Only the TCP, UDP, file, and ownership cases run on macOS: its pipes, local streams, processes,
+//! Only the TCP, UDP, local stream, file, and ownership cases run on macOS: its pipes, processes,
 //! and signals have no kqueue form yet. A datagram with a segment size has its own case there,
 //! because macOS has no segmentation offload.
 //!
@@ -357,7 +357,7 @@ mod law {
         tests => teardown_ends_a_waiting_send_unsent_and_releases_its_lease_once,
         #[cfg(target_os = "linux")]
         pipe::tests => a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations,
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
         #[cfg(unix)]
@@ -515,14 +515,31 @@ mod operation {
         tests => a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on,
         tests => a_half_close_on_a_failed_write_direction_sends_no_end_of_stream,
         // Local stream.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        local::tests => a_bind_refuses_while_a_listener_holds_the_lock_of_its_path,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        local::tests => a_bind_does_not_replace_the_socket_file_of_a_live_listener_with_no_lock,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        local::tests => a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_path_that_does_not_fit_a_socket_address_gives_invalid_input,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        local::tests => an_accepted_stream_of_a_closed_peer_reports_its_user_and_group,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[ignore = "starts a process as a second OS user, which only root can do"]
+        local::tests => a_connect_of_a_second_os_user_is_refused,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[ignore = "starts a process as a second OS user, which only root can do"]
+        local::tests => an_accepted_stream_reports_the_user_group_and_process_of_its_peer,
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[ignore = "changes the owner of a file to a second OS user, which only root can do"]
+        local::tests => a_bind_does_not_replace_a_stale_socket_file_of_another_user,
         // UDP.
         tests => send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports,
         #[cfg(not(target_os = "macos"))]
