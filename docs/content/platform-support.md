@@ -2,8 +2,8 @@
 
 rsasync is in development, and its alpha releases are on crates.io. This page gives the Linux C
 libraries that rsasync supports, the hosts of the io_uring driver, the macOS and Windows parts of
-`rsnetwork-udp`, the WebAssembly targets of its portable subset, and the evidence that its tests
-give today.
+the driver and of `rsnetwork-udp`, the WebAssembly targets of its portable subset, and the evidence
+that its tests give today.
 
 ## Linux C libraries
 
@@ -99,10 +99,23 @@ Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both 
 
 ## macOS
 
-The datagram calls of `rsnetwork-udp` also support macOS on aarch64 (`aarch64-apple-darwin`): see
-[Datagram I/O on any socket](datagram-io.md). The runtime has no macOS backend yet. CI does not run
-on macOS. On an aarch64 Mac with macOS 27.2, the tests of `rsnetwork-udp` pass through Tokio
-sockets, with each of these commands:
+The driver runs TCP and UDP on macOS on aarch64 (`aarch64-apple-darwin`), on
+[kqueue](kqueue.md), in driver-only use. Files, pipes, local streams, processes, and signals of the
+driver have no macOS form yet. The datagram calls of `rsnetwork-udp` also support macOS on aarch64:
+see [Datagram I/O on any socket](datagram-io.md). CI does not run on macOS.
+
+On 2026-11-17, these runs passed on an aarch64 Mac (MacBookPro18,3, Apple M1 Pro) with macOS 27.2.1
+(build 26B131), Darwin 27.2.0, xnu-13432.41.4:
+
+- At revision `b5f0d71`, `cargo xtask test -j 2` ran the 197 tests of the whole workspace, and
+  `cargo test --locked --doc --workspace` ran the 25, 1, and 9 doctests. The tests include the TCP,
+  UDP, and ownership cases of the driver suites on kqueue, and the tests of `rsnetwork-udp` through
+  Tokio sockets.
+- In the same tree, a C build of the macOS 27.2 SDK headers showed that the 57 checked values and
+  layouts and the 18 checked signatures of the new macOS declarations of the driver and
+  `rsnetwork-udp` match them.
+
+On the same Mac, the tests of `rsnetwork-udp` pass with each of these commands:
 
 ```sh
 cargo xtask test -p rsnetwork-udp
