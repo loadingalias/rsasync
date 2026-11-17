@@ -124,9 +124,9 @@ wait. `Waiter::wait_blocking` waits on the current thread. Both give `Result<R, 
 
 No job is cancelled, because a running closure cannot be made to stop. A drop of the waiter ends
 only your interest in the result. The job runs until it returns, and it holds its job slot until
-then. Its result then drops on the thread of the service. A panic in that drop does not end the
-thread. Thus a job that never returns holds its slot for the life of the service, and each such
-job leaves one job slot less for other jobs.
+then. Its result then drops on the thread of the service, still under the charge of the job. A
+panic in that drop does not end the thread. Thus a job that never returns holds its slot for the
+life of the service, and each such job leaves one job slot less for other jobs.
 
 ## Stop the service
 

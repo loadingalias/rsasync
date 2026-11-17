@@ -241,14 +241,8 @@ pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_
         drive(&mut driver, change).unwrap().unwrap();
         assert_eq!(file_len(&mut driver, &file), 100);
     }
-    // The job slot of the held job ends just after its waiter returns.
-    let change = loop {
-        match driver.set_file_len(&file, 4000) {
-            Ok(change) => break change,
-            Err(refused) => assert_eq!(refused.reason(), Reason::Blocking),
-        }
-        std::thread::yield_now();
-    };
+    // The waiter of the held job has its result, so the job slot is free.
+    let change = driver.set_file_len(&file, 4000).unwrap();
     drive(&mut driver, change).unwrap().unwrap();
     assert_eq!(file_len(&mut driver, &file), 4000);
     assert_eq!(fs::metadata(scratch.join("data")).unwrap().len(), 4000);

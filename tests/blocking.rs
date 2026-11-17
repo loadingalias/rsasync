@@ -134,14 +134,9 @@ fn an_abandoned_job_holds_its_slot_until_it_returns_and_then_its_result_drops() 
     results.recv().unwrap();
     results.recv().unwrap();
 
-    // After the results drop, the slots end, and the service admits a job again.
-    let mut waiter = loop {
-        match submitter.submit(|| 7) {
-            Ok(waiter) => break waiter,
-            Err(refused) => assert_eq!(refused.reason, Reason::Full),
-        }
-        thread::yield_now();
-    };
+    // The slots ended when the jobs returned, before their results dropped, so the service admits
+    // a job again at once.
+    let mut waiter = submitter.submit(|| 7).unwrap();
     assert_eq!(waiter.wait_blocking(), Ok(7));
     service.teardown();
 }
@@ -234,14 +229,9 @@ fn a_panicking_job_gives_panicked_and_its_thread_runs_the_next_job() {
     let mut failed = submitter.submit(|| -> u32 { panic!("the job fails") }).unwrap();
     assert_eq!(block_on(failed.wait()), Err(Failed::Panicked));
     drop(failed);
-    // The one thread runs the next job.
-    let mut next = loop {
-        match submitter.submit(|| 7) {
-            Ok(waiter) => break waiter,
-            Err(refused) => assert_eq!(refused.reason, Reason::Full),
-        }
-        thread::yield_now();
-    };
+    // The waiter has the result, so the one job slot is free, and the one thread runs the next
+    // job.
+    let mut next = submitter.submit(|| 7).unwrap();
     assert_eq!(block_on(next.wait()), Ok(7));
     service.teardown();
 }
@@ -275,7 +265,8 @@ fn a_panic_in_the_drop_of_an_abandoned_result_does_not_end_the_thread() {
             .unwrap(),
     );
     gate.open();
-    // The one thread still runs the next job.
+    // The one thread still runs the next job. No waiter shows when the job returns and its slot
+    // ends, so the test submits until the service admits the job.
     let mut next = loop {
         match submitter.submit(|| 7) {
             Ok(waiter) => break waiter,

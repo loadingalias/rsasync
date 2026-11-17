@@ -34,8 +34,8 @@
 //!
 //! - The service has [`Config::threads`] threads for its whole life.
 //! - At most [`Config::jobs`] jobs are admitted at one time. An admitted job holds its job slot
-//!   while it waits in the queue and while it runs, until it returns and its result goes to its
-//!   waiter or drops.
+//!   while it waits in the queue and while it runs, until it returns. The slot is free before the
+//!   waiter can see the result, so a waiter that has its result can submit again at once.
 //! - [`Service::new`] charges the memory of the service and of the queue to its budget, and
 //!   [`Config::stack`] for each thread. The platform can round a stack up, so keep headroom for it.
 //!   Each thread holds the charge of its stack until it ends.
@@ -50,8 +50,8 @@
 //!
 //! No job is cancelled, because no arbitrary closure can be made to stop. A drop of the waiter
 //! ends only the interest in the result: the job runs until it returns, and it holds its job slot
-//! until then. Its result then drops on the thread of the service. A panic in that drop does not
-//! end the thread.
+//! until then. Its result then drops on the thread of the service, still under the charge of the
+//! job. A panic in that drop does not end the thread.
 //!
 //! # Teardown
 //!
@@ -352,10 +352,12 @@ impl<J: Job> Run for Task<J> {
         // The check comes before the send: a waiter that took the result before the stop makes
         // the teardown count no running job. Ordering: `Acquire` reads the release of the stop.
         let late = stopped.load(Ordering::Acquire);
-        // A waiter that is gone gives the result back, and it drops here.
-        drop(reply.send(outcome));
-        // The job slot ends only now, after the job returned and its result left this thread.
+        // The job slot ends when the job returned, before the waiter can see the result, so a
+        // waiter that has its result finds its slot free.
         drop(slot);
+        // A waiter that is gone gives the result back, and it drops here, still under the memory
+        // charge of the task and on this thread.
+        drop(reply.send(outcome));
         late
     }
 }
