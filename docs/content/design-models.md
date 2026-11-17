@@ -71,7 +71,7 @@ then validates and runs profiles from that revision. A new run never replaces an
 A record with no final verdict is incomplete.
 
 TLC uses `-XX:+ExitOnOutOfMemoryError`: Java stops on heap exhaustion. This prevents the
-pinned checker's [liveness index](https://github.com/tlaplus/tlaplus/blob/d8fb231de4e4/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
+pinned checker's [liveness index](https://github.com/tlaplus/tlaplus/blob/bc1b506bdcad/tlatools/org.lamport.tlatools/src/tlc2/tool/liveness/NodePtrTable.java)
 from continuing after a failed allocation leaves its index arrays inconsistent. Such a run fails;
 it gives no verification result.
 
@@ -97,16 +97,16 @@ input options for explicit settings.
 
 ## Large profiles
 
-The operation-ownership gate has 55 profiles. Its 43 fault and witness checks take about 101
-seconds of checker time on the shared development Mac. The complete searches take longer. The
-largest profiles have these results on a quiet EC2 c8g.4xlarge (16 vCPUs, 32 GiB, 2026-11-11):
+The operation-ownership gate has 59 profiles. Its 47 fault and witness checks take about 35
+seconds of checker time on a quiet EC2 c8i.4xlarge. The complete searches take longer. The
+largest profiles have these results on quiet EC2 hosts with 16 vCPUs and 32 GiB (2026-11-17):
 
-| Profile | Distinct states | Time |
-| --- | --- | --- |
-| `OperationOwnership.UringWide.cfg` | 22,058,438 | 36.1 minutes |
-| `OperationOwnership.UringOps3.cfg` | 19,962,870 | 33.9 minutes |
-| `OperationOwnership.IocpWide.cfg` | 7,752,242 | 12.4 minutes |
-| `OperationOwnership.IocpOps3.cfg` | 9,357,002 | 15.1 minutes |
+| Profile | Distinct states | Time | Host |
+| --- | --- | --- | --- |
+| `OperationOwnership.UringWide.cfg` | 25,858,420 | 42.7 minutes | c8g.4xlarge |
+| `OperationOwnership.UringOps3.cfg` | 22,667,262 | 31.9 minutes | c8i.4xlarge |
+| `OperationOwnership.IocpOps3.cfg` | 12,097,132 | 19.5 minutes | c8g.4xlarge |
+| `OperationOwnership.IocpWide.cfg` | 10,159,624 | 14.5 minutes | c8i.4xlarge |
 
 The [model evidence record](../../models/operation-ownership/README.md#evidence-record)
 gives every positive profile, its host, and its retained evidence.

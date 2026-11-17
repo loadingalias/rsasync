@@ -8,10 +8,10 @@ Buffers (the terminal-event table and the cancel rule), Future and Wake Contract
 Startup, Shutdown, and Failures. The Design Models section of `docs/specs/family-policy.md` sets the
 acceptance.
 
-**Status (2026-11-17): the inputs changed, and the 59 profiles have no result yet.** This
-change adds the kept receive error and the IOCP abort. The [evidence record](#evidence-record)
-holds the last result, of the earlier inputs. The design decisions of 2026-11-07 and 2026-11-08
-stay below.
+**Status (2026-11-17): all 59 profiles pass at the current inputs.** This change adds the kept
+receive error and the IOCP abort. The 12 positive searches complete, and all 18 fault variants and
+29 witnesses give their required violations. See [Evidence record](#evidence-record). The design
+decisions of 2026-11-07 and 2026-11-08 stay below.
 
 ## The promise and a concrete failure
 
@@ -566,59 +566,81 @@ resets of 2026-11-07, and a reset purges every pending notice of the connection.
 
 ## Evidence record
 
-All 55 profiles pass for
-`sha256:9519fd9c04854f42cb016adb867e3671e135a2ab8bb6333b3073855b31ca6beb` (56 files).
-SANY parsed the module before TLC. The checks use Temurin JRE 21.0.13+9,
-TLC 1.8.0+d8fb231de4e4, and `cargo xtask model operation-ownership/<profile>`.
-Each retained profile closure matches the current module and configuration.
+All 59 profiles pass for
+`sha256:8ddd06c769d39dd85170f94a7eadd8492fb6649125bd4c4d9ee98dc620d9a1d1` (60 files), at
+commit `7e3c6de`. The rebase onto main left each model file the same, so the digest is that of
+the merged files. SANY parsed the module before TLC. The checks use Temurin JRE 21.0.13+9,
+tla2tools 1.8.0+bc1b506bdcad (TLC2 Version 2026.11.15.002146, rev bc1b506), and
+`cargo xtask model operation-ownership/<profile>`, one command for each profile, each with a
+cap of 3600 seconds.
 
-The 12 positive searches finish with no violation, an empty queue, and exit 0. The main
-io_uring run used this shared Mac; its duration is indicative. The other positive runs used
-one quiet EC2 c8g.4xlarge: 16 vCPUs, 32 GiB, Ubuntu 26.04, aarch64, kernel 7.0.0-1016-aws.
-Every profile finished within the one-hour limit.
+Two quiet ephemeral EC2 hosts, each with 16 vCPUs and Ubuntu 26.04 on kernel 7.0.0-1016-aws,
+ran the profiles at the same time: a c8g.4xlarge (aarch64, 32 GiB, run `20261117T030545Z-51205`)
+and a c8i.4xlarge (x86_64, 32 GiB, run `20261117T030619Z-55084`). Each host first ran smaller
+searches of each backend. The time of each such probe, divided by its recorded time, scaled the
+recorded time of each large profile, and a large profile ran only with an estimate of at most
+3300 seconds. Every estimate was below that limit, and every profile finished within the
+one-hour limit.
 
-| Profile | Distinct states | Seconds | Host |
-| --- | --- | --- | --- |
-| `OperationOwnership.Iocp.cfg` | 648,946 | 53.93 | EC2 |
-| `OperationOwnership.IocpBytes4.cfg` | 873,266 | 71.73 | EC2 |
-| `OperationOwnership.IocpConns2.cfg` | 861,278 | 74.04 | EC2 |
-| `OperationOwnership.IocpOps3.cfg` | 9,357,002 | 904.79 | EC2 |
-| `OperationOwnership.IocpWide.cfg` | 7,752,242 | 746.93 | EC2 |
-| `OperationOwnership.IocpWorkers3.cfg` | 1,100,658 | 94.53 | EC2 |
-| `OperationOwnership.Uring.cfg` | 970,534 | 352.85 | Mac |
-| `OperationOwnership.UringBytes4.cfg` | 1,282,956 | 110.42 | EC2 |
-| `OperationOwnership.UringConns2.cfg` | 1,852,358 | 152.81 | EC2 |
-| `OperationOwnership.UringOps3.cfg` | 19,962,870 | 2033.76 | EC2 |
-| `OperationOwnership.UringWide.cfg` | 22,058,438 | 2168.35 | EC2 |
-| `OperationOwnership.UringWorkers3.cfg` | 2,198,912 | 190.24 | EC2 |
+The 12 positive searches finish with no violation, an empty queue, and exit 0:
 
-All 16 known-bad variants violate their named property, and all 27 witnesses reach their
-named target. Their combined checker time is 100.74 seconds on this shared Mac; this is
-functional evidence, not a qualified performance measurement. The three new fault checks are:
+| Profile | Distinct states | Recorded on 2026-11-11 | Change | Depth | Time | Host |
+| --- | --- | --- | --- | --- | --- | --- |
+| `OperationOwnership.Iocp.cfg` | 815,370 | 648,946 | +25.6 % | 22 | 55 s | x86_64 |
+| `OperationOwnership.IocpBytes4.cfg` | 1,075,142 | 873,266 | +23.1 % | 22 | 1 min 17 s | x86_64 |
+| `OperationOwnership.IocpConns2.cfg` | 1,083,608 | 861,278 | +25.8 % | 24 | 1 min 17 s | x86_64 |
+| `OperationOwnership.IocpOps3.cfg` | 12,097,132 | 9,357,002 | +29.3 % | 29 | 19 min 27 s | aarch64 |
+| `OperationOwnership.IocpWide.cfg` | 10,159,624 | 7,752,242 | +31.1 % | 30 | 14 min 28 s | x86_64 |
+| `OperationOwnership.IocpWorkers3.cfg` | 1,392,448 | 1,100,658 | +26.5 % | 23 | 2 min 05 s | aarch64 |
+| `OperationOwnership.Uring.cfg` | 1,075,462 | 970,534 | +10.8 % | 23 | 1 min 32 s | aarch64 |
+| `OperationOwnership.UringBytes4.cfg` | 1,391,202 | 1,282,956 | +8.4 % | 23 | 1 min 56 s | aarch64 |
+| `OperationOwnership.UringConns2.cfg` | 2,052,838 | 1,852,358 | +10.8 % | 25 | 2 min 17 s | x86_64 |
+| `OperationOwnership.UringOps3.cfg` | 22,667,262 | 19,962,870 | +13.5 % | 30 | 31 min 53 s | x86_64 |
+| `OperationOwnership.UringWide.cfg` | 25,858,420 | 22,058,438 | +17.2 % | 31 | 42 min 44 s | aarch64 |
+| `OperationOwnership.UringWorkers3.cfg` | 2,429,840 | 2,198,912 | +10.5 % | 24 | 3 min 29 s | aarch64 |
 
-| Profile | Required violation | Seconds |
+The io_uring counts differ from the record only through the receive results. The abort needs
+`Backend = "iocp"`, so on io_uring `ab` stays false, `wd` never becomes `lost`, and each send
+step is the step of the record. The receive results changed in three ways. A result with no bytes
+and no cancel is now the error of a failed stream, and it ends the stream, so later bytes no
+longer follow it. Each later result is the end of the stream, a state that the record did not
+have. An abandoned error stays in the stream (`re`) until the next receive or close, and the
+state records the kind of the result (`ro`) and the first result with no bytes that the caller
+got (`ce`). The net change is +8 % to +17 %, and it grows with the receive submissions. The IOCP
+counts also have the abort, and its later sends and receives, so they grow more.
+
+All 18 known-bad variants violate their named property, and all 29 witnesses reach their named
+target, on the x86_64 host, in 34.95 seconds of checker time. The four new profiles:
+
+| Profile | Required result | Seconds |
 | --- | --- | --- |
-| `DropRxTail_bad` | `InOrderOnce` | 1.20 |
-| `OmitReport_bad` | `ReportOnce` | 1.21 |
-| `OmitDebt_bad` | `ReleaseOnce` | 3.33 |
+| `AbortCount_bad` | `ExactCount` violated | 0.68 |
+| `DropRxError_bad` | `NoFalseEnd` violated | 0.90 |
+| `IocpAbort_reach` | `UnreachedIocpAbort` violated: the target is reached | 0.76 |
+| `KeptError_reach` | `UnreachedKeptError` violated: the target is reached | 0.64 |
 
-The original logs, traces, manifests, and source copies are retained under
-`target/model/operation-ownership/<profile>/<run>/`. The current-input index is
-`target/model/operation-ownership-evidence-status.tsv`. The `OmitDebt_bad` run
-`1794375904485908000-57608` also exercises the retained-input runner: it reads `source/`,
-and the earlier run remains present.
+The traces of the two new variants are the ones in [Known-bad variants](#known-bad-variants).
 
-The EC2 run is `20261111T073937Z-48704`. Its collected archive is
-`target/model/remote-r000/node-1-artifacts.tar.gz`, with SHA-256
-`a8d1d1d2cc847da9c143656372ddc7c7e4b4d961793ab8e27e5049d68d87ef8d`.
-Collection and teardown both exit 0. `dev-machine status rsasync aws-linux-arm64-ubuntu2604`
-reports no AWS instance or EBS volume. The archive excludes TLC state caches; it keeps the
-inputs, commands, results, and replay artifacts.
+The tests that check the premise of reduction 13 ran on the x86_64 host before the profiles, 6
+of 6, at `7e3c6de`. The rebase onto main and the change to `assert_matches!` made that result
+invalid, so the six tests ran again at the rebased commit on an ephemeral c8i.4xlarge with
+Ubuntu 26.04 (run `20261117T041755Z-57337`, clean tree):
+`cargo xtask test -E 'test(waiting_send_unsent)'`, 6 tests run, 6 passed, on the kernel, the
+injection, and epoll.
 
-The gate recorded at Git revision `4b5e8c1` checked digest
-`sha256:48cb71030ec27b3eb01114a3970fe0a79081423c7b161f09c6a88cd4fe23abaa` (53 files).
-That is a historical baseline. The current main and largest io_uring searches have the same
-state counts: the added obligation state does not multiply the reachable states. Durations
+The two collected archives keep the logs, traces, manifests, and source copies of each profile,
+and the job and the coordinator of each host. They are in
+`~/.local/state/model-evidence/rsasync/R000/20261117-iocp-abort/` of the evidence Mac:
+`arm64-20261117T030545Z-51205.tar.gz` (SHA-256
+`be33ce047052f9e4085a6a33970ce65035b68e31e7db8264cea5330b100fb3c9`) and
+`x64-20261117T030619Z-55084.tar.gz` (SHA-256
+`7f47002ae94e841ea5e92b9db9bc4af7c47eeb06977dd364f7a6a7a7a3201f69`). The archives exclude
+TLC state caches. Collection and teardown exit 0 for each host, and `dev-machine status` shows
+no instance or volume for each target.
+
+The earlier record, of 2026-11-11, checked
+`sha256:9519fd9c04854f42cb016adb867e3671e135a2ab8bb6333b3073855b31ca6beb` (56 files) with TLC
+rev d8fb231. It is a historical baseline: its counts are the "Recorded" column above. Durations
 from different hosts are not a speed comparison.
 
 [FP Design Models]: ../../docs/specs/family-policy.md#design-models
