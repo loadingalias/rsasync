@@ -68,7 +68,10 @@ run(&mut driver, unlink)???;
 
 The descriptor closes on `exec`, and a Windows handle is not inherited. Options that no open can
 take, and a path with a NUL byte, give `InvalidInput`. On Windows, the open lets other handles read,
-write, rename, and delete the file, as on Linux and macOS.
+write, rename, and delete the file, as on Linux and macOS. A relative path, or a path that can be
+longer than `MAX_PATH` (260 units), goes to the system in its absolute verbatim form (`\\?\`, or
+`\\?\UNC\` for a network path), as `std::fs` gives it, so each path that `std::fs` opens also opens
+on the driver. A rename and an unlink take their paths in the same way.
 
 ## Operations
 

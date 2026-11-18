@@ -94,15 +94,97 @@ impl Opening {
     }
 }
 
-/// `path` as a NUL-terminated UTF-16 string, or `None` when it holds a NUL unit.
+/// `path` as a NUL-terminated UTF-16 string, or `None` when it holds a NUL unit. A path that
+/// can be longer than `MAX_PATH` becomes absolute with the verbatim prefix ([`verbatim`]), so the
+/// driver opens each path that `std::fs` opens.
 pub(super) fn wide(path: &Path) -> Option<Vec<u16>> {
     let mut wide: Vec<u16> = OsStr::encode_wide(path.as_os_str()).collect();
     if wide.contains(&0) {
         return None;
     }
     wide.push(0);
-    Some(wide)
+    Some(verbatim(wide))
 }
+
+/// The length below which an absolute path is short for each call: `MAX_PATH` is 260 units with
+/// the NUL, and `CreateDirectoryW` takes 248 (`fileapi.h`).
+const SHORT: usize = 248;
+
+/// The NUL-terminated UTF-16 path `path`, as `std::fs` gives it to the system: a short absolute
+/// path as it is, and each other path made absolute (`GetFullPathNameW`) with the verbatim prefix
+/// `\\?\`, or `\\?\UNC\` for a network path. The system then takes it with no length limit.
+/// A path that has a verbatim prefix stays as it is, and a path that `GetFullPathNameW` refuses
+/// stays as it is, so its call gives the error.
+#[expect(unsafe_code, reason = "the call reads the path and writes the buffer of its length")]
+fn verbatim(path: Vec<u16>) -> Vec<u16> {
+    const SEPARATOR: u16 = b'\\' as u16;
+    const SLASH: u16 = b'/' as u16;
+    const COLON: u16 = b':' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    const VERBATIM: [u16; 4] = [SEPARATOR, SEPARATOR, QUERY, SEPARATOR];
+    const NT: [u16; 4] = [SEPARATOR, QUERY, QUERY, SEPARATOR];
+    const UNC: [u16; 8] = [
+        SEPARATOR,
+        SEPARATOR,
+        QUERY,
+        SEPARATOR,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        SEPARATOR,
+    ];
+    if path.starts_with(&VERBATIM) || path.starts_with(&NT) || path == [0] {
+        return path;
+    }
+    let short_absolute = path.len() < SHORT
+        && match path.as_slice() {
+            [drive, COLON, 0] | [drive, COLON, SEPARATOR | SLASH, ..] => *drive != SEPARATOR && *drive != SLASH,
+            [SEPARATOR | SLASH, SEPARATOR | SLASH, ..] => true,
+            _ => false,
+        };
+    if short_absolute {
+        return path;
+    }
+    // The working directory can change between the calls, so the loop tries a few times.
+    let mut absolute = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let room = u32::try_from(absolute.capacity()).unwrap_or(u32::MAX);
+        // SAFETY: the path is NUL-terminated, and the call writes at most `room` units.
+        let len = unsafe { sys::GetFullPathNameW(path.as_ptr(), room, absolute.as_mut_ptr(), ptr::null_mut()) };
+        match usize::try_from(len) {
+            Ok(0) | Err(_) => return path,
+            // The units and the NUL fitted: the call wrote `len` units before the NUL.
+            Ok(len) if len < absolute.capacity() => {
+                // SAFETY: the call initialized `len` units.
+                unsafe { absolute.set_len(len) };
+                break;
+            }
+            // The buffer needs `len` units with the NUL.
+            Ok(len) => absolute.reserve_exact(len),
+        }
+    }
+    if absolute.is_empty() {
+        return path;
+    }
+    let (prefix, rest): (&[u16], &[u16]) = match absolute.as_slice() {
+        [_, COLON, SEPARATOR, ..] => (&VERBATIM, &absolute),
+        // `\\.\` names a device: the verbatim form keeps it.
+        [SEPARATOR, SEPARATOR, DOT, SEPARATOR, rest @ ..] => (&VERBATIM, rest),
+        [SEPARATOR, SEPARATOR, QUERY, SEPARATOR, ..] | [SEPARATOR, QUERY, QUERY, SEPARATOR, ..] => (&[], &absolute),
+        [SEPARATOR, SEPARATOR, rest @ ..] => (&UNC, rest),
+        _ => (&[], &absolute),
+    };
+    let mut verbatim = Vec::with_capacity(prefix.len() + rest.len() + 1);
+    verbatim.extend_from_slice(prefix);
+    verbatim.extend_from_slice(rest);
+    verbatim.push(0);
+    verbatim
+}
+
+/// The calls of `GetFullPathNameW` for one path: the second one has the length that the first one
+/// gave, and a third one serves a change of the working directory between them.
+const ATTEMPTS: usize = 3;
 
 /// The handle of the number `number` of an entry: the number extended with its sign, as for a
 /// socket.

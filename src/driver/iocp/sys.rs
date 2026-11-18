@@ -10,7 +10,7 @@
 //! (`WSAID_ACCEPTEX`, `WSAID_CONNECTEX`, `LPFN_ACCEPTEX`, `LPFN_CONNECTEX`, and the update
 //! options), `ntstatus.h` (the statuses), and `winerror.h` (the error codes). The file items agree
 //! with `fileapi.h` (`CreateFileW`, `ReadFile`, `WriteFile`, `FlushFileBuffers`, `DeleteFileW`,
-//! `GetFinalPathNameByHandleW`), `winbase.h` (`ReOpenFile`, `MoveFileExW`,
+//! `GetFinalPathNameByHandleW`, `GetFullPathNameW`), `winbase.h` (`ReOpenFile`, `MoveFileExW`,
 //! `SetFileInformationByHandle`, `GetFileInformationByHandleEx`, and the file flags),
 //! `minwinbase.h` (`FILE_INFO_BY_HANDLE_CLASS` and its structures), `winnt.h` (the access rights
 //! and the share modes), `ioapiset.h` (`DeviceIoControl`, `GetOverlappedResult`), `winioctl.h`
@@ -573,6 +573,9 @@ unsafe extern "system" {
     /// `DWORD GetFinalPathNameByHandleW(HANDLE hFile, LPWSTR lpszFilePath, DWORD cchFilePath, DWORD
     /// dwFlags)`.
     pub(crate) fn GetFinalPathNameByHandleW(file: Handle, path: *mut u16, len: u32, flags: u32) -> u32;
+    /// `DWORD GetFullPathNameW(LPCWSTR lpFileName, DWORD nBufferLength, LPWSTR lpBuffer, LPWSTR
+    /// *lpFilePart)`.
+    pub(crate) fn GetFullPathNameW(name: *const u16, len: u32, buffer: *mut u16, part: *mut *mut u16) -> u32;
 }
 
 #[expect(unsafe_code, reason = "cfgmgr32.dll gives these functions")]

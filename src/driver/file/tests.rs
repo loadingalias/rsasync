@@ -630,3 +630,26 @@ pub(in crate::driver) fn the_nvme_report_of_a_file_follows_the_driver_of_its_dis
         "the disk of drive {letter} has the driver service {service}"
     );
 }
+
+/// On Windows, a file at a path longer than `MAX_PATH` (260 units) opens, takes a write, and reads
+/// it back, as with `std::fs`: the driver gives the system the verbatim form of the path.
+#[cfg(target_os = "windows")]
+pub(in crate::driver) fn a_file_at_a_path_longer_than_max_path_opens_writes_and_reads_back(backend: Backend) {
+    let scratch = Scratch::new("long");
+    let directory = scratch.join(&"d".repeat(120)).join("e".repeat(120));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("data");
+    assert!(path.as_os_str().len() > 260, "{}", path.display());
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &path, writable().read(true));
+    write(&mut driver, &file, b"long", 0);
+    let read = driver.read_at(&file, Backing::from(Vec::with_capacity(8)), 0).unwrap();
+    let (count, buffer) = drive(&mut driver, read).unwrap();
+    assert_eq!((count.unwrap(), buffer.bytes()), (4, &b"long"[..]));
+    let close = driver.close_file(file).unwrap();
+    drive(&mut driver, close).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"long");
+    let unlink = driver.unlink(&path).unwrap();
+    drive(&mut driver, unlink).unwrap().unwrap();
+    assert!(!path.exists());
+}

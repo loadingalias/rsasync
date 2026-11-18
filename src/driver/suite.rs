@@ -102,6 +102,8 @@
 //!     `a_rename_an_unlink_and_a_directory_sync_complete`.
 //!   - The native NVMe path of the device of a file, on Windows:
 //!     `the_nvme_report_of_a_file_follows_the_driver_of_its_disk`.
+//!   - A path longer than `MAX_PATH`, on Windows:
+//!     `a_file_at_a_path_longer_than_max_path_opens_writes_and_reads_back`.
 //! - TCP
 //!   - Bind and listen with socket options, and the options:
 //!     `each_socket_option_reads_back_the_value_that_was_set`.
@@ -511,6 +513,8 @@ mod operation {
         file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
         #[cfg(target_os = "windows")]
         file::tests => the_nvme_report_of_a_file_follows_the_driver_of_its_disk,
+        #[cfg(target_os = "windows")]
+        file::tests => a_file_at_a_path_longer_than_max_path_opens_writes_and_reads_back,
         // TCP.
         tests => each_socket_option_reads_back_the_value_that_was_set,
         tests => a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere,
