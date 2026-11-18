@@ -9,7 +9,9 @@
 //! writes, with the index and the generation of its slot as the data ([`Registrar`]). An entry
 //! runs at once when its direction is ready. When its call gives `EAGAIN`, the direction is not
 //! ready, and the entry waits in the list of that direction until the next edge. A poll of a
-//! descriptor that is not a resource, such as a process descriptor, has a one-shot registration.
+//! descriptor that is not a resource, such as a process descriptor, has a one-shot registration,
+//! and so do a poll of the exit of a process and a poll of a time on macOS ([`EXITED`] and
+//! [`ELAPSED`]).
 //! A linked chain of datagram sends or receives, the batch of the driver, is one `sendmmsg` or
 //! `recvmmsg` on Linux, and one `sendmsg` or `recvmsg` for each datagram on macOS, through
 //! `rsnetwork-udp`.
@@ -37,8 +39,6 @@ use std::time::Instant;
 #[cfg(target_os = "linux")]
 use epoll::{Event, Selector, decode};
 #[cfg(target_os = "macos")]
-pub(crate) use kqueue::Wake;
-#[cfg(target_os = "macos")]
 use kqueue::{Event, Selector, decode};
 
 #[cfg(target_os = "linux")]
@@ -64,6 +64,18 @@ const POLLOUT: u32 = 0x4;
 const POLLERR: u32 = 0x8;
 const POLLHUP: u32 = 0x10;
 const POLLRDHUP: u32 = 0x2000;
+
+/// The bit of a poll of the exit of the process whose ID is the descriptor of the entry, which is
+/// no `poll` bit of either system. The kqueue selector waits for the exit event of the process
+/// (`EVFILT_PROC` with `NOTE_EXIT`), and reports it with this bit.
+#[cfg(target_os = "macos")]
+pub(crate) const EXITED: u32 = 1 << 16;
+
+/// The bit of a poll that waits for the time in microseconds in the offset of its entry, which is
+/// no `poll` bit of either system. The kqueue selector arms a one-shot timer (`EVFILT_TIMER`) whose
+/// identifier is the descriptor of the entry, and reports its end with this bit.
+#[cfg(target_os = "macos")]
+pub(crate) const ELAPSED: u32 = 1 << 17;
 
 /// The events that make the read direction ready.
 const READABLE: u32 = POLLIN | POLLPRI | POLLRDHUP | POLLHUP | POLLERR;
@@ -196,9 +208,10 @@ pub(crate) struct Poller {
 
 impl Poller {
     /// A poller with `entries` submission entries, rounded up to a power of two as a ring does, room
-    /// for `completions` entries in flight, `resources` resource slots, and `jobs` file jobs. On
-    /// Linux, the wake descriptor `wake` stays registered, so a wake from another thread ends a
-    /// wait. On macOS, the wake is an event of the kqueue itself ([`Poller::wake`]).
+    /// for `completions` entries in flight, `resources` resource slots, and `jobs` file jobs. The
+    /// wake descriptor `wake` stays registered, level-triggered, so a wake from another thread ends
+    /// a wait: on Linux the `eventfd` of the driver, and on macOS the read end of its wake pipe.
+    /// The driver clears it at each turn.
     ///
     /// # Errors
     ///
@@ -209,16 +222,13 @@ impl Poller {
         completions: u32,
         resources: u32,
         jobs: u32,
-        #[cfg(target_os = "linux")] wake: BorrowedFd<'_>,
+        wake: BorrowedFd<'_>,
     ) -> io::Result<Self> {
         let entries = entries
             .checked_next_power_of_two()
             .filter(|&entries| entries > 0)
             .ok_or(io::ErrorKind::InvalidInput)?;
-        #[cfg(target_os = "linux")]
         let selector = Selector::new(wake)?;
-        #[cfg(target_os = "macos")]
-        let selector = Selector::new()?;
         let completions = completions.max(entries);
         Ok(Self {
             selector,
@@ -257,12 +267,6 @@ impl Poller {
     /// The descriptor of the selector, epoll or kqueue: it is readable when an event waits.
     pub(crate) fn fd(&self) -> BorrowedFd<'_> {
         self.selector.fd()
-    }
-
-    /// The wake of the poller, which another thread posts to end a wait.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn wake(&self) -> Wake {
-        self.selector.wake()
     }
 
     /// Copies `entry` of the resource `token` to the submission queue. The next submit takes it.
@@ -506,8 +510,23 @@ impl Poller {
         let Some(slot) = self.slots[index as usize] else {
             return;
         };
-        match self.selector.arm(slot.sqe.fd, events, ONE_SHOT | u64::from(index)) {
+        let data = ONE_SHOT | u64::from(index);
+        #[cfg(target_os = "macos")]
+        let armed = if events & ELAPSED != 0 {
+            self.selector.delay(slot.sqe.fd, slot.sqe.off, data)
+        } else {
+            self.selector.arm(slot.sqe.fd, events, data)
+        };
+        #[cfg(target_os = "linux")]
+        let armed = self.selector.arm(slot.sqe.fd, events, data);
+        match armed {
             Ok(()) => {}
+            // A process that ended before the registration is no process for kqueue then, so its
+            // exit came already: the poll ends as at the event, and the home takes the status.
+            #[cfg(target_os = "macos")]
+            Err(error) if events & EXITED != 0 && error.raw_os_error() == Some(sys::ESRCH) => {
+                self.post(index, i32::try_from(EXITED).unwrap_or(i32::MAX), 0);
+            }
             Err(error) => self.post(index, -error.raw_os_error().unwrap_or(sys::EINVAL), 0),
         }
     }

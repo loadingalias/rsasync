@@ -51,8 +51,9 @@ fn a_failed_registration_returns_the_descriptor_open_with_its_reason() {
     assert_eq!((count.unwrap(), buffer.bytes()), (4, &b"next"[..]));
 }
 
-/// A strict epoll driver reports epoll, and each file call on the blocking service. With no
-/// service, a file operation refuses before it starts, because no file call blocks the driver.
+/// A strict epoll driver reports epoll, each file call on the blocking service, and the wait of a
+/// child as a poll of its process descriptor. With no service, a file operation refuses before it
+/// starts, because no file call blocks the driver.
 #[test]
 #[cfg(target_os = "linux")]
 fn an_epoll_driver_reports_its_backend_and_refuses_a_file_operation_with_no_service() {
@@ -64,6 +65,7 @@ fn an_epoll_driver_reports_its_backend_and_refuses_a_file_operation_with_no_serv
     );
     assert_eq!(report.route(Call::File), Route::BlockingService);
     assert_eq!(report.route(Call::SetFileLen), Route::BlockingService);
+    assert_eq!(report.route(Call::WaitChild), Route::Poll);
     let path = std::env::current_exe().unwrap();
     let refused = driver.open_file(&path, OpenOptions::new()).unwrap_err();
     assert_eq!(refused.reason(), Reason::Blocking);
@@ -139,7 +141,7 @@ fn a_refused_registration_of_an_accepted_connection_keeps_it_for_the_next_accept
 }
 
 /// A driver on macOS runs kqueue, and the report says so, with each file call on the blocking
-/// service. With no service, a file operation refuses before it starts, because no file call
+/// service and the wait of a child as a poll of its exit event. With no service, a file operation refuses before it starts, because no file call
 /// blocks the driver. A strict requirement of a backend that macOS does not have refuses before a
 /// driver exists.
 #[test]
@@ -155,6 +157,7 @@ fn a_kqueue_driver_reports_its_backend_and_a_strict_other_backend_refuses() {
         );
         assert_eq!(report.route(Call::File), Route::BlockingService);
         assert_eq!(report.route(Call::SetFileLen), Route::BlockingService);
+        assert_eq!(report.route(Call::WaitChild), Route::Poll);
         let path = std::env::current_exe().unwrap();
         let refused = driver.open_file(&path, OpenOptions::new()).unwrap_err();
         assert_eq!(refused.reason(), Reason::Blocking);

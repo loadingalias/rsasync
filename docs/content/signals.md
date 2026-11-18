@@ -3,8 +3,8 @@
 A signal stream reports that a Unix signal arrived, for example `SIGTERM` from a service manager or
 `SIGINT` from Ctrl-C. Its home is an I/O driver that you own and turn (see
 [Drive the I/O driver yourself](driver-only.md)). The type is `rsasync::driver::SignalStream`.
-rsasync is in development, and its alpha releases are on crates.io. Signal streams need Linux on
-x86_64 or aarch64, and the `std` feature.
+rsasync is in development, and its alpha releases are on crates.io. Signal streams need the `std`
+feature, and Linux on x86_64 or aarch64 (io_uring and epoll) or macOS on aarch64 (kqueue).
 
 rsasync never connects a signal to the end of your program by itself. Your code receives the
 signal and starts its own shutdown.
@@ -76,7 +76,21 @@ The handler does only async-signal-safe work: it counts the signal, writes the w
 the homes of its streams, and at a stated escalation restores the default action and raises the
 signal again. It takes no lock, allocates nothing, and keeps `errno` of the code that it interrupts.
 The handler uses `SA_RESTART`, so a system call that it interrupts restarts where the kernel allows
-it. A wait in io_uring or epoll never restarts, so `Driver::wait()` returns early.
+it. The write of the handler ends a `Driver::wait()` of the home, as [Backends](#backends) tells.
+
+## Backends
+
+The handler writes the descriptors that a `WakeHandle` writes, with `write`, which POSIX lists as
+async-signal-safe:
+
+| Backend | The wake descriptors of a home |
+| --- | --- |
+| io_uring | The wake `eventfd` and the interrupt `eventfd`, which the ring polls during a wait |
+| [epoll](epoll.md) | The wake `eventfd`, which epoll watches, and the interrupt `eventfd` |
+| [kqueue](kqueue.md), on macOS | The write end of the wake pipe, whose read end kqueue watches. A pipe, because `kevent` is not async-signal-safe |
+
+Each turn of the home compares the count of each signal after it clears its wake descriptors. So a
+signal that comes during a turn gives its report at that turn or wakes the next wait.
 
 ## Refusals
 
@@ -84,11 +98,13 @@ it. A wait in io_uring or epoll never restarts, so `Driver::wait()` returns earl
 
 | Refusal | Cause |
 | --- | --- |
-| `SignalError::Fault` | `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL`, `SIGTRAP`, and `SIGSYS` report a fault of the thread that caused it. A stream cannot handle that fault |
+| `SignalError::Fault` | `SIGSEGV`, `SIGBUS`, `SIGFPE`, `SIGILL`, `SIGTRAP`, and `SIGSYS`, and `SIGEMT` on macOS, report a fault of the thread that caused it. A stream cannot handle that fault |
 | `SignalError::Uncatchable` | No handler can take `SIGKILL` or `SIGSTOP` |
-| `SignalError::Invalid` | The number is not a signal of 1 to 64, or the C library keeps the signal for itself, such as 32 |
+| `SignalError::Invalid` | The number is not a signal of 1 to 64 on Linux or of 1 to 31 on macOS, or the C library keeps the signal for itself, such as 32 on Linux |
 | `SignalError::Full` | The process has 64 signal streams, of all signals and drivers |
-| `SignalError::Escalation` | The registration states `Escalation::At`, and the default action of the signal does not end the process: `SIGCHLD`, `SIGCONT`, `SIGURG`, or `SIGWINCH` |
+| `SignalError::Escalation` | The registration states `Escalation::At`, and the default action of the signal does not end the process: `SIGCHLD`, `SIGCONT`, `SIGURG`, and `SIGWINCH`, the stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU`, and `SIGIO` and `SIGINFO` on macOS |
 
-`Signal` names the common signals, such as `Signal::TERMINATE` and `Signal::HANGUP`.
-`Signal::from_raw(number)` gives each other signal, such as a real-time signal.
+`Signal` names the common signals, such as `Signal::TERMINATE` and `Signal::HANGUP`. Some numbers
+differ between the systems, so each constant gives the number of the target: `Signal::USER1` is 10
+on Linux and 30 on macOS. `Signal::from_raw(number)` gives each other signal, such as a real-time
+signal on Linux.

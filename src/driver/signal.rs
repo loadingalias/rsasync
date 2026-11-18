@@ -12,14 +12,17 @@
 //!
 //! - lock-free atomic loads, stores, and read-modify-writes on statics;
 //! - `write`, `sigaction`, and `raise`, which POSIX lists as async-signal-safe;
-//! - `__errno_location`, to keep `errno` of the code that it interrupts.
+//! - `__errno_location` on Linux and `__error` on macOS, to keep `errno` of the code that it
+//!   interrupts.
 //!
 //! It takes no lock, allocates nothing, and runs no destructor. The statics are hardware atomics
 //! in each form of [`crate::sync`]: a static needs a `const` atomic, and the verification form has
 //! none, and it cannot deliver signals either. The bookkeeping of the registrations, which only
 //! threads change, has one lock, which the handler never takes.
 //!
-//! A slot names the wake descriptors of one stream's home. A close stores 0 in the signal of the
+//! A slot names the wake descriptors of one stream's home: those that a wake from another thread
+//! writes, the wake and the interrupt `eventfd` on Linux, and the write end of the wake pipe of the
+//! kqueue on macOS. The handler writes 8 bytes to each, which a pipe takes whole or not at all. A close stores 0 in the signal of the
 //! slot, and then waits until no handler is in the slot. A handler announces itself in the slot
 //! and then reads the signal again. Each of the four accesses is `SeqCst`, so the close sees the
 //! handler, or the handler sees the close. Thus no handler writes a descriptor after its stream
@@ -32,15 +35,17 @@ use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll};
-use std::os::fd::AsRawFd as _;
 use std::sync::{Mutex, PoisonError};
 
 use super::{Ended, Shared};
 use crate::sync::{Arc, atomic::AtomicBool, hint};
 use crate::wait::Waiter;
 
-/// The signals 1 to 64 of Linux, and an unused 0.
+/// The signals 1 to 64 of Linux, or 1 to 31 of macOS, and an unused 0.
+#[cfg(target_os = "linux")]
 const SIGNALS: usize = 65;
+#[cfg(target_os = "macos")]
+const SIGNALS: usize = 32;
 /// The streams of the process, of all signals and drivers.
 pub(super) const STREAMS: usize = 64;
 
@@ -61,8 +66,7 @@ const _: () = assert!(
 struct Slot {
     /// The signal of the stream, or 0 for a free slot.
     signal: AtomicI32,
-    wake: AtomicI32,
-    interrupt: AtomicI32,
+    wakes: [AtomicI32; WAKES],
     /// The handlers that are in the slot now.
     active: AtomicU32,
 }
@@ -71,12 +75,14 @@ impl Slot {
     const fn new() -> Self {
         Self {
             signal: AtomicI32::new(0),
-            wake: AtomicI32::new(-1),
-            interrupt: AtomicI32::new(-1),
+            wakes: [const { AtomicI32::new(-1) }; WAKES],
             active: AtomicU32::new(0),
         }
     }
 }
+
+/// The wake descriptors of one home ([`Shared::wakes`]).
+pub(super) const WAKES: usize = if cfg!(target_os = "linux") { 2 } else { 1 };
 
 /// The bookkeeping that registrations change, under [`REGISTRY`].
 struct Registry {
@@ -110,7 +116,8 @@ impl Registry {
     }
 }
 
-/// A signal of Linux, by its number.
+/// A signal of the system, by its number. Some numbers differ between Linux and macOS, so each
+/// constant gives the number of the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Signal(c_int);
 
@@ -122,9 +129,9 @@ impl Signal {
     /// `SIGQUIT`: a quit from the terminal.
     pub const QUIT: Self = Self(3);
     /// `SIGUSR1`: a signal that the application defines.
-    pub const USER1: Self = Self(10);
+    pub const USER1: Self = Self(sys::SIGUSR1);
     /// `SIGUSR2`: a signal that the application defines.
-    pub const USER2: Self = Self(12);
+    pub const USER2: Self = Self(sys::SIGUSR2);
     /// `SIGPIPE`: a write to a pipe or socket whose reader closed.
     pub const PIPE: Self = Self(13);
     /// `SIGALRM`: a timer of `alarm` ended.
@@ -132,7 +139,7 @@ impl Signal {
     /// `SIGTERM`: a request to end, for example from a service manager.
     pub const TERMINATE: Self = Self(15);
     /// `SIGCHLD`: a child stopped or ended.
-    pub const CHILD: Self = Self(17);
+    pub const CHILD: Self = Self(sys::SIGCHLD);
     /// `SIGWINCH`: the size of the terminal window changed.
     pub const WINDOW_CHANGE: Self = Self(28);
 
@@ -165,7 +172,7 @@ pub enum Escalation {
 #[non_exhaustive]
 pub enum SignalError {
     /// The signal reports a fault of the thread that caused it: `SIGSEGV`, `SIGBUS`, `SIGFPE`,
-    /// `SIGILL`, `SIGTRAP`, or `SIGSYS`.
+    /// `SIGILL`, `SIGTRAP`, or `SIGSYS`, and `SIGEMT` on macOS.
     Fault,
     /// No handler can take the signal: `SIGKILL` or `SIGSTOP`.
     Uncatchable,
@@ -174,7 +181,8 @@ pub enum SignalError {
     /// Each of the 64 streams of the process is in use.
     Full,
     /// The registration states an [`Escalation::At`], and the default action of the signal does
-    /// not end the process: `SIGCHLD`, `SIGCONT`, `SIGURG`, or `SIGWINCH`.
+    /// not end the process: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, the stop signals
+    /// `SIGTSTP`, `SIGTTIN`, and `SIGTTOU`, and `SIGIO` and `SIGINFO` on macOS.
     Escalation,
 }
 
@@ -229,12 +237,17 @@ pub(super) fn register(
     escalation: Escalation,
 ) -> Result<(SignalStream, Arc<Home>), SignalError> {
     let number = signal.0;
-    match number {
-        4 | 5 | 7 | 8 | 11 | 31 => return Err(SignalError::Fault),
-        9 | 19 => return Err(SignalError::Uncatchable),
-        17 | 18 | 23 | 28 if escalation != Escalation::Never => return Err(SignalError::Escalation),
-        1..=64 => {}
-        _ => return Err(SignalError::Invalid),
+    if sys::FAULTS.contains(&number) {
+        return Err(SignalError::Fault);
+    }
+    if sys::UNCATCHABLE.contains(&number) {
+        return Err(SignalError::Uncatchable);
+    }
+    if sys::NOT_ENDING.contains(&number) && escalation != Escalation::Never {
+        return Err(SignalError::Escalation);
+    }
+    if !(1..SIGNALS).contains(&usize::try_from(number).unwrap_or(0)) {
+        return Err(SignalError::Invalid);
     }
     let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
     let slot = SLOTS
@@ -251,8 +264,9 @@ pub(super) fn register(
         Escalation::At(at) => count.saturating_add(u64::from(at.get())),
     };
     let entry = &SLOTS[slot];
-    entry.wake.store(shared.wake.as_raw_fd(), Ordering::Relaxed);
-    entry.interrupt.store(shared.interrupt.as_raw_fd(), Ordering::Relaxed);
+    for (wake, fd) in entry.wakes.iter().zip(shared.wakes()) {
+        wake.store(fd, Ordering::Relaxed);
+    }
     // Ordering: the handler reads the descriptors after it reads the signal.
     entry.signal.store(number, Ordering::SeqCst);
     registry.escalate(number);
@@ -386,7 +400,7 @@ impl Future for Recv<'_> {
     }
 }
 
-/// The index of `signal`, which is 1 to 64.
+/// The index of `signal`, which is 1 to 64 on Linux and 1 to 31 on macOS.
 fn index(signal: c_int) -> usize {
     usize::try_from(signal).unwrap_or(0) % SIGNALS
 }
@@ -403,8 +417,9 @@ extern "C" fn handle(signal: c_int) {
         // Ordering: see the module documentation.
         slot.active.fetch_add(1, Ordering::SeqCst);
         if slot.signal.load(Ordering::SeqCst) == signal {
-            sys::wake(slot.wake.load(Ordering::Relaxed));
-            sys::wake(slot.interrupt.load(Ordering::Relaxed));
+            for wake in &slot.wakes {
+                sys::wake(wake.load(Ordering::Relaxed));
+            }
         }
         slot.active.fetch_sub(1, Ordering::SeqCst);
     }
@@ -414,18 +429,56 @@ extern "C" fn handle(signal: c_int) {
     sys::set_errno(errno);
 }
 
-/// The declarations of `signal.h`, `unistd.h`, and `errno.h` of glibc and musl, on x86_64 and
-/// aarch64, which have the same signal numbers and `struct sigaction`.
+/// The declarations of `signal.h`, `unistd.h`, and `errno.h`: of glibc and musl on x86_64 and
+/// aarch64 Linux, which have the same signal numbers and `struct sigaction`, and of the macOS 27.2
+/// SDK (`MacOSX27.2.sdk`) on aarch64, with `sys/signal.h`.
 mod sys {
     use core::ffi::{c_int, c_void};
 
-    /// `SA_RESTART`: a call that the handler interrupts restarts.
-    const SA_RESTART: c_int = 0x1000_0000;
     /// `SIG_DFL`: the default action.
     const SIG_DFL: usize = 0;
 
+    /// `SA_RESTART`: a call that the handler interrupts restarts.
+    #[cfg(target_os = "linux")]
+    const SA_RESTART: c_int = 0x1000_0000;
+    #[cfg(target_os = "macos")]
+    const SA_RESTART: c_int = 0x2;
+
+    /// The signals whose numbers differ between the systems.
+    #[cfg(target_os = "linux")]
+    pub(super) const SIGUSR1: c_int = 10;
+    #[cfg(target_os = "linux")]
+    pub(super) const SIGUSR2: c_int = 12;
+    #[cfg(target_os = "linux")]
+    pub(super) const SIGCHLD: c_int = 17;
+    #[cfg(target_os = "macos")]
+    pub(super) const SIGUSR1: c_int = 30;
+    #[cfg(target_os = "macos")]
+    pub(super) const SIGUSR2: c_int = 31;
+    #[cfg(target_os = "macos")]
+    pub(super) const SIGCHLD: c_int = 20;
+
+    /// The fault signals: `SIGILL`, `SIGTRAP`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, and `SIGSYS`, and
+    /// `SIGEMT` on macOS.
+    #[cfg(target_os = "linux")]
+    pub(super) const FAULTS: [c_int; 6] = [4, 5, 7, 8, 11, 31];
+    #[cfg(target_os = "macos")]
+    pub(super) const FAULTS: [c_int; 7] = [4, 5, 7, 8, 10, 11, 12];
+    /// `SIGKILL` and `SIGSTOP`.
+    #[cfg(target_os = "linux")]
+    pub(super) const UNCATCHABLE: [c_int; 2] = [9, 19];
+    #[cfg(target_os = "macos")]
+    pub(super) const UNCATCHABLE: [c_int; 2] = [9, 17];
+    /// The signals whose default action ignores them or stops the process: `SIGCHLD`, `SIGCONT`,
+    /// `SIGURG`, `SIGWINCH`, `SIGTSTP`, `SIGTTIN`, and `SIGTTOU`, and `SIGIO` and `SIGINFO` on macOS.
+    #[cfg(target_os = "linux")]
+    pub(super) const NOT_ENDING: [c_int; 7] = [17, 18, 20, 21, 22, 23, 28];
+    #[cfg(target_os = "macos")]
+    pub(super) const NOT_ENDING: [c_int; 9] = [16, 18, 19, 20, 21, 22, 23, 28, 29];
+
     /// `struct sigaction`: the handler, a `sigset_t` of 128 bytes, the flags, and the restorer,
     /// which the C library sets.
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy)]
     #[repr(C)]
     pub(super) struct SigAction {
@@ -435,12 +488,14 @@ mod sys {
         restorer: usize,
     }
 
+    #[cfg(target_os = "linux")]
     const _: () = {
         assert!(size_of::<SigAction>() == 152);
         assert!(core::mem::offset_of!(SigAction, flags) == 136);
         assert!(core::mem::offset_of!(SigAction, restorer) == 144);
     };
 
+    #[cfg(target_os = "linux")]
     impl SigAction {
         pub(super) const fn new(handler: usize, flags: c_int) -> Self {
             Self {
@@ -452,7 +507,35 @@ mod sys {
         }
     }
 
-    #[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+    /// `struct sigaction`: the handler, a `sigset_t` of 32 bits, and the flags.
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    pub(super) struct SigAction {
+        pub(super) handler: usize,
+        mask: u32,
+        flags: c_int,
+    }
+
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(size_of::<SigAction>() == 16);
+        assert!(core::mem::offset_of!(SigAction, mask) == 8);
+        assert!(core::mem::offset_of!(SigAction, flags) == 12);
+    };
+
+    #[cfg(target_os = "macos")]
+    impl SigAction {
+        pub(super) const fn new(handler: usize, flags: c_int) -> Self {
+            Self {
+                handler,
+                mask: 0,
+                flags,
+            }
+        }
+    }
+
+    #[expect(unsafe_code, reason = "the C library of each target gives these functions")]
     unsafe extern "C" {
         /// `int sigaction(int sig, const struct sigaction *act, struct sigaction *oact)`.
         fn sigaction(sig: c_int, act: *const SigAction, oact: *mut SigAction) -> c_int;
@@ -461,7 +544,13 @@ mod sys {
         /// `ssize_t write(int fd, const void *buf, size_t count)`.
         fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
         /// `int *__errno_location(void)`: the `errno` of this thread.
-        fn __errno_location() -> *mut c_int;
+        #[cfg(target_os = "linux")]
+        #[link_name = "__errno_location"]
+        fn errno_location() -> *mut c_int;
+        /// `int *__error(void)`: the `errno` of this thread.
+        #[cfg(target_os = "macos")]
+        #[link_name = "__error"]
+        fn errno_location() -> *mut c_int;
     }
 
     /// Installs the handler for `signal`, and gives the disposition that it replaced. `None`
@@ -495,7 +584,8 @@ mod sys {
         }
     }
 
-    /// Adds 1 to the `eventfd` counter of `fd`. A full counter is a wake already.
+    /// Adds 1 to the `eventfd` counter of `fd`, or writes 8 bytes to the pipe of `fd`. A full
+    /// counter or pipe is a wake already.
     #[expect(unsafe_code, reason = "the call reads only the 8 bytes of the value")]
     pub(super) fn wake(fd: c_int) {
         let one = 1_u64;
@@ -504,16 +594,18 @@ mod sys {
         unsafe { write(fd, (&raw const one).cast::<c_void>(), 8) };
     }
 
+    /// The `errno` of this thread.
     #[expect(unsafe_code, reason = "the location is the `errno` of this thread")]
     pub(super) fn errno() -> c_int {
         // SAFETY: the C library gives a valid location for each thread.
-        unsafe { *__errno_location() }
+        unsafe { *errno_location() }
     }
 
+    /// Sets the `errno` of this thread to `value`.
     #[expect(unsafe_code, reason = "the location is the `errno` of this thread")]
     pub(super) fn set_errno(value: c_int) {
         // SAFETY: the C library gives a valid location for each thread.
-        unsafe { *__errno_location() = value };
+        unsafe { *errno_location() = value };
     }
 }
 

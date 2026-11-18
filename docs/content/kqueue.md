@@ -1,7 +1,7 @@
 # The kqueue backend
 
-On macOS, the driver runs on kqueue. TCP, UDP, and files have the same API and the same ownership
-rules as on io_uring, epoll, and IOCP: the terminal event of an operation releases its buffer and
+On macOS, the driver runs on kqueue. TCP, UDP, local streams, pipes, child processes, signal
+streams, and files have the same API and the same ownership rules as on io_uring and epoll: the terminal event of an operation releases its buffer and
 its charge, and a dropped or forgotten future ends only the interest. This page tells how each
 operation runs on kqueue, what you give the driver, and what differs from Linux. rsasync is in development, and the
 kqueue backend is not in a published release yet.
@@ -29,11 +29,14 @@ kqueue reports its socket ready.
 
 | Operations | On kqueue |
 | --- | --- |
-| TCP and [local streams](local-streams.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket is ready. A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
+| TCP, [local streams](local-streams.md), and [pipes](pipes.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket or the pipe end is ready. A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
 | UDP: one datagram, with its metadata and truncation | One nonblocking `sendmsg` or `recvmsg`, with the control messages of [datagram I/O](datagram-io.md) |
 | UDP batches: `send_batch` and `recv_batch` | One `sendmsg` or `recvmsg` for each datagram, in order. A batch stops at the first datagram that the kernel does not take, and its report counts the datagrams before it |
 | Bind and listen (`Call::Bind`, `Call::BindUdp`, and `Driver::bind_local`) | System calls on the thread of the driver (`Route::SystemCall`) |
 | Files and directories (`Call::File`, `Call::SetFileLen`) | A job of your [blocking service](blocking-service.md), with positional calls, because kqueue cannot wait on a regular file (`Route::BlockingService`). See [Files](#files) |
+| Spawn of a [child](processes.md) | A job of your blocking service, as on Linux |
+| The exit of a child (`Call::WaitChild`) | kqueue waits for the exit event of the process (`EVFILT_PROC` with `NOTE_EXIT`), then one nonblocking `waitid` (`Route::Poll`). A registration that finds no process is the exit event. When the status is not ready yet, a one-shot kqueue timer waits from 100 µs, doubling up to 10 ms, and the wait repeats each 10 ms until the status comes ([Wait for the exit](processes.md#wait-for-the-exit)) |
+| [Signals](signals.md) | The handler writes the wake pipe of the home |
 
 macOS has no flags of `socket` and `accept` for a close at `exec` and for no blocking. So the driver
 sets `FD_CLOEXEC` and `O_NONBLOCK` with `fcntl` on each socket that it makes or accepts, after the
@@ -148,24 +151,27 @@ byte.
 
 ## Registrations
 
-The driver registers each socket in its kqueue when it takes the socket: one edge-triggered
-registration (`EV_CLEAR`) for reads (`EVFILT_READ`) and one for writes (`EVFILT_WRITE`). It
-removes both before the close. A file has no registration. When kqueue refuses a registration, for
+The driver registers each socket and pipe end in its kqueue when it takes the descriptor: one
+edge-triggered registration (`EV_CLEAR`) for reads (`EVFILT_READ`) and one for writes
+(`EVFILT_WRITE`). It removes both before the close. A pipe end gets `O_NONBLOCK` at the
+registration. The exit of a child and the timer after it have one-shot registrations. A file has no registration. When kqueue refuses a registration, for
 example with no kernel memory, the operation gives `OutOfMemory`, as with no free resource slot, and
 an accepted connection stays with its listener for the next accept.
 
 ## Drive it
 
 `turn`, `wait`, and `teardown` work as on io_uring ([driver-only use](driver-only.md)). Each turn
-takes the events of the kqueue with no wait. A wake from another thread, and each request of a
-future on another thread, triggers a user event of the kqueue (`EVFILT_USER`), which ends a wait.
-The wake descriptor (`AsFd` of the driver) is the kqueue: it is readable when an event of a socket
-waits or another thread wakes the driver, so a host reactor watches it, for example with `poll`.
+takes the events of the kqueue with no wait. A wake from another thread, each request of a future
+on another thread, and the handler of a [signal stream](signals.md) write the wake pipe of the
+driver. kqueue watches its read end, level-triggered, so the write ends a wait, and each turn
+takes the bytes. A pipe, because a signal handler can call `write` and not `kevent`. Each driver
+thus holds two more descriptors. Both ends stay open while a `WakeHandle` or a signal stream of
+the driver lives, so a write after the drop of the driver raises no `SIGPIPE`. The wake descriptor (`AsFd` of the driver) is the
+kqueue: it is readable when an event waits or another thread wakes the driver, so a host reactor
+watches it, for example with `poll`.
 
 ## Limits
 
-- Only TCP, UDP, local streams, and files. Pipes, child processes, and signals have no macOS form
-  yet.
 - A hole inside a file stays a hole after a preallocation, and another process can write a file
   during an allocation with `Length::Extend` (see [Preallocation](#preallocation)).
 - No zero-copy send yet.

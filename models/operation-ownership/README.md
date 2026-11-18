@@ -265,19 +265,20 @@ which R520 and R521 extend for their backends. R603 adds its transitions when it
 | `Terminated` | None. The end state stutters, so deadlock checking stays on | One step | — | — | — | — |
 
 The backends. The R507 column names the IOCP transitions (`src/driver/iocp.rs`), and the
-R503 and R505 column names the transitions of the readiness poller (`src/driver/poller.rs`), with
-the epoll selector on Linux and the kqueue selector on macOS. Each backend takes the submission
+R503, R505, and R520 column names the transitions of the readiness poller (`src/driver/poller.rs`),
+with the epoll selector on Linux and the kqueue selector on macOS. Each backend takes the submission
 entries of the driver and posts the completions that a ring posts, so the other columns apply to
 each backend. The readiness backends run under the io_uring profiles: each of their events is an
 io_uring event with no `IORING_CQE_F_MORE` and no multishot item, and a cancel that finds its
 entry ends it at once, which is `Process` and then `Complete`.
 
-| Action | R507 transition (IOCP) | R503 and R505 transition (epoll and kqueue) |
+| Action | R507 transition (IOCP) | R503, R505, and R520 transition (epoll and kqueue) |
 | --- | --- | --- |
 | `Submit` | `Port::call` runs one overlapped call, and `terminal` classifies its return by the NT status: pending; an error, or a status that is still `STATUS_PENDING` (no packet); success or a warning, with skip-on-success (no packet) or without it (a packet) | `Poller::run`: one nonblocking call when the direction is ready. `EAGAIN` waits in the list of the direction until the next edge |
 | `Complete` | `Port::poll` takes each packet, reads its NT status, and gives the result to `Port::ended`. After a cancel, the packet of a send with an error status and 0 bytes gives `WSAECONNABORTED`: the abort | The return of the nonblocking call is the terminal event (`Poller::post`) |
 | `Process` | `Port::cancel`: `CancelIoEx` with the `OVERLAPPED` of the target, which ends at its own packet | `Poller::cancel` takes the waiting entry out of its list and posts `ECANCELED` at once |
 | The abort (`CompleteTx` with `abort`) | `tcp::abandon` sets `Sent::Lost` for an abort that no future took. `WriteFailed::sent` and `Closed::sent` then give `SendCount::Unknown` | — |
+| `Submit` and `Complete` of an exit operation (R219) | — | `Poller::arm`: epoll has a one-shot registration of the process descriptor. kqueue has a one-shot `EVFILT_PROC` registration with `NOTE_EXIT`, and a registration that gives `ESRCH` (the child ended first) posts its completion at once: the immediate completion of an exit before the start. A poll with no status yet waits in a one-shot `EVFILT_TIMER` on kqueue (`again_poll` in `src/driver/process.rs`) and is no event of the table |
 
 ## Properties
 

@@ -1,8 +1,9 @@
 //! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
 //! nonblocking turns. No scheduler runs. On Linux, the driver runs on io_uring, or on epoll where the
-//! kernel refuses io_uring. On macOS, it runs TCP and UDP on kqueue, and files on the blocking
-//! service. On Windows, it runs TCP, UDP, and files on an I/O completion port, and the file calls
-//! with no overlapped form on the blocking service ([`Backend`]). Each backend has
+//! kernel refuses io_uring. On macOS, it runs TCP, UDP, local streams, pipes, child processes, and
+//! signal streams on kqueue, and files on the blocking service. On Windows, it runs TCP, UDP, and
+//! files on an I/O completion port, and the file calls with no overlapped form on the blocking
+//! service ([`Backend`]). Each backend has
 //! the same operations and the same ownership rules.
 //!
 //! A [`Driver`] is the home of each operation that it accepts, from the submission to the
@@ -63,16 +64,16 @@ mod home;
 mod iocp;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod local;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod pipe;
 #[cfg(unix)]
 mod poller;
 #[cfg(target_os = "linux")]
 mod probe;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod process;
 mod queue;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod signal;
 // Two attributes each, so that Clippy sees the test modules (`allow-unwrap-in-tests`).
 #[cfg(test)]
@@ -95,10 +96,10 @@ use core::mem::{self, ManuallyDrop};
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::fs;
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd as _;
@@ -130,11 +131,11 @@ pub use file::NvmePath;
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use local::{LocalListener, LocalStream, Peer, Stale};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use pipe::{PipeReader, PipeWriter};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use process::{Child, ChildOptions, End, SignalChildError, Wait};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use signal::{Escalation, Recv, Signal, SignalError, SignalStream};
 pub use tcp::{
     Closed, ReadHalf, Regions, SendCount, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf,
@@ -153,7 +154,7 @@ pub struct Config {
     submissions: u32,
     operations: u32,
     resources: u32,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     children: u32,
     completions_per_turn: u32,
     required: Features,
@@ -169,7 +170,7 @@ impl Config {
             submissions: 64,
             operations: 256,
             resources: 256,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             children: 64,
             completions_per_turn: 64,
             required: Features::NONE,
@@ -220,7 +221,7 @@ impl Config {
 
     /// The child processes that the driver can own at one time ([`Driver::spawn`]). Each one also
     /// holds an operation slot until its status is taken or it drops.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[must_use]
     pub const fn children(self, children: u32) -> Self {
         Self { children, ..self }
@@ -307,7 +308,7 @@ impl Turn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Teardown {
     cancelled: u32,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     kept: u32,
 }
 
@@ -320,7 +321,7 @@ impl Teardown {
 
     /// The children with [`End::Keep`] that teardown left unreaped, because they still ran.
     /// Nothing reaps them now: each one stays a zombie after its end until this process ends.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[must_use]
     pub const fn kept(self) -> u32 {
         self.kept
@@ -422,14 +423,14 @@ pub(crate) enum Payload {
     /// The waiter of the job of an operation that runs on the blocking service.
     Job(crate::blocking::Waiter<i32>),
     /// The waiter of the job of a spawn, and the child that the home makes at the end of the job.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Spawn {
         waiter: crate::blocking::Waiter<io::Result<process::Spawned>>,
         child: Option<Child>,
     },
     /// The status of a child, which a `waitid` of the exit operation writes.
-    #[cfg(target_os = "linux")]
-    Exit(sys::SigInfo),
+    #[cfg(unix)]
+    Exit(process::SigInfo),
 }
 
 impl Payload {
@@ -491,11 +492,11 @@ pub(crate) enum Kind {
     /// file.
     File(file::Op),
     /// A spawn of a child in the child slot of the index, as a job of the blocking service.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Spawn(u32),
     /// The exit of the child in the child slot of the index: it ends when the driver reaps the
     /// child.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Exit(u32),
 }
 
@@ -538,11 +539,11 @@ pub enum Reason {
     /// Each resource slot of the driver is in use.
     Resources,
     /// The descriptor is not a pipe or a FIFO.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     NotPipe,
     /// The pipe end does not have the direction of the adoption: a read end for a writer, or a
     /// write end for a reader.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Direction,
     /// The operation does not apply to this resource, for example a half-close of a pipe.
     Unsupported,
@@ -554,11 +555,11 @@ pub enum Reason {
     /// the service refused the job.
     Blocking,
     /// Each child slot of the driver is in use ([`Config::children`]).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Children,
     /// The child ended, and the [`std::process::Child`] that the refusal gives back has its
     /// status.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Exited,
     /// The backend did not take the descriptor: on epoll, `epoll_ctl` failed, for example at the
     /// limit of `fs.epoll.max_user_watches`. On kqueue, `kevent` refused a registration, for
@@ -741,7 +742,7 @@ enum Medium {
     Stream,
     /// A pipe end: its operations are reads and writes, because a receive and a send need a
     /// socket. It has no half-close.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     Pipe,
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
     Udp,
@@ -789,7 +790,7 @@ impl Resources {
     }
 
     /// Takes `fd` into a slot that [`Resources::reserve`] kept.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn adopt_reserved(&mut self, fd: OwnedFd, medium: Medium) -> Option<Resource> {
         self.reserved = self.reserved.checked_sub(1)?;
         self.take(fd, medium).ok()
@@ -797,7 +798,7 @@ impl Resources {
 
     /// Keeps `count` free slots for [`Resources::adopt_reserved`]. Gives whether that many are
     /// free.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn reserve(&mut self, count: u32) -> bool {
         let free = self.free().saturating_sub(self.reserved);
         if free < count {
@@ -808,7 +809,7 @@ impl Resources {
     }
 
     /// Ends the keep of `count` slots.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn unreserve(&mut self, count: u32) {
         self.reserved = self.reserved.saturating_sub(count);
     }
@@ -838,7 +839,6 @@ impl Resources {
             };
             // A pipe end gets `O_NONBLOCK` first, because a read or a write that waits would stop
             // the driver. A failure changes nothing but that flag.
-            #[cfg(target_os = "linux")]
             if medium == Medium::Pipe && !pipe::set_nonblocking(fd.as_fd(), true) {
                 return Err((Reason::Register, fd));
             }
@@ -944,6 +944,11 @@ const GROUP: u16 = 0;
 #[cfg(target_os = "linux")]
 const WAKE: u64 = CONTROL;
 
+/// The user data of the poll of the timer of the children whose poll found no status, on the
+/// ring or on epoll.
+#[cfg(target_os = "linux")]
+const CHILD_TIMER: u64 = CONTROL | 1;
+
 /// The provided buffers: the slots of a pool, which the kernel selects for a receive. Each one is
 /// in the kernel ring, or in a lease of a consumer, or back in the pool.
 #[derive(Debug)]
@@ -1021,10 +1026,16 @@ impl Selected {
 struct Shared {
     entries: Box<[Entry<Held>]>,
     requests: Requests,
-    /// The wake descriptor: an `eventfd` that the kernel also signals at each completion and for
-    /// its deferred work.
-    #[cfg(target_os = "linux")]
+    /// The wake descriptor. On Linux, an `eventfd` that the kernel also signals at each completion
+    /// and for its deferred work. On macOS, the write end of the wake pipe, whose read end the
+    /// kqueue watches: a pipe, because a signal handler wakes the home too, and `write` is
+    /// async-signal-safe, which `kevent` is not.
+    #[cfg(unix)]
     wake: fs::File,
+    /// The read end of the wake pipe, which each turn clears. It lives as long as the write end,
+    /// so a wake or a signal handler never writes a pipe with no reader, which raises `SIGPIPE`.
+    #[cfg(target_os = "macos")]
+    wake_read: fs::File,
     /// An `eventfd` that only the other threads signal. A wait polls it in the ring. A signal of
     /// the kernel would also complete that poll, so the wait does not poll `wake`.
     #[cfg(target_os = "linux")]
@@ -1032,10 +1043,6 @@ struct Shared {
     /// The wake of the port: a packet that another thread posts, which ends a wait.
     #[cfg(target_os = "windows")]
     wake: iocp::Wake,
-    /// The wake of the kqueue: a user event that another thread triggers, which ends a wait and
-    /// makes the kqueue readable.
-    #[cfg(target_os = "macos")]
-    wake: poller::Wake,
 }
 
 impl Shared {
@@ -1047,9 +1054,28 @@ impl Shared {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn wake(&self) {
+        // A full pipe is a pending wake already. The 8 bytes go whole or not at all, as the
+        // writes of a signal handler do.
+        drop((&self.wake).write(&1_u64.to_ne_bytes()));
+    }
+
+    #[cfg(target_os = "windows")]
     fn wake(&self) {
         self.wake.post();
+    }
+
+    /// The descriptors that a wake writes, which a signal handler writes too.
+    #[cfg(target_os = "linux")]
+    fn wakes(&self) -> [std::os::fd::RawFd; signal::WAKES] {
+        [self.wake.as_raw_fd(), self.interrupt.as_raw_fd()]
+    }
+
+    /// The descriptors that a wake writes, which a signal handler writes too.
+    #[cfg(target_os = "macos")]
+    fn wakes(&self) -> [std::os::fd::RawFd; signal::WAKES] {
+        [std::os::fd::AsRawFd::as_raw_fd(&self.wake)]
     }
 
     /// Clears the wake descriptors. Gives `true` when the wake descriptor had a wake.
@@ -1059,6 +1085,15 @@ impl Shared {
         // A descriptor with no wake gives `WouldBlock`, which is the clear state.
         drop((&self.interrupt).read(&mut count));
         (&self.wake).read(&mut count).is_ok()
+    }
+
+    /// Clears the wake pipe. One read takes at most 64 wakes of 8 bytes, and bytes that remain
+    /// keep the level-triggered registration readable, so the next wait ends at once.
+    #[cfg(target_os = "macos")]
+    fn clear(&self) {
+        let mut bytes = [0; 512];
+        // An empty pipe gives `WouldBlock`, which is the clear state.
+        drop((&self.wake_read).read(&mut bytes));
     }
 }
 
@@ -1070,8 +1105,8 @@ impl fmt::Debug for Shared {
     }
 }
 
-/// A driver that its caller owns and drives, on io_uring or on epoll ([`Backend`]). It stays on
-/// the thread that created it.
+/// A driver that its caller owns and drives, on io_uring, epoll, kqueue, or IOCP ([`Backend`]). It
+/// stays on the thread that created it.
 pub struct Driver {
     /// The queues of the backend: the ring, or the poller.
     queue: Queue,
@@ -1099,10 +1134,10 @@ pub struct Driver {
     #[cfg(target_os = "linux")]
     rearm_wake: bool,
     /// The signal streams whose home is this driver.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     signals: Vec<Arc<signal::Home>>,
     /// The child processes that this driver owns.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     children: process::Children,
     /// The blocking service of the operations that the kernel cannot run
     /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
@@ -1134,10 +1169,11 @@ impl fmt::Debug for Driver {
 
 impl Driver {
     /// Starts a driver with the limits of `config`. It allocates here, one time. On io_uring, it
-    /// opens three descriptors: the ring, the wake descriptor, and the interrupt descriptor. With
-    /// the `local` feature, it also opens a duplicate of the ring, the target of the wake messages
-    /// of local tasks. On epoll, the epoll descriptor takes the place of the ring. On macOS, it
-    /// opens one kqueue, and on Windows one completion port.
+    /// opens four descriptors: the ring, the wake descriptor, the interrupt descriptor, and the
+    /// timer of the children whose status a poll did not find. With the `local` feature, it also
+    /// opens a duplicate of the ring, the target of the wake messages of local tasks. On epoll, the
+    /// epoll descriptor takes the place of the ring. On macOS, it opens one kqueue and the two ends
+    /// of its wake pipe, and on Windows one completion port.
     ///
     /// # Errors
     ///
@@ -1221,17 +1257,25 @@ impl Driver {
             backend: Backend::Kqueue,
             fallback: None,
         };
-        let poller = poller::Poller::new(config.submissions, completions, config.resources, config.operations)
-            .map_err(|error| match error.kind() {
-                io::ErrorKind::InvalidInput => Error::Config,
-                _ => Error::System(error),
-            })?;
-        let (wake, registrar) = (poller.wake(), poller.registrar());
+        let (wake_read, wake) = wake_pipe().map_err(Error::System)?;
+        let poller = poller::Poller::new(
+            config.submissions,
+            completions,
+            config.resources,
+            config.operations,
+            wake_read.as_fd(),
+        )
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::InvalidInput => Error::Config,
+            _ => Error::System(error),
+        })?;
+        let registrar = poller.registrar();
         let table = Table::new(config.operations);
         let shared = Arc::new(Shared {
             entries: (0..config.operations).map(|_| Entry::new()).collect(),
             requests: table.requests(),
             wake,
+            wake_read,
         });
         Ok(Self {
             queue: Queue::Poller(poller),
@@ -1248,6 +1292,8 @@ impl Driver {
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
+            signals: Vec::new(),
+            children: process::Children::new(config.children).map_err(Error::System)?,
             blocking: None,
             jobs: Vec::with_capacity(config.operations as usize),
             waiting: Vec::with_capacity(config.operations as usize),
@@ -1336,7 +1382,7 @@ impl Driver {
                 reserved: 0,
                 registrar,
             },
-            children: process::Children::new(config.children),
+            children: process::Children::new(config.children).map_err(Error::System)?,
             taken: Vec::with_capacity(config.operations as usize * 2),
             pending: Vec::with_capacity(config.resources as usize),
             copied: 0,
@@ -1379,7 +1425,7 @@ impl Driver {
     /// # Errors
     ///
     /// [`SignalError`] gives the reason, and nothing changes.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn signal(&mut self, signal: Signal, escalation: Escalation) -> Result<SignalStream, SignalError> {
         let (stream, home) = signal::register(&self.shared, signal, escalation)?;
         if self.signals.capacity() == 0 {
@@ -1454,6 +1500,8 @@ impl Driver {
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
         self.take_requests();
+        // A packet of the port wakes the next wait for a job that ends later, and no turn clears it.
+        #[cfg(target_os = "windows")]
         self.poll_jobs();
         if let Some(selected) = &mut self.selected {
             selected.refill();
@@ -1467,8 +1515,6 @@ impl Driver {
             }
         }
         let completed = self.harvest(self.completions_per_turn);
-        #[cfg(target_os = "linux")]
-        signal::wake(&mut self.signals);
         // Start the operations that waited for an operation that ended, and end the closes.
         self.attend();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1484,6 +1530,20 @@ impl Driver {
             // registration. Deferred work that comes before the new registration sets
             // `IORING_SQ_TASKRUN` before it tries the signal, so the look below sees it.
             rearm(ring, &self.shared.wake)?;
+        }
+        #[cfg(target_os = "macos")]
+        self.shared.clear();
+        // After the clear: a signal that came before it counted its delivery first, so this look
+        // sees it, and a later one wakes the descriptor again. This is an R220 correction: a look
+        // before the clear lost the wake of a signal between the two.
+        #[cfg(unix)]
+        signal::wake(&mut self.signals);
+        // The jobs of the driver are polled after the clear too, for the same reason: a job that
+        // ended before it is taken now. The end of a job can end the wait of a close.
+        #[cfg(unix)]
+        {
+            self.poll_jobs();
+            self.attend();
         }
         more |=
             self.queue.ready() || self.queue.more() || self.queue.unsubmitted() > 0 || !self.shared.requests.is_empty();
@@ -1546,7 +1606,7 @@ impl Driver {
     /// blocking service ([`Route::BlockingService`]) cannot be cancelled, so the teardown waits until
     /// it returns.
     ///
-    /// On Linux, teardown applies the `End` of each child: it kills a child with `End::Kill`, or
+    /// On Linux and macOS, teardown applies the `End` of each child: it kills a child with `End::Kill`, or
     /// each process of its tree, and waits until the driver reaps it. A child with `End::Keep` runs
     /// on, and `Teardown::kept` counts it.
     ///
@@ -1556,7 +1616,7 @@ impl Driver {
     pub fn teardown(mut self) -> io::Result<Teardown> {
         // A spawn cannot be cancelled, and its child starts at the end of its job, so teardown
         // applies the end of each child after each spawn ended.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         while self.spawns() {
             self.take_requests();
             self.poll_jobs();
@@ -1585,7 +1645,7 @@ impl Driver {
             }
         }
         let mut cancelled = 0_u32;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             self.children.ending = true;
         }
@@ -1595,7 +1655,7 @@ impl Driver {
                 Some(Kind::Close) => continue,
                 // The exit of a child with `End::Kill` ends after its kill. A cancel ends the exit
                 // operation of a child with `End::Keep`.
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 Some(Kind::Exit(child)) if self.children.kills(child) => {
                     self.children.kill(child);
                     continue;
@@ -1612,7 +1672,7 @@ impl Driver {
                 break;
             }
             // The wait also ends when a job of the blocking service ends, because the job wakes
-            // the driver: the interrupt descriptor on Linux, the user event on macOS, and a packet
+            // the driver: the interrupt descriptor on Linux, the wake pipe on macOS, and a packet
             // of the port on Windows.
             self.wait()?;
             self.harvest(u32::MAX);
@@ -1621,13 +1681,13 @@ impl Driver {
         self.take_requests();
         Ok(Teardown {
             cancelled,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             kept: self.children.kept,
         })
     }
 
     /// Whether the job of a spawn runs.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn spawns(&self) -> bool {
         self.jobs.iter().any(|&id| {
             matches!(
@@ -1663,7 +1723,7 @@ impl Driver {
     ///
     /// The memory that the entry names belongs to the resources, and each descriptor that it names
     /// is `resource`. The memory keeps its address while the resources move.
-    #[cfg(all(test, not(loom), target_os = "linux"))]
+    #[cfg(all(test, not(loom), unix))]
     #[expect(unsafe_code, reason = "the kernel uses the memory that the entry names")]
     pub(crate) unsafe fn submit<P>(
         &mut self,
@@ -1874,7 +1934,7 @@ impl Driver {
         }
         // The cancel of the exit of a child is a kill by its end policy, and no cancel of the
         // kernel: the operation ends when the child ends.
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let Kind::Exit(child) = tag.kind {
             self.children.kill(child);
             return;
@@ -1918,13 +1978,13 @@ impl Driver {
         let waking = &mut self.waking;
         #[cfg(all(feature = "local", target_os = "linux"))]
         let wakes = &mut self.wakes;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
         for cqe in self.queue.completions().take(limit as usize) {
             completed += 1;
             let mut event = cqe.event();
             // The completion of an exit operation ends it when the home has the status of its child.
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             if let Some(id) = OpId::from_user_data(cqe.user_data)
                 && let Some(&Tag {
                     kind: Kind::Exit(child),
@@ -1973,6 +2033,12 @@ impl Driver {
                     *waking = false;
                     continue;
                 }
+                // The timer of the children ended: the poll of each child whose time came follows.
+                #[cfg(target_os = "linux")]
+                (Outcome::Control(CHILD_TIMER), _) => {
+                    children.timed();
+                    continue;
+                }
                 // A wake message of this driver completed. If it failed, it did not reach its
                 // home, and the interrupt descriptor wakes the home instead.
                 #[cfg(all(feature = "local", target_os = "linux"))]
@@ -2012,7 +2078,7 @@ impl Driver {
                 slot.publish(id, event.result);
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         self.poll_again();
         completed
     }
@@ -2050,7 +2116,7 @@ fn finish(
         | Kind::SendTo
         | Kind::SendBatch
         | Kind::RecvBatch => {}
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         Kind::Spawn(_) | Kind::Exit(_) => {}
         Kind::RecvFrom => {
             if let (Ok(count), Some(loan)) = (count, held.loan.as_mut()) {
@@ -2185,7 +2251,7 @@ impl Drop for Driver {
         for entry in &self.shared.entries {
             entry.close();
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         signal::end(&self.signals);
         if let Some(selected) = self.selected.take() {
             if busy {
@@ -2196,6 +2262,18 @@ impl Drop for Driver {
             }
         }
     }
+}
+
+/// The wake pipe of a kqueue driver: its read end and its write end. Both ends close at an exec,
+/// and neither blocks, so a wake or a signal handler never waits for a full pipe.
+#[cfg(target_os = "macos")]
+fn wake_pipe() -> io::Result<(fs::File, fs::File)> {
+    let (read, write) = io::pipe()?;
+    let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
+    if !(pipe::set_nonblocking(read.as_fd(), true) && pipe::set_nonblocking(write.as_fd(), true)) {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((fs::File::from(read), fs::File::from(write)))
 }
 
 /// Pushes a cancel of `id` by its own user data, and submits once when the queue is full.

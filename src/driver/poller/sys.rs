@@ -78,11 +78,11 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 pub(super) const F_SETFD: c_int = 2;
 #[cfg(target_os = "macos")]
-pub(super) const F_SETFL: c_int = 4;
+pub(in crate::driver) const F_SETFL: c_int = 4;
 #[cfg(target_os = "macos")]
 pub(super) const FD_CLOEXEC: c_int = 1;
 #[cfg(target_os = "macos")]
-pub(super) const O_NONBLOCK: c_int = 0x4;
+pub(in crate::driver) const O_NONBLOCK: c_int = 0x4;
 
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code, reason = "libSystem of macOS gives these functions")]
@@ -105,7 +105,7 @@ unsafe extern "C" {
     pub(super) fn ftruncate(fd: c_int, length: i64) -> c_int;
     /// `int fstat(int, struct stat *)`, the form with 64-bit inode numbers, which is the one form
     /// on aarch64.
-    pub(super) fn fstat(fd: c_int, buf: *mut Stat) -> c_int;
+    pub(in crate::driver) fn fstat(fd: c_int, buf: *mut Stat) -> c_int;
     /// `int fstatfs(int, struct statfs *)` (`sys/mount.h`), the form with 64-bit inode numbers.
     pub(super) fn fstatfs(fd: c_int, buf: *mut Statfs) -> c_int;
     /// `long sysconf(int)`.
@@ -184,7 +184,11 @@ pub(super) struct Punchhole {
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Stat {
-    _before_size: [u64; 12],
+    _st_dev: i32,
+    /// The type and the permissions of the file.
+    pub(in crate::driver) st_mode: u16,
+    _st_nlink: u16,
+    _before_size: [u64; 11],
     pub(in crate::driver) st_size: i64,
     pub(super) st_blocks: i64,
     _after_blocks: [u64; 4],
@@ -224,6 +228,7 @@ const _: () = {
     assert!(offset_of!(Punchhole, fp_offset) == 8);
     assert!(offset_of!(Punchhole, fp_length) == 16);
     assert!(size_of::<Stat>() == 144);
+    assert!(offset_of!(Stat, st_mode) == 4);
     assert!(offset_of!(Stat, st_size) == 96);
     assert!(offset_of!(Stat, st_blocks) == 104);
 };
@@ -251,6 +256,9 @@ pub(super) const SO_ERROR: c_int = 4;
 pub(super) const SO_ERROR: c_int = 0x1007;
 
 pub(super) const ENOENT: i32 = 2;
+/// No process has the ID: a registration of the exit of a process that ended.
+#[cfg(target_os = "macos")]
+pub(super) const ESRCH: i32 = 3;
 pub(super) const EINVAL: i32 = 22;
 #[cfg(target_os = "linux")]
 pub(super) const EAGAIN: i32 = 11;

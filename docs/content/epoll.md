@@ -39,10 +39,10 @@ refuses with `Error::Unsupported`.
 | UDP: one datagram, with its metadata, segments, and truncation | One nonblocking `sendmsg` or `recvmsg`, with the control messages of [datagram I/O](datagram-io.md) |
 | UDP batches: `send_batch` and `recv_batch` | One `sendmmsg` or `recvmmsg` for the batch. A send that went only in part sends the rest in the next call |
 | Bind and listen (`Call::Bind`, `Call::BindUdp`) | System calls on the thread of the driver (`Route::SystemCall`) |
-| The exit of a child (`Call::WaitChild`) | epoll waits for the process descriptor, then one nonblocking `waitid` (`Route::Poll`) |
+| The exit of a child (`Call::WaitChild`) | epoll waits for the process descriptor, then one nonblocking `waitid` (`Route::Poll`). A poll that finds no status, for a traced child, waits for the timer of the children of the driver ([Wait for the exit](processes.md#wait-for-the-exit)) |
 | Files and directories (`Call::File`, `Call::SetFileLen`) | A job of your [blocking service](blocking-service.md), with positional calls (`preadv2`, `pwritev2`, and the others), because epoll cannot wait on a regular file (`Route::BlockingService`) |
 | Spawn of a child | A job of your blocking service, as on io_uring |
-| Signals | The same streams as on io_uring |
+| [Signals](signals.md) | The same streams as on io_uring. The handler writes the wake descriptor that epoll watches |
 
 The terminal event of each readiness operation is the return of its nonblocking call, and the
 terminal event of a file operation is the return of its job. After that return, the kernel keeps no

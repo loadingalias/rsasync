@@ -1486,7 +1486,7 @@ impl Driver {
         let cx = Context::from_waker(&waker);
         let mut index = 0;
         while let Some(&id) = self.jobs.get(index) {
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             if let Some(&Tag {
                 kind: Kind::Spawn(child),
                 ..

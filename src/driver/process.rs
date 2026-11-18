@@ -1,13 +1,22 @@
 //! Child processes on the driver: a spawn of a [`Command`] on the blocking service, or the adoption
 //! of a [`std::process::Child`]; the exit, which the driver reaps once and reports once; signals
-//! through the process descriptor; a process tree; and the end policy.
+//! that never reach a reused process ID; a process tree; and the end policy.
 //!
-//! The driver holds a process descriptor (pidfd) for each child. The exit is an operation with a
-//! home: on Linux 6.7 and later, `IORING_OP_WAITID` takes the status in the ring; before 6.7, the
-//! ring polls the descriptor, and when it becomes readable, the home takes the status with one
-//! nonblocking `waitid`. Each wait names the descriptor of the child, so the driver never takes
-//! the status of a child that it does not own. It installs no `SIGCHLD` handler and starts no
-//! thread for a wait.
+//! On Linux, the driver holds a process descriptor (pidfd) for each child. The exit is an operation
+//! with a home: on Linux 6.7 and later, `IORING_OP_WAITID` takes the status in the ring; before
+//! 6.7, and on epoll, the ring or the poller polls the descriptor, and when it becomes readable,
+//! the home takes the status with one nonblocking `waitid`.
+//!
+//! macOS has no process descriptor, so there the driver holds the process ID of each child. The
+//! kqueue waits for the exit event of the process (`EVFILT_PROC` with `NOTE_EXIT`), and the home
+//! then takes the status with one nonblocking `waitid` of that process ID. A registration that
+//! finds no process, because the child ended first, is an exit event too. The ID names the child
+//! only while the driver holds it unreaped, so the driver signals a child only then.
+//!
+//! Each wait names one child, so the driver never takes the status of a child that it does not
+//! own. It installs no `SIGCHLD` handler and starts no thread for a wait.
+
+mod sys;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -17,28 +26,74 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Command, ExitStatus};
+#[cfg(target_os = "linux")]
+use std::time::Instant;
+
+pub(super) use sys::SigInfo;
 
 use super::tcp::{ReadHalf, WriteHalf};
 use super::{
     Call, Completion, Driver, ECANCELED, Ended, Held, Kind, Medium, Operation, Payload, PipeReader, PipeWriter, Reason,
-    Refused, Route, Signal, Tag, sys,
+    Refused, Route, Signal, Tag,
 };
 use crate::blocking::{Failed, Job};
 use crate::sync::Arc;
 use crate::table::OpId;
 use crate::uring::Sqe;
 
-/// `SIGKILL` (`include/uapi/asm-generic/signal.h`).
+/// `SIGKILL`, on Linux and macOS.
 const SIGKILL: c_int = 9;
 
-/// `ESRCH` (`include/uapi/asm-generic/errno-base.h`): no process has the identity.
+/// `ESRCH`, on Linux and macOS: no process has the identity.
 const ESRCH: i32 = 3;
 
-/// `EIO` (`include/uapi/asm-generic/errno-base.h`), for a spawn whose job gave no result.
+/// `EIO`, on Linux and macOS, for a spawn whose job gave no result.
 const EIO: i32 = 5;
+
+/// The first wait after a poll of the exit that found no status, in microseconds: on macOS 27.2.1,
+/// the status came 1 ms after the exit event on average and 12 ms after it at most.
+const DELAY_US_FIRST: u64 = 100;
+
+/// The longest wait after a poll of the exit that found no status, in microseconds. The driver
+/// then polls once in each such wait until the status comes, the kernel gives `ECHILD`, a cancel,
+/// or teardown: at most one poll each 10 ms for each waiting child, and the child slots bound the
+/// children (`Config::children`). On Linux, only a child whose status a tracer holds waits so.
+const DELAY_US_MAX: u64 = 10_000;
+
+/// The wait after the poll of the exit that found no status for the `misses`-th time, in
+/// microseconds: [`DELAY_US_FIRST`], which doubles at each miss up to [`DELAY_US_MAX`].
+fn delay_us(misses: u32) -> u64 {
+    // Seven doublings pass the longest wait, and a larger shift would lose bits.
+    let doublings = misses.saturating_sub(1).min(7);
+    (DELAY_US_FIRST << doublings).min(DELAY_US_MAX)
+}
+
+/// The handle of a child that the driver holds unreaped, through which it signals and reaps the
+/// child: its process descriptor on Linux.
+#[cfg(target_os = "linux")]
+type Process = OwnedFd;
+
+/// The handle of a child that the driver holds unreaped, through which it signals and reaps the
+/// child: its process ID on macOS, which has no process descriptor. The ID names the child only
+/// while the driver holds it unreaped.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct Process(c_int);
+
+/// The number that names the child of `process` in a system call: its process descriptor.
+#[cfg(target_os = "linux")]
+fn number(process: &Process) -> c_int {
+    std::os::fd::AsRawFd::as_raw_fd(process)
+}
+
+/// The number that names the child of `process` in a system call: its process ID.
+#[cfg(target_os = "macos")]
+const fn number(process: &Process) -> c_int {
+    process.0
+}
 
 /// The resource slots that a spawn reserves while its job runs: one for each standard stream that
 /// the command can pipe.
@@ -207,7 +262,8 @@ pub struct Child {
 
 impl Child {
     /// The process ID of the child. After the reap, the system can give the number to another
-    /// process, so signal the child through the driver, which uses its process descriptor.
+    /// process, so signal the child through the driver, which uses its process descriptor on
+    /// Linux, and on macOS signals it only while it holds the child unreaped.
     #[must_use]
     pub const fn id(&self) -> u32 {
         self.pid
@@ -259,7 +315,7 @@ impl Future for Wait<'_> {
 }
 
 /// The exit status that `info`, the result of a `waitid`, gives.
-fn status(info: &sys::SigInfo) -> ExitStatus {
+fn status(info: &SigInfo) -> ExitStatus {
     // The form of `wait(2)`: an exit code in bits 8 to 15, or a signal in bits 0 to 6, and bit 7
     // for a core dump.
     let raw = match info.code {
@@ -270,11 +326,11 @@ fn status(info: &sys::SigInfo) -> ExitStatus {
     ExitStatus::from_raw(raw)
 }
 
-/// What a spawn job gives the home: the process descriptor and the process ID of the child, and
-/// the parent ends of its piped standard streams.
+/// What a spawn job gives the home: the handle and the process ID of the child, and the parent
+/// ends of its piped standard streams.
 #[derive(Debug)]
 pub(crate) struct Spawned {
-    pidfd: OwnedFd,
+    process: Process,
     pid: u32,
     stdin: Option<OwnedFd>,
     stdout: Option<OwnedFd>,
@@ -295,9 +351,9 @@ impl Job for SpawnJob {
             self.command.process_group(0);
         }
         let mut child = self.command.spawn()?;
-        match pidfd_open(child.id()) {
-            Ok(pidfd) => Ok(Spawned {
-                pidfd,
+        match unsafe_call::open(child.id()) {
+            Ok(process) => Ok(Spawned {
+                process,
                 pid: child.id(),
                 stdin: child.stdin.take().map(OwnedFd::from),
                 stdout: child.stdout.take().map(OwnedFd::from),
@@ -320,38 +376,74 @@ struct Slot {
     generation: u32,
     /// The exit operation. A slot with none is free.
     exit: Option<OpId>,
-    /// The process descriptor, from the end of the spawn job to the reap.
-    pidfd: Option<OwnedFd>,
+    /// The handle of the child, from the end of the spawn job to the reap.
+    process: Option<Process>,
     pid: c_int,
     tree: bool,
     end: End,
+    /// The polls of the exit that found no status: the wait before the next one doubles.
+    misses: u32,
+    /// The time of the next poll of the exit, after a poll that found no status.
+    #[cfg(target_os = "linux")]
+    due: Option<Instant>,
 }
 
 /// The child slots of a driver, in a slice that it allocates once.
 #[derive(Debug)]
 pub(super) struct Children {
     slots: Box<[Slot]>,
-    /// The kernel gives process descriptors. The first spawn or adoption finds it.
+    /// The kernel gives process descriptors, or the system needs none. The first spawn or adoption
+    /// finds it.
     descriptors: Option<bool>,
     /// The exit operations whose poll ended before the status of their child was ready, which the
-    /// home polls again.
+    /// home polls again: on macOS at once, with a timer entry, and on Linux at the due time of the
+    /// child.
     again: Vec<OpId>,
     /// The children with [`End::Keep`] that teardown left unreaped.
     pub(super) kept: u32,
     /// Teardown runs: a child with [`End::Keep`] whose status is not ready ends its exit
     /// operation, because the cancel of teardown can miss a poll that the home pushes again.
     pub(super) ending: bool,
+    /// The timer of the children whose poll found no status, a `timerfd`, and the end that it is
+    /// armed for. The driver polls it as a control entry while its poll is in flight (`timing`).
+    #[cfg(target_os = "linux")]
+    timer: std::fs::File,
+    #[cfg(target_os = "linux")]
+    armed: Option<Instant>,
+    #[cfg(target_os = "linux")]
+    timing: bool,
 }
 
 impl Children {
-    pub(super) fn new(children: u32) -> Self {
-        Self {
+    /// The child slots of a driver. On Linux, it also makes the timer of the children.
+    ///
+    /// # Errors
+    ///
+    /// The error of `timerfd_create` on Linux.
+    pub(super) fn new(children: u32) -> io::Result<Self> {
+        Ok(Self {
             slots: (0..children).map(|_| Slot::default()).collect(),
             descriptors: None,
             again: Vec::with_capacity(children as usize),
             kept: 0,
             ending: false,
-        }
+            #[cfg(target_os = "linux")]
+            timer: unsafe_call::timer()?,
+            #[cfg(target_os = "linux")]
+            armed: None,
+            #[cfg(target_os = "linux")]
+            timing: false,
+        })
+    }
+
+    /// The timer of the children ended: it takes the end, so the timer is not readable, and the
+    /// next miss arms it again.
+    #[cfg(target_os = "linux")]
+    pub(super) fn timed(&mut self) {
+        let mut ends = [0; 8];
+        // A timer with no end gives `WouldBlock`, which is the clear state.
+        drop(std::io::Read::read(&mut &self.timer, &mut ends));
+        (self.armed, self.timing) = (None, false);
     }
 
     /// The index of a free slot.
@@ -369,7 +461,7 @@ impl Children {
     fn get(&self, id: ChildId) -> Option<&Slot> {
         self.slots
             .get(id.index as usize)
-            .filter(|slot| slot.generation == id.generation && slot.pidfd.is_some())
+            .filter(|slot| slot.generation == id.generation && slot.process.is_some())
     }
 
     /// Ends the slot `index`: it closes the descriptor, and the identity is stale from now on.
@@ -377,34 +469,43 @@ impl Children {
         if let Some(slot) = self.slot(index) {
             slot.generation = slot.generation.wrapping_add(1);
             slot.exit = None;
-            slot.pidfd = None;
+            slot.process = None;
+            slot.misses = 0;
+            #[cfg(target_os = "linux")]
+            {
+                slot.due = None;
+            }
         }
     }
 
-    /// Whether the kernel gives process descriptors. It opens one for this process the first time.
+    /// Whether the kernel gives process descriptors, or the system needs none. It opens one for
+    /// this process the first time.
     fn descriptors(&mut self) -> bool {
-        *self
-            .descriptors
-            .get_or_insert_with(|| pidfd_open(unsafe_call::getpid().cast_unsigned()).is_ok())
+        *self.descriptors.get_or_insert_with(unsafe_call::descriptors)
     }
 
     /// Sends `signal` to the child of `id`, or to its process group when `tree` holds.
     fn signal(&self, id: ChildId, signal: c_int, tree: bool) -> Result<(), SignalChildError> {
         let slot = self.get(id).ok_or(SignalChildError::Reaped)?;
-        let pidfd = slot.pidfd.as_ref().ok_or(SignalChildError::Reaped)?;
-        if !tree {
-            return unsafe_call::pidfd_send_signal(pidfd, signal).map_err(refusal);
-        }
-        if !slot.tree {
+        let process = slot.process.as_ref().ok_or(SignalChildError::Reaped)?;
+        if tree && !slot.tree {
             return Err(SignalChildError::NoTree);
         }
-        // The group ID names this group only while the driver holds its leader unreaped. The
-        // kernel reaps for `IORING_OP_WAITID` only in an entry of this thread to the ring, so no
-        // reap comes between this look and the signal.
-        if !unsafe_call::held(pidfd) {
+        // The group ID names this group only while the driver holds its leader unreaped, and on
+        // macOS the process ID names the child only then. Another waiter of the process can take
+        // the status of a child, so the driver looks first, and the look reaps nothing. Only this
+        // thread reaps for the driver: on io_uring, the kernel reaps for `IORING_OP_WAITID` only in
+        // an entry of this thread to the ring. So no reap of the driver comes between this look
+        // and the signal.
+        if (tree || cfg!(target_os = "macos")) && !unsafe_call::held(process) {
             return Err(SignalChildError::Reaped);
         }
-        unsafe_call::kill_group(slot.pid, signal).map_err(refusal)
+        if tree {
+            unsafe_call::kill_group(slot.pid, signal)
+        } else {
+            unsafe_call::send_signal(process, signal)
+        }
+        .map_err(refusal)
     }
 
     /// Whether the child of the slot `index` has [`End::Kill`].
@@ -439,14 +540,14 @@ impl Children {
         ring: bool,
         info: &mut sys::SigInfo,
     ) -> Option<i32> {
-        // An exit operation has its entry only while its slot has the descriptor.
-        let Some(pidfd) = self.slots.get(index as usize).and_then(|slot| slot.pidfd.as_ref()) else {
+        // An exit operation has its entry only while its slot has the handle.
+        let Some(process) = self.slots.get(index as usize).and_then(|slot| slot.process.as_ref()) else {
             return Some(res);
         };
         let result = match res {
             // Only teardown cancels an exit operation, for a child with `End::Keep`. The home
             // reaps a child that ended just then, and it counts a child that runs.
-            res if res == -ECANCELED => match unsafe_call::reap(pidfd, info) {
+            res if res == -ECANCELED => match unsafe_call::reap(process, info) {
                 Ok(true) => 0,
                 _ => {
                     self.kept = self.kept.saturating_add(1);
@@ -454,9 +555,11 @@ impl Children {
                 }
             },
             res if res < 0 || ring => res,
-            // The descriptor is readable: the child ended. A child that another process traces
-            // shows its status to that process first, so the poll repeats until it is ready.
-            _ => match unsafe_call::reap(pidfd, info) {
+            // The descriptor is readable, or the exit event of the process came: the child ended.
+            // A child that another process traces shows its status to that process first, and
+            // on macOS the exit event can come before the status, so the poll repeats until the
+            // status is ready.
+            _ => match unsafe_call::reap(process, info) {
                 Ok(true) => 0,
                 Ok(false) if self.ending && !self.kills(index) => {
                     self.kept = self.kept.saturating_add(1);
@@ -465,6 +568,14 @@ impl Children {
                 Ok(false) => {
                     // At most one entry for each child, so the capacity of the list holds it.
                     self.again.push(id);
+                    if let Some(slot) = self.slot(index) {
+                        slot.misses = slot.misses.saturating_add(1);
+                        #[cfg(target_os = "linux")]
+                        {
+                            let delay = core::time::Duration::from_micros(delay_us(slot.misses));
+                            slot.due = Some(Instant::now() + delay);
+                        }
+                    }
                     return None;
                 }
                 Err(errno) => -errno,
@@ -484,31 +595,38 @@ fn refusal(errno: i32) -> SignalChildError {
     }
 }
 
-/// Opens the process descriptor of the process `pid`, which closes on `exec`.
-fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
-    unsafe_call::pidfd_open(pid)
-}
-
 /// The system calls of children. Each one names no memory, or only the structure that it gets.
 #[expect(unsafe_code, reason = "each call names no memory or only the structure that it gets")]
 mod unsafe_call {
     use core::ffi::c_int;
     use std::io;
+    #[cfg(target_os = "linux")]
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-    use super::super::sys;
+    use super::{Process, SigInfo, sys};
 
     /// The `errno` of the last failed call.
     fn errno() -> i32 {
         io::Error::last_os_error().raw_os_error().unwrap_or(super::EIO)
     }
 
-    pub(super) fn getpid() -> c_int {
+    /// Whether the kernel gives process descriptors: it opens one for this process.
+    #[cfg(target_os = "linux")]
+    pub(super) fn descriptors() -> bool {
         // SAFETY: `getpid` names no memory.
-        unsafe { sys::getpid() }
+        open(unsafe { sys::getpid() }.cast_unsigned()).is_ok()
     }
 
-    pub(super) fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
+    /// macOS needs no process descriptor.
+    #[cfg(target_os = "macos")]
+    pub(super) const fn descriptors() -> bool {
+        true
+    }
+
+    /// The handle of the child `pid`, which the caller holds unreaped: its process descriptor,
+    /// which closes on `exec`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn open(pid: u32) -> io::Result<Process> {
         // SAFETY: `pidfd_open` names no memory.
         let fd = unsafe { sys::syscall(sys::SYS_PIDFD_OPEN, pid, 0_u32) };
         match c_int::try_from(fd) {
@@ -518,12 +636,59 @@ mod unsafe_call {
         }
     }
 
-    pub(super) fn pidfd_send_signal(pidfd: &OwnedFd, signal: c_int) -> Result<(), i32> {
+    /// The handle of the child `pid`, which the caller holds unreaped: its process ID.
+    #[cfg(target_os = "macos")]
+    pub(super) fn open(pid: u32) -> io::Result<Process> {
+        c_int::try_from(pid)
+            .map(Process)
+            .map_err(|_| io::ErrorKind::InvalidInput.into())
+    }
+
+    /// A timer of the monotonic clock that does not block and closes at an exec.
+    #[cfg(target_os = "linux")]
+    pub(super) fn timer() -> io::Result<std::fs::File> {
+        // SAFETY: `timerfd_create` names no memory.
+        let fd = unsafe { sys::timerfd_create(sys::CLOCK_MONOTONIC, sys::TFD_NONBLOCK | sys::TFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the kernel gave a new descriptor that nothing else owns.
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Arms `timer` to end once after `after`, at least 1 ns, because a time of 0 disarms it. A
+    /// timer of `timer` and a time below 2^63 s cannot fail, so the call has no error.
+    #[cfg(target_os = "linux")]
+    pub(super) fn arm(timer: &std::fs::File, after: core::time::Duration) {
+        let spec = sys::ITimerSpec {
+            it_value: sys::Timespec {
+                tv_sec: i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: i64::from(after.subsec_nanos()).max(i64::from(after.is_zero())),
+            },
+            ..sys::ITimerSpec::default()
+        };
+        // SAFETY: the call reads only `spec`, and a null `old_value` is allowed.
+        unsafe { sys::timerfd_settime(timer.as_raw_fd(), 0, &raw const spec, core::ptr::null_mut()) };
+    }
+
+    /// The kind of the identity of the child of `process` for `waitid`, and the identity.
+    fn identity(process: &Process) -> (c_int, u32) {
+        #[cfg(target_os = "linux")]
+        let kind = sys::P_PIDFD;
+        #[cfg(target_os = "macos")]
+        let kind = sys::P_PID;
+        (kind, super::number(process).cast_unsigned())
+    }
+
+    /// Sends `signal` to the child of `process`: through its process descriptor on Linux, and to
+    /// its process ID on macOS.
+    #[cfg(target_os = "linux")]
+    pub(super) fn send_signal(process: &Process, signal: c_int) -> Result<(), i32> {
         // SAFETY: a null `info` makes the kernel fill the information as `kill` does.
         let result = unsafe {
             sys::syscall(
                 sys::SYS_PIDFD_SEND_SIGNAL,
-                pidfd.as_raw_fd(),
+                process.as_raw_fd(),
                 signal,
                 core::ptr::null::<u8>(),
                 0_u32,
@@ -532,29 +697,43 @@ mod unsafe_call {
         if result == 0 { Ok(()) } else { Err(errno()) }
     }
 
+    /// Sends `signal` to the child of `process`: through its process descriptor on Linux, and to
+    /// its process ID on macOS.
+    #[cfg(target_os = "macos")]
+    pub(super) fn send_signal(process: &Process, signal: c_int) -> Result<(), i32> {
+        kill(process.0, signal)
+    }
+
     pub(super) fn kill_group(group: c_int, signal: c_int) -> Result<(), i32> {
+        kill(group.saturating_neg(), signal)
+    }
+
+    /// `kill`, with its `errno`.
+    fn kill(pid: c_int, signal: c_int) -> Result<(), i32> {
         // SAFETY: `kill` names no memory.
-        if unsafe { sys::kill(group.saturating_neg(), signal) } == 0 {
+        if unsafe { sys::kill(pid, signal) } == 0 {
             Ok(())
         } else {
             Err(errno())
         }
     }
 
-    /// Whether the driver still holds the child of `pidfd` unreaped. The look reaps nothing.
-    pub(super) fn held(pidfd: &OwnedFd) -> bool {
-        let mut info = sys::SigInfo::default();
+    /// Whether the driver still holds the child of `process` unreaped. The look reaps nothing.
+    pub(super) fn held(process: &Process) -> bool {
+        let (kind, id) = identity(process);
+        let mut info = SigInfo::default();
         let options = sys::WEXITED | sys::WNOHANG | sys::WNOWAIT;
         // SAFETY: the call writes only `info`.
-        unsafe { sys::waitid(sys::P_PIDFD, pidfd.as_raw_fd().cast_unsigned(), &raw mut info, options) == 0 }
+        unsafe { sys::waitid(kind, id, &raw mut info, options) == 0 }
     }
 
-    /// Reaps the child of `pidfd` into `info` when it ended. Gives whether it ended.
-    pub(super) fn reap(pidfd: &OwnedFd, info: &mut sys::SigInfo) -> Result<bool, i32> {
-        *info = sys::SigInfo::default();
+    /// Reaps the child of `process` into `info` when it ended. Gives whether it ended.
+    pub(super) fn reap(process: &Process, info: &mut SigInfo) -> Result<bool, i32> {
+        let (kind, id) = identity(process);
+        *info = SigInfo::default();
         let options = sys::WEXITED | sys::WNOHANG;
         // SAFETY: the call writes only `info`.
-        if unsafe { sys::waitid(sys::P_PIDFD, pidfd.as_raw_fd().cast_unsigned(), info, options) } == 0 {
+        if unsafe { sys::waitid(kind, id, info, options) } == 0 {
             Ok(info.pid != 0)
         } else {
             Err(errno())
@@ -562,16 +741,64 @@ mod unsafe_call {
     }
 }
 
-/// The entry of the exit operation of the child `pidfd`: an `IORING_OP_WAITID` that writes the
-/// status into the payload of `held` when `ring` holds, or a poll of the descriptor.
-fn exit_entry(ring: bool, pidfd: std::os::fd::RawFd, held: &mut Held) -> Sqe {
+/// The entry of the exit operation of the child of the number `child` ([`number`]): an
+/// `IORING_OP_WAITID` that writes the status into the payload of `held` when `ring` holds, or a
+/// poll of its exit.
+#[cfg(target_os = "linux")]
+fn exit_entry(ring: bool, child: c_int, held: &mut Held) -> Sqe {
     match &mut held.payload {
         Payload::Exit(info) if ring => {
             let options = sys::WEXITED.cast_unsigned();
-            Sqe::waitid(sys::P_PIDFD.cast_unsigned(), pidfd, options, (&raw mut *info).cast())
+            Sqe::waitid(sys::P_PIDFD.cast_unsigned(), child, options, (&raw mut *info).cast())
         }
-        _ => Sqe::poll_readable(pidfd),
+        _ => exit_poll(child),
     }
+}
+
+/// The entry of the exit operation of the child of the number `child`: a poll of its exit. No
+/// ring runs on macOS.
+#[cfg(target_os = "macos")]
+fn exit_entry(_ring: bool, child: c_int, _held: &mut Held) -> Sqe {
+    exit_poll(child)
+}
+
+/// A poll of the exit of the child of the number `child`: on Linux, its process descriptor
+/// becomes readable.
+#[cfg(target_os = "linux")]
+fn exit_poll(child: c_int) -> Sqe {
+    Sqe::poll_readable(child)
+}
+
+/// A poll of the exit of the child of the number `child`: on macOS, the exit event of its process
+/// ID, which the kqueue poller waits for.
+#[cfg(target_os = "macos")]
+fn exit_poll(child: c_int) -> Sqe {
+    Sqe {
+        rw_flags: super::poller::EXITED,
+        ..Sqe::poll_readable(child)
+    }
+}
+
+/// The poll of the exit of the child of `slot` after a poll that found no status, at its due
+/// time. On Linux, the process descriptor stays readable after the exit, also while a tracer holds
+/// the status, so the driver waits for the due time with the timer of the children first.
+#[cfg(target_os = "linux")]
+fn again_poll(slot: &Slot) -> Option<Sqe> {
+    slot.process.as_ref().map(|process| exit_poll(number(process)))
+}
+
+/// The poll of the exit of the child of `slot` after a poll that found no status. On macOS, the
+/// exit event can come before the status: on macOS 27.2.1, the status was not ready at the event
+/// in 16 % to 56 % of the exits, in four runs of 2000. The exit event came already, so the kqueue
+/// waits the time of [`delay_us`] in a timer entry.
+#[cfg(target_os = "macos")]
+fn again_poll(slot: &Slot) -> Option<Sqe> {
+    let process = slot.process.as_ref()?;
+    Some(Sqe {
+        rw_flags: super::poller::ELAPSED,
+        off: delay_us(slot.misses),
+        ..Sqe::poll_readable(number(process))
+    })
 }
 
 /// The output of a spawn: the child, or the error of the spawn.
@@ -708,14 +935,14 @@ impl Driver {
             }
         };
         // The standard library keeps the status that its own wait took. Such a child is reaped,
-        // and its process ID can name another process now, so the driver opens no descriptor for
-        // it. A child that is not reaped keeps its process ID, so the descriptor names it.
-        let pidfd = match child.try_wait() {
-            Ok(None) => pidfd_open(child.id()).map_err(|_| Reason::Unsupported),
+        // and its process ID can name another process now, so the driver opens no handle for it.
+        // A child that is not reaped keeps its process ID, so the handle names it.
+        let process = match child.try_wait() {
+            Ok(None) => unsafe_call::open(child.id()).map_err(|_| Reason::Unsupported),
             Ok(Some(_)) | Err(_) => Err(Reason::Exited),
         };
-        let pidfd = match pidfd {
-            Ok(pidfd) => pidfd,
+        let process = match process {
+            Ok(process) => process,
             Err(reason) => {
                 self.end_exit(exit);
                 self.resources.unreserve(streams);
@@ -726,7 +953,7 @@ impl Driver {
             (slot.exit, slot.tree, slot.end) = (Some(exit), false, end);
         }
         let spawned = Spawned {
-            pidfd,
+            process,
             pid: child.id(),
             stdin: child.stdin.take().map(OwnedFd::from),
             stdout: child.stdout.take().map(OwnedFd::from),
@@ -735,18 +962,21 @@ impl Driver {
         Ok(self.register(index, exit, spawned, streams))
     }
 
-    /// Sends `signal` to `child` through its process descriptor, so a reused process ID is never
-    /// the target. A signal ends no wait: the wait ends when the child ends.
+    /// Sends `signal` to `child`, so that a reused process ID is never the target: on Linux through
+    /// its process descriptor. macOS has no process descriptor, so there the driver signals the
+    /// process ID only while it holds the child unreaped, after a look that reaps nothing. A
+    /// signal ends no wait: the wait ends when the child ends.
     ///
     /// # Errors
     ///
-    /// [`SignalChildError::Reaped`] after the reap, and [`SignalChildError::System`] when the
-    /// system refuses the signal.
+    /// [`SignalChildError::Reaped`] after the reap, also after a reap by another waiter of the
+    /// process, and [`SignalChildError::System`] when the system refuses the signal.
     pub fn signal_child(&mut self, child: &Child, signal: Signal) -> Result<(), SignalChildError> {
         self.children.signal(child.id, signal.as_raw(), false)
     }
 
-    /// Kills `child` (`SIGKILL`) through its process descriptor. The wait then gives the status.
+    /// Kills `child` (`SIGKILL`), as [`Driver::signal_child`] signals it. The wait then gives the
+    /// status.
     ///
     /// # Errors
     ///
@@ -804,15 +1034,15 @@ impl Driver {
         self.complete_now(exit, -ECANCELED);
     }
 
-    /// Registers the child of `spawned` in the slot `index`: its descriptor, its pipe ends, which
-    /// take `reserved` reserved resource slots, and the entry of its exit operation `exit`. The
-    /// queue has room for the entry.
+    /// Registers the child of `spawned` in the slot `index`: its handle, its pipe ends, which take
+    /// `reserved` reserved resource slots, and the entry of its exit operation `exit`. The queue
+    /// has room for the entry.
     #[expect(unsafe_code, reason = "the entry of the exit operation names its own payload")]
     fn register(&mut self, index: u32, exit: OpId, spawned: Spawned, reserved: u32) -> Child {
-        let raw = spawned.pidfd.as_raw_fd();
+        let child = number(&spawned.process);
         let (generation, end) = match self.children.slot(index) {
             Some(slot) => {
-                (slot.pidfd, slot.pid) = (Some(spawned.pidfd), spawned.pid.cast_signed());
+                (slot.process, slot.pid) = (Some(spawned.process), spawned.pid.cast_signed());
                 (slot.generation, slot.end)
             }
             None => (0, End::Keep),
@@ -839,7 +1069,7 @@ impl Driver {
         // SAFETY: the entry names the status structure in the payload of `exit`, which stays in
         // its slot until the terminal event, and the descriptor, which the child slot keeps open
         // until that event. The caller made room in the queue.
-        unsafe { self.push(exit, |held| exit_entry(ring, raw, held)) };
+        unsafe { self.push(exit, |held| exit_entry(ring, child, held)) };
         Child {
             stdin,
             stdout,
@@ -904,29 +1134,65 @@ impl Driver {
     }
 
     /// Polls again each exit operation whose poll ended before the status of its child was ready.
-    /// One that finds no room in the queue stays for the next turn.
+    /// On Linux, a child waits until its due time, and the timer of the children is armed for the
+    /// earliest one. One that finds no room in the queue stays for the next turn.
     #[expect(unsafe_code, reason = "a poll names no memory")]
     pub(super) fn poll_again(&mut self) {
-        while let Some(&id) = self.children.again.last() {
-            let fd = match self.table.resources(id) {
+        #[cfg(target_os = "linux")]
+        let (now, mut earliest) = (Instant::now(), None::<Instant>);
+        #[cfg_attr(
+            target_os = "macos",
+            expect(unused_mut, reason = "only Linux passes over an entry, which waits for its due time")
+        )]
+        let mut index = 0;
+        // Each step takes an entry out of the list or passes it, so the loop ends after at most
+        // two steps for each entry.
+        while let Some(&id) = self.children.again.get(index) {
+            let slot = match self.table.resources(id) {
                 Some(&Tag {
-                    kind: Kind::Exit(index),
+                    kind: Kind::Exit(child),
                     ..
-                }) => self
-                    .children
-                    .slots
-                    .get(index as usize)
-                    .and_then(|slot| slot.pidfd.as_ref()),
+                }) => self.children.slots.get(child as usize),
                 _ => None,
             };
-            if let Some(fd) = fd {
-                let entry = Sqe::poll_readable(fd.as_raw_fd()).with_user_data(id.user_data());
+            #[cfg(target_os = "linux")]
+            if let Some(due) = slot.and_then(|slot| slot.due).filter(|&due| due > now) {
+                earliest = Some(earliest.map_or(due, |earliest| earliest.min(due)));
+                index += 1;
+                continue;
+            }
+            if let Some(poll) = slot.and_then(again_poll) {
+                let entry = poll.with_user_data(id.user_data());
                 // SAFETY: a poll names no memory.
                 if unsafe { super::push_now(&mut self.queue, &entry) }.is_err() {
                     return;
                 }
             }
-            self.children.again.pop();
+            self.children.again.swap_remove(index);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(earliest) = earliest {
+            self.time_children(earliest - now);
+        }
+    }
+
+    /// Arms the timer of the children to end after `after`, when it has no earlier end, and polls
+    /// it as a control entry when no poll of it is in flight. A poll that finds no room in the
+    /// queue comes at the next turn.
+    #[cfg(target_os = "linux")]
+    #[expect(unsafe_code, reason = "a poll names no memory")]
+    fn time_children(&mut self, after: core::time::Duration) {
+        let children = &mut self.children;
+        let end = Instant::now() + after;
+        if children.armed.is_none_or(|armed| end < armed) {
+            unsafe_call::arm(&children.timer, after);
+            children.armed = Some(end);
+        }
+        if !children.timing {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&children.timer);
+            let poll = Sqe::poll_readable(raw).with_user_data(super::CHILD_TIMER);
+            // SAFETY: a poll names no memory.
+            children.timing = unsafe { super::push_now(&mut self.queue, &poll) }.is_ok();
         }
     }
 }

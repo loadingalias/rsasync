@@ -1,13 +1,21 @@
 //! The selector of the poller on macOS: one kqueue. Each resource has two edge-triggered
 //! registrations (`EV_CLEAR`), one of `EVFILT_READ` and one of `EVFILT_WRITE`. A descriptor that is
-//! no resource has a one-shot registration (`EV_ONESHOT`) of the filter of its direction. The wake
-//! is a user event (`EVFILT_USER`) of the kqueue, which another thread triggers.
+//! no resource has a one-shot registration (`EV_ONESHOT`) of the filter of its direction. The read
+//! end of the wake pipe has a level-triggered registration of `EVFILT_READ`: another thread, or a
+//! signal handler, writes the pipe, and `write` is async-signal-safe, which `kevent` is not.
 //!
-//! The selector reports each event with the `poll` bit of its filter: `POLLIN` for `EVFILT_READ`
-//! and `POLLOUT` for `EVFILT_WRITE`. The declarations agree with `sys/event.h` and
+//! A poll of the exit of a process ([`EXITED`]) is a one-shot registration of `EVFILT_PROC` with
+//! `NOTE_EXIT`, whose identifier is the process ID. A process that ended, also one that is a zombie
+//! now, refuses the registration with `ESRCH`: measured on macOS 27.2.1 (`xnu-13432.41.4`).
+//!
+//! A poll of a time ([`ELAPSED`]) is a one-shot timer (`EVFILT_TIMER` with `NOTE_USECONDS`), whose
+//! identifier is the descriptor of its entry.
+//!
+//! The selector reports each event with the `poll` bit of its filter: `POLLIN` for `EVFILT_READ`,
+//! `POLLOUT` for `EVFILT_WRITE`, [`EXITED`] for `EVFILT_PROC`, and [`ELAPSED`] for `EVFILT_TIMER`. The declarations agree with `sys/event.h` and
 //! `sys/_types/_timespec.h` of the macOS 27.2 SDK (`MacOSX27.2.sdk`) on aarch64.
 
-use alloc::sync::Arc;
+use alloc::rc::Rc;
 use core::ffi::{c_int, c_long, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr;
@@ -16,37 +24,21 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
 use super::sys::{F_SETFD, FD_CLOEXEC, fcntl};
-use super::{POLLIN, POLLOUT, WAKE};
-
-/// The identifier of the user event of the wake. User events have their own identifiers, so it
-/// is the identifier of no descriptor.
-const WAKE_IDENT: usize = 0;
+use super::{ELAPSED, EXITED, POLLIN, POLLOUT, WAKE};
 
 /// The kqueue of a poller. A clone refers to the same kqueue.
 #[derive(Debug, Clone)]
-pub(super) struct Selector(Arc<OwnedFd>);
-
-/// The wake of a poller, which any thread can post: it triggers the user event of the kqueue, and
-/// a wait of the poller then ends.
-#[derive(Debug)]
-pub(crate) struct Wake(Arc<OwnedFd>);
-
-impl Wake {
-    /// Triggers the user event. A trigger that the poller has not taken yet is the same wake.
-    pub(crate) fn post(&self) {
-        // Only a closed kqueue refuses the trigger, and this value keeps the kqueue open.
-        drop(change(&self.0, user(NOTE_TRIGGER)));
-    }
-}
+pub(super) struct Selector(Rc<OwnedFd>);
 
 impl Selector {
-    /// A new kqueue that closes at an exec, with the user event of the wake.
+    /// A new kqueue that closes at an exec, with the read end `wake` of the wake pipe registered,
+    /// so that a wake from another thread or from a signal handler ends a wait.
     ///
     /// # Errors
     ///
-    /// The error of `kqueue`, of `fcntl`, or of the registration of the user event.
+    /// The error of `kqueue`, of `fcntl`, or of the registration of `wake`.
     #[expect(unsafe_code, reason = "the C library returns a new descriptor")]
-    pub(super) fn new() -> io::Result<Self> {
+    pub(super) fn new(wake: BorrowedFd<'_>) -> io::Result<Self> {
         // SAFETY: the call takes no pointer.
         let fd = unsafe { kqueue() };
         if fd < 0 {
@@ -58,25 +50,14 @@ impl Selector {
         if unsafe { fcntl(fd.as_raw_fd(), F_SETFD, FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let selector = Self(Arc::new(fd));
-        change(
-            &selector.0,
-            Kevent {
-                flags: EV_ADD | EV_CLEAR,
-                ..user(0)
-            },
-        )?;
+        let selector = Self(Rc::new(fd));
+        change(&selector.0, registration(wake.as_raw_fd(), EVFILT_READ, EV_ADD, WAKE))?;
         Ok(selector)
     }
 
     /// The kqueue: it is readable when an event waits.
     pub(super) fn fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
-    }
-
-    /// The wake of the poller.
-    pub(super) fn wake(&self) -> Wake {
-        Wake(Arc::clone(&self.0))
     }
 
     /// Registers the resource `fd` with `data`, edge-triggered for reads and writes.
@@ -102,10 +83,21 @@ impl Selector {
         drop(changes_all(&self.0, &changes));
     }
 
-    /// Waits one time for the `poll` bits `events` of `fd`, with `data`: for `POLLIN` when it has
-    /// it, else for `POLLOUT`. A one-shot registration ends at its event.
+    /// Waits one time for the `poll` bits `events` of `fd`, with `data`: for the exit of the
+    /// process `fd` with [`EXITED`], else for `POLLIN` when it has it, else for `POLLOUT`. A
+    /// one-shot registration ends at its event.
     pub(super) fn arm(&self, fd: RawFd, events: u32, data: u64) -> io::Result<()> {
         change(&self.0, registration(fd, filter(events), EV_ADD | EV_ONESHOT, data))
+    }
+
+    /// Waits one time for `micros` microseconds, in a timer whose identifier is `ident`, with
+    /// `data`.
+    pub(super) fn delay(&self, ident: RawFd, micros: u64, data: u64) -> io::Result<()> {
+        let timer = Kevent {
+            data: isize::try_from(micros).unwrap_or(isize::MAX),
+            ..registration(ident, EVFILT_TIMER, EV_ADD | EV_ONESHOT, data)
+        };
+        change(&self.0, timer)
     }
 
     /// Ends the one-shot registration of `fd` for `events`.
@@ -151,6 +143,8 @@ pub(super) fn decode(event: Event) -> (u64, u32) {
     let events = match event.filter {
         EVFILT_READ => POLLIN,
         EVFILT_WRITE => POLLOUT,
+        EVFILT_PROC => EXITED,
+        EVFILT_TIMER => ELAPSED,
         _ => 0,
     };
     (event.udata.addr() as u64, events)
@@ -158,34 +152,31 @@ pub(super) fn decode(event: Event) -> (u64, u32) {
 
 /// The filter of the `poll` bits `events`.
 const fn filter(events: u32) -> i16 {
-    if events & POLLIN != 0 {
+    if events & EXITED != 0 {
+        EVFILT_PROC
+    } else if events & ELAPSED != 0 {
+        EVFILT_TIMER
+    } else if events & POLLIN != 0 {
         EVFILT_READ
     } else {
         EVFILT_WRITE
     }
 }
 
-/// A change of the registration of `filter` of `fd`.
+/// A change of the registration of `filter` of `fd`, which is a process ID for `EVFILT_PROC` and
+/// the identifier of a timer for `EVFILT_TIMER`.
 fn registration(fd: RawFd, filter: i16, flags: u16, data: u64) -> Kevent {
     Kevent {
         ident: usize::try_from(fd).unwrap_or(usize::MAX),
         filter,
         flags,
-        fflags: 0,
+        fflags: match filter {
+            EVFILT_PROC => NOTE_EXIT,
+            EVFILT_TIMER => NOTE_USECONDS,
+            _ => 0,
+        },
         data: 0,
         udata: udata(data),
-    }
-}
-
-/// A change of the user event of the wake, with `fflags`.
-fn user(fflags: u32) -> Kevent {
-    Kevent {
-        ident: WAKE_IDENT,
-        filter: EVFILT_USER,
-        flags: 0,
-        fflags,
-        data: 0,
-        udata: udata(WAKE),
     }
 }
 
@@ -312,12 +303,15 @@ const _: () = {
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
-const EVFILT_USER: i16 = -10;
+const EVFILT_PROC: i16 = -5;
+const EVFILT_TIMER: i16 = -7;
 const EV_ADD: u16 = 0x0001;
 const EV_DELETE: u16 = 0x0002;
 const EV_ONESHOT: u16 = 0x0010;
 const EV_CLEAR: u16 = 0x0020;
 const EV_RECEIPT: u16 = 0x0040;
 const EV_ERROR: u16 = 0x4000;
-/// The `fflags` of a user event that triggers it.
-const NOTE_TRIGGER: u32 = 0x0100_0000;
+/// The `fflags` of `EVFILT_PROC` for the exit of the process, and of `EVFILT_TIMER` for a time in
+/// microseconds.
+const NOTE_EXIT: u32 = 0x8000_0000;
+const NOTE_USECONDS: u32 = 0x2;

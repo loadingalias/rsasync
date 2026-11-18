@@ -4,7 +4,7 @@
 #![cfg(not(loom))]
 
 use alloc::vec::Vec;
-use core::ffi::{c_int, c_void};
+use core::ffi::{c_int, c_short, c_void};
 use core::num::NonZeroU32;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
@@ -15,24 +15,46 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use super::sys::SigAction;
+use super::sys::{self, SigAction};
 use super::{REGISTRY, Signal, SignalError, SignalStream};
-use crate::driver::sys::{POLLIN, PollFd, poll};
+use crate::driver::suite::{self, Backend};
 use crate::driver::{Config, Driver, Escalation};
 use crate::wait::tests::counter;
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
+#[cfg(target_os = "linux")]
 const SIGUSR1: c_int = 10;
+#[cfg(target_os = "linux")]
 const SIGUSR2: c_int = 12;
+#[cfg(target_os = "macos")]
+const SIGUSR1: c_int = 30;
+#[cfg(target_os = "macos")]
+const SIGUSR2: c_int = 31;
 const SIG_IGN: usize = 1;
 
-#[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+/// `struct pollfd`, with one layout on Linux and macOS, and `POLLIN`.
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: c_short,
+    revents: c_short,
+}
+
+const POLLIN: c_short = 0x1;
+
+/// `nfds_t`: an `unsigned long` on Linux, and an `unsigned int` on macOS.
+#[cfg(target_os = "linux")]
+type Nfds = core::ffi::c_ulong;
+#[cfg(target_os = "macos")]
+type Nfds = core::ffi::c_uint;
+
+#[expect(unsafe_code, reason = "the C library of each target gives these functions")]
 unsafe extern "C" {
     fn raise(sig: c_int) -> c_int;
     fn sigaction(sig: c_int, act: *const SigAction, oact: *mut SigAction) -> c_int;
     fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
-    fn __errno_location() -> *mut c_int;
+    fn poll(fds: *mut PollFd, nfds: Nfds, timeout: c_int) -> c_int;
 }
 
 #[expect(unsafe_code, reason = "raise names no memory")]
@@ -50,8 +72,9 @@ fn handler_of(signal: c_int) -> usize {
     action.handler
 }
 
+/// Sets the disposition of `signal` to `SIG_IGN` in this test process.
 #[expect(unsafe_code, reason = "the call reads only the structure that it gets")]
-fn ignore(signal: c_int) {
+pub(in crate::driver) fn ignore(signal: c_int) {
     let action = SigAction::new(SIG_IGN, 0);
     // SAFETY: `action` is a valid structure for the call.
     let result = unsafe { sigaction(signal, &raw const action, core::ptr::null_mut()) };
@@ -76,8 +99,8 @@ fn stream(driver: &mut Driver, signal: Signal) -> SignalStream {
     driver.signal(signal, Escalation::Never).unwrap()
 }
 
-pub(in crate::driver) fn several_raises_before_one_poll_give_one_report() {
-    let mut driver = Driver::new(Config::new()).unwrap();
+pub(in crate::driver) fn several_raises_before_one_poll_give_one_report(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
     let mut stream = stream(&mut driver, Signal::TERMINATE);
     let (woken, waker) = counter();
     assert_eq!(stream.poll_recv(&Context::from_waker(&waker)), Poll::Pending);
@@ -91,8 +114,11 @@ pub(in crate::driver) fn several_raises_before_one_poll_give_one_report() {
     assert_eq!(stream.poll_recv(&cx), Poll::Pending);
 }
 
-pub(in crate::driver) fn two_streams_of_one_signal_on_two_drivers_both_report() {
-    let mut drivers = [Driver::new(Config::new()).unwrap(), Driver::new(Config::new()).unwrap()];
+pub(in crate::driver) fn two_streams_of_one_signal_on_two_drivers_both_report(backend: Backend) {
+    let mut drivers = [
+        suite::driver(Config::new(), backend),
+        suite::driver(Config::new(), backend),
+    ];
     let mut streams = drivers.each_mut().map(|driver| stream(driver, Signal::TERMINATE));
     let cx = Context::from_waker(Waker::noop());
     for (driver, stream) in drivers.iter_mut().zip(&mut streams) {
@@ -127,19 +153,35 @@ pub(in crate::driver) fn a_close_restores_the_earlier_disposition_and_other_sign
 pub(in crate::driver) fn a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse() {
     let mut driver = Driver::new(Config::new()).unwrap();
     let refusal = |driver: &mut Driver, number| driver.signal(Signal::from_raw(number), Escalation::Never).unwrap_err();
-    for fault in [4, 5, 7, 8, 11, 31] {
+    // SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV, and SIGSYS, and SIGEMT on macOS.
+    #[cfg(target_os = "linux")]
+    let faults = [4, 5, 7, 8, 11, 31].as_slice();
+    #[cfg(target_os = "macos")]
+    let faults = [4, 5, 7, 8, 10, 11, 12].as_slice();
+    for &fault in faults {
         assert_eq!(refusal(&mut driver, fault), SignalError::Fault);
     }
-    for uncatchable in [9, 19] {
+    // SIGKILL and SIGSTOP.
+    #[cfg(target_os = "linux")]
+    let uncatchable = [9, 19];
+    #[cfg(target_os = "macos")]
+    let uncatchable = [9, 17];
+    for uncatchable in uncatchable {
         assert_eq!(refusal(&mut driver, uncatchable), SignalError::Uncatchable);
     }
-    // The default action of these signals does not end the process.
+    // The default action of these signals ignores them or stops the process: SIGCHLD, SIGCONT,
+    // SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, and SIGWINCH, and SIGIO and SIGINFO on macOS.
     let first = Escalation::At(NonZeroU32::MIN);
-    for ignored in [17, 18, 23, 28] {
-        let refusal = driver.signal(Signal::from_raw(ignored), first).unwrap_err();
+    #[cfg(target_os = "linux")]
+    let not_ending = [17, 18, 20, 21, 22, 23, 28].as_slice();
+    #[cfg(target_os = "macos")]
+    let not_ending = [16, 18, 19, 20, 21, 22, 23, 28, 29].as_slice();
+    for &number in not_ending {
+        let refusal = driver.signal(Signal::from_raw(number), first).unwrap_err();
         assert_eq!(refusal, SignalError::Escalation);
     }
-    // 0 and 65 are not signals, and the C library keeps 32 for itself.
+    // 0 and 65 are not signals, and the C library of Linux keeps 32 for itself. macOS has the
+    // signals 1 to 31.
     for invalid in [0, 32, 65] {
         assert_eq!(refusal(&mut driver, invalid), SignalError::Invalid);
     }
@@ -200,23 +242,53 @@ fn the_handler_takes_no_lock() {
     assert_eq!(handled, Ok(()), "the handler waited for the registry lock");
 }
 
+/// A signal stream and a wake handle that outlive their driver raise no `SIGPIPE` at their writes,
+/// which would end a process that does not ignore the signal, such as a C host. The wake pipe of
+/// macOS keeps its read end open while a stream or a handle lives.
+#[cfg(target_os = "macos")]
+#[test]
+#[expect(unsafe_code, reason = "the call changes only the disposition of `SIGPIPE`")]
+fn a_stream_and_a_wake_handle_that_outlive_their_driver_raise_no_sigpipe() {
+    const SIGPIPE: c_int = 13;
+    let action = SigAction::new(0, 0);
+    // SAFETY: `action` is a valid structure for the call, and the test process alone has it.
+    let result = unsafe { sigaction(SIGPIPE, &raw const action, core::ptr::null_mut()) };
+    assert_eq!(result, 0);
+    let mut driver = Driver::new(Config::new()).unwrap();
+    let wake = driver.wake_handle();
+    let stream = stream(&mut driver, Signal::TERMINATE);
+    drop(driver);
+    raise_signal(SIGTERM);
+    wake.wake();
+    drop(stream);
+}
+
 /// The handler keeps the `errno` of the code that it interrupts, also when its own write fails.
 #[test]
-#[expect(
-    unsafe_code,
-    reason = "the calls name only the counter value and the `errno` of this thread"
-)]
 fn the_handler_keeps_errno() {
     let mut driver = Driver::new(Config::new()).unwrap();
     let _stream = stream(&mut driver, Signal::TERMINATE);
-    // A full `eventfd` counter makes the next write of the handler fail with `EAGAIN`.
-    let full = u64::MAX - 1;
-    // SAFETY: the buffer is the 8 bytes of `full`.
-    let written = unsafe { write(driver.as_fd().as_raw_fd(), (&raw const full).cast(), 8) };
-    assert_eq!(written, 8);
-    // SAFETY: the C library gives a valid location for each thread.
-    unsafe { *__errno_location() = 1234 };
+    fill_wake(&driver);
+    sys::set_errno(1234);
     raise_signal(SIGTERM);
-    // SAFETY: as above.
-    assert_eq!(unsafe { *__errno_location() }, 1234);
+    assert_eq!(sys::errno(), 1234);
+}
+
+/// Fills the wake descriptor of `driver`, so that the next write of the handler fails with
+/// `EAGAIN`: the `eventfd` counter on Linux, and the wake pipe on macOS.
+#[expect(unsafe_code, reason = "each write reads only the 8 bytes of its value")]
+fn fill_wake(driver: &Driver) {
+    let fd = driver.shared.wake.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let full = u64::MAX - 1;
+    #[cfg(target_os = "macos")]
+    let full = 1_u64;
+    // A pipe takes at most 64 KiB, 8192 writes of 8 bytes.
+    for _ in 0..=8192 {
+        // SAFETY: the buffer is the 8 bytes of `full`.
+        if unsafe { write(fd, (&raw const full).cast(), 8) } < 0 {
+            return;
+        }
+    }
+    panic!("the wake descriptor took each write");
 }

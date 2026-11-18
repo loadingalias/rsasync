@@ -730,7 +730,7 @@ impl Directions {
             Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
             Kind::File(_) => None,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Kind::Spawn(_) | Kind::Exit(_) => None,
         }
     }
@@ -752,7 +752,7 @@ impl Directions {
             ),
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
             Kind::File(_) => false,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             Kind::Spawn(_) | Kind::Exit(_) => false,
         }
     }
@@ -887,7 +887,7 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
         // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
         Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
         Kind::File(_) => {}
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         Kind::Spawn(_) | Kind::Exit(_) => {}
     }
 }
@@ -1586,10 +1586,10 @@ impl Driver {
         let Some(fd) = owned.fd.as_ref().map(|fd| number(borrow(fd))) else {
             return true;
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let pipe = owned.medium == Medium::Pipe;
-        // On macOS and Windows, the driver owns no pipe end yet.
-        #[cfg(not(target_os = "linux"))]
+        // On Windows, the driver owns no pipe end yet.
+        #[cfg(target_os = "windows")]
         let pipe = false;
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return true;

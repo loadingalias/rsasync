@@ -23,8 +23,8 @@ pub enum Backend {
     /// ends it, by the NT status of the call. Each other file operation has no overlapped form, so
     /// it runs on the blocking service ([`Route::BlockingService`]).
     Iocp,
-    /// kqueue, on macOS: the driver runs each socket operation as one nonblocking call on its own
-    /// thread when kqueue reports its descriptor ready, as on epoll. UDP has no segmentation
+    /// kqueue, on macOS: the driver runs each socket and pipe operation as one nonblocking call on
+    /// its own thread when kqueue reports its descriptor ready, as on epoll. UDP has no segmentation
     /// offload and no coalesced receive: a send with a segment size gives
     /// `datagram::Refused::NoSegmentation` with no call, and the `gro` option of a UDP socket gives
     /// `Unsupported`. A caller learns it as on each system, from the send of a `datagram::Probe`.
@@ -149,7 +149,7 @@ pub enum Call {
     BindUdp,
     /// [`Driver::set_file_len`](super::Driver::set_file_len): a change of the length of a file.
     SetFileLen,
-    /// The exit of a `Child`, on Linux: the reap of the child and its status.
+    /// The exit of a `Child`, on Linux and macOS: the reap of the child and its status.
     WaitChild,
     /// The operations on the bytes of a file: the positional and vectored reads and writes, and the
     /// hole punch.
@@ -175,7 +175,8 @@ pub enum Route {
     /// [`Reason::Blocking`](super::Reason::Blocking).
     BlockingService,
     /// A poll of a descriptor on the ring or the poller, then one nonblocking system call on the
-    /// thread of the driver when the descriptor is readable.
+    /// thread of the driver when the descriptor is readable. On kqueue, the poll of the exit of a
+    /// child is the exit event of its process (`EVFILT_PROC`).
     Poll,
     /// Overlapped calls on the completion port, on Windows: the packet of each call, or its return,
     /// ends it.

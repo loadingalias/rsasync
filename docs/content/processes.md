@@ -1,12 +1,13 @@
 # Child processes on the driver
 
-This page is the reference for child processes on the io_uring driver, `rsasync::driver::Driver`:
-how to start a child or give one to the driver, the wait for its exit, signals, a process tree,
-and the end policy. [Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and
-end the driver.
+This page is the reference for child processes on the driver, `rsasync::driver::Driver`, on
+io_uring and epoll on Linux and on kqueue on macOS: how to start a child or give one to the driver,
+the wait for its exit, signals, a process tree, and the end policy.
+[Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end the driver.
 
-The driver holds a process descriptor (pidfd) for each child. It reaps each child exactly once and
-reports the status once. It installs no `SIGCHLD` handler, and it never waits for a child that it
+On Linux, the driver holds a process descriptor (pidfd) for each child. macOS has no process
+descriptor, so there the driver holds the process ID, which names the child only while the driver
+holds it unreaped. The driver reaps each child exactly once and reports the status once. It installs no `SIGCHLD` handler, and it never waits for a child that it
 does not own, so it shares a process with other libraries that start children. No thread waits for
 a child.
 
@@ -27,7 +28,7 @@ A spawn refuses, gives the command back in its `Refused`, and changes nothing:
 | `Reason::Children` | Each child slot of the driver is in use (`Config::children`) |
 | `Reason::Blocking` | The driver has no blocking service, or the service refused the job, for example because each job slot is in use |
 | `Reason::Resources` | Fewer than three resource slots are free for the pipe ends of the child |
-| `Reason::Unsupported` | The kernel gives no process descriptor, for example under a seccomp filter |
+| `Reason::Unsupported` | On Linux, the kernel gives no process descriptor, for example under a seccomp filter |
 | `Reason::Operations`, `Reason::Queue` | The driver has no room for the operations |
 
 A drop of the future of a spawn ends only the interest: the child starts, and its end policy
@@ -82,7 +83,7 @@ An adoption refuses, gives the `std::process::Child` back, and changes nothing:
 | `Reason::Children` | Each child slot of the driver is in use |
 | `Reason::Exited` | The child ended. The `std::process::Child` has its status: call its `wait` |
 | `Reason::Resources` | The driver has no resource slot for a pipe end of the child |
-| `Reason::Unsupported` | The kernel gave no process descriptor |
+| `Reason::Unsupported` | On Linux, the kernel gave no process descriptor |
 | `Reason::Operations`, `Reason::Queue` | The driver has no room for the operation |
 
 Give the driver only a child that nothing reaped. The standard library keeps the status that its
@@ -94,10 +95,12 @@ own `wait` or `try_wait` took, and the driver refuses such a child with `Reason:
 operation of the driver from the spawn or the adoption on, and it ends when the driver reaps the
 child:
 
-| Kernel | `report().route(Call::WaitChild)` | The exit operation |
+| Backend | `report().route(Call::WaitChild)` | The exit operation |
 | --- | --- | --- |
-| Linux 6.7 and later | `Route::Ring` | `IORING_OP_WAITID` on the process descriptor, which reaps the child and writes the status |
-| Linux 6.1 to 6.6 | `Route::Poll` | A poll of the process descriptor on the ring. When the descriptor is readable, the driver reaps the child with one nonblocking `waitid` |
+| io_uring on Linux 6.7 and later | `Route::Ring` | `IORING_OP_WAITID` on the process descriptor, which reaps the child and writes the status |
+| io_uring on Linux 6.1 to 6.6 | `Route::Poll` | A poll of the process descriptor on the ring. When the descriptor is readable, the driver reaps the child with one nonblocking `waitid` |
+| [epoll](epoll.md) | `Route::Poll` | epoll waits for the process descriptor to become readable, then the driver reaps the child with one nonblocking `waitid` |
+| [kqueue](kqueue.md), on macOS | `Route::Poll` | kqueue waits for the exit event of the process (`EVFILT_PROC` with `NOTE_EXIT`), then the driver reaps the child with one nonblocking `waitid` of its process ID. A registration that finds no process, because the child ended first, is the exit event |
 
 - A child that ended before the operation started gives its status at once.
 - A drop of the wait future ends nothing: the next wait gives the status. A wait after the status
@@ -107,9 +110,16 @@ child:
 - The wait gives `ECHILD` when something else in the process took the status first. This occurs
   when the process sets the disposition of `SIGCHLD` to `SIG_IGN`, because the kernel then reaps
   each child at its end.
-- Before Linux 6.7, a child that another process traces, for example under `strace -f`, can make
-  its descriptor readable before its status is ready for the driver. The driver then polls the
-  descriptor again, at once, until the tracer gives the status back.
+- A poll can find no status yet. On a `Route::Poll` backend of Linux, this occurs when another
+  process traces the child, for example under `strace -f`: its descriptor is readable after its
+  end, and the tracer gets the status first. On macOS, the exit event can come before the status:
+  on macOS 27.2.1, in 16 % to 56 % of the exits, in four runs of 2000.
+- After such a poll, the driver waits 100 µs, and the wait doubles at each poll that finds no
+  status, up to 10 ms. Then it polls once each 10 ms until the status comes, the kernel gives
+  `ECHILD`, or teardown. So a waiting child costs at most one poll each 10 ms, and the child slots
+  bound the waiting children. No thread waits and nothing spins. On Linux, one timer of the
+  driver (a `timerfd`) ends each wait. On macOS, a one-shot kqueue timer ends it, and the status
+  came 1 ms after the exit event on average and 12 ms after it at most (measured).
 
 ## Standard streams
 
@@ -121,8 +131,11 @@ keeps its descriptor until teardown.
 
 ## Signals and kill
 
-Each call goes through the process descriptor, so a process ID that the system gave to another
-process is never the target. A `Signal` is the type of [signal streams](signals.md), for example
+No call reaches a process ID that the system gave to another process. On Linux, each call goes
+through the process descriptor. On macOS, the driver signals the process ID only while it holds the
+child unreaped, and it first looks, with no reap, that no other waiter of the process took the
+status: a `SIGCHLD` disposition of `SIG_IGN`, or a wait for any child in another library, can take
+it. A `Signal` is the type of [signal streams](signals.md), for example
 `Signal::TERMINATE`, or `Signal::from_raw(number)`:
 
 | Call | Effect |

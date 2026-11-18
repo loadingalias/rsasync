@@ -1,7 +1,8 @@
 # Pipes on the driver
 
-This page is the reference for pipe ends on the io_uring driver, `rsasync::driver::Driver`: how
-to give a pipe end to the driver, each operation, and its result. A pipe end follows the stream
+This page is the reference for pipe ends on the driver, `rsasync::driver::Driver`, on io_uring and
+epoll on Linux and on kqueue on macOS: how to give a pipe end to the driver, each operation, and
+its result. A pipe end follows the stream
 rules of [TCP on the driver](tcp.md): one operation for each direction, the rules for a dropped,
 forgotten, or cancelled operation, and close. [Drive the I/O driver yourself](driver-only.md)
 tells how to start, turn, and end the driver.
@@ -14,10 +15,9 @@ tells how to start, turn, and end the driver.
 `OwnedFd::from(child.stdout.take().unwrap())`. A child of the driver has its piped streams as pipe
 ends already (see [Child processes on the driver](processes.md#standard-streams)).
 
-On io_uring, the driver clears `O_NONBLOCK` of the open file description of the end, because a
-nonblocking read or write ends at once instead of waiting. On [epoll](epoll.md), the driver sets
-`O_NONBLOCK`, because each read and write runs when epoll reports the end ready. Another descriptor
-of the same open file description, for example a duplicate, gets the same flag.
+The driver changes `O_NONBLOCK` of the open file description of the end, as
+[Backends](#backends) tells. Another descriptor of the same open file description, for example a
+duplicate, gets the same flag.
 
 An adoption refuses and gives the descriptor back in its `Refused`. Except as the table says, it
 changes nothing:
@@ -27,7 +27,7 @@ changes nothing:
 | `Reason::NotPipe` | The descriptor is not a pipe or a FIFO, for example a socket |
 | `Reason::Direction` | A write end to `adopt_reader`, or a read end to `adopt_writer` |
 | `Reason::Resources` | Each resource slot of the driver is in use (`Config::resources`) |
-| `Reason::Register` | On epoll, epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. The descriptor has `O_NONBLOCK` then |
+| `Reason::Register` | On epoll, epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. On kqueue, kqueue refused the registration, for example with no kernel memory. The descriptor has `O_NONBLOCK` then |
 
 ## Operations
 
@@ -47,9 +47,8 @@ Each operation gives an `Operation` future. Turn the driver until the future is 
 A receive on an idle reader waits for data. A selecting receive holds no buffer while it waits:
 the kernel takes a buffer from the pool only when the data comes.
 
-A send of more bytes than the pipe has room for depends on the kernel. On Linux 7.0 it ends with
-the count of the bytes that fit. On Linux 6.1 it waits until the reader takes the rest, or until a
-cancel or a close, which then gives the count of the bytes that went. Each count is exact.
+A send of more bytes than the pipe has room for depends on the backend (see [Backends](#backends)).
+Each count is exact.
 
 This example sends through a pipe, closes the writer, and receives until the end of the stream,
 with `run` as in `Operation`:
@@ -79,6 +78,17 @@ let receive = driver.recv(&mut reader, Backing::from(Vec::with_capacity(64)))?;
 let (end, _buffer) = run(&mut driver, receive)??;
 assert_eq!(end?, 0, "the end of the stream");
 ```
+
+## Backends
+
+| Backend | Reads and writes | `O_NONBLOCK` of the end | A send of more bytes than the pipe has room for |
+| --- | --- | --- | --- |
+| io_uring | A read, a write, or a vectored write entry of the ring | Cleared, because a nonblocking read or write ends at once instead of waiting | On Linux 7.0, it ends with the count of the bytes that fit. On Linux 6.1, it waits until the reader takes the rest, or until a cancel or a close, which then gives the count of the bytes that went |
+| [epoll](epoll.md) | One nonblocking `read`, `write`, or `writev` on the thread of the driver, when epoll reports the end ready | Set, at the adoption | It ends with the count of the bytes that fit |
+| [kqueue](kqueue.md), on macOS | One nonblocking `read`, `write`, or `writev` on the thread of the driver, when kqueue reports the end ready (`EVFILT_READ` or `EVFILT_WRITE`) | Set, at the adoption | It ends with the count of the bytes that fit |
+
+Linux tells a pipe or a FIFO by its capacity (`F_GETPIPE_SZ`), and macOS by the type of its file
+(`fstat`). Windows has no pipe ends on the driver yet.
 
 ## End of the stream and a closed reader
 

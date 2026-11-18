@@ -1,30 +1,28 @@
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use alloc::task::Wake;
 use core::alloc::Layout;
 #[cfg(unix)]
 use core::assert_matches;
-#[cfg(target_os = "linux")]
-use core::ffi::c_int;
 use core::future::Future;
 use core::mem::{self, ManuallyDrop};
 use core::num::{NonZeroU32, NonZeroU64};
 use core::pin::Pin;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use core::pin::pin;
 use core::ptr::NonNull;
 #[cfg(target_os = "linux")]
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::fs::File;
 use std::io::{ErrorKind, Read as _, Write as _};
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _};
-#[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::thread::Thread;
 #[cfg(unix)]
 use std::time::Instant;
@@ -40,21 +38,18 @@ use super::{
     TcpStream, UdpOptions, UdpSocket, WriteFailed,
 };
 #[cfg(target_os = "linux")]
-use super::{Call, Completion, Ended, Error, Feature, Features, Held, Medium, Route, eventfd, probe, sys};
+use super::{Call, Ended, Error, Feature, Features, Route, eventfd, probe, sys};
+#[cfg(unix)]
+use super::{Completion, Held, Medium};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
 use crate::capacity::Budget;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::completion::Gone;
 use crate::uring::Cqe;
 #[cfg(target_os = "linux")]
-use crate::uring::{Ring, Sqe};
-
-#[expect(unsafe_code, reason = "the C library of each Linux target gives this function")]
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    /// `int pipe2(int pipefd[2], int flags)`.
-    fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
-}
+use crate::uring::Ring;
+#[cfg(unix)]
+use crate::uring::Sqe;
 
 /// `struct pollfd` and `poll` of macOS (`sys/poll.h` of the macOS 27.2 SDK), with `nfds_t` an
 /// `unsigned int`: the reactor of a host in `wait_readable`.
@@ -91,23 +86,20 @@ fn wait_readable(driver: &Driver) {
     assert_eq!(unsafe { sys::poll(&raw mut fd, 1, -1) }, 1);
 }
 
-/// `O_NONBLOCK` and `O_CLOEXEC` (`include/uapi/asm-generic/fcntl.h`).
-#[cfg(target_os = "linux")]
-const O_NONBLOCK: c_int = 0o4_000;
-#[cfg(target_os = "linux")]
-const O_CLOEXEC: c_int = 0o2_000_000;
-
-/// A nonblocking pipe: its read end and its write end. Linux 6.1 then waits for its readiness and
+/// A nonblocking pipe that closes at an exec: its read end and its write end, from
+/// `std::io::pipe` and then `fcntl`, on each system. Linux 6.1 then waits for its readiness and
 /// reads it in the task work of the ring, as Linux 7.0 does for each pipe. A read of a blocking
 /// pipe on 6.1 goes to an io-wq worker instead, because 6.1 pipes lack `FMODE_NOWAIT`.
-#[expect(unsafe_code, reason = "the test makes its pipe with the C library")]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn pipe() -> (OwnedFd, File) {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` has room for the two descriptors.
-    assert_eq!(unsafe { pipe2(fds.as_mut_ptr(), O_NONBLOCK | O_CLOEXEC) }, 0);
-    // SAFETY: `pipe2` gave two new descriptors that nothing else owns.
-    unsafe { (OwnedFd::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+    let (read, write) = std::io::pipe().expect("the test host makes a pipe");
+    let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
+    let nonblocking = super::pipe::set_nonblocking(read.as_fd(), true);
+    assert!(
+        nonblocking && super::pipe::set_nonblocking(write.as_fd(), true),
+        "fcntl"
+    );
+    (read, File::from(write))
 }
 
 /// The order of the events of a test, from any thread.
@@ -171,7 +163,7 @@ pub(super) fn driver(config: Config) -> Driver {
 
 /// Submits a read of the pipe `fd`, which the driver then owns, into the loan of `held`.
 #[expect(unsafe_code, reason = "the read names the buffer of its resources")]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn read(driver: &mut Driver, fd: OwnedFd, mut held: Held) -> Completion {
     let resource = driver
         .adopt(fd, Medium::Pipe)
@@ -211,7 +203,7 @@ impl Wake for Count {
 }
 
 /// Polls `future` to its end on this thread.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn block_on<F: Future>(future: F) -> F::Output {
     struct Unpark(Thread);
     impl Wake for Unpark {
@@ -230,7 +222,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn held(log: &Log, budget: &Budget) -> Held {
     Held {
         loan: Some(WriteLoan::new(recorded(log, 16))),
@@ -270,7 +262,7 @@ fn a_completion_wakes_only_the_waker_of_its_latest_poll() {
 /// A forgotten future ends no operation: the buffer and the charge stay until the terminal
 /// completion, and teardown releases them after it.
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(in crate::driver) fn a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion(
     backend: Backend,
 ) {
@@ -384,7 +376,7 @@ fn a_completion_during_a_wait_adds_no_other_completion() {
 
 /// Teardown cancels a read that gets no data, returns after the completion of the read, closes
 /// the pipe, and reports the cancelled read. Its future then gets `Gone`.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_and_reports_it(backend: Backend) {
     let (log, budget) = (Log::default(), budget());
     let mut driver = suite::driver(Config::new(), backend);
@@ -401,7 +393,7 @@ pub(in crate::driver) fn teardown_cancels_a_read_with_no_data_closes_its_pipe_an
 
 /// A driver that drops with a running read ends the future with `Gone`, and it keeps the buffer
 /// that the kernel can still use.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(in crate::driver) fn a_dropped_driver_ends_its_futures_and_keeps_the_buffers_of_running_operations(
     backend: Backend,
 ) {

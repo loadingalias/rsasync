@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::io::{BufRead as _, BufReader};
-use std::os::fd::{AsRawFd as _, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -21,18 +22,25 @@ use std::thread;
 use std::time::Instant;
 
 use super::super::suite::{self, Backend};
-use super::super::tests::{drive, driver, numbered};
-use super::super::{Call, Config, Driver, PipeReader, Reason, Route, Signal, sys};
-use super::{Child, ChildOptions, End, SignalChildError, pidfd_open};
+#[cfg(target_os = "linux")]
+use super::super::tests::driver;
+use super::super::tests::{drive, numbered};
+#[cfg(target_os = "linux")]
+use super::super::{Call, Route};
+use super::super::{Config, Driver, PipeReader, Reason, Signal};
+use super::{Child, ChildOptions, End, SignalChildError, sys};
 use crate::blocking::{self, Service};
 use crate::buffer::{Backing, Buffer as _, Lease};
 use crate::capacity::Budget;
 use crate::sync::Arc;
 
-/// `P_PID` (`include/uapi/linux/wait.h`): a `waitid` of one process ID.
+/// `P_ALL` and `P_PID` (`include/uapi/linux/wait.h`, and `sys/wait.h` of macOS): a `waitid` of
+/// each child, and of one process ID.
+const P_ALL: c_int = 0;
 const P_PID: c_int = 1;
 
 /// `ESRCH` (`include/uapi/asm-generic/errno-base.h`).
+#[cfg(target_os = "linux")]
 const ESRCH: i32 = 3;
 
 /// A driver on `backend` with a blocking service of one thread and `jobs` job slots, for its
@@ -91,15 +99,66 @@ fn state(pid: u32) -> State {
     }
 }
 
+/// Turns nothing, and waits until `done` holds, at most 10 s. Gives whether it held.
+fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
+/// Whether a child of this process ended and waits for its reap. The look reaps nothing.
+#[expect(unsafe_code, reason = "the call writes only the structure that it gets")]
+fn a_zombie_waits() -> bool {
+    let mut info = sys::SigInfo::default();
+    let options = sys::WEXITED | sys::WNOHANG | sys::WNOWAIT;
+    // SAFETY: the call writes only `info`.
+    (unsafe { sys::waitid(P_ALL, 0, &raw mut info, options) }) == 0 && info.pid != 0
+}
+
 /// The threads of this process.
+#[cfg(target_os = "linux")]
 fn threads() -> usize {
     std::fs::read_dir("/proc/self/task")
         .expect("the test host has procfs")
         .count()
 }
 
+/// The threads of this process: `pti_threadnum` of `struct proc_taskinfo` (`sys/proc_info.h`),
+/// which `proc_pidinfo` of `libproc.h` writes for `PROC_PIDTASKINFO`.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the call writes only the structure that it gets")]
+fn threads() -> usize {
+    const PROC_PIDTASKINFO: c_int = 4;
+    /// Six `uint64_t` counts, then twelve `int32_t` counts, of which `pti_threadnum` is the tenth.
+    #[repr(C)]
+    struct TaskInfo {
+        times: [u64; 6],
+        counts: [i32; 12],
+    }
+    #[expect(unsafe_code, reason = "libSystem of macOS gives this function")]
+    unsafe extern "C" {
+        fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: *mut core::ffi::c_void, size: c_int) -> c_int;
+    }
+    let mut info = TaskInfo {
+        times: [0; 6],
+        counts: [0; 12],
+    };
+    let size = c_int::try_from(size_of::<TaskInfo>()).expect("96 bytes");
+    let pid = c_int::try_from(std::process::id()).expect("a process ID");
+    // SAFETY: the call writes at most `size` bytes into `info`.
+    let written = unsafe { proc_pidinfo(pid, PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    assert_eq!(written, size, "proc_pidinfo");
+    usize::try_from(info.counts[9]).expect("a count")
+}
+
 /// Whether this process catches or ignores `SIGCHLD`: bit 16 of `SigCgt` or of `SigIgn` in
 /// `/proc/self/status`.
+#[cfg(target_os = "linux")]
 fn sigchld_changed() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").expect("the test host has procfs");
     status
@@ -109,16 +168,57 @@ fn sigchld_changed() -> bool {
         .any(|mask| mask & (1 << 16) != 0)
 }
 
-/// Whether `fd` becomes readable within `timeout` milliseconds.
+/// Whether this process catches or ignores `SIGCHLD` (20): its handler is not `SIG_DFL` (0) in
+/// `struct sigaction` of `sys/signal.h`.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the call writes only the structure that it gets")]
+fn sigchld_changed() -> bool {
+    #[repr(C)]
+    struct SigAction {
+        handler: usize,
+        mask: u32,
+        flags: c_int,
+    }
+    #[expect(unsafe_code, reason = "libSystem of macOS gives this function")]
+    unsafe extern "C" {
+        fn sigaction(sig: c_int, act: *const SigAction, oact: *mut SigAction) -> c_int;
+    }
+    let mut action = SigAction {
+        handler: 0,
+        mask: 0,
+        flags: 0,
+    };
+    // SAFETY: a null `act` only reads the disposition into `action`.
+    assert_eq!(unsafe { sigaction(20, core::ptr::null(), &raw mut action) }, 0);
+    action.handler != 0
+}
+
+/// Whether the process `pid`, which is no child of this process, ends within 10 s: its process
+/// descriptor becomes readable, or no process has its ID.
+#[cfg(target_os = "linux")]
 #[expect(unsafe_code, reason = "a poll writes only the structure that it gets")]
-fn readable(fd: &OwnedFd, timeout: c_int) -> bool {
-    let mut poll = sys::PollFd {
+fn ends(pid: u32) -> bool {
+    let fd = match super::unsafe_call::open(pid) {
+        Ok(fd) => fd,
+        Err(error) => return error.raw_os_error() == Some(ESRCH),
+    };
+    let mut poll = crate::driver::sys::PollFd {
         fd: fd.as_raw_fd(),
-        events: sys::POLLIN,
+        events: crate::driver::sys::POLLIN,
         revents: 0,
     };
     // SAFETY: the call writes only `poll`.
-    (unsafe { sys::poll(&raw mut poll, 1, timeout) }) == 1
+    (unsafe { crate::driver::sys::poll(&raw mut poll, 1, 10_000) }) == 1
+}
+
+/// Whether the process `pid`, which is no child of this process, ends within 10 s: no process has
+/// its ID, after `launchd` reaped it. macOS has no process descriptor.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "a kill of signal 0 names no memory")]
+fn ends(pid: u32) -> bool {
+    let pid = c_int::try_from(pid).expect("a process ID");
+    // SAFETY: `kill` names no memory, and signal 0 sends nothing.
+    wait_until(|| unsafe { sys::kill(pid, 0) } != 0)
 }
 
 /// Turns the driver until `done` holds, at most 10 s. A thread wakes the driver each 10 ms, so a
@@ -257,9 +357,10 @@ pub(in crate::driver) fn a_dropped_spawn_ends_at_the_return_of_its_job_and_its_c
 pub(in crate::driver) fn the_driver_never_reaps_a_child_that_the_test_starts_itself(backend: Backend) {
     let (mut driver, _service) = with_service(Config::new(), 4, backend);
     let mut own = Command::new("true").spawn().expect("the test host runs true");
-    let own_pidfd = pidfd_open(own.id()).expect("the kernel gives process descriptors");
-    assert!(readable(&own_pidfd, 10_000), "the test's own child ends");
-    assert_eq!(state(own.id()), State::Zombie);
+    assert!(
+        wait_until(|| state(own.id()) == State::Zombie),
+        "the test's own child ends"
+    );
 
     let adopted = sh("exit 4").spawn().expect("the test host runs sh");
     let mut adopted = driver
@@ -335,15 +436,12 @@ pub(in crate::driver) fn a_tree_kill_ends_a_grandchild_and_a_tree_signal_after_t
         line.extend_from_slice(buffer.bytes());
     }
     let grandchild = core::str::from_utf8(&line).expect("text").trim().parse::<u32>();
-    let grandchild = pidfd_open(grandchild.expect("a process ID"));
+    let grandchild = grandchild.expect("a process ID");
 
     driver.kill_tree(&child).expect("the leader runs");
     let status = drive(&mut driver, child.wait()).expect("the driver runs");
     assert_eq!(status.expect("the wait works").signal(), Some(9));
-    match grandchild {
-        Ok(grandchild) => assert!(readable(&grandchild, 10_000), "the grandchild ends"),
-        Err(error) => assert_eq!(error.raw_os_error(), Some(ESRCH), "the grandchild ended already"),
-    }
+    assert!(ends(grandchild), "the grandchild ends");
     let signal = driver.signal_tree(&child, Signal::TERMINATE);
     assert_matches!(signal, Err(SignalChildError::Reaped));
 }
@@ -441,8 +539,169 @@ pub(in crate::driver) fn the_kill_policy_close_kills_and_reaps_the_child(backend
     assert_eq!(driver.teardown().expect("the teardown works").kept(), 0);
 }
 
+/// A child that ends before the driver registers its exit still has its exit reported once: on
+/// kqueue, the registration then finds no process, and the home takes the status at once. The
+/// spawn ends its job, and the child its run, before the turn that registers the exit.
+pub(in crate::driver) fn a_child_that_ends_before_its_registration_has_its_exit_reported_once(backend: Backend) {
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
+    let spawn = driver
+        .spawn(sh("exit 6"), ChildOptions::new())
+        .expect("the test driver admits the spawn");
+    assert!(wait_until(a_zombie_waits), "the child ends before the next turn");
+    let mut child = drive(&mut driver, spawn)
+        .expect("the driver runs")
+        .expect("the test host starts the command");
+    let status = drive(&mut driver, child.wait()).expect("the driver runs");
+    assert_eq!(status.expect("the wait works").code(), Some(6));
+    assert_eq!(state(child.id()), State::Reaped);
+}
+
+/// With `SIGCHLD` ignored, the kernel reaps each child at its end, so the status is lost for the
+/// driver: the wait ends with `ECHILD`, and it does not wait for a status that cannot come. On
+/// macOS, the exit event can come before the kernel reaps the child, so the driver waits again
+/// with its bound.
+pub(in crate::driver) fn an_ignored_sigchld_ends_the_wait_with_echild(backend: Backend) {
+    /// `SIGCHLD` and `ECHILD`.
+    #[cfg(target_os = "linux")]
+    const SIGCHLD: c_int = 17;
+    #[cfg(target_os = "macos")]
+    const SIGCHLD: c_int = 20;
+    const ECHILD: i32 = 10;
+    crate::driver::signal::tests::ignore(SIGCHLD);
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
+    let mut command = sh("read line; exit 3");
+    command.stdin(Stdio::piped());
+    let mut child = spawn(&mut driver, command, ChildOptions::new());
+    let stdin = child.stdin.take().expect("the command pipes its input");
+    let close = driver.close_writer(stdin).expect("the test driver has room");
+    drive(&mut driver, close).expect("the driver runs");
+    let status = drive(&mut driver, child.wait()).expect("the driver runs");
+    let error = status.expect_err("the kernel took the status");
+    assert_eq!(error.raw_os_error(), Some(ECHILD));
+}
+
+/// A child whose status a tracer holds after its exit does not make the driver spin. Its process
+/// descriptor is readable, and each poll of the driver finds no status, so the driver waits with
+/// the backoff of its children before each poll: from 100 µs, doubling to 10 ms, then one poll
+/// each 10 ms. A driver that polls again at once turns thousands of times in `WINDOW`. The child
+/// lets any process of its user trace it (`PR_SET_PTRACER_ANY`), so the tracer needs no
+/// privilege. On io_uring from Linux 6.7, `IORING_OP_WAITID` waits in the kernel and makes no poll.
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "the calls name no memory, or only the status that they write")]
+pub(in crate::driver) fn a_child_whose_status_a_tracer_holds_does_not_make_the_driver_spin(backend: Backend) {
+    // The test of this case in the index of `driver::suite`, which the child and the tracer run.
+    const NAME: &str =
+        "driver::suite::operation::epoll::a_child_whose_status_a_tracer_holds_does_not_make_the_driver_spin";
+    const ROLE: &str = "RSASYNC_TRACED_ROLE";
+    const WINDOW_MS: u64 = 300;
+    /// `prctl` and `ptrace` requests (`include/uapi/linux/prctl.h` and `ptrace.h`), and the
+    /// option of `waitpid` that waits for a traced process that is no child (`__WALL`).
+    const PR_SET_PTRACER: c_int = 0x5961_6D61;
+    const PR_SET_PTRACER_ANY: core::ffi::c_ulong = core::ffi::c_ulong::MAX;
+    const PTRACE_SEIZE: c_int = 0x4206;
+    const WALL: c_int = 0x4000_0000;
+    #[expect(unsafe_code, reason = "the C library of each Linux target gives these functions")]
+    unsafe extern "C" {
+        fn prctl(option: c_int, ...) -> c_int;
+        fn ptrace(request: c_int, ...) -> core::ffi::c_long;
+        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    }
+    match std::env::var(ROLE).as_deref() {
+        // The child lets a tracer in, and it ends when its input ends.
+        Ok("child") => {
+            // SAFETY: the option names no memory.
+            let allowed = unsafe { prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0_u64, 0_u64, 0_u64) };
+            assert_eq!(allowed, 0, "prctl");
+            std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("the child reads its input");
+            std::process::exit(7);
+        }
+        // The tracer seizes the child, holds its status while its own input lasts, and then takes
+        // the status, which goes on to the parent.
+        Ok(pid) => {
+            let pid = pid.parse::<c_int>().expect("a process ID");
+            let null = core::ptr::null_mut::<core::ffi::c_void>();
+            let seize = || {
+                // SAFETY: a seize names no memory.
+                unsafe { ptrace(PTRACE_SEIZE, pid, null, null) == 0 }
+            };
+            assert!(
+                wait_until(seize),
+                "the tracer seizes the child: {}",
+                std::io::Error::last_os_error()
+            );
+            std::println!("seized");
+            std::io::copy(&mut std::io::stdin(), &mut std::io::sink()).expect("the tracer reads its input");
+            let mut status = 0;
+            // SAFETY: the call writes only `status`.
+            assert_eq!(unsafe { waitpid(pid, &raw mut status, WALL) }, pid);
+            std::process::exit(0);
+        }
+        Err(_) => {}
+    }
+    let (mut driver, _service) = with_service(Config::new(), 4, backend);
+    let exe = std::env::current_exe().expect("the test binary");
+    // `--nocapture`: libtest keeps the output of a test from its pipe otherwise.
+    let mut command = Command::new(&exe);
+    command.args(["--exact", NAME, "--nocapture"]).env(ROLE, "child");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = spawn(&mut driver, command, ChildOptions::new());
+    let mut tracer = Command::new(&exe)
+        .args(["--exact", NAME, "--nocapture"])
+        .env(ROLE, alloc::format!("{}", child.id()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the test host runs the tracer");
+    let mut lines = BufReader::new(tracer.stdout.take().expect("the tracer pipes its output")).lines();
+    assert!(
+        lines.any(|line| line.is_ok_and(|line| line == "seized")),
+        "the tracer seizes the child"
+    );
+
+    // The child ends, and the tracer holds its status.
+    let stdin = child.stdin.take().expect("the command pipes its input");
+    let close = driver.close_writer(stdin).expect("the test driver has room");
+    drive(&mut driver, close).expect("the driver runs");
+    let deadline = Instant::now() + Duration::from_millis(WINDOW_MS);
+    let wake = driver.wake_handle();
+    let ticker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(WINDOW_MS));
+        wake.wake();
+    });
+    let mut turns = 0_u64;
+    while Instant::now() < deadline {
+        let more = driver.turn().expect("a turn works").more();
+        turns += 1;
+        if !more && Instant::now() < deadline {
+            driver.wait().expect("a wait works");
+        }
+    }
+    ticker.join().expect("the ticker ends");
+    // The child ended and nothing reaped it, so its descriptor is readable and each poll missed.
+    let stat = std::fs::read_to_string(alloc::format!("/proc/{}/stat", child.id())).expect("procfs");
+    let state = stat.rsplit_once(") ").and_then(|(_, rest)| rest.chars().next());
+    assert_eq!(state, Some('Z'), "the tracer holds the status of the ended child");
+    // Seven waits take 12.7 ms, and then one poll comes each 10 ms. Each poll takes three turns:
+    // the end of the timer, the poll of the descriptor, which finds no status, and the next poll
+    // of the timer. The bound allows twice that. A driver that polls again at once turns thousands
+    // of times.
+    let polls = 8 + WINDOW_MS / 10;
+    assert!(turns <= 6 * polls, "{turns} turns in {WINDOW_MS} ms");
+
+    // The tracer gives the status back, and the wait gives it.
+    drop(tracer.stdin.take());
+    let status = drive(&mut driver, child.wait()).expect("the driver runs");
+    assert_eq!(status.expect("the wait works").code(), Some(7));
+    assert!(tracer.wait().expect("the tracer ends").success());
+}
+
 /// The report names the wait path of the kernel: `IORING_OP_WAITID` from Linux 6.7, and a poll of
 /// the process descriptor before.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_report_names_the_wait_path_of_the_kernel() {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("the test host has procfs");

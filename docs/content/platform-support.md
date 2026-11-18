@@ -99,10 +99,10 @@ Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both 
 
 ## macOS
 
-The driver runs TCP, UDP, local streams, and files on macOS on aarch64 (`aarch64-apple-darwin`), on
+The driver runs TCP, UDP, local streams, [pipes](pipes.md), [child processes](processes.md),
+[signal streams](signals.md), and files on macOS on aarch64 (`aarch64-apple-darwin`), on
 [kqueue](kqueue.md), in driver-only use. The files run on your blocking service, with the macOS
-calls of [Files](kqueue.md#files). Pipes, processes, and signals of the driver have no macOS form
-yet. The datagram calls of `rsnetwork-udp` also support macOS on aarch64:
+calls of [Files](kqueue.md#files). The datagram calls of `rsnetwork-udp` also support macOS on aarch64:
 see [Datagram I/O on any socket](datagram-io.md). CI does not run on macOS.
 
 On 2026-11-17, these runs passed on an aarch64 Mac (MacBookPro18,3, Apple M1 Pro) with macOS 27.2.1

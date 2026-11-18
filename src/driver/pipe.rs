@@ -1,10 +1,12 @@
 //! Pipe ends on the driver: the read end and the write end of a pipe or a FIFO, under the stream
 //! rules of TCP.
 
+mod sys;
+
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 
 use super::tcp::{Closed, ReadHalf, WriteHalf};
-use super::{Driver, Medium, Operation, Reason, Refused, Resource, sys};
+use super::{Driver, Medium, Operation, Reason, Refused, Resource};
 
 /// The read end of a pipe, which the driver owns. [`Driver::recv`] and [`Driver::recv_selected`]
 /// borrow it, as they borrow a [`TcpStream`](super::TcpStream), under the same rules: one
@@ -90,13 +92,13 @@ impl AsMut<WriteHalf> for PipeWriter {
 impl Driver {
     /// Takes `fd`, the read end of a pipe or a FIFO, for example the standard output of a child.
     /// On io_uring, the driver clears `O_NONBLOCK` of its open file description, because a
-    /// nonblocking read ends at once with no data instead of waiting. On epoll, the driver sets
-    /// it, because its reads run when epoll reports the descriptor readable.
+    /// nonblocking read ends at once with no data instead of waiting. On epoll and kqueue, the
+    /// driver sets it, because its reads run when the poller reports the descriptor readable.
     ///
     /// # Errors
     ///
     /// A refusal, with `fd`, that gives [`Reason::NotPipe`], [`Reason::Direction`] for a write
-    /// end, [`Reason::Resources`], or [`Reason::Register`] on epoll.
+    /// end, [`Reason::Resources`], or [`Reason::Register`] on epoll and kqueue.
     pub fn adopt_reader(&mut self, fd: OwnedFd) -> Result<PipeReader, Refused<OwnedFd>> {
         let resource = self.adopt_pipe(fd, true)?;
         Ok(PipeReader {
@@ -106,13 +108,13 @@ impl Driver {
 
     /// Takes `fd`, the write end of a pipe or a FIFO, for example the standard input of a child.
     /// On io_uring, the driver clears `O_NONBLOCK` of its open file description, because a
-    /// nonblocking write to a full pipe ends at once instead of waiting. On epoll, the driver sets
-    /// it, because its writes run when epoll reports the descriptor writable.
+    /// nonblocking write to a full pipe ends at once instead of waiting. On epoll and kqueue, the
+    /// driver sets it, because its writes run when the poller reports the descriptor writable.
     ///
     /// # Errors
     ///
     /// A refusal, with `fd`, that gives [`Reason::NotPipe`], [`Reason::Direction`] for a read
-    /// end, [`Reason::Resources`], or [`Reason::Register`] on epoll.
+    /// end, [`Reason::Resources`], or [`Reason::Register`] on epoll and kqueue.
     pub fn adopt_writer(&mut self, fd: OwnedFd) -> Result<PipeWriter, Refused<OwnedFd>> {
         let resource = self.adopt_pipe(fd, false)?;
         Ok(PipeWriter {
@@ -151,8 +153,7 @@ impl Driver {
     fn adopt_pipe(&mut self, fd: OwnedFd, read: bool) -> Result<Resource, Refused<OwnedFd>> {
         let refuse = |reason, value| Err(Refused { reason, value });
         let raw = fd.as_raw_fd();
-        // SAFETY: the command names no memory. Only a pipe or a FIFO has a capacity.
-        if unsafe { sys::fcntl(raw, sys::F_GETPIPE_SZ) } < 0 {
+        if !sys::is_pipe(raw) {
             return refuse(Reason::NotPipe, fd);
         }
         // SAFETY: the command names no memory.
