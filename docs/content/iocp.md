@@ -1,10 +1,11 @@
 # The IOCP backend
 
-On Windows, the driver runs on an I/O completion port (IOCP). TCP and UDP have the same API and the
-same ownership rules as on io_uring and epoll: the terminal event of an operation releases its buffer and
-its charge, and a dropped or forgotten future ends only the interest. This page tells how each TCP
-and UDP operation runs on the port, when the port skips a packet, and what differs from Linux. rsasync is in
-development, and the IOCP backend is not in a published release yet.
+On Windows, the driver runs on an I/O completion port (IOCP). TCP, UDP, and files have the same API
+and the same ownership rules as on io_uring and epoll: the terminal event of an operation releases
+its buffer and its charge, and a dropped or forgotten future ends only the interest. This page tells
+how each TCP, UDP, and file operation runs on the port, when the port skips a packet, which file
+operations run on your blocking service, and what differs from Linux. rsasync is in development,
+and the IOCP backend is not in a published release yet.
 
 ## Select the backend
 
@@ -81,6 +82,57 @@ the segment sizes and each datagram, so no run shows a fallback.
 
 Windows refuses to send the CE codepoint (`WSAEINVAL`), and it has one IPv4 loopback address.
 
+## Files
+
+Files run on the port with the API of [files on the driver](files.md). A read, a write, and a hole
+punch are overlapped calls on the port (`Route::Port` for `Call::FileData`). Windows has no
+overlapped form of the other file calls, so each one runs as a job of the
+[blocking service](blocking-service.md) that `Driver::use_blocking` gives (`Route::BlockingService`
+for `Call::File` and `Call::SetFileLen`). With no service, such a call refuses with
+`Reason::Blocking`. Give the driver a service before the first open:
+
+```rust
+use core::num::NonZeroU64;
+
+use rsasync::blocking::{self, Service};
+use rsasync::capacity::Budget;
+use rsasync::driver::{Config, Driver};
+
+let mut driver = Driver::new(Config::new())?;
+let budget = Budget::new(NonZeroU64::new(16 << 20).unwrap());
+let service = Service::new(&budget, blocking::Config::new())?;
+driver.use_blocking(service.submitter());
+```
+
+| Operation | On IOCP |
+| --- | --- |
+| Open and directory open | A job: one `CreateFileW` with `FILE_FLAG_OVERLAPPED`, which lets other handles read, write, rename, and delete the file. A file with writes gets a second handle of the same file with `FILE_FLAG_WRITE_THROUGH` (`ReOpenFile`), for the durable writes. A directory open uses `FILE_FLAG_BACKUP_SEMANTICS`. The driver associates each handle with its port |
+| Read and write | One overlapped `ReadFile` or `WriteFile` at the offset of the `OVERLAPPED`. A read at or after the end of the file gives 0 |
+| Durable write (`WriteMode::DataSync`) | One overlapped `WriteFile` on the write-through handle |
+| Vectored read and write | One overlapped call for each region, in order: the next region starts at the packet of the one before it. A short or failed region ends the operation, with the bytes before it |
+| Length and its change | A job: `GetFileInformationByHandleEx` with `FileStandardInfo`, and `SetFileInformationByHandle` with `FileEndOfFileInfo` |
+| Preallocation | A job: `FileAllocationInfo`, and `FileEndOfFileInfo` for `Length::Extend`. It runs alone on its file (see [Length and space](files.md#length-and-space)) |
+| Hole punch | Two overlapped `DeviceIoControl` calls: `FSCTL_SET_SPARSE`, then `FSCTL_SET_ZERO_DATA` |
+| Sync | A job: `FlushFileBuffers` |
+| Directory sync | `Unsupported` at once, with no call (`Route::Unsupported` for `Call::SyncDirectory`): no source states that a flush of a directory makes its creates, renames, and unlinks durable on NTFS |
+| Rename and unlink | A job: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, and `DeleteFileW` |
+| NVMe report (`Driver::nvme_path`) | A job that reads the driver of each disk of the volume of the file (see [Native NVMe](#native-nvme)) |
+| Close | `CloseHandle` of each handle of the file, on the thread of the driver, after each operation of the file ended |
+
+A file never skips packets: each job owns a duplicate of the file handle, so that it never names a
+handle that the driver closed, and the port skips packets only on a handle that is never
+duplicated. So each overlapped file call that does not fail at once ends at its packet, and the file
+cases pass the same on both forms of the suites. A transfer moves at most `i32::MAX` bytes in one
+operation, and the rest stays for the next one, as on Linux.
+
+### Native NVMe
+
+`Driver::nvme_path(&file)` gives `NvmePath::Native` when the native NVMe path of Windows Server
+2025 serves each disk of the volume of the file, and `NvmePath::Other` when another driver serves a
+disk, or when the volume has no local disk. A job reads the driver service of the device node of
+each disk (`nvmedisk` for the native path, `disk` for the disk class driver over the SCSI
+translation of the port driver). It never infers the path from the version of the system.
+
 ## Skip-on-success
 
 A socket skips the packet of a call that ends at once (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`) only
@@ -104,7 +156,9 @@ that ends it. At most one wake packet waits in the port.
 
 ## Helper threads
 
-The driver starts no thread, and `report().helper_threads()` gives 0.
+The driver starts no thread, and `report().helper_threads()` gives 0. The file calls with no
+overlapped form run on the threads of your blocking service: open, directory open, length
+inspection and change, preallocation, sync, rename, unlink, and the NVMe report.
 
 ## Differences from Linux
 
@@ -130,5 +184,5 @@ The driver starts no thread, and `report().helper_threads()` gives 0.
 
 ## Limits
 
-- TCP and UDP only. Files, pipes, local streams, processes, and signals have no Windows form yet.
+- TCP, UDP, and files only. Pipes, local streams, processes, and signals have no Windows form yet.
 - Windows x86_64 only. Windows on aarch64 has no run evidence.

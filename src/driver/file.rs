@@ -5,30 +5,49 @@
 //! the close of the file waits until each of them ends. Each operation keeps its buffer until its
 //! terminal event, also after a drop of its future. A dropped write is not cancelled: it can still
 //! change the file.
+//!
+//! On Windows, the reads, the writes, and the hole punches are overlapped calls on the port of the
+//! driver, and each other operation runs on the blocking service ([`windows`]).
+
+#[cfg(target_os = "windows")]
+pub(super) mod windows;
 
 use alloc::vec::Vec;
+#[cfg(unix)]
 use core::ffi::{c_int, c_void};
 use core::fmt;
 use core::task::{Context, Poll};
+#[cfg(unix)]
 use std::ffi::CString;
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd as _, OwnedFd as Duplicate, OwnedFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, OwnedHandle as Duplicate};
 use std::path::Path;
 
-use rsnetwork_udp::sys::IoVec;
+// One region of a vectored read: `struct iovec` on Linux and macOS, and `WSABUF` on Windows.
+#[cfg(unix)]
+use rsnetwork_udp::sys::IoVec as Region;
 
-use super::tcp::{Regions, count};
 // The open flags and the structures of the file calls: the declarations of the driver on Linux,
-// and those of the poller on macOS, where only the file jobs of the poller make file calls.
+// those of the poller on macOS, where only the file jobs of the poller make file calls, and those
+// of the port on Windows.
+#[cfg(target_os = "windows")]
+use super::iocp::sys::{self, WsaBuf as Region};
+#[cfg(unix)]
+use super::poller;
 #[cfg(target_os = "macos")]
 use super::poller::sys;
 #[cfg(target_os = "linux")]
 use super::sys;
+use super::tcp::{Regions, count};
 use super::{
     Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
-    Route, Tag, poller,
+    Route, Tag,
 };
 use crate::blocking::{Job, Submitter};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
@@ -41,10 +60,89 @@ use crate::uring::sys::{FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, RWF_DSYNC};
 const EMPTY: &core::ffi::CStr = c"";
 
 /// `EIO` (`include/uapi/asm-generic/errno-base.h` of Linux, and `sys/errno.h` of macOS), for a job
-/// of the blocking service that gives no error number.
+/// of the blocking service that gives no error number. On Windows, `ERROR_GEN_FAILURE`
+/// (`winerror.h`).
+#[cfg(unix)]
 const EIO: i32 = 5;
-/// `EINVAL`, for options or a path that no call can take.
+#[cfg(target_os = "windows")]
+const EIO: i32 = 31;
+/// `EINVAL`, for options or a path that no call can take. On Windows, `ERROR_INVALID_PARAMETER`,
+/// which also reads as `InvalidInput`.
+#[cfg(unix)]
 const EINVAL: i32 = 22;
+#[cfg(target_os = "windows")]
+const EINVAL: i32 = sys::ERROR_INVALID_PARAMETER;
+/// The error of a call with no qualified form ([`Route::Unsupported`]), which reads as
+/// `Unsupported`: `EOPNOTSUPP` on Linux, `ENOTSUP` on macOS, and `ERROR_CALL_NOT_IMPLEMENTED` on
+/// Windows.
+#[cfg(target_os = "linux")]
+const UNSUPPORTED: i32 = 95;
+#[cfg(target_os = "macos")]
+const UNSUPPORTED: i32 = 45;
+#[cfg(target_os = "windows")]
+const UNSUPPORTED: i32 = sys::ERROR_CALL_NOT_IMPLEMENTED;
+
+/// The descriptor of an entry that names no file: `AT_FDCWD` for a path relative to the working
+/// directory on Linux and macOS. A Windows call of a path takes no handle.
+#[cfg(unix)]
+const CWD: RawFd = sys::AT_FDCWD;
+#[cfg(target_os = "windows")]
+const CWD: i32 = -1;
+
+/// A path as the system calls take it: a C string on Linux and macOS, and a NUL-terminated UTF-16
+/// string on Windows.
+#[cfg(unix)]
+pub(crate) type Name = CString;
+#[cfg(target_os = "windows")]
+pub(crate) type Name = Vec<u16>;
+
+/// The handles of a file that the driver owns on Windows: the file, and for a file with writes a
+/// second handle of the same file with `FILE_FLAG_WRITE_THROUGH`, for the durable writes
+/// ([`WriteMode::DataSync`]).
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) struct Handles {
+    pub(crate) file: OwnedHandle,
+    pub(crate) through: Option<OwnedHandle>,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::Opening;
+
+/// The open of a file or a directory on Linux and macOS: the path and the flags of `openat`, its
+/// mode, and the alignment of direct I/O of the file that the open gave.
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) struct Opening {
+    path: CString,
+    flags: c_int,
+    mode: u32,
+    alignment: Option<Alignment>,
+}
+
+#[cfg(unix)]
+impl Opening {
+    /// The open of the file at `path` with `options`, or `None` for options that no open can take
+    /// or a path with a NUL byte.
+    fn file(path: &Path, options: OpenOptions) -> Option<Self> {
+        Some(Self {
+            path: name(path)?,
+            flags: options.flags()?,
+            mode: options.mode,
+            alignment: None,
+        })
+    }
+
+    /// The open of the directory at `path`, or `None` for a path with a NUL byte.
+    fn directory(path: &Path) -> Option<Self> {
+        Some(Self {
+            path: name(path)?,
+            flags: sys::O_RDONLY | sys::O_DIRECTORY | sys::O_CLOEXEC,
+            mode: 0,
+            alignment: None,
+        })
+    }
+}
 
 /// The alignment of direct I/O when the file system does not report it: one page.
 #[cfg(target_os = "linux")]
@@ -53,12 +151,14 @@ const PAGE: Alignment = Alignment {
     offset: 4096,
 };
 
-/// The structure that the length inspection of a file fills: `struct statx` on Linux, and
-/// `struct stat` on macOS.
+/// The structure that the length inspection of a file fills: `struct statx` on Linux,
+/// `struct stat` on macOS, and `FILE_STANDARD_INFO` on Windows.
 #[cfg(target_os = "linux")]
 pub(crate) type Stat = sys::Statx;
 #[cfg(target_os = "macos")]
 pub(crate) type Stat = sys::Stat;
+#[cfg(target_os = "windows")]
+pub(crate) type Stat = sys::FileStandardInfo;
 
 /// The file operation of [`Kind::File`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,26 +170,51 @@ pub(crate) enum Op {
     Read,
     /// A vectored read into the buffers.
     ReadVectored,
-    /// An operation that gives only its result: a write, a sync, a change of length or space, a
-    /// `statx`, a rename, or an unlink.
+    /// A write, or a vectored write, with its mode. It gives only its result. On Windows, a durable
+    /// write goes through the write-through handle of its file.
+    Write(WriteMode),
+    /// A hole punch. It gives only its result.
+    Punch,
+    /// An operation that gives only its result: a sync, a change of length or space, a `statx`, a
+    /// rename, or an unlink.
     Plain,
-    /// A preallocation that extends the length, on macOS ([`Length::Extend`]): it runs alone on its
-    /// file, because its length change is a second call.
-    #[cfg(target_os = "macos")]
-    Extend,
+    /// An operation that runs alone on its file, because it is more than one call
+    /// ([`Driver::allocate`]): on macOS, a preallocation that extends the length, and on Windows,
+    /// each preallocation.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    Alone,
 }
 
-/// A file operation that waits on macOS until it can run, because an allocation that extends the
-/// length runs alone on its file ([`Driver::allocate`]): its operation, its file, and its job.
-#[cfg(target_os = "macos")]
+impl Op {
+    /// The call of the report that names the route of the operation.
+    const fn call(self) -> Call {
+        match self {
+            Self::Read | Self::ReadVectored | Self::Write(_) | Self::Punch => Call::FileData,
+            _ => Call::File,
+        }
+    }
+}
+
+/// A file operation that waits on macOS and Windows until it can run, because an operation runs
+/// alone on its file ([`Op::Alone`]): its operation, its file, and how it starts.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(super) struct Waiting {
     id: super::OpId,
     resource: Resource,
     op: Op,
-    job: FileJob,
+    start: Start,
 }
 
-#[cfg(target_os = "macos")]
+/// How a waiting file operation starts: as a job of the blocking service, or on Windows as an
+/// overlapped entry of the port.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+enum Start {
+    Job(FileJob),
+    #[cfg(target_os = "windows")]
+    Port(Sqe),
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Waiting {
     /// The operation that waits.
     pub(super) const fn id(&self) -> super::OpId {
@@ -132,7 +257,8 @@ impl Waiting {
 /// use rsasync::driver::{Config, Driver, OpenOptions, SyncMode, WriteMode};
 ///
 /// let mut driver = Driver::new(Config::new())?;
-/// // On epoll and kqueue, each file call is a job of a blocking service.
+/// // On epoll and kqueue, each file call is a job of a blocking service, and on IOCP each file
+/// // call with no overlapped form.
 /// let budget = Budget::new(NonZeroU64::new(16 << 20).unwrap());
 /// let service = Service::new(&budget, blocking::Config::new())?;
 /// driver.use_blocking(service.submitter());
@@ -278,13 +404,15 @@ pub enum Cache {
     #[default]
     Buffered,
     /// Between the device and the buffers of the caller, with no copy in the page cache
-    /// (`O_DIRECT`, and `F_NOCACHE` after the open on macOS). Each buffer, length, and offset has
-    /// the [`Alignment`] of the file.
+    /// (`O_DIRECT`, `F_NOCACHE` after the open on macOS, and `FILE_FLAG_NO_BUFFERING` on Windows).
+    /// Each buffer, length, and offset has the [`Alignment`] of the file.
     Direct,
 }
 
 /// How [`Driver::open_file`] opens a file. The defaults: read only, through the page cache, and mode
-/// `0o666` (less the umask) for a file that the open makes.
+/// `0o666` (less the umask) for a file that the open makes. On Windows, the open lets other handles
+/// read, write, rename, and delete the file, as on Linux and macOS, and a file that the open makes
+/// takes the security of its directory, with no mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOptions {
     read: bool,
@@ -341,7 +469,7 @@ impl OpenOptions {
         Self { truncate, ..self }
     }
 
-    /// The mode of a file that the open makes, less the umask.
+    /// The mode of a file that the open makes, less the umask. Windows has no mode.
     #[must_use]
     pub const fn mode(self, mode: u32) -> Self {
         Self { mode, ..self }
@@ -355,6 +483,7 @@ impl OpenOptions {
 
     /// The flags of `openat`, or `None` for options that no open can take, as for
     /// `std::fs::OpenOptions`.
+    #[cfg(unix)]
     fn flags(self) -> Option<c_int> {
         let access = match (self.read, self.write) {
             (true, false) => sys::O_RDONLY,
@@ -390,7 +519,9 @@ impl Default for OpenOptions {
 }
 
 /// What [`Driver::sync`] makes durable. On macOS, each mode is `F_FULLFSYNC`, which also writes the
-/// cache of the device to its media: a plain `fsync` of macOS leaves the bytes in that cache.
+/// cache of the device to its media: a plain `fsync` of macOS leaves the bytes in that cache. On
+/// Windows, each mode is `FlushFileBuffers`, which writes the contents and the metadata of the
+/// file and the cache of the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     /// The contents, and the metadata that a later read needs, such as the length (`fdatasync`).
@@ -406,7 +537,9 @@ pub enum WriteMode {
     #[default]
     Plain,
     /// The write ends when its bytes are durable, as with a `fdatasync` after it (`RWF_DSYNC`). On
-    /// macOS, the job of the write makes an `F_FULLFSYNC` after it.
+    /// macOS, the job of the write makes an `F_FULLFSYNC` after it. On Windows, the write goes
+    /// through a second handle of the file with `FILE_FLAG_WRITE_THROUGH`, which the open makes for
+    /// a file with writes.
     DataSync,
 }
 
@@ -462,7 +595,7 @@ impl core::error::Error for Incomplete {}
 pub struct Buffers {
     loans: Vec<WriteLoan<Backing>>,
     /// The iovec array of the read, whose capacity the pushes reserve.
-    vectors: Vec<IoVec>,
+    vectors: Vec<Region>,
 }
 
 #[expect(unsafe_code, reason = "the array holds only addresses of memory that the loans own")]
@@ -500,11 +633,19 @@ impl Buffers {
 
     /// The iovec array of the capacity of each buffer, and its length. Its capacity holds the
     /// array, so it allocates nothing.
-    fn vectors(&mut self) -> (*const IoVec, u32) {
+    fn vectors(&mut self) -> (*const Region, u32) {
         self.vectors.clear();
-        self.vectors.extend(self.loans.iter_mut().map(|loan| IoVec {
+        #[cfg(unix)]
+        self.vectors.extend(self.loans.iter_mut().map(|loan| Region {
             iov_base: loan.as_mut_ptr().cast::<c_void>(),
             iov_len: loan.capacity(),
+        }));
+        // A `WSABUF` holds at most `u32::MAX` bytes, so a larger buffer takes a prefix, and the
+        // count of the read reports it.
+        #[cfg(target_os = "windows")]
+        self.vectors.extend(self.loans.iter_mut().map(|loan| Region {
+            len: u32::try_from(loan.capacity()).unwrap_or(u32::MAX),
+            buf: loan.as_mut_ptr().cast(),
         }));
         (
             self.vectors.as_ptr(),
@@ -546,6 +687,7 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
         return;
     };
     match op {
+        #[cfg(unix)]
         Op::Open { direct } => {
             // SAFETY: the kernel gave a new descriptor, which only this operation names.
             let fd = unsafe { OwnedFd::from_raw_fd(result) };
@@ -563,10 +705,28 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
             match resources.adopt(fd, Medium::File) {
                 Ok(resource) => {
                     held.accepted = Some(resource);
-                    if let Payload::Open { alignment: field, .. } = &mut held.payload {
-                        *field = alignment;
+                    if let Payload::Open(opening) = &mut held.payload {
+                        opening.alignment = alignment;
                     }
                 }
+                Err((_, _closed)) => held.error = Some(io::ErrorKind::OutOfMemory),
+            }
+        }
+        // The job of the open read the alignment, and made the write-through handle.
+        #[cfg(target_os = "windows")]
+        Op::Open { .. } => {
+            // SAFETY: the job gave the number of a new handle, which only this operation names.
+            let file = unsafe { OwnedHandle::from_raw_handle(windows::handle(result)) };
+            let through = match &mut held.payload {
+                Payload::Open(opening) => opening.through.take(),
+                _ => None,
+            };
+            if abandoned {
+                // No caller takes the file, so the drops close its handles.
+                return;
+            }
+            match resources.adopt_file(Handles { file, through }) {
+                Ok(resource) => held.accepted = Some(resource),
                 Err((_, _closed)) => held.error = Some(io::ErrorKind::OutOfMemory),
             }
         }
@@ -582,9 +742,9 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
                 buffers.fill(count);
             }
         }
-        Op::Plain => {}
-        #[cfg(target_os = "macos")]
-        Op::Extend => {}
+        Op::Write(_) | Op::Punch | Op::Plain => {}
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        Op::Alone => {}
     }
 }
 
@@ -672,9 +832,22 @@ fn length(stat: &Stat) -> io::Result<u64> {
     u64::try_from(stat.st_size).map_err(|_| io::ErrorKind::InvalidData.into())
 }
 
+/// The length of a file in the structure of its inspection.
+#[cfg(target_os = "windows")]
+fn length(stat: &Stat) -> io::Result<u64> {
+    u64::try_from(stat.end).map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
 /// The C string of `path`, or `None` when it holds a NUL byte.
-fn c_path(path: &Path) -> Option<CString> {
+#[cfg(unix)]
+fn name(path: &Path) -> Option<Name> {
     CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+/// The UTF-16 string of `path`, or `None` when it holds a NUL unit.
+#[cfg(target_os = "windows")]
+fn name(path: &Path) -> Option<Name> {
+    windows::wide(path)
 }
 
 /// The result of an operation that gives no value, or the error of the home.
@@ -691,8 +864,8 @@ fn opened(result: i32, held: &Held) -> io::Result<(Resource, Option<Alignment>)>
     if let Some(kind) = held.error {
         return Err(kind.into());
     }
-    let alignment = match held.payload {
-        Payload::Open { alignment, .. } => alignment,
+    let alignment = match &held.payload {
+        Payload::Open(opening) => opening.alignment,
         _ => None,
     };
     held.accepted
@@ -717,29 +890,64 @@ fn poll_job(held: Option<&mut Held>, cx: &Context<'_>) -> Option<i32> {
     }
 }
 
-/// Whether the file operation `op` can start on the file of `owned` on macOS, with `waiting` of its
-/// operations that wait: no allocation that extends the file runs, and such an allocation starts
-/// only when no other operation of the file runs.
-#[cfg(target_os = "macos")]
+/// Whether the file operation `op` can start on the file of `owned` on macOS and Windows, with
+/// `waiting` of its operations that wait: no operation that runs alone runs, and such an operation
+/// starts only when no other operation of the file runs.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn free(owned: &super::Owned, table: &crate::table::Table<Tag>, op: Op, waiting: usize) -> bool {
     let exclusive = owned.exclusive.is_some_and(|id| table.runs(id));
     let others = (owned.running as usize).saturating_sub(waiting);
-    !exclusive && (op != Op::Extend || others == 0)
+    !exclusive && (op != Op::Alone || others == 0)
 }
 
-/// The job of a file entry on the epoll and kqueue backends: its entry, and the duplicate of its
-/// descriptor, which stays open until the job returns.
+/// The job of a file entry on the blocking service: its entry, and the duplicate of its descriptor
+/// or handle, which stays open until the job returns.
 struct FileJob {
     sqe: Sqe,
-    _fd: Option<OwnedFd>,
+    _fd: Option<Duplicate>,
 }
 
 impl Job for FileJob {
     type Output = i32;
 
+    #[cfg(unix)]
     fn run(self) -> i32 {
         poller::run_file(&self.sqe)
     }
+
+    #[cfg(target_os = "windows")]
+    fn run(self) -> i32 {
+        windows::run_file(&self.sqe)
+    }
+}
+
+/// The number of the descriptor `fd` in an entry.
+#[cfg(unix)]
+fn raw(fd: &Duplicate) -> Option<i32> {
+    Some(fd.as_raw_fd())
+}
+
+/// The number of the handle `fd` in an entry, or `None` for a handle with significant bits above
+/// the low 32.
+#[cfg(target_os = "windows")]
+fn raw(fd: &Duplicate) -> Option<i32> {
+    windows::number(fd.as_raw_handle())
+}
+
+/// Whether the native NVMe path of Windows Server 2025 serves the device of a file
+/// ([`Driver::nvme_path`]). The driver reads the driver service of the device node of each disk of
+/// the volume of the file, never the version of the system.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NvmePath {
+    /// The native NVMe driver (`nvmedisk`) serves each disk of the volume: an NVMe command goes to
+    /// the device with no SCSI translation, so each read and write costs less.
+    Native,
+    /// Another driver serves a disk of the volume, for example the disk class driver (`disk`) over
+    /// the SCSI translation of `stornvme` or of the NVMe driver of a cloud provider, or the volume
+    /// has no local disk, as a network share has none.
+    Other,
 }
 
 /// The waker of the jobs of the blocking service: it wakes the driver, also in a wait.
@@ -786,22 +994,22 @@ impl Driver {
         };
         // An open that changes the file system runs to its end.
         let changes = options.create || options.create_new || options.truncate;
-        let completion = self.begin_open(path, options.flags(), options.mode, op, !changes)?;
+        let completion = self.begin_open(Opening::file(path, options), op, !changes)?;
         Ok(Operation::new(completion, |result, held| {
             Some(opened(result, &held).map(|(resource, alignment)| File { resource, alignment }))
         }))
     }
 
-    /// Opens the directory at `path` (`O_DIRECTORY`), for [`Driver::sync_directory`]. The open
-    /// changes nothing, so a drop of its future asks for a cancel.
+    /// Opens the directory at `path` (`O_DIRECTORY`, and `FILE_FLAG_BACKUP_SEMANTICS` on Windows),
+    /// for [`Driver::sync_directory`]. The open changes nothing, so a drop of its future asks for a
+    /// cancel.
     ///
     /// # Errors
     ///
     /// As for [`Driver::open_file`]: the future gives `NotADirectory` for a path that is not a
     /// directory.
     pub fn open_directory(&mut self, path: &Path) -> Result<Operation<'static, io::Result<Directory>>, Refused<()>> {
-        let flags = sys::O_RDONLY | sys::O_DIRECTORY | sys::O_CLOEXEC;
-        let completion = self.begin_open(path, Some(flags), 0, Op::Open { direct: false }, true)?;
+        let completion = self.begin_open(Opening::directory(path), Op::Open { direct: false }, true)?;
         Ok(Operation::new(completion, |result, held| {
             Some(opened(result, &held).map(|(resource, _)| Directory { resource }))
         }))
@@ -930,7 +1138,7 @@ impl Driver {
                 .with_rw_flags(mode.flags()),
             _ => Sqe::nop(),
         };
-        let completion = self.begin_file(Some(file.resource), Op::Plain, lease, held, entry, false)?;
+        let completion = self.begin_file(Some(file.resource), Op::Write(mode), lease, held, entry, false)?;
         Ok(Operation::new(completion, |result, held| {
             let Payload::Lease(lease) = held.payload else {
                 return None;
@@ -974,7 +1182,7 @@ impl Driver {
             }
             _ => Sqe::nop(),
         };
-        let completion = self.begin_file(Some(file.resource), Op::Plain, regions, held, entry, false)?;
+        let completion = self.begin_file(Some(file.resource), Op::Write(mode), regions, held, entry, false)?;
         Ok(Operation::new(completion, |result, held| {
             let Payload::Regions(regions) = held.payload else {
                 return None;
@@ -1006,8 +1214,9 @@ impl Driver {
             ),
             _ => Sqe::nop(),
         };
-        // The job makes an `fstat` of the descriptor of the entry into its structure.
-        #[cfg(target_os = "macos")]
+        // The job makes an `fstat` of the descriptor of the entry into its structure, and on Windows
+        // a `GetFileInformationByHandleEx` of the handle.
+        #[cfg(not(target_os = "linux"))]
         let entry = |fd, held: &mut Held| match &mut held.payload {
             Payload::Stat(stat) => Sqe::statx(fd, core::ptr::null(), 0, 0, (&raw mut *stat).cast()),
             _ => Sqe::nop(),
@@ -1038,7 +1247,11 @@ impl Driver {
             let entry = move |fd, _: &mut Held| Sqe::ftruncate(fd, len);
             self.begin_file(Some(file.resource), Op::Plain, (), |()| Held::default(), entry, false)?
         } else {
-            self.begin_job(file.resource, len)?
+            let job = move |fd: Duplicate| match fs::File::from(fd).set_len(len) {
+                Ok(()) => 0,
+                Err(error) => -error.raw_os_error().unwrap_or(EIO),
+            };
+            self.begin_job(file.resource, job)?
         };
         Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
     }
@@ -1054,6 +1267,13 @@ impl Driver {
     /// change, so such an allocation runs alone on its file: it starts when each other operation
     /// of the file ended, and each later one waits until it ends. Another process that writes the
     /// file at the same time is outside that order, as for each `ftruncate`.
+    ///
+    /// On Windows, the job sets `FileAllocationInfo`, and then `FileEndOfFileInfo` for
+    /// [`Length::Extend`]. A value of `FileAllocationInfo` below the length cuts the file, so the
+    /// job reads the allocation and the length first, and each preallocation runs alone on its
+    /// file, as above. NTFS frees the clusters after the end of the file at its last close, so
+    /// [`Length::Keep`] reserves them only while the file is open. In a sparse file, a hole can stay
+    /// a hole.
     ///
     /// # Errors
     ///
@@ -1074,8 +1294,12 @@ impl Driver {
         #[cfg(target_os = "macos")]
         let op = match length {
             Length::Keep => Op::Plain,
-            Length::Extend => Op::Extend,
+            Length::Extend => Op::Alone,
         };
+        // `FileAllocationInfo` sets the allocation, and a value below the length cuts the file, so
+        // the job reads both first, and no write of the driver can end between the calls.
+        #[cfg(target_os = "windows")]
+        let op = Op::Alone;
         #[cfg(target_os = "linux")]
         let op = Op::Plain;
         self.fallocate(file, op, mode, offset, len)
@@ -1088,7 +1312,8 @@ impl Driver {
     ///
     /// On macOS, `F_PUNCHHOLE` frees the whole blocks of the file system in the range, and then
     /// the job writes zeros into the bytes of the range in its first and last block, before the
-    /// end of the file.
+    /// end of the file. On Windows, the punch makes the file sparse (`FSCTL_SET_SPARSE`), and then
+    /// `FSCTL_SET_ZERO_DATA` frees the clusters of the range, both overlapped calls on the port.
     ///
     /// # Errors
     ///
@@ -1101,11 +1326,12 @@ impl Driver {
         offset: u64,
         len: u64,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        self.fallocate(file, Op::Plain, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len)
+        self.fallocate(file, Op::Punch, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len)
     }
 
     /// Makes the writes of `file` that ended before it durable, as `mode` says
-    /// (`IORING_OP_FSYNC`, and `F_FULLFSYNC` on macOS). A drop of the future does not cancel it.
+    /// (`IORING_OP_FSYNC`, `F_FULLFSYNC` on macOS, and `FlushFileBuffers` on Windows). A drop of the
+    /// future does not cancel it.
     ///
     /// # Errors
     ///
@@ -1118,7 +1344,9 @@ impl Driver {
 
     /// Makes the creates, renames, and unlinks in `directory` that ended before it durable
     /// (`IORING_OP_FSYNC` on the directory, and `F_FULLFSYNC` on macOS). A drop of the future does
-    /// not cancel it.
+    /// not cancel it. On Windows, the future gives `Unsupported` at once ([`Route::Unsupported`]
+    /// for [`Call::SyncDirectory`]): no source states that a flush of a directory makes its
+    /// namespace changes durable.
     ///
     /// # Errors
     ///
@@ -1127,6 +1355,10 @@ impl Driver {
         &mut self,
         directory: &'a Directory,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
+        if self.report.route(Call::SyncDirectory) == Route::Unsupported {
+            let completion = self.fail_now(UNSUPPORTED)?;
+            return Ok(Operation::new(completion, |result, held| Some(done(result, &held))));
+        }
         self.fsync(directory.resource, false)
     }
 
@@ -1139,7 +1371,7 @@ impl Driver {
     /// A refusal when the driver has no room for the operation. The future gives an error of the
     /// system, or `InvalidInput` for a path with a NUL byte.
     pub fn rename(&mut self, from: &Path, to: &Path) -> Result<Operation<'static, io::Result<()>>, Refused<()>> {
-        let completion = match (c_path(from), c_path(to)) {
+        let completion = match (name(from), name(to)) {
             (Some(from), Some(to)) => {
                 let held = |(path, target)| Held {
                     payload: Payload::Paths {
@@ -1152,13 +1384,7 @@ impl Driver {
                     Payload::Paths {
                         path,
                         target: Some(target),
-                    } => Sqe::renameat(
-                        sys::AT_FDCWD,
-                        path.as_ptr().cast(),
-                        sys::AT_FDCWD,
-                        target.as_ptr().cast(),
-                        0,
-                    ),
+                    } => Sqe::renameat(CWD, path.as_ptr().cast(), CWD, target.as_ptr().cast(), 0),
                     _ => Sqe::nop(),
                 };
                 self.begin_file(None, Op::Plain, (from, to), held, entry, false)
@@ -1179,14 +1405,14 @@ impl Driver {
     ///
     /// As for [`Driver::rename`].
     pub fn unlink(&mut self, path: &Path) -> Result<Operation<'static, io::Result<()>>, Refused<()>> {
-        let completion = match c_path(path) {
+        let completion = match name(path) {
             Some(path) => {
                 let held = |path| Held {
                     payload: Payload::Paths { path, target: None },
                     ..Held::default()
                 };
                 let entry = |_, held: &mut Held| match &held.payload {
-                    Payload::Paths { path, .. } => Sqe::unlinkat(sys::AT_FDCWD, path.as_ptr().cast(), 0),
+                    Payload::Paths { path, .. } => Sqe::unlinkat(CWD, path.as_ptr().cast(), 0),
                     _ => Sqe::nop(),
                 };
                 self.begin_file(None, Op::Plain, path, held, entry, false)
@@ -1220,6 +1446,32 @@ impl Driver {
     pub fn close_directory(&mut self, directory: Directory) -> Result<Operation<'static, ()>, Refused<Directory>> {
         let completion = self.close_resource(directory.resource, directory)?;
         Ok(Operation::new(completion, |_, _| Some(())))
+    }
+
+    /// Whether the native NVMe path of Windows Server 2025 serves the device of `file`: a job of the
+    /// blocking service reads the driver of each disk of the volume of the file
+    /// ([`Route::BlockingService`]). A drop of the future does not cancel it.
+    ///
+    /// # Errors
+    ///
+    /// A refusal when the driver has no room for the operation, and [`Reason::Blocking`] when the
+    /// driver has no blocking service, or the service refused the job. The future gives an error of
+    /// the system.
+    #[cfg(target_os = "windows")]
+    pub fn nvme_path<'a>(&mut self, file: &'a File) -> Result<Operation<'a, io::Result<NvmePath>>, Refused<()>> {
+        let job = |file: Duplicate| match windows::nvme_path(file.as_raw_handle()) {
+            Ok(NvmePath::Native) => 1,
+            Ok(NvmePath::Other) => 0,
+            Err(error) => error,
+        };
+        let completion = self.begin_job(file.resource, job)?;
+        Ok(Operation::new(completion, |result, held| {
+            let path = done(result, &held).map(|()| match result {
+                1 => NvmePath::Native,
+                _ => NvmePath::Other,
+            });
+            Some(path)
+        }))
     }
 
     /// Polls the job of each operation that runs on the blocking service, and gives the result
@@ -1265,29 +1517,37 @@ impl Driver {
         }
     }
 
-    /// Starts an open of `path` with `flags` and `mode`, or an operation that fails at once with
-    /// `EINVAL` when `flags` is `None` or the path holds a NUL byte. A drop of the future asks for
-    /// a cancel when `cancel_on_drop` holds.
+    /// Starts the open `opening`, or an operation that fails at once with `EINVAL` when it is
+    /// `None`, for options that no open can take or a path with a NUL byte. A drop of the future
+    /// asks for a cancel when `cancel_on_drop` holds.
     fn begin_open(
         &mut self,
-        path: &Path,
-        flags: Option<c_int>,
-        mode: u32,
+        opening: Option<Opening>,
         op: Op,
         cancel_on_drop: bool,
     ) -> Result<Completion, Refused<()>> {
-        let (Some(flags), Some(path)) = (flags, c_path(path)) else {
+        let Some(opening) = opening else {
             return self.fail_now(EINVAL);
         };
-        let held = |path| Held {
-            payload: Payload::Open { path, alignment: None },
+        let held = |opening| Held {
+            payload: Payload::Open(opening),
             ..Held::default()
         };
-        let entry = move |_, held: &mut Held| match &held.payload {
-            Payload::Open { path, .. } => Sqe::openat(sys::AT_FDCWD, path.as_ptr().cast(), flags.cast_unsigned(), mode),
+        // On Windows, the job of the open reads the open from the entry, and writes what it gives
+        // there.
+        let entry = move |_, held: &mut Held| match &mut held.payload {
+            #[cfg(unix)]
+            Payload::Open(opening) => Sqe::openat(
+                CWD,
+                opening.path.as_ptr().cast(),
+                opening.flags.cast_unsigned(),
+                opening.mode,
+            ),
+            #[cfg(target_os = "windows")]
+            Payload::Open(opening) => Sqe::openat(CWD, core::ptr::from_mut(opening).cast(), 0, 0),
             _ => Sqe::nop(),
         };
-        self.begin_file(None, op, path, held, entry, cancel_on_drop)
+        self.begin_file(None, op, opening, held, entry, cancel_on_drop)
             .map_err(|refused| Refused {
                 reason: refused.reason,
                 value: (),
@@ -1363,32 +1623,24 @@ impl Driver {
         op: Op,
         value: P,
         held: impl FnOnce(P) -> Held,
-        entry: impl FnOnce(RawFd, &mut Held) -> Sqe,
+        entry: impl FnOnce(i32, &mut Held) -> Sqe,
         cancel_on_drop: bool,
     ) -> Result<Completion, Refused<P>> {
         let fd = match resource {
-            None => sys::AT_FDCWD,
-            Some(resource) => match self.resources.get(resource) {
-                Some(owned) if owned.medium == Medium::File => match owned.fd.as_ref() {
-                    Some(fd) => fd.as_raw_fd(),
-                    None => {
-                        return Err(Refused {
-                            reason: Reason::Resource,
-                            value,
-                        });
-                    }
-                },
-                _ => {
-                    return Err(Refused {
-                        reason: Reason::Resource,
-                        value,
-                    });
-                }
-            },
+            None => Some(CWD),
+            Some(resource) => self.number(resource, op),
         };
-        if self.report.route(Call::File) == Route::BlockingService {
+        let Some(fd) = fd else {
+            return Err(Refused {
+                reason: Reason::Resource,
+                value,
+            });
+        };
+        if self.report.route(op.call()) == Route::BlockingService {
             return self.begin_file_job(resource, op, value, held, entry, cancel_on_drop);
         }
+        #[cfg(target_os = "windows")]
+        let waits = resource.is_some_and(|resource| self.waits(resource, op));
         let tag = Tag {
             resource,
             kind: Kind::File(op),
@@ -1397,6 +1649,23 @@ impl Driver {
             .open(tag, 1, value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         self.count_start(resource);
+        // An operation on the port waits while an operation runs alone on its file.
+        #[cfg(target_os = "windows")]
+        if let (true, Some(resource), Some(slot)) = (waits, resource, self.shared.entries.get(id.index() as usize)) {
+            let mut sqe = None;
+            slot.update(id, |held| sqe = held.as_mut().map(|held| entry(fd, held)));
+            match sqe {
+                // At most one entry for each operation, so the capacity of the list holds it.
+                Some(sqe) => self.waiting.push(Waiting {
+                    id,
+                    resource,
+                    op,
+                    start: Start::Port(sqe),
+                }),
+                None => self.complete_now(id, -EINVAL),
+            }
+            return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
+        }
         // SAFETY: the entry names only the loan, the lease, the regions, the buffers, the paths,
         // or the structure in the resources of `id`, which the home keeps until its terminal
         // event, and the descriptor of `resource`, which stays open until its close, after each
@@ -1408,18 +1677,67 @@ impl Driver {
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
     }
 
+    /// The number of the descriptor of the file `resource` in an entry, while the driver owns it.
+    #[cfg(unix)]
+    fn number(&mut self, resource: Resource, _: Op) -> Option<i32> {
+        let owned = self
+            .resources
+            .get(resource)
+            .filter(|owned| owned.medium == Medium::File)?;
+        owned.fd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    /// The number of the handle of the file `resource` for `op` in an entry, while the driver owns
+    /// it: the write-through handle for a durable write, where the file has one.
+    #[cfg(target_os = "windows")]
+    fn number(&mut self, resource: Resource, op: Op) -> Option<i32> {
+        let owned = self
+            .resources
+            .get(resource)
+            .filter(|owned| owned.medium == Medium::File)?;
+        let handles = owned.file.as_ref()?;
+        let handle = match (op, &handles.through) {
+            (Op::Write(WriteMode::DataSync), Some(through)) => through,
+            _ => &handles.file,
+        };
+        windows::number(handle.as_raw_handle())
+    }
+
+    /// A duplicate of the descriptor of the file `resource`, for a job, or `None` when the driver
+    /// does not own it.
+    #[cfg(unix)]
+    fn duplicate(&mut self, resource: Resource) -> Option<io::Result<Duplicate>> {
+        let owned = self
+            .resources
+            .get(resource)
+            .filter(|owned| owned.medium == Medium::File)?;
+        owned.fd.as_ref().map(OwnedFd::try_clone)
+    }
+
+    /// A duplicate of the handle of the file `resource`, for a job, or `None` when the driver does
+    /// not own it.
+    #[cfg(target_os = "windows")]
+    fn duplicate(&mut self, resource: Resource) -> Option<io::Result<Duplicate>> {
+        let owned = self
+            .resources
+            .get(resource)
+            .filter(|owned| owned.medium == Medium::File)?;
+        owned.file.as_ref().map(|handles| handles.file.try_clone())
+    }
+
     /// Starts the file operation `op` of [`Driver::begin_file`] as a job of the blocking service,
-    /// which makes the call of its entry with one positional call ([`poller::run_file`]), because
-    /// epoll and kqueue cannot wait on a file. The job owns a duplicate of the descriptor, so it never names a
-    /// descriptor number that the driver closed and the system gave to another file. The job
-    /// posts the completion of the entry to the poller when it returns.
+    /// which makes the call of its entry with one positional call (`run_file`), because epoll and
+    /// kqueue cannot wait on a file, and IOCP has no overlapped form of the call. The job owns a
+    /// duplicate of the descriptor, so it never names a descriptor number that the driver closed
+    /// and the system gave to another file. The job posts the completion of the entry to the
+    /// poller or the port when it returns.
     fn begin_file_job<P>(
         &mut self,
         resource: Option<Resource>,
         op: Op,
         value: P,
         held: impl FnOnce(P) -> Held,
-        entry: impl FnOnce(RawFd, &mut Held) -> Sqe,
+        entry: impl FnOnce(i32, &mut Held) -> Sqe,
         cancel_on_drop: bool,
     ) -> Result<Completion, Refused<P>> {
         let Some((submitter, waker)) = self
@@ -1439,7 +1757,7 @@ impl Driver {
                 value,
             });
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let waits = resource.is_some_and(|resource| self.waits(resource, op));
         let tag = Tag {
             resource,
@@ -1449,48 +1767,49 @@ impl Driver {
             .open(tag, 0, value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
         self.count_start(resource);
-        let duplicate = match resource.and_then(|resource| self.resources.get(resource)?.fd.as_ref()) {
-            Some(fd) => fd.try_clone().map(Some),
-            None => Ok(None),
-        };
-        let fd = match duplicate {
-            Ok(fd) => fd,
+        let duplicate = resource.and_then(|resource| self.duplicate(resource)).transpose();
+        let (fd, raw) = match duplicate {
+            Ok(fd) => {
+                let raw = fd.as_ref().map_or(Some(CWD), raw);
+                (fd, raw)
+            }
             Err(error) => {
                 self.complete_now(id, -error.raw_os_error().unwrap_or(EIO));
                 return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
             }
         };
         let mut sqe = None;
-        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
-            let raw = fd.as_ref().map_or(sys::AT_FDCWD, AsRawFd::as_raw_fd);
+        if let (Some(slot), Some(raw)) = (self.shared.entries.get(id.index() as usize), raw) {
             slot.update(id, |held| sqe = held.as_mut().map(|held| entry(raw, held)));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let (true, Some(sqe), Some(resource)) = (waits, sqe, resource) {
             // At most one entry for each operation, so the capacity of the list holds it.
             self.waiting.push(Waiting {
                 id,
                 resource,
                 op,
-                job: FileJob { sqe, _fd: fd },
+                start: Start::Job(FileJob { sqe, _fd: fd }),
             });
             return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.started(resource, op, id);
-        match (sqe, self.queue.poller()) {
-            (Some(sqe), Some(poller)) => {
-                poller.add_job(id.user_data(), reservation.send(FileJob { sqe, _fd: fd }), &waker)
-            }
+        #[cfg(unix)]
+        let jobs = self.queue.poller();
+        #[cfg(target_os = "windows")]
+        let jobs = Some(self.queue.port());
+        match (sqe, jobs) {
+            (Some(sqe), Some(jobs)) => jobs.add_job(id.user_data(), reservation.send(FileJob { sqe, _fd: fd }), &waker),
             _ => self.complete_now(id, -EINVAL),
         }
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
     }
 
-    /// Whether a new file operation `op` of `resource` waits on macOS: an earlier operation of the
-    /// file waits, an allocation that extends the file runs, or `op` is such an allocation and
-    /// another operation of the file runs.
-    #[cfg(target_os = "macos")]
+    /// Whether a new file operation `op` of `resource` waits on macOS and Windows: an earlier
+    /// operation of the file waits, an operation that runs alone on the file runs, or `op` is such
+    /// an operation and another operation of the file runs.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn waits(&mut self, resource: Resource, op: Op) -> bool {
         let waiting = self
             .waiting
@@ -1504,11 +1823,11 @@ impl Driver {
                 .is_some_and(|owned| !free(owned, table, op, waiting))
     }
 
-    /// Records that the file operation `id` of `resource` started on macOS: an allocation that
-    /// extends the file then runs alone on it.
-    #[cfg(target_os = "macos")]
+    /// Records that the file operation `id` of `resource` started on macOS and Windows: an
+    /// operation of [`Op::Alone`] then runs alone on it.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn started(&mut self, resource: Option<Resource>, op: Op, id: super::OpId) {
-        if op == Op::Extend
+        if op == Op::Alone
             && let Some(owned) = resource.and_then(|resource| self.resources.get(resource))
         {
             owned.exclusive = Some(id);
@@ -1516,22 +1835,17 @@ impl Driver {
     }
 
     /// Starts each waiting file operation that can run now, in the order of their starts on each
-    /// file, on macOS. A full service starts none: a job that ends wakes the driver, and a later
-    /// turn tries again. A stopped service ends each one, as it ends a job.
-    #[cfg(target_os = "macos")]
+    /// file, on macOS and Windows. A full service starts no job, and a full submission queue no
+    /// entry: a job that ends wakes the driver, a later turn submits the queue, and a later turn
+    /// tries again. A stopped service ends each job, as it ends a job that runs.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(super) fn start_waiting(&mut self) {
-        let Some((submitter, waker)) = self
-            .blocking
-            .as_ref()
-            .map(|(submitter, waker)| (submitter.clone(), waker.clone()))
-        else {
-            return;
-        };
         let mut index = 0;
         // Each step starts, ends, or skips one entry, and the list holds at most one entry for each
         // operation, so the loop ends after at most `Config::operations` steps.
         while let Some(waiting) = self.waiting.get(index) {
             let (resource, op) = (waiting.resource, waiting.op);
+            let job = matches!(waiting.start, Start::Job(_));
             // An earlier operation of the same file waits, and it starts first.
             let first = !self.waiting[..index].iter().any(|earlier| earlier.resource == resource);
             let count = self.waiting.iter().filter(|other| other.resource == resource).count();
@@ -1544,25 +1858,63 @@ impl Driver {
                 index += 1;
                 continue;
             }
-            let reservation = match submitter.reserve::<FileJob>() {
-                Ok(reservation) => reservation,
-                Err(crate::blocking::Reason::Ended) => {
-                    let waiting = self.waiting.remove(index);
-                    self.complete_now(waiting.id, -ECANCELED);
-                    continue;
+            if job {
+                let Some((submitter, waker)) = self
+                    .blocking
+                    .as_ref()
+                    .map(|(submitter, waker)| (submitter.clone(), waker.clone()))
+                else {
+                    return;
+                };
+                let reservation = match submitter.reserve::<FileJob>() {
+                    Ok(reservation) => reservation,
+                    Err(crate::blocking::Reason::Ended) => {
+                        let waiting = self.waiting.remove(index);
+                        self.complete_now(waiting.id, -ECANCELED);
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let waiting = self.waiting.remove(index);
+                self.started(Some(resource), op, waiting.id);
+                #[cfg(unix)]
+                let jobs = self.queue.poller();
+                #[cfg(target_os = "windows")]
+                let jobs = Some(self.queue.port());
+                if let (Start::Job(file_job), Some(jobs)) = (waiting.start, jobs) {
+                    jobs.add_job(waiting.id.user_data(), reservation.send(file_job), &waker);
                 }
-                Err(_) => return,
-            };
-            let waiting = self.waiting.remove(index);
-            self.started(Some(resource), op, waiting.id);
-            if let Some(poller) = self.queue.poller() {
-                poller.add_job(waiting.id.user_data(), reservation.send(waiting.job), &waker);
+                continue;
+            }
+            #[cfg(target_os = "windows")]
+            {
+                if !self.room(1) {
+                    return;
+                }
+                let waiting = self.waiting.remove(index);
+                self.started(Some(resource), op, waiting.id);
+                if let Start::Port(sqe) = waiting.start {
+                    let token = super::iocp::Token {
+                        skips: false,
+                        file: true,
+                    };
+                    // SAFETY: the entry names only the resources of its operation, which the home
+                    // keeps until its terminal event, and its file, which stays open until its
+                    // close, after each of its operations ends. The queue has room.
+                    #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
+                    let pushed = unsafe {
+                        self.queue
+                            .push(&sqe.with_user_data(waiting.id.user_data()), Some(token))
+                    };
+                    assert!(pushed.is_ok(), "the queue has room for the entry");
+                }
             }
         }
     }
 
-    /// Ends the waiting file operation `id` on macOS, which never ran. Gives whether it waited.
-    #[cfg(target_os = "macos")]
+    /// Ends the waiting file operation `id` on macOS and Windows, which never ran. Gives whether it
+    /// waited.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(super) fn unwait(&mut self, id: super::OpId) -> bool {
         let Some(index) = self.waiting.iter().position(|waiting| waiting.id == id) else {
             return false;
@@ -1572,34 +1924,29 @@ impl Driver {
         true
     }
 
-    /// Starts a change of the length of the file `resource` to `len` as a job of the blocking
-    /// service. The job owns a duplicate of the descriptor, so it never names a descriptor number
-    /// that the driver closed and the system gave to another file.
-    fn begin_job(&mut self, resource: Resource, len: u64) -> Result<Completion, Refused<()>> {
+    /// Starts `job` on a duplicate of the descriptor of the file `resource`, as a job of the
+    /// blocking service: the job gives the result of the operation. The job owns the duplicate, so
+    /// it never names a descriptor number that the driver closed and the system gave to another
+    /// file.
+    fn begin_job(
+        &mut self,
+        resource: Resource,
+        job: impl FnOnce(Duplicate) -> i32 + Send + 'static,
+    ) -> Result<Completion, Refused<()>> {
         let refuse = |reason| Err(Refused { reason, value: () });
         let Some(submitter) = self.blocking.as_ref().map(|(submitter, _)| submitter.clone()) else {
             return refuse(Reason::Blocking);
         };
-        let duplicate = match self.resources.get(resource) {
-            Some(owned) if owned.medium == Medium::File => match owned.fd.as_ref() {
-                Some(fd) => fd.try_clone(),
-                None => return refuse(Reason::Resource),
-            },
-            _ => return refuse(Reason::Resource),
-        };
-        let fd = match duplicate {
-            Ok(fd) => fd,
-            Err(error) => return self.fail_now(error.raw_os_error().unwrap_or(EIO)),
+        let fd = match self.duplicate(resource) {
+            Some(Ok(fd)) => fd,
+            Some(Err(error)) => return self.fail_now(error.raw_os_error().unwrap_or(EIO)),
+            None => return refuse(Reason::Resource),
         };
         let tag = Tag {
             resource: Some(resource),
             kind: Kind::File(Op::Plain),
         };
-        let job = move || match fs::File::from(fd).set_len(len) {
-            Ok(()) => 0,
-            Err(error) => -error.raw_os_error().unwrap_or(EIO),
-        };
-        let held = move |()| match submitter.submit(job) {
+        let held = move |()| match submitter.submit(move || job(fd)) {
             Ok(waiter) => Ok(Held {
                 payload: Payload::Job(waiter),
                 ..Held::default()

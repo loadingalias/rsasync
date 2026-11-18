@@ -18,8 +18,10 @@ pub enum Backend {
     /// thread when epoll reports its descriptor ready. Each file operation runs on the blocking
     /// service ([`Route::BlockingService`]), because epoll cannot wait on regular files.
     Epoll,
-    /// IOCP, on Windows: each socket operation is one overlapped call, and its completion packet
-    /// or the return of the call ends it, by the NT status of the call.
+    /// IOCP, on Windows: each socket operation, and each read, write, and hole punch of a file, is
+    /// one overlapped call or a few in order, and its completion packet or the return of the call
+    /// ends it, by the NT status of the call. Each other file operation has no overlapped form, so
+    /// it runs on the blocking service ([`Route::BlockingService`]).
     Iocp,
     /// kqueue, on macOS: the driver runs each socket operation as one nonblocking call on its own
     /// thread when kqueue reports its descriptor ready, as on epoll. UDP has no segmentation
@@ -145,12 +147,18 @@ pub enum Call {
     Bind,
     /// `Driver::bind_udp`, on Linux: a bind of a UDP socket.
     BindUdp,
-    /// `Driver::set_file_len`, on Linux and macOS: a change of the length of a file.
+    /// [`Driver::set_file_len`](super::Driver::set_file_len): a change of the length of a file.
     SetFileLen,
     /// The exit of a `Child`, on Linux: the reap of the child and its status.
     WaitChild,
-    /// Each other operation of a file or a directory: open, reads, writes, length, space, sync,
-    /// rename, and unlink.
+    /// The operations on the bytes of a file: the positional and vectored reads and writes, and the
+    /// hole punch.
+    FileData,
+    /// [`Driver::sync_directory`](super::Driver::sync_directory): the sync that makes the creates,
+    /// renames, and unlinks of a directory durable.
+    SyncDirectory,
+    /// Each other operation of a file or a directory: open, length inspection, preallocation,
+    /// sync, rename, and unlink. On Windows, also the report of the device of a file.
     File,
 }
 
@@ -162,16 +170,32 @@ pub enum Route {
     Ring,
     /// System calls on the thread of the driver, which end at once.
     SystemCall,
-    /// A job of the blocking service that `Driver::use_blocking` gives, on Linux and macOS. With no
-    /// service, the call refuses with `Reason::Blocking`.
+    /// A job of the blocking service that [`Driver::use_blocking`](super::Driver::use_blocking)
+    /// gives. With no service, the call refuses with
+    /// [`Reason::Blocking`](super::Reason::Blocking).
     BlockingService,
     /// A poll of a descriptor on the ring or the poller, then one nonblocking system call on the
     /// thread of the driver when the descriptor is readable.
     Poll,
+    /// Overlapped calls on the completion port, on Windows: the packet of each call, or its return,
+    /// ends it.
+    Port,
+    /// No qualified form of the call: it gives `Unsupported` at once, with no system call. On
+    /// Windows, no source states that a flush of a directory makes its namespace changes durable,
+    /// so a directory sync has this route (selected on 2026-11-18).
+    Unsupported,
 }
 
 /// Each call, in the order of the report.
-const CALLS: [Call; 5] = [Call::Bind, Call::BindUdp, Call::SetFileLen, Call::WaitChild, Call::File];
+const CALLS: [Call; 7] = [
+    Call::Bind,
+    Call::BindUdp,
+    Call::SetFileLen,
+    Call::WaitChild,
+    Call::FileData,
+    Call::SyncDirectory,
+    Call::File,
+];
 
 /// What a driver found and applied when it started. The report does not change after
 /// [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each call and the
@@ -241,19 +265,22 @@ impl Report {
             Call::BindUdp => self.probed.contains(Feature::Bind),
             Call::SetFileLen => self.probed.contains(Feature::Truncate),
             Call::WaitChild => self.probed.contains(Feature::ChildWait),
-            Call::File => matches!(self.backend, Backend::IoUring),
+            Call::FileData | Call::SyncDirectory | Call::File => matches!(self.backend, Backend::IoUring),
         };
+        let iocp = matches!(self.backend, Backend::Iocp);
         match (ring, call) {
             (true, _) => Route::Ring,
+            (false, Call::FileData) if iocp => Route::Port,
+            (false, Call::SyncDirectory) if iocp => Route::Unsupported,
             (false, Call::Bind | Call::BindUdp) => Route::SystemCall,
-            (false, Call::SetFileLen | Call::File) => Route::BlockingService,
+            (false, Call::SetFileLen | Call::FileData | Call::SyncDirectory | Call::File) => Route::BlockingService,
             (false, Call::WaitChild) => Route::Poll,
         }
     }
 
     /// The threads that the driver starts: none, on each backend. A call on
-    /// [`Route::BlockingService`] runs on a thread of the service that `Driver::use_blocking`
-    /// gives, which the caller owns.
+    /// [`Route::BlockingService`] runs on a thread of the service that
+    /// [`Driver::use_blocking`](super::Driver::use_blocking) gives, which the caller owns.
     #[must_use]
     pub const fn helper_threads(&self) -> u32 {
         0

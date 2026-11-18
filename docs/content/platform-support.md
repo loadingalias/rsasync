@@ -137,9 +137,11 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 ## Windows
 
 The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
-[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP and UDP on Windows x86_64, on
-an [I/O completion port](iocp.md), in driver-only use. Files, pipes, local streams, processes, and
-signals of the driver have no Windows form yet. CI does not run on Windows.
+[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP, UDP, and files on Windows
+x86_64, on an [I/O completion port](iocp.md), in driver-only use. The files run on NTFS, with the
+file calls that have no overlapped form on your blocking service ([Files](iocp.md#files)). Pipes,
+local streams, processes, and signals of the driver have no Windows form yet. CI does not run on
+Windows.
 
 On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
 Windows Server 2025, OS build 10.0.26100.33822. The tests use Tokio sockets. Revision `285cc44` has
@@ -163,6 +165,15 @@ and UDP cases of the driver suites, each one with skip-on-success and with no sk
 check matched 57 values and layouts. Revision `067075e` differs from the tree of that run only in
 the classification of a warning at once on a skipping socket, which no host run can make, and in
 its docs.
+
+Files on the port then passed in run `20261118T060435Z-36193` of revision `7855dd4`, on the same
+instance type and OS build: `cargo xtask test` ran 252 tests of the workspace and the doctests.
+They include the 12 file cases of the driver suites on NTFS, each one with skip-on-success and with
+no skip, and the header check matched 41 values and layouts and 17 signatures of the file and
+device declarations. On that host, the disk is an EBS volume behind the AWS NVMe adapter
+(`AWSNVMe`) and the disk class driver (`disk`), so `Driver::nvme_path` gives `NvmePath::Other`, as
+the driver service of the disk says. No run shows `NvmePath::Native`, which needs a host with the
+native NVMe path on. A directory sync gives `Unsupported` on Windows.
 
 Windows on aarch64 has no run evidence yet.
 

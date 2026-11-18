@@ -28,7 +28,7 @@ println!("{report:#?}");
 | Resolved | `fallback()` | The error number of the ring creation (`EPERM` or `ENOSYS`) when the permissive selection runs epoll for that reason, else `None` |
 | Requested | `required()` | The features of `Config::require`. The driver has each of them |
 | Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing. On epoll, kqueue, and IOCP, no probe runs, and the set is empty |
-| Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring`, `Route::SystemCall`, `Route::BlockingService`, or `Route::Poll` |
+| Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring`, `Route::SystemCall`, `Route::BlockingService`, `Route::Poll`, or on Windows `Route::Port` and `Route::Unsupported` |
 | Applied | `helper_threads()` | The threads that the driver starts: 0. A call on `Route::BlockingService` runs on a thread of your service |
 | Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws`. It also does so when a deferred signal came late during the probe of the kernel |
 
@@ -43,9 +43,13 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 | `Call::BindUdp` (`Driver::bind_udp`) | `Bind` | `Route::SystemCall` |
 | `Call::SetFileLen` (`Driver::set_file_len`) | `Truncate` | `Route::BlockingService`: the call is a job of the service of `Driver::use_blocking`. With no service, it refuses with `Reason::Blocking` |
 | `Call::WaitChild` (the exit of a `Child`, see [child processes](processes.md)) | `ChildWait` | `Route::Poll`: the ring or epoll polls the process descriptor of the child, and when it is readable, the driver takes the status with one nonblocking `waitid` |
-| `Call::File` (each other file and directory operation, see [files](files.md)) | The io_uring backend | `Route::BlockingService`, on epoll and kqueue |
+| `Call::FileData` (the reads, the writes, and the hole punch of a file, see [files](files.md)) | The io_uring backend | `Route::Port` on IOCP: overlapped calls on the completion port. `Route::BlockingService` on epoll and kqueue |
+| `Call::SyncDirectory` (`Driver::sync_directory`) | The io_uring backend | `Route::BlockingService` on epoll and kqueue. `Route::Unsupported` on IOCP: the call gives `Unsupported` at once, because no source states that a flush of a directory makes its namespace changes durable on Windows |
+| `Call::File` (each other file and directory operation: open, length, preallocation, sync, rename, and unlink, and on Windows the NVMe report) | The io_uring backend | `Route::BlockingService`, on epoll, kqueue, and IOCP |
 
-On epoll and kqueue, no feature is probed, so each call takes the route of the last column.
+On epoll, kqueue, and IOCP, no feature is probed, so each call takes the route of the last column.
+On IOCP, `Call::Bind` and `Call::BindUdp` are `Route::SystemCall`, and `Call::SetFileLen` is
+`Route::BlockingService`, because Windows has no overlapped form of a length change.
 
 ## Strict and permissive selection
 
@@ -93,6 +97,8 @@ Report {
         BindUdp: SystemCall,
         SetFileLen: BlockingService,
         WaitChild: Poll,
+        FileData: Ring,
+        SyncDirectory: Ring,
         File: Ring,
     },
     helper_threads: 0,

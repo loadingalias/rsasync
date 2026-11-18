@@ -46,6 +46,19 @@
 //! head of the provided ring. An accept is `AcceptEx` with a socket that the port makes, and a
 //! connect is `ConnectEx` on a socket that the port binds to the wildcard address first. A
 //! half-close is one `shutdown`, which ends at its return.
+//!
+//! # Files
+//!
+//! The driver associates each file and directory with the port at its open, and no file skips
+//! packets: the jobs of the blocking service use a duplicate of its handle, and skip-on-success is
+//! only for handles that are never duplicated. A read is one `ReadFile` and a write one
+//! `WriteFile`, each at the offset of its `OVERLAPPED`. A vectored read or write is one call for
+//! each region, in order, on the same `OVERLAPPED`: the next region starts at the packet of the one
+//! before it, and a short or failed region ends the operation with the bytes before it. A hole
+//! punch is `FSCTL_SET_SPARSE` and then `FSCTL_SET_ZERO_DATA`, each one `DeviceIoControl`. A read at
+//! or after the end of the file reads 0 bytes. The calls that have no overlapped form, such as an
+//! open, a sync, or a length change, run as jobs of the blocking service (`file::windows`), and
+//! the port posts the completion of each job when it returns.
 
 pub(crate) mod sys;
 
@@ -57,6 +70,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Waker};
 use std::io;
 use std::os::windows::io::{
     AsRawHandle as _, AsRawSocket as _, AsSocket, BorrowedSocket, FromRawHandle as _, FromRawSocket as _,
@@ -67,10 +81,11 @@ use std::sync::OnceLock;
 use rsnetwork_udp::{AF_INET, AF_INET6, SaFamily, SockAddrStorage};
 use sys::{Overlapped, OverlappedEntry};
 
+use crate::blocking::Waiter;
 use crate::uring::sys as ring;
 use crate::uring::{Cqe, Group, Sqe};
 
-/// The key of the association of each socket.
+/// The key of the association of each socket and file.
 const SOCKET: usize = 0;
 
 /// The key of the packet of a wake.
@@ -85,12 +100,18 @@ const ACCEPT_ADDRESS: u32 = 28 + 16;
 
 const _: () = assert!(2 * ACCEPT_ADDRESS as usize <= size_of::<SockAddrStorage>());
 
-/// The facts of the socket of an entry that the port needs.
+/// The facts of the socket or the file of an entry that the port needs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Token {
     /// The socket queues no packet for a call that ends at once.
     pub(crate) skips: bool,
+    /// The handle is a file or a directory, not a socket.
+    pub(crate) file: bool,
 }
+
+/// The most bytes that one file operation moves: a completion gives its count as an `i32`, so the
+/// rest stays for the next operation, as on Linux.
+const FILE_MAX: u32 = i32::MAX.cast_unsigned();
 
 /// The socket handle of the number `number` of an entry: the number extended with its sign.
 pub(crate) const fn socket(number: i32) -> RawSocket {
@@ -177,6 +198,21 @@ impl Registrar {
                 && unsafe { sys::SetFileCompletionNotificationModes(handle(raw), flags) } != 0,
         )
     }
+
+    /// Associates the file or the directory `file` with the port for its life. A file never skips
+    /// packets.
+    ///
+    /// # Errors
+    ///
+    /// The error of `CreateIoCompletionPort`. Nothing changed then.
+    #[expect(unsafe_code, reason = "the call takes the open file and the open port")]
+    pub(crate) fn add_file(&self, file: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: the file and the port are open handles during the call.
+        if unsafe { sys::CreateIoCompletionPort(file.as_raw_handle(), self.port.handle(), SOCKET, 0) }.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 /// Whether the provider of `socket` gives handles that the I/O manager completes, with no layered
@@ -227,6 +263,13 @@ pub(crate) struct Full;
 struct Slot {
     sqe: Sqe,
     skips: bool,
+    /// The entry is an operation of a file.
+    file: bool,
+    /// The bytes that the regions of a vectored file operation moved before its current call.
+    done: u32,
+    /// The current call of a file operation of more than one: its region, or the step of a hole
+    /// punch.
+    step: u32,
     /// The call of the entry runs, and its packet ends it.
     queued: bool,
     /// The socket that an accept makes, which the port owns until the completion of the accept.
@@ -293,17 +336,24 @@ pub(crate) struct Port {
     events: Vec<OverlappedEntry>,
     /// The last wait filled the event array, so packets can remain.
     full: bool,
+    /// The jobs of the blocking service that run file entries, and the waker of the driver.
+    jobs: Vec<(u64, Waiter<i32>)>,
+    waker: Option<Waker>,
+    /// The test seam of the packets of the kernel: while it holds, the port takes no packet, and
+    /// the kernel keeps each one in the port.
+    #[cfg(test)]
+    pub(crate) held: bool,
 }
 
 impl Port {
-    /// A port with `entries` submission entries, rounded up to a power of two as a ring does, and
-    /// room for `completions` entries in flight.
+    /// A port with `entries` submission entries, rounded up to a power of two as a ring does, room
+    /// for `completions` entries in flight, and for `jobs` file jobs.
     ///
     /// # Errors
     ///
     /// The error of `WSAStartup` or of `CreateIoCompletionPort`, or `InvalidInput` for 0 entries.
     #[expect(unsafe_code, reason = "the call returns a new handle")]
-    pub(crate) fn new(entries: u32, completions: u32) -> io::Result<Self> {
+    pub(crate) fn new(entries: u32, completions: u32, jobs: u32) -> io::Result<Self> {
         let entries = entries
             .checked_next_power_of_two()
             .filter(|&entries| entries > 0)
@@ -335,7 +385,7 @@ impl Port {
             overlapped: (0..completions).map(|_| UnsafeCell::new(idle())).collect(),
             slots: (0..completions).map(|_| None).collect(),
             free: (0..completions).rev().collect(),
-            completions: VecDeque::with_capacity(completions as usize),
+            completions: VecDeque::with_capacity((completions + jobs) as usize),
             group: None,
             events: alloc::vec![
                 OverlappedEntry {
@@ -347,6 +397,10 @@ impl Port {
                 EVENTS
             ],
             full: false,
+            jobs: Vec::with_capacity(jobs as usize),
+            waker: None,
+            #[cfg(test)]
+            held: false,
         })
     }
 
@@ -424,20 +478,56 @@ impl Port {
         self.group = None;
     }
 
-    /// Takes the entries of the submission queue and starts each one, takes the packets, and posts
-    /// the completions. With `wait` above 0, it waits until a completion is ready or a wake came.
-    /// Gives the number of entries that it took.
+    /// Takes the waiter of a job that runs the file entry of `user_data` on the blocking service.
+    /// The port posts its completion when it returns. `waker` wakes the driver at that return.
+    pub(crate) fn add_job(&mut self, user_data: u64, waiter: Waiter<i32>, waker: &Waker) {
+        if self.waker.is_none() {
+            self.waker = Some(waker.clone());
+        }
+        // The list has room for each operation, and each one has at most one job.
+        self.jobs.push((user_data, waiter));
+    }
+
+    /// Takes the entries of the submission queue and starts each one, takes the packets and the
+    /// results of the jobs, and posts the completions. With `wait` above 0, it waits until a
+    /// completion is ready or a wake came. A job wakes the driver when it returns. Gives the number
+    /// of entries that it took.
     ///
     /// # Errors
     ///
     /// An error of `GetQueuedCompletionStatusEx` other than the end of its time.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
         let taken = self.take();
+        self.poll_jobs();
         let mut woke = self.poll(0)?;
         while wait > 0 && !woke && self.completions.len() < wait as usize {
             woke = self.poll(sys::INFINITE)?;
+            self.poll_jobs();
         }
         Ok(taken)
+    }
+
+    /// Polls the job of each file entry, and posts the completion of each one that returned.
+    fn poll_jobs(&mut self) {
+        let Some(waker) = self.waker.as_ref() else {
+            return;
+        };
+        let cx = Context::from_waker(waker);
+        let mut index = 0;
+        while let Some((user_data, waiter)) = self.jobs.get_mut(index) {
+            match waiter.poll(&cx) {
+                core::task::Poll::Ready(result) => {
+                    let user_data = *user_data;
+                    self.jobs.swap_remove(index);
+                    self.completions.push_back(Cqe {
+                        user_data,
+                        res: result.unwrap_or(-super::ECANCELED),
+                        flags: 0,
+                    });
+                }
+                core::task::Poll::Pending => index += 1,
+            }
+        }
     }
 
     /// Takes each entry of the submission queue that has room in flight, and starts it.
@@ -463,6 +553,9 @@ impl Port {
                 self.slots[index as usize] = Some(Slot {
                     sqe,
                     skips: token.is_some_and(|token| token.skips),
+                    file: token.is_some_and(|token| token.file),
+                    done: 0,
+                    step: 0,
                     queued: false,
                     accepted: None,
                     link: None,
@@ -505,7 +598,11 @@ impl Port {
             | ring::IORING_OP_ACCEPT
             | ring::IORING_OP_CONNECT
             | ring::IORING_OP_SENDMSG
-            | ring::IORING_OP_RECVMSG => self.call(index),
+            | ring::IORING_OP_RECVMSG
+            | ring::IORING_OP_READ
+            | ring::IORING_OP_WRITE
+            | ring::IORING_OP_READV
+            | ring::IORING_OP_FALLOCATE => self.call(index),
             // The driver submits no other entry on this backend.
             _ => self.post(index, -sys::WSAEINVAL, 0),
         }
@@ -525,6 +622,9 @@ impl Port {
         // SAFETY: no call of the slot runs, so nothing else reads or writes its `OVERLAPPED`.
         unsafe { overlapped.write(idle()) };
         let returned = match slot.sqe.opcode {
+            // SAFETY: the driver keeps the buffer, the regions, and the file of the entry until its
+            // completion.
+            _ if slot.file => unsafe { file_call(slot, overlapped) },
             ring::IORING_OP_RECVMSG if selects(&slot.sqe) => {
                 // SAFETY: a peek of no bytes names no memory but its `OVERLAPPED`.
                 unsafe { peek(slot.sqe.fd, overlapped) }
@@ -593,6 +693,10 @@ impl Port {
     /// whether a wake came.
     #[expect(unsafe_code, reason = "the kernel writes the event array")]
     fn poll(&mut self, timeout: u32) -> io::Result<bool> {
+        #[cfg(test)]
+        if self.held {
+            return Ok(false);
+        }
         let capacity = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         let mut removed = 0;
         // SAFETY: the array has `capacity` entries, and the kernel writes at most that many.
@@ -636,6 +740,15 @@ impl Port {
             let (fd, opcode) = (slot.sqe.fd, slot.sqe.opcode);
             // SAFETY: the packet of the call came, so the kernel wrote its status and writes no more.
             let status = unsafe { status(overlapped) };
+            if slot.file {
+                let result = if sys::nt_error(status) {
+                    Err(file_failure(fd, overlapped))
+                } else {
+                    Ok(bytes)
+                };
+                self.file_ended(index, result);
+                continue;
+            }
             // A send that failed after it transferred bytes gives their count, so the driver reports
             // the exact progress: a dropped send fails its direction. A cancel of a send that runs
             // aborts the connection, and its packet gives no count, also when bytes went, so the
@@ -671,6 +784,10 @@ impl Port {
     /// receive, an accept, or a connect.
     #[expect(unsafe_code, reason = "the calls take the sockets and the storage of the entry")]
     fn ended(&mut self, index: u32, result: Result<u32, c_int>) {
+        if self.slots[index as usize].as_ref().is_some_and(|slot| slot.file) {
+            self.file_ended(index, result);
+            return;
+        }
         let bytes = match result {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -720,6 +837,53 @@ impl Port {
             }
             _ => self.post(index, i32::try_from(bytes).unwrap_or(i32::MAX), 0),
         }
+    }
+
+    /// The call of the file entry of `index` ended with `result`, the transferred bytes or a Win32
+    /// error, at its terminal event. Starts the next call of a vectored operation or of a hole
+    /// punch, or posts the completion: a read at or after the end of the file reads 0 bytes, and a
+    /// vectored operation gives the bytes before a short or failed region.
+    fn file_ended(&mut self, index: u32, result: Result<u32, c_int>) {
+        let Some(slot) = self.slots[index as usize].as_mut() else {
+            return;
+        };
+        let opcode = slot.sqe.opcode;
+        let result = match result {
+            Err(sys::ERROR_HANDLE_EOF) if matches!(opcode, ring::IORING_OP_READ | ring::IORING_OP_READV) => Ok(0),
+            // A file system with no sparse files has no hole punch, and `std::io` reads this error
+            // as `Unsupported`.
+            Err(sys::ERROR_INVALID_FUNCTION | sys::ERROR_NOT_SUPPORTED)
+                if opcode == ring::IORING_OP_FALLOCATE && slot.step == 0 =>
+            {
+                Err(sys::ERROR_CALL_NOT_IMPLEMENTED)
+            }
+            result => result,
+        };
+        let next = match (opcode, result) {
+            (ring::IORING_OP_READV | ring::IORING_OP_WRITEV, Ok(bytes)) => {
+                let wanted = region(slot).map_or(0, |region| step_len(region.len, slot.done));
+                slot.done = slot.done.saturating_add(bytes);
+                slot.step += 1;
+                bytes == wanted && slot.step < slot.sqe.len && slot.done < FILE_MAX
+            }
+            (ring::IORING_OP_FALLOCATE, Ok(_)) => {
+                slot.step += 1;
+                slot.step < 2
+            }
+            _ => false,
+        };
+        if next {
+            self.call(index);
+            return;
+        }
+        let vectored = matches!(opcode, ring::IORING_OP_READV | ring::IORING_OP_WRITEV);
+        let posted = match result {
+            _ if vectored && slot.done > 0 => i32::try_from(slot.done).unwrap_or(i32::MAX),
+            Ok(_) if vectored || opcode == ring::IORING_OP_FALLOCATE => 0,
+            Ok(bytes) => i32::try_from(bytes).unwrap_or(i32::MAX),
+            Err(error) => error.saturating_neg(),
+        };
+        self.post(index, posted, 0);
     }
 
     /// The receive of no bytes of the selecting receive of `index` ended: data or the end of the
@@ -944,6 +1108,116 @@ fn failure(fd: i32, overlapped: *mut Overlapped) -> c_int {
     } else {
         sys::WSAEINVAL
     }
+}
+
+/// The Win32 error of the call of the `OVERLAPPED` at `overlapped` on the file `fd`, whose packet
+/// came with an error status.
+#[expect(unsafe_code, reason = "the call reads the OVERLAPPED of a call that ended")]
+fn file_failure(fd: i32, overlapped: *mut Overlapped) -> c_int {
+    let mut bytes = 0;
+    // SAFETY: the call ended, the file is open until its terminal event, and the output lives
+    // during the call.
+    let done = unsafe { sys::GetOverlappedResult(handle(socket(fd)), overlapped, &raw mut bytes, 0) };
+    if done == 0 {
+        last_error().saturating_neg()
+    } else {
+        sys::ERROR_INVALID_PARAMETER
+    }
+}
+
+/// The region of the current call of the vectored file operation of `slot`.
+#[expect(unsafe_code, reason = "the driver keeps the regions until the completion")]
+fn region(slot: &Slot) -> Option<sys::WsaBuf> {
+    (slot.step < slot.sqe.len).then(|| {
+        // SAFETY: the entry names an array of `len` regions, which the driver keeps until its
+        // completion, and `step` is below `len`.
+        unsafe { pointer::<sys::WsaBuf>(slot.sqe.addr).add(slot.step as usize).read() }
+    })
+}
+
+/// The bytes of one call for a region of `len` bytes after `done` bytes of its operation: at
+/// most [`FILE_MAX`] in all.
+const fn step_len(len: u32, done: u32) -> u32 {
+    let room = FILE_MAX.saturating_sub(done);
+    if len < room { len } else { room }
+}
+
+/// Starts the current call of the file entry of `slot`, overlapped with `overlapped`, at the
+/// offset of the entry: a read, a write, one region of a vectored read or write, or one step of a
+/// hole punch.
+///
+/// # Safety
+///
+/// The buffer, the regions, and the bytes of the entry stay valid until its terminal event, the
+/// file is open until then, and `overlapped` stays in place until then.
+#[expect(unsafe_code, reason = "the caller keeps the memory of the entry and the OVERLAPPED")]
+unsafe fn file_call(slot: &Slot, overlapped: *mut Overlapped) -> Returned {
+    let file = handle(socket(slot.sqe.fd));
+    let offset = slot.sqe.off.saturating_add(u64::from(slot.done));
+    // SAFETY: no call of the slot runs, so nothing else writes its `OVERLAPPED`.
+    #[expect(clippy::cast_possible_truncation, reason = "the halves of the offset")]
+    unsafe {
+        (*overlapped).offset = [offset as u32, (offset >> 32) as u32];
+    }
+    let succeeded = match slot.sqe.opcode {
+        // SAFETY: the caller's contract: the buffer holds `len` bytes.
+        ring::IORING_OP_READ => unsafe {
+            sys::ReadFile(
+                file,
+                pointer(slot.sqe.addr),
+                slot.sqe.len.min(FILE_MAX),
+                ptr::null_mut(),
+                overlapped,
+            )
+        },
+        // SAFETY: as above, for the bytes of a write.
+        ring::IORING_OP_WRITE => unsafe {
+            sys::WriteFile(
+                file,
+                pointer(slot.sqe.addr),
+                slot.sqe.len.min(FILE_MAX),
+                ptr::null_mut(),
+                overlapped,
+            )
+        },
+        ring::IORING_OP_READV | ring::IORING_OP_WRITEV => {
+            let Some(region) = region(slot) else {
+                return Returned::Failed(sys::ERROR_INVALID_PARAMETER);
+            };
+            let len = step_len(region.len, slot.done);
+            if slot.sqe.opcode == ring::IORING_OP_READV {
+                // SAFETY: the caller's contract: the region holds its `len` bytes.
+                unsafe { sys::ReadFile(file, region.buf.cast(), len, ptr::null_mut(), overlapped) }
+            } else {
+                // SAFETY: as above.
+                unsafe { sys::WriteFile(file, region.buf.cast(), len, ptr::null_mut(), overlapped) }
+            }
+        }
+        // The entry holds the length in `addr`. The input of the control is a copy, so it lives
+        // only during the call.
+        // A hole of 0 bytes is not valid, as for `fallocate` of Linux.
+        ring::IORING_OP_FALLOCATE if slot.sqe.addr == 0 => return Returned::Failed(sys::ERROR_INVALID_PARAMETER),
+        ring::IORING_OP_FALLOCATE => {
+            let range = sys::FileZeroDataInformation {
+                offset: slot.sqe.off.cast_signed(),
+                end: slot.sqe.off.saturating_add(slot.sqe.addr).cast_signed(),
+            };
+            let (code, input, len) = if slot.step == 0 {
+                (sys::FSCTL_SET_SPARSE, ptr::null(), 0)
+            } else {
+                (
+                    sys::FSCTL_SET_ZERO_DATA,
+                    ptr::from_ref(&range).cast(),
+                    u32_len(size_of_val(&range)),
+                )
+            };
+            // SAFETY: the input lives during the call, the control writes no output, and the
+            // caller keeps the `OVERLAPPED`.
+            unsafe { sys::DeviceIoControl(file, code, input, len, ptr::null_mut(), 0, ptr::null_mut(), overlapped) }
+        }
+        _ => return Returned::Failed(sys::ERROR_INVALID_PARAMETER),
+    };
+    returned(succeeded != 0, 0)
 }
 
 /// One `WSARecv` of up to `len` bytes at `buffer` on the socket `fd`, overlapped with

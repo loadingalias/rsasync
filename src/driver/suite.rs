@@ -25,8 +25,10 @@
 //! On Windows, `Backend::Iocp` gives each completion as the completion port gives it, where each
 //! socket that passes the installed-provider check skips the packet of a call that ends at once,
 //! and `Backend::Packets` gives it with no skip, so each call that does not fail at once ends at
-//! its packet. Only the TCP and UDP cases run on Windows: its files, pipes, local streams,
-//! processes, and signals have no IOCP form yet. The cases whose kernel facts differ on Windows state the
+//! its packet. A file never skips packets, so its cases run the same on both, and each file
+//! operation with no overlapped form runs on a blocking service of the case. Only the TCP, UDP,
+//! and file cases run on Windows: its pipes, local streams, processes, and signals have no IOCP
+//! form yet. The cases whose kernel facts differ on Windows state the
 //! difference beside their bodies: a send there goes whole or fails, so a send goes in part only at
 //! a reset of its connection, and a cancel of a send that runs aborts the connection. The two cases
 //! of a send that waits in the driver at close and at teardown run only on Linux: the wait queue
@@ -63,13 +65,13 @@
 //! | io_uring, multishot request | No driver operation is multishot. The table rule runs in `uring::table_tests::a_multishot_operation_releases_at_its_last_completion` on the kernel, and in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` under injection |
 //! | io_uring, zero-copy send | No driver operation is a zero-copy send before R611. The table rule runs in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` |
 //! | epoll, `MSG_ZEROCOPY` send | No driver operation is a zero-copy send before R611, which adds it on epoll too |
-//! | IOCP, initiating call returns `STATUS_PENDING` | On Windows, `law::iocp` and `law::packets`, for example `a_dropped_accept_leaves_its_connection_to_the_next_accept`; after `CancelIoEx`, `a_cancelled_receive_keeps_its_buffer_until_its_packet` |
+//! | IOCP, initiating call returns `STATUS_PENDING` | On Windows, `law::iocp` and `law::packets`, for example `a_dropped_accept_leaves_its_connection_to_the_next_accept`; after `CancelIoEx`, `a_cancelled_receive_keeps_its_buffer_until_its_packet`; for a file write, `a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet` |
 //! | IOCP, immediate return with an error status | On Windows, `a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it`: the stack refuses a datagram above 65507 bytes at once |
 //! | IOCP, immediate return with any other status | On Windows, with skip-on-success in `law::iocp` and with a packet in `law::packets`: `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order`, whose receive ends at once with its bytes. The warning status of an oversized datagram comes in the packet of `an_oversized_datagram_gives_the_truncation_outcome`: on Windows Server 2025, the receive of a datagram that waits returns pending, so no case makes the warning at once |
-//! | Windows IoRing | No IoRing backend: the Windows file task of R5 adds it |
+//! | Windows IoRing | No IoRing backend: R508 adds it |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
 //! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. On kqueue, each case of `law::kqueue`, for example `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order` |
-//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll and kqueue, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion` |
+//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll and kqueue, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion`. On IOCP, each file case that opens, syncs, or changes the length or the space of a file |
 //! | Child wait | `a_dropped_wait_and_child_leave_no_zombie_after_the_exit` |
 //!
 //! A cancel result is not a terminal event: `law::injected_only` and the table cases show it, with
@@ -97,6 +99,8 @@
 //!     `an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay`.
 //!   - Sync, rename, unlink, directory open and sync, and close:
 //!     `a_rename_an_unlink_and_a_directory_sync_complete`.
+//!   - The native NVMe path of the device of a file, on Windows:
+//!     `the_nvme_report_of_a_file_follows_the_driver_of_its_disk`.
 //! - TCP
 //!   - Bind and listen with socket options, and the options:
 //!     `each_socket_option_reads_back_the_value_that_was_set`.
@@ -155,13 +159,10 @@
 //!   - Refusals: `a_fault_an_uncatchable_or_a_reserved_signal_and_a_full_registry_refuse`.
 //!   - Escalation: `escalation_at_the_second_delivery_ends_a_child_that_never_polls`.
 
-#[cfg(unix)]
 use core::num::NonZeroU64;
 
 use super::{Config, Driver};
-#[cfg(unix)]
 use crate::blocking::{self, Service};
-#[cfg(unix)]
 use crate::capacity::Budget;
 
 /// Where the completions of a case come from.
@@ -179,11 +180,13 @@ pub(super) enum Backend {
     #[cfg(target_os = "linux")]
     Epoll,
     /// The completion port, where each socket that passes the installed-provider check skips the
-    /// packet of a call that ends at once: the return of that call is its terminal event.
+    /// packet of a call that ends at once: the return of that call is its terminal event. Each file
+    /// operation with no overlapped form runs on a blocking service of the case.
     #[cfg(target_os = "windows")]
     Iocp,
     /// The completion port with no skip-on-success: each call that does not fail at once ends at
-    /// its packet.
+    /// its packet. Each file operation with no overlapped form runs on a blocking service of the
+    /// case.
     #[cfg(target_os = "windows")]
     Packets,
     /// The kqueue poller, as its nonblocking calls end. Each file operation runs on a blocking
@@ -204,10 +207,11 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
 /// A driver of `config` that takes its completions from `backend`.
 #[cfg(target_os = "windows")]
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
-    let driver = super::tests::driver(config);
+    let mut driver = super::tests::driver(config);
     if backend == Backend::Packets {
         driver.resources.registrar.packets.set(true);
     }
+    driver.use_blocking(service().submitter());
     driver
 }
 
@@ -227,9 +231,8 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
     driver
 }
 
-/// A blocking service for the file operations of an epoll or a kqueue driver. It lives until the
-/// test process ends, as the threads of the case do.
-#[cfg(unix)]
+/// A blocking service for the file operations of an epoll, a kqueue, or an IOCP driver. It lives
+/// until the test process ends, as the threads of the case do.
 fn service() -> &'static Service {
     let budget = Budget::new(NonZeroU64::new(64 << 20).unwrap());
     let config = blocking::Config::new().threads(4).jobs(64).stack(256 << 10);
@@ -330,7 +333,6 @@ mod law {
         // Short I/O.
         tests => a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once,
         tests => a_vectored_send_gives_its_exact_progress_across_regions,
-        #[cfg(unix)]
         file::tests => a_short_read_gives_its_exact_extent_and_the_exact_read_reports_incomplete_progress,
         // Failed I/O.
         tests => a_connect_to_a_port_with_no_listener_is_refused,
@@ -360,8 +362,9 @@ mod law {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations,
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
-        #[cfg(unix)]
         file::tests => a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion,
+        #[cfg(target_os = "windows")]
+        file::tests => a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet,
         #[cfg(target_os = "linux")]
         process::tests => a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy,
         #[cfg(target_os = "linux")]
@@ -492,22 +495,16 @@ mod law {
 mod operation {
     cases! {
         // File.
-        #[cfg(unix)]
         file::tests => a_misaligned_direct_io_buffer_refuses_before_submission,
-        #[cfg(unix)]
         file::tests => vectored_writes_and_reads_keep_the_order_of_their_regions,
-        #[cfg(unix)]
         file::tests => a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before,
-        #[cfg(unix)]
         file::tests => a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks,
-        #[cfg(unix)]
         file::tests => a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks,
-        #[cfg(unix)]
         file::tests => an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay,
-        #[cfg(unix)]
         file::tests => a_write_after_the_end_of_an_extending_allocation_keeps_each_byte,
-        #[cfg(unix)]
         file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
+        #[cfg(target_os = "windows")]
+        file::tests => the_nvme_report_of_a_file_follows_the_driver_of_its_disk,
         // TCP.
         tests => each_socket_option_reads_back_the_value_that_was_set,
         tests => a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere,

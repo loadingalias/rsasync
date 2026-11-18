@@ -1,7 +1,8 @@
 //! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
 //! nonblocking turns. No scheduler runs. On Linux, the driver runs on io_uring, or on epoll where the
 //! kernel refuses io_uring. On macOS, it runs TCP and UDP on kqueue, and files on the blocking
-//! service. On Windows, it runs TCP and UDP on an I/O completion port ([`Backend`]). Each backend has
+//! service. On Windows, it runs TCP, UDP, and files on an I/O completion port, and the file calls
+//! with no overlapped form on the blocking service ([`Backend`]). Each backend has
 //! the same operations and the same ownership rules.
 //!
 //! A [`Driver`] is the home of each operation that it accepts, from the submission to the
@@ -26,17 +27,16 @@
 //! a stream runs one operation at a time, and the rules for a dropped or forgotten future keep each
 //! byte and each connection: see [`TcpStream`].
 //!
-//! On Linux and macOS, files run on the driver too: `Driver::open_file` with an explicit cache
-//! mode, positional and vectored reads and writes, length, space, sync, rename, unlink,
-//! directories, and `Driver::close_file`. Several operations of one file run at one time: see
-//! `File`.
+//! Files run on the driver too: [`Driver::open_file`] with an explicit cache mode, positional and
+//! vectored reads and writes, length, space, sync, rename, unlink, directories, and
+//! [`Driver::close_file`]. Several operations of one file run at one time: see [`File`].
 //!
 //! [`Driver::report`] states what the driver found and applied when it started: the backend, the
 //! features of the kernel, and the [`Route`] of each [`Call`] that depends on them. The driver
 //! starts no helper thread. A kernel with no ring operation for a file call runs that call on the
-//! blocking service of the caller, which `Driver::use_blocking` gives, and on epoll and kqueue each
-//! file call runs there. [`Config::require`] makes a missing feature refuse the driver, and
-//! [`Config::backend`] a missing backend.
+//! blocking service of the caller, which [`Driver::use_blocking`] gives. On epoll and kqueue each
+//! file call runs there, and on IOCP each file call with no overlapped form. [`Config::require`]
+//! makes a missing feature refuse the driver, and [`Config::backend`] a missing backend.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,7 +56,6 @@
 
 mod capability;
 mod completion;
-#[cfg(unix)]
 mod file;
 #[cfg(all(feature = "local", target_os = "linux"))]
 mod home;
@@ -126,7 +125,8 @@ use crate::uring::{Ring, SetupError};
 use queue::Queue;
 
 pub use capability::{Backend, Call, Feature, Features, Report, Route};
-#[cfg(unix)]
+#[cfg(target_os = "windows")]
+pub use file::NvmePath;
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use local::{LocalListener, LocalStream, Peer, Stale};
@@ -367,7 +367,6 @@ pub(crate) struct Held {
     /// The home asked the kernel to cancel the operation.
     pub(crate) cancelled: bool,
     /// An error of the home that the future gives in place of the result of the kernel.
-    #[cfg(unix)]
     pub(crate) error: Option<io::ErrorKind>,
 }
 
@@ -406,27 +405,21 @@ pub(crate) enum Payload {
     SendTo { message: udp::Message, datagram: Datagram },
     /// The datagrams of a batch, and its progress while its completions come.
     Batch { batch: udp::Batch, progress: udp::Progress },
-    /// The C strings of the paths of a rename or an unlink, which the kernel reads.
-    #[cfg(unix)]
+    /// The paths of a rename or an unlink, which the kernel reads: C strings, and UTF-16 strings on
+    /// Windows.
     Paths {
-        path: std::ffi::CString,
-        target: Option<std::ffi::CString>,
+        path: file::Name,
+        target: Option<file::Name>,
     },
-    /// The C string of the path of an open, which the kernel reads, and the alignment of direct
-    /// I/O of the file that the open gave.
-    #[cfg(unix)]
-    Open {
-        path: std::ffi::CString,
-        alignment: Option<Alignment>,
-    },
-    /// The structure that a `statx` of a file writes on Linux, and an `fstat` on macOS.
-    #[cfg(unix)]
+    /// The open of a file or a directory: its path, which the kernel reads, and what the open
+    /// gives, such as the alignment of direct I/O.
+    Open(file::Opening),
+    /// The structure that a `statx` of a file writes on Linux, an `fstat` on macOS, and
+    /// `GetFileInformationByHandleEx` on Windows.
     Stat(file::Stat),
     /// The buffers of a vectored read of a file.
-    #[cfg(unix)]
     Buffers(Buffers),
     /// The waiter of the job of an operation that runs on the blocking service.
-    #[cfg(unix)]
     Job(crate::blocking::Waiter<i32>),
     /// The waiter of the job of a spawn, and the child that the home makes at the end of the job.
     #[cfg(target_os = "linux")]
@@ -496,7 +489,6 @@ pub(crate) enum Kind {
     Close,
     /// An operation of a file or a directory, which runs at the same time as the others of its
     /// file.
-    #[cfg(unix)]
     File(file::Op),
     /// A spawn of a child in the child slot of the index, as a job of the blocking service.
     #[cfg(target_os = "linux")]
@@ -556,12 +548,10 @@ pub enum Reason {
     Unsupported,
     /// The buffer, the length, or the offset of a direct-I/O operation does not have the
     /// [`Alignment`] of its file.
-    #[cfg(unix)]
     Alignment,
     /// The operation runs on the blocking service on this kernel or backend
     /// ([`Route::BlockingService`]), and the driver has no service ([`Driver::use_blocking`]), or
     /// the service refused the job.
-    #[cfg(unix)]
     Blocking,
     /// Each child slot of the driver is in use ([`Config::children`]).
     #[cfg(target_os = "linux")]
@@ -725,16 +715,19 @@ struct Owned {
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
     /// The operations of a file that run, which its close waits for.
-    #[cfg(unix)]
     running: u32,
-    /// The last allocation of the file that extends its length on macOS, which runs alone on the
-    /// file while the table says that it runs.
-    #[cfg(target_os = "macos")]
+    /// The last operation of the file that runs alone on it (`file::Op::Alone`), on macOS and
+    /// Windows, while the table says that it runs.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     exclusive: Option<OpId>,
     /// The port queues no packet for an operation of the socket that ends at its call
     /// (skip-on-success).
     #[cfg(target_os = "windows")]
     skips: bool,
+    /// The handles of the file or the directory of the slot, on Windows, where `fd` holds only
+    /// sockets.
+    #[cfg(target_os = "windows")]
+    file: Option<file::Handles>,
     /// The lock file of a local listener, whose lock lives while the socket lives.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     lock: Option<OwnedFd>,
@@ -753,8 +746,21 @@ enum Medium {
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
     Udp,
     /// A file or a directory: its operations are positional, and several run at one time.
-    #[cfg(unix)]
     File,
+}
+
+impl Owned {
+    /// Whether the slot holds a resource.
+    #[cfg(unix)]
+    const fn used(&self) -> bool {
+        self.fd.is_some()
+    }
+
+    /// Whether the slot holds a resource: a socket, or a file or a directory.
+    #[cfg(target_os = "windows")]
+    const fn used(&self) -> bool {
+        self.fd.is_some() || self.file.is_some()
+    }
 }
 
 /// The descriptors that the driver owns, in a slice that it allocates once.
@@ -809,7 +815,7 @@ impl Resources {
 
     /// The free slots.
     fn free(&self) -> u32 {
-        let free = self.slots.iter().filter(|slot| slot.fd.is_none()).count();
+        let free = self.slots.iter().filter(|slot| !slot.used()).count();
         u32::try_from(free).unwrap_or(u32::MAX)
     }
 
@@ -817,7 +823,7 @@ impl Resources {
     /// backends, or associates it with the port on IOCP. A file has no readiness, so it has no
     /// registration.
     fn take(&mut self, fd: Handle, medium: Medium) -> Result<Resource, (Reason, Handle)> {
-        let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| slot.fd.is_none()) else {
+        let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| !slot.used()) else {
             return Err((Reason::Resources, fd));
         };
         #[cfg(unix)]
@@ -853,10 +859,38 @@ impl Resources {
         })
     }
 
+    /// Takes the handles of a file or a directory that an open gave into the first free slot, and
+    /// associates them with the port. Refuses with them when each slot that no spawn keeps is in
+    /// use or the port does not take them.
+    #[cfg(target_os = "windows")]
+    fn adopt_file(&mut self, file: file::Handles) -> Result<Resource, (Reason, file::Handles)> {
+        if self.reserved > 0 && self.free() <= self.reserved {
+            return Err((Reason::Resources, file));
+        }
+        let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| !slot.used()) else {
+            return Err((Reason::Resources, file));
+        };
+        let associated = self.registrar.add_file(&file.file).is_ok()
+            && file
+                .through
+                .as_ref()
+                .is_none_or(|through| self.registrar.add_file(through).is_ok());
+        if !associated {
+            return Err((Reason::Register, file));
+        }
+        slot.file = Some(file);
+        slot.medium = Medium::File;
+        slot.skips = false;
+        Ok(Resource {
+            index,
+            generation: slot.generation,
+        })
+    }
+
     fn get(&mut self, resource: Resource) -> Option<&mut Owned> {
         self.slots
             .get_mut(resource.index as usize)
-            .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())
+            .filter(|slot| slot.generation == resource.generation && slot.used())
     }
 
     /// The descriptor of `resource`, while the driver owns it.
@@ -877,17 +911,17 @@ impl Resources {
         let slot = self
             .slots
             .get_mut(resource.index as usize)
-            .filter(|slot| slot.generation == resource.generation && slot.fd.is_some())?;
+            .filter(|slot| slot.generation == resource.generation && slot.used())?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
-        #[cfg(unix)]
-        {
-            slot.running = 0;
-        }
-        #[cfg(target_os = "macos")]
+        slot.running = 0;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             slot.exclusive = None;
         }
+        // A file closes here. It stays associated with its port until then, as a socket does.
+        #[cfg(target_os = "windows")]
+        drop(slot.file.take());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             slot.lock = None;
@@ -1072,14 +1106,12 @@ pub struct Driver {
     children: process::Children,
     /// The blocking service of the operations that the kernel cannot run
     /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
-    #[cfg(unix)]
     blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
     /// The operations that run on the blocking service, which each turn polls.
-    #[cfg(unix)]
     jobs: Vec<OpId>,
-    /// The file operations that wait for an allocation that extends their file, or that such an
-    /// allocation waits for, in start order: at most one entry for each operation.
-    #[cfg(target_os = "macos")]
+    /// The file operations that wait for an operation that runs alone on their file, or that such
+    /// an operation waits for, in start order: at most one entry for each operation.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     waiting: Vec<file::Waiting>,
     /// The home of a local owner on this driver, and the wake messages that it sent.
     #[cfg(all(feature = "local", target_os = "linux"))]
@@ -1140,7 +1172,8 @@ impl Driver {
             backend: Backend::Iocp,
             fallback: None,
         };
-        let port = iocp::Port::new(config.submissions, completions).map_err(|error| match error.kind() {
+        let port = iocp::Port::new(config.submissions, completions, config.operations);
+        let port = port.map_err(|error| match error.kind() {
             io::ErrorKind::InvalidInput => Error::Config,
             _ => Error::System(error),
         })?;
@@ -1166,6 +1199,9 @@ impl Driver {
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
+            blocking: None,
+            jobs: Vec::with_capacity(config.operations as usize),
+            waiting: Vec::with_capacity(config.operations as usize),
         })
     }
 
@@ -1418,7 +1454,6 @@ impl Driver {
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
         self.take_requests();
-        #[cfg(unix)]
         self.poll_jobs();
         if let Some(selected) = &mut self.selected {
             selected.refill();
@@ -1436,7 +1471,7 @@ impl Driver {
         signal::wake(&mut self.signals);
         // Start the operations that waited for an operation that ended, and end the closes.
         self.attend();
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.start_waiting();
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
         // the descriptor already, so this turn reports it, or a later wake comes.
@@ -1532,7 +1567,7 @@ impl Driver {
             }
         }
         // An operation that waits for the one before it never ran, so it ends now.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         for waiting in mem::take(&mut self.waiting) {
             self.complete_now(waiting.id(), -ECANCELED);
         }
@@ -1572,13 +1607,13 @@ impl Driver {
         }
         while self.table.busy() {
             self.take_requests();
-            #[cfg(unix)]
             self.poll_jobs();
             if !self.table.busy() {
                 break;
             }
             // The wait also ends when a job of the blocking service ends, because the job wakes
-            // the driver: the interrupt descriptor on Linux, and the user event on macOS.
+            // the driver: the interrupt descriptor on Linux, the user event on macOS, and a packet
+            // of the port on Windows.
             self.wait()?;
             self.harvest(u32::MAX);
             self.attend();
@@ -1746,7 +1781,10 @@ impl Driver {
             #[cfg(target_os = "windows")]
             let token = resource
                 .and_then(|resource| self.resources.get(resource))
-                .map(|owned| iocp::Token { skips: owned.skips });
+                .map(|owned| iocp::Token {
+                    skips: owned.skips,
+                    file: owned.medium == Medium::File,
+                });
             // SAFETY: the entry of the slot keeps the resources in place until the terminal event
             // of `id`, and nothing changes the variant of their payload before it. The caller keeps
             // the descriptor open. The queue has room.
@@ -1773,7 +1811,6 @@ impl Driver {
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return;
         };
-        #[cfg(unix)]
         if let Some(tag) = match &outcome {
             Outcome::Ready => self.table.resources(id).copied(),
             Outcome::Abandoned(Done { resources, .. }) => *resources,
@@ -1846,7 +1883,7 @@ impl Driver {
             self.complete_now(id, -ECANCELED);
             return;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.unwait(id) {
             return;
         }
@@ -1965,7 +2002,6 @@ impl Driver {
                     finish(held, tag, &cqe, abandoned, resources, selected.as_mut());
                 }
             });
-            #[cfg(unix)]
             file::ended(resources, pending, tag);
             if abandoned {
                 if let Some(held) = slot.reclaim(id) {
@@ -2005,7 +2041,6 @@ fn finish(
 ) {
     let count = usize::try_from(cqe.res);
     match tag.kind {
-        #[cfg(unix)]
         Kind::File(op) => file::finish(held, op, cqe.res, abandoned, resources),
         Kind::Other
         | Kind::Send

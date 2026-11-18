@@ -279,6 +279,13 @@ impl Queue {
         }
     }
 
+    /// The port.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn port(&mut self) -> &mut Port {
+        let Self::Port(port) = self;
+        port
+    }
+
     /// The poller.
     #[cfg(unix)]
     pub(crate) fn poller(&mut self) -> Option<&mut Poller> {

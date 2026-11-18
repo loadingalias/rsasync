@@ -656,7 +656,8 @@ impl<R> Waiter<R> {
     /// waker of `cx` stays registered after a `Pending`, so the end of the job wakes it.
     #[cfg(any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", target_arch = "aarch64")
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "windows", target_arch = "x86_64")
     ))]
     pub(crate) fn poll(&mut self, cx: &Context<'_>) -> Poll<Result<R, Failed>> {
         self.reply.poll_recv(cx).map(result)

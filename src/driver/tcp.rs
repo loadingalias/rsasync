@@ -729,7 +729,6 @@ impl Directions {
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
-            #[cfg(unix)]
             Kind::File(_) => None,
             #[cfg(target_os = "linux")]
             Kind::Spawn(_) | Kind::Exit(_) => None,
@@ -752,7 +751,6 @@ impl Directions {
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
-            #[cfg(unix)]
             Kind::File(_) => false,
             #[cfg(target_os = "linux")]
             Kind::Spawn(_) | Kind::Exit(_) => false,
@@ -888,7 +886,6 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
         },
         // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
         Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
-        #[cfg(unix)]
         Kind::File(_) => {}
         #[cfg(target_os = "linux")]
         Kind::Spawn(_) | Kind::Exit(_) => {}
@@ -2056,16 +2053,9 @@ fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, rec
     len
 }
 
-/// Whether operations of the file of `owned` run, which its close waits for. Windows has no file
-/// resource yet.
-#[cfg(unix)]
+/// Whether operations of the file of `owned` run, which its close waits for.
 const fn running(owned: &super::Owned) -> bool {
     owned.running > 0
-}
-
-#[cfg(target_os = "windows")]
-const fn running(_: &super::Owned) -> bool {
-    false
 }
 
 /// The negative errno of `error`, as a kernel result gives it.

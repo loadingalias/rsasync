@@ -3,6 +3,7 @@ use core::alloc::Layout;
 use core::num::{NonZeroU32, NonZeroU64};
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -79,6 +80,38 @@ fn file_len(driver: &mut Driver, file: &File) -> u64 {
 fn sync(driver: &mut Driver, file: &File) {
     let sync = driver.sync(file, SyncMode::All).expect("the test driver has room");
     drive(driver, sync).expect("the driver runs").expect("the sync works");
+}
+
+/// The bytes that the file system allocated for the file at `path`: `st_blocks`, which counts
+/// 512-byte units.
+#[cfg(unix)]
+fn allocated(path: &Path) -> u64 {
+    fs::metadata(path).expect("the test file exists").blocks() * 512
+}
+
+/// The bytes that the file system allocated for the file at `path`: the `AllocationSize` of
+/// `FILE_STANDARD_INFO`, which counts the clusters of a sparse file that hold data.
+#[cfg(target_os = "windows")]
+#[expect(unsafe_code, reason = "the call writes one structure of the test")]
+fn allocated(path: &Path) -> u64 {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use super::super::iocp::sys;
+
+    let file = fs::File::open(path).expect("the test file exists");
+    let mut info = sys::FileStandardInfo::default();
+    let len = u32::try_from(size_of::<sys::FileStandardInfo>()).unwrap();
+    // SAFETY: `info` holds `len` bytes, and the call writes at most that many.
+    let read = unsafe {
+        sys::GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            sys::FILE_STANDARD_INFO,
+            core::ptr::from_mut(&mut info).cast(),
+            len,
+        )
+    };
+    assert_ne!(read, 0, "{}", io::Error::last_os_error());
+    u64::try_from(info.allocation).unwrap()
 }
 
 /// A read gives the exact count of the bytes that it put in, fewer at the end of the file and 0
@@ -215,7 +248,8 @@ pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_
         backend == Backend::Epoll,
         backend == Backend::Epoll || kernel() < (6, 9),
     );
-    #[cfg(target_os = "macos")]
+    // On Windows, the length change has no overlapped form, and the open needs the service too.
+    #[cfg(not(target_os = "linux"))]
     let (readiness, on_service) = (true, true);
     let route = driver.report().route(Call::SetFileLen);
     assert_eq!(route == Route::BlockingService, on_service);
@@ -250,8 +284,22 @@ pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_
     drive(&mut driver, close).unwrap();
 }
 
+/// Syncs `directory`. On Windows, the report gives the sync no qualified form, and the sync gives
+/// `Unsupported`.
+fn sync_directory(driver: &mut Driver, directory: &super::Directory) {
+    let sync = driver.sync_directory(directory).unwrap();
+    let synced = drive(driver, sync).unwrap();
+    #[cfg(unix)]
+    synced.unwrap();
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(driver.report().route(Call::SyncDirectory), Route::Unsupported);
+        assert_eq!(synced.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+}
+
 /// A rename, an unlink, and the sync of their directory complete, and the names change as they
-/// say.
+/// say. On Windows, the sync of the directory gives `Unsupported`.
 pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backend: Backend) {
     let scratch = Scratch::new("names");
     let mut driver = suite::driver(Config::new(), backend);
@@ -263,15 +311,13 @@ pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backen
 
     let rename = driver.rename(&scratch.join("first"), &scratch.join("second")).unwrap();
     drive(&mut driver, rename).unwrap().unwrap();
-    let sync = driver.sync_directory(&directory).unwrap();
-    drive(&mut driver, sync).unwrap().unwrap();
+    sync_directory(&mut driver, &directory);
     assert!(!scratch.join("first").exists());
     assert_eq!(fs::read(scratch.join("second")).unwrap(), b"contents");
 
     let unlink = driver.unlink(&scratch.join("second")).unwrap();
     drive(&mut driver, unlink).unwrap().unwrap();
-    let sync = driver.sync_directory(&directory).unwrap();
-    drive(&mut driver, sync).unwrap().unwrap();
+    sync_directory(&mut driver, &directory);
     assert!(!scratch.join("second").exists());
     let unlink = driver.unlink(&scratch.join("second")).unwrap();
     assert_eq!(
@@ -290,16 +336,15 @@ pub(in crate::driver) fn a_preallocation_keeps_or_extends_the_length_and_allocat
     let file = open(&mut driver, &scratch.join("data"), writable());
     let allocate = driver.allocate(&file, 0, MIB, Length::Keep).unwrap();
     drive(&mut driver, allocate).unwrap().unwrap();
-    let metadata = fs::metadata(scratch.join("data")).unwrap();
-    assert_eq!(metadata.len(), 0);
-    // `st_blocks` counts 512-byte units.
-    assert!(metadata.blocks() * 512 >= MIB, "{} blocks", metadata.blocks());
+    assert_eq!(fs::metadata(scratch.join("data")).unwrap().len(), 0);
+    let bytes = allocated(&scratch.join("data"));
+    assert!(bytes >= MIB, "{bytes} bytes");
 
     let allocate = driver.allocate(&file, 0, 2 * MIB, Length::Extend).unwrap();
     drive(&mut driver, allocate).unwrap().unwrap();
-    let metadata = fs::metadata(scratch.join("data")).unwrap();
-    assert_eq!(metadata.len(), 2 * MIB);
-    assert!(metadata.blocks() * 512 >= 2 * MIB, "{} blocks", metadata.blocks());
+    assert_eq!(fs::metadata(scratch.join("data")).unwrap().len(), 2 * MIB);
+    let bytes = allocated(&scratch.join("data"));
+    assert!(bytes >= 2 * MIB, "{bytes} bytes");
 }
 
 /// A punched hole reads as zeros, keeps the length, and frees its blocks.
@@ -310,18 +355,14 @@ pub(in crate::driver) fn a_punched_hole_reads_as_zeros_keeps_the_length_and_free
     let file = open(&mut driver, &scratch.join("data"), writable().read(true));
     write(&mut driver, &file, &alloc::vec![0xab; 1024 * KIB], 0);
     sync(&mut driver, &file);
-    let before = fs::metadata(scratch.join("data")).unwrap().blocks();
+    let before = allocated(&scratch.join("data"));
 
     let punch = driver.punch_hole(&file, 256 * 1024, 512 * 1024).unwrap();
     drive(&mut driver, punch).unwrap().unwrap();
     sync(&mut driver, &file);
-    let metadata = fs::metadata(scratch.join("data")).unwrap();
-    assert_eq!(metadata.len(), 1024 * 1024);
-    assert!(
-        (before - metadata.blocks()) * 512 >= 512 * 1024,
-        "{before} blocks before, {} after",
-        metadata.blocks()
-    );
+    assert_eq!(fs::metadata(scratch.join("data")).unwrap().len(), 1024 * 1024);
+    let after = allocated(&scratch.join("data"));
+    assert!(before - after >= 512 * 1024, "{before} bytes before, {after} after");
     let read = driver
         .read_at(&file, Backing::from(Vec::with_capacity(1024 * KIB)), 0)
         .unwrap();
@@ -459,4 +500,133 @@ pub(in crate::driver) fn vectored_writes_and_reads_keep_the_order_of_their_regio
     assert_eq!(&buffers[1].bytes()[..4], b"kept");
     assert_eq!(&buffers[1].bytes()[4..], numbered(250, 500));
     assert_eq!(buffers[2].bytes(), numbered(750, 250));
+}
+
+/// A backing of `capacity` bytes at an address that is a multiple of 4096, which holds the sector
+/// alignment of direct I/O, whose release, through its release hook, records "released".
+#[cfg(target_os = "windows")]
+#[expect(
+    unsafe_code,
+    reason = "the test maps its own block into a backing, as a library does"
+)]
+fn recorded_aligned(log: &super::super::tests::Log, capacity: usize) -> Backing {
+    use crate::buffer::Release;
+
+    let layout = Layout::from_size_align(capacity, ALIGNED).unwrap();
+    // SAFETY: the layout has a size above 0.
+    let ptr = core::ptr::NonNull::new(unsafe { alloc::alloc::alloc(layout) }).expect("the test host has memory");
+    let data = Arc::into_raw(Arc::clone(log)).cast::<()>();
+    // SAFETY: the block is valid for `capacity` bytes and only the backing uses it.
+    // `release_aligned` frees it, on any thread.
+    unsafe { Backing::from_raw_parts(ptr, capacity, 0, capacity, Release::new(data, release_aligned)) }
+}
+
+/// The alignment of the blocks of `recorded_aligned`.
+#[cfg(target_os = "windows")]
+const ALIGNED: usize = 4096;
+
+/// The release hook of `recorded_aligned`: records the release, then frees the block.
+///
+/// # Safety
+///
+/// `data` is from `Arc::into_raw` of a `Log`, and `ptr` and `capacity` are a block of
+/// `recorded_aligned` that nothing freed. Nothing uses them after this call.
+#[cfg(target_os = "windows")]
+#[expect(
+    unsafe_code,
+    reason = "the hook takes back the log and the block that `recorded_aligned` gave"
+)]
+unsafe fn release_aligned(data: *const (), ptr: core::ptr::NonNull<u8>, capacity: usize) {
+    // SAFETY: `recorded_aligned` made `data` with `Arc::into_raw`, and this call is its only use.
+    let log = unsafe { Arc::from_raw(data.cast::<Mutex<Vec<&'static str>>>()) };
+    note(&log, "released");
+    // SAFETY: the caller gives a block of `recorded_aligned` with this layout that nothing freed.
+    unsafe { alloc::alloc::dealloc(ptr.as_ptr(), Layout::from_size_align(capacity, ALIGNED).unwrap()) };
+}
+
+/// On Windows, a dropped write that returns pending keeps its lease until its packet. A write
+/// with no cache inside the length of the file goes to the device, so its call returns pending.
+/// While the port takes no packet, turns of the driver release nothing. The release comes after
+/// the packet in the release record (R203).
+#[cfg(target_os = "windows")]
+pub(in crate::driver) fn a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet(backend: Backend) {
+    const LEN: usize = 1 << 16;
+    let scratch = Scratch::new("pending");
+    let log = Log::default();
+    // The bytes are on the device and not in the cache, so the write does not wait for a flush.
+    let data = fs::File::create(scratch.join("data")).unwrap();
+    data.set_len(16 * LEN as u64).unwrap();
+    data.sync_all().unwrap();
+    drop(data);
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(
+        &mut driver,
+        &scratch.join("data"),
+        OpenOptions::new().write(true).cache(Cache::Direct),
+    );
+    let mut loan = WriteLoan::new(recorded_aligned(&log, LEN));
+    loan.fill_from(&numbered(0, LEN));
+    let super::super::queue::Queue::Port(port) = &mut driver.queue;
+    port.held = true;
+    drop(
+        driver
+            .write_at(&file, Lease::from(loan.into_inner()), 4 * LEN as u64, WriteMode::Plain)
+            .unwrap(),
+    );
+    for _ in 0..4 {
+        driver.turn().unwrap();
+    }
+    assert!(taken(&log).is_empty(), "the lease returned before its packet");
+
+    let super::super::queue::Queue::Port(port) = &mut driver.queue;
+    port.held = false;
+    posted(&mut driver, 1);
+    note(&log, "completed");
+    while driver.turn().unwrap().more() {}
+    assert_eq!(taken(&log), ["completed", "released"]);
+    let close = driver.close_file(file).unwrap();
+    drive(&mut driver, close).unwrap();
+    let bytes = fs::read(scratch.join("data")).unwrap();
+    assert_eq!(&bytes[4 * LEN..5 * LEN], numbered(0, LEN));
+}
+
+/// On Windows, the report of a file states whether the native NVMe path serves its disk, as the
+/// driver service of that disk, which PowerShell reads through CIM, says.
+#[cfg(target_os = "windows")]
+pub(in crate::driver) fn the_nvme_report_of_a_file_follows_the_driver_of_its_disk(backend: Backend) {
+    let scratch = Scratch::new("nvme");
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), writable());
+    let report = driver.nvme_path(&file).unwrap();
+    let path = drive(&mut driver, report).unwrap().unwrap();
+
+    let letter = scratch.0.to_str().unwrap().chars().next().unwrap();
+    let script = alloc::format!(
+        "$n = (Get-Partition -DriveLetter {letter}).DiskNumber; \
+         $d = Get-CimInstance Win32_DiskDrive | Where-Object Index -eq $n; \
+         (Get-PnpDeviceProperty -InstanceId $d.PNPDeviceID -KeyName DEVPKEY_Device_Service).Data"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        alloc::string::String::from_utf8_lossy(&output.stderr)
+    );
+    let service: alloc::string::String = alloc::string::String::from_utf8_lossy(&output.stdout).trim().into();
+    assert!(
+        !service.is_empty(),
+        "PowerShell found no driver service for drive {letter}"
+    );
+    let expected = if service.eq_ignore_ascii_case("nvmedisk") {
+        super::NvmePath::Native
+    } else {
+        super::NvmePath::Other
+    };
+    assert_eq!(
+        path, expected,
+        "the disk of drive {letter} has the driver service {service}"
+    );
 }
