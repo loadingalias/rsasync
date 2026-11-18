@@ -369,6 +369,8 @@ mod law {
         pipe::tests => a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations,
+        #[cfg(target_os = "windows")]
+        local::windows::tests => a_numbered_stream_crosses_a_named_pipe_with_no_gap_through_the_abandoned_operations,
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
         file::tests => a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion,
         #[cfg(target_os = "windows")]
@@ -522,6 +524,24 @@ mod operation {
         tests => a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on,
         tests => a_half_close_on_a_failed_write_direction_sends_no_end_of_stream,
         // Local stream.
+        #[cfg(target_os = "windows")]
+        local::windows::tests => an_accepted_stream_reports_the_process_and_user_of_its_client,
+        #[cfg(target_os = "windows")]
+        local::windows::tests => a_bind_refuses_a_pipe_name_with_an_instance_also_one_that_a_squatter_made_first,
+        #[cfg(target_os = "windows")]
+        local::windows::tests => a_remote_client_of_a_pipe_is_rejected,
+        #[cfg(target_os = "windows")]
+        local::windows::tests => a_waiting_accept_ends_at_the_close_of_its_listener_and_the_name_binds_again,
+        #[cfg(target_os = "windows")]
+        local::windows::tests => a_path_that_is_not_a_pipe_name_gives_invalid_input,
+        #[cfg(target_os = "windows")]
+        local::windows::tests => a_burst_of_backlog_clients_connects_and_each_one_is_accepted,
+        #[cfg(target_os = "windows")]
+        #[ignore = "needs a second OS user with a password, which the Windows run makes"]
+        local::windows::tests => a_connect_of_a_second_os_user_is_denied,
+        #[cfg(target_os = "windows")]
+        #[ignore = "needs a second OS user with a password, which the Windows run makes"]
+        local::windows::tests => a_client_reads_the_process_and_user_of_a_server_of_a_second_os_user,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         local::tests => the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends,
         #[cfg(any(target_os = "linux", target_os = "macos"))]

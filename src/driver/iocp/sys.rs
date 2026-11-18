@@ -15,8 +15,14 @@
 //! `minwinbase.h` (`FILE_INFO_BY_HANDLE_CLASS` and its structures), `winnt.h` (the access rights
 //! and the share modes), `ioapiset.h` (`DeviceIoControl`, `GetOverlappedResult`), `winioctl.h`
 //! (the control codes and their structures), `cfgmgr32.h` (the device functions), `devpkey.h`
-//! (the device properties), and `ntddstor.h` (`GUID_DEVINTERFACE_DISK`). `kernel32.dll`,
-//! `ws2_32.dll`, and `cfgmgr32.dll` give the functions; `AcceptEx` and `ConnectEx` come only as
+//! (the device properties), and `ntddstor.h` (`GUID_DEVINTERFACE_DISK`). The named pipe items agree
+//! with `namedpipeapi.h` and `winbase.h` (the pipe functions and modes), `processthreadsapi.h`
+//! (`OpenProcessToken`, `OpenThreadToken`, `GetCurrentProcess`, `GetCurrentThread`),
+//! `securitybaseapi.h` (`GetTokenInformation`, `RevertToSelf`, `GetLengthSid`), `aclapi.h`
+//! (`GetSecurityInfo`, `SE_OBJECT_TYPE`), `sddl.h` (the
+//! string form of a security descriptor), `winnt.h` (`TOKEN_USER`, `TOKEN_QUERY`), and
+//! `minwinbase.h` (`SECURITY_ATTRIBUTES`). `kernel32.dll`, `ws2_32.dll`, `advapi32.dll`, and
+//! `cfgmgr32.dll` give the functions; `AcceptEx` and `ConnectEx` come only as
 //! pointers from `WSAIoctl`. The datagram declarations and the shared socket calls are in
 //! `rsnetwork_udp::sys`.
 
@@ -621,4 +627,154 @@ unsafe extern "system" {
         len: *mut u32,
         flags: u32,
     ) -> u32;
+}
+
+/// `PIPE_ACCESS_DUPLEX`: the server reads and writes the pipe.
+pub(crate) const PIPE_ACCESS_DUPLEX: u32 = 0x3;
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`: the call fails when an instance of the name exists.
+pub(crate) const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+/// `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT`: a byte stream, in the mode that waits.
+pub(crate) const PIPE_BYTES: u32 = 0;
+/// `PIPE_REJECT_REMOTE_CLIENTS`: a client on another computer cannot connect.
+pub(crate) const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x8;
+/// `PIPE_UNLIMITED_INSTANCES`.
+pub(crate) const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+/// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the server of a pipe that the client opens
+/// can read the identity of the client, and cannot act as the client.
+pub(crate) const SECURITY_IDENTIFICATION: u32 = 0x0010_0000 | 0x0001_0000;
+/// `TOKEN_QUERY`.
+pub(crate) const TOKEN_QUERY: u32 = 0x8;
+/// `TokenUser` of `TOKEN_INFORMATION_CLASS`.
+pub(crate) const TOKEN_USER: c_int = 1;
+/// `SDDL_REVISION_1`.
+pub(crate) const SDDL_REVISION_1: u32 = 1;
+/// `SE_FILE_OBJECT` of `SE_OBJECT_TYPE`: the object of a file handle, also of a pipe.
+pub(crate) const SE_FILE_OBJECT: c_int = 1;
+/// `OWNER_SECURITY_INFORMATION`.
+pub(crate) const OWNER_SECURITY_INFORMATION: u32 = 0x1;
+/// `SECURITY_MAX_SID_SIZE`: the most bytes of a SID.
+pub(crate) const SECURITY_MAX_SID_SIZE: usize = 68;
+
+/// `ERROR_ACCESS_DENIED`: for a pipe, an instance of the name exists, or the security descriptor of
+/// the pipe denies the caller.
+pub(crate) const ERROR_ACCESS_DENIED: c_int = 5;
+/// `ERROR_BROKEN_PIPE`: the other end of the pipe closed. A read gives the end of the stream.
+pub(crate) const ERROR_BROKEN_PIPE: c_int = 109;
+/// `ERROR_PIPE_BUSY`: each instance of the pipe has a client.
+pub(crate) const ERROR_PIPE_BUSY: c_int = 231;
+/// `ERROR_NO_DATA`: the client of an instance closed before the server took it.
+pub(crate) const ERROR_NO_DATA: c_int = 232;
+/// `ERROR_PIPE_CONNECTED`: a client connected before the server waited for it.
+pub(crate) const ERROR_PIPE_CONNECTED: c_int = 535;
+/// `ERROR_BUSY`: the error that `std::io` reads as `ResourceBusy`.
+pub(crate) const ERROR_BUSY: c_int = 170;
+/// `WSAEADDRINUSE`: the error that `std::io` reads as `AddrInUse`.
+pub(crate) const WSAEADDRINUSE: c_int = 10048;
+
+/// `SECURITY_ATTRIBUTES`: the security descriptor of a new object.
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct SecurityAttributes {
+    /// `nLength`.
+    pub(crate) len: u32,
+    /// `lpSecurityDescriptor`.
+    pub(crate) descriptor: *mut c_void,
+    /// `bInheritHandle`.
+    pub(crate) inherit: i32,
+}
+
+/// `TOKEN_USER`: the `SID_AND_ATTRIBUTES` of the user of a token. The SID follows it in the buffer
+/// of `GetTokenInformation`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TokenUser {
+    /// `User.Sid`.
+    pub(crate) sid: *mut c_void,
+    /// `User.Attributes`.
+    pub(crate) attributes: u32,
+}
+
+const _: () = {
+    assert!(size_of::<SecurityAttributes>() == 24);
+    assert!(offset_of!(SecurityAttributes, descriptor) == 8);
+    assert!(offset_of!(SecurityAttributes, inherit) == 16);
+    assert!(size_of::<TokenUser>() == 16);
+    assert!(offset_of!(TokenUser, attributes) == 8);
+};
+
+#[expect(unsafe_code, reason = "kernel32.dll gives these functions")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// `HANDLE CreateNamedPipeW(LPCWSTR lpName, DWORD dwOpenMode, DWORD dwPipeMode, DWORD
+    /// nMaxInstances, DWORD nOutBufferSize, DWORD nInBufferSize, DWORD nDefaultTimeOut,
+    /// LPSECURITY_ATTRIBUTES lpSecurityAttributes)`.
+    pub(crate) fn CreateNamedPipeW(
+        name: *const u16,
+        open: u32,
+        mode: u32,
+        instances: u32,
+        out_len: u32,
+        in_len: u32,
+        timeout: u32,
+        security: *mut SecurityAttributes,
+    ) -> Handle;
+    /// `BOOL ConnectNamedPipe(HANDLE hNamedPipe, LPOVERLAPPED lpOverlapped)`.
+    pub(crate) fn ConnectNamedPipe(pipe: Handle, overlapped: *mut Overlapped) -> i32;
+    /// `BOOL GetNamedPipeClientProcessId(HANDLE Pipe, PULONG ClientProcessId)`.
+    pub(crate) fn GetNamedPipeClientProcessId(pipe: Handle, process: *mut u32) -> i32;
+    /// `BOOL GetNamedPipeServerProcessId(HANDLE Pipe, PULONG ServerProcessId)`.
+    pub(crate) fn GetNamedPipeServerProcessId(pipe: Handle, process: *mut u32) -> i32;
+    /// `HANDLE GetCurrentProcess(void)`: a pseudo handle that needs no close.
+    pub(crate) fn GetCurrentProcess() -> Handle;
+    /// `HANDLE GetCurrentThread(void)`: a pseudo handle that needs no close.
+    pub(crate) fn GetCurrentThread() -> Handle;
+    /// `HLOCAL LocalFree(HLOCAL hMem)`.
+    pub(crate) fn LocalFree(memory: *mut c_void) -> *mut c_void;
+}
+
+#[expect(unsafe_code, reason = "advapi32.dll gives these functions")]
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    /// `BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, PHANDLE TokenHandle)`.
+    pub(crate) fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+    /// `BOOL OpenThreadToken(HANDLE ThreadHandle, DWORD DesiredAccess, BOOL OpenAsSelf, PHANDLE
+    /// TokenHandle)`.
+    pub(crate) fn OpenThreadToken(thread: Handle, access: u32, as_self: i32, token: *mut Handle) -> i32;
+    /// `BOOL GetTokenInformation(HANDLE TokenHandle, TOKEN_INFORMATION_CLASS TokenInformationClass,
+    /// LPVOID TokenInformation, DWORD TokenInformationLength, PDWORD ReturnLength)`.
+    pub(crate) fn GetTokenInformation(
+        token: Handle,
+        class: c_int,
+        information: *mut c_void,
+        len: u32,
+        returned: *mut u32,
+    ) -> i32;
+    /// `BOOL ImpersonateNamedPipeClient(HANDLE hNamedPipe)`.
+    pub(crate) fn ImpersonateNamedPipeClient(pipe: Handle) -> i32;
+    /// `BOOL RevertToSelf(void)`.
+    pub(crate) fn RevertToSelf() -> i32;
+    /// `DWORD GetLengthSid(PSID pSid)`.
+    pub(crate) fn GetLengthSid(sid: *mut c_void) -> u32;
+    /// `DWORD GetSecurityInfo(HANDLE handle, SE_OBJECT_TYPE ObjectType, SECURITY_INFORMATION
+    /// SecurityInfo, PSID *ppsidOwner, PSID *ppsidGroup, PACL *ppDacl, PACL *ppSacl,
+    /// PSECURITY_DESCRIPTOR *ppSecurityDescriptor)`. It gives a Win32 error, not a `BOOL`.
+    pub(crate) fn GetSecurityInfo(
+        handle: Handle,
+        kind: c_int,
+        information: u32,
+        owner: *mut *mut c_void,
+        group: *mut *mut c_void,
+        dacl: *mut *mut c_void,
+        sacl: *mut *mut c_void,
+        descriptor: *mut *mut c_void,
+    ) -> u32;
+    /// `BOOL ConvertStringSecurityDescriptorToSecurityDescriptorW(LPCWSTR
+    /// StringSecurityDescriptor, DWORD StringSDRevision, PSECURITY_DESCRIPTOR *SecurityDescriptor,
+    /// PULONG SecurityDescriptorSize)`.
+    pub(crate) fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string: *const u16,
+        revision: u32,
+        descriptor: *mut *mut c_void,
+        len: *mut u32,
+    ) -> i32;
 }

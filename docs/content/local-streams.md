@@ -2,9 +2,10 @@
 
 This page is the reference for local streams on the driver, `rsasync::driver::Driver`:
 Unix-domain stream sockets at a path, for processes on one host. Local streams run on Linux, on
-io_uring and on [epoll](epoll.md), and on macOS, on [kqueue](kqueue.md). Windows has no local stream
-yet. This page gives each operation, its result, the permission rule of the socket file, the lock of
-the path, and the identity of the peer. A local stream follows the stream rules of
+io_uring and on [epoll](epoll.md), on macOS, on [kqueue](kqueue.md), and on Windows as byte-mode
+named pipes, on the [I/O completion port](iocp.md) (see [Windows](#windows)). This page gives each
+operation, its result, the permission rule of the socket file, the lock of the path, and the
+identity of the peer. A local stream follows the stream rules of
 [TCP on the driver](tcp.md): one operation for each direction, the rules for a dropped, forgotten,
 or cancelled operation, and close. [Drive the I/O driver yourself](driver-only.md) tells how to
 start, turn, and end the driver.
@@ -41,6 +42,8 @@ fails at once. The future of `bind_local` and `connect_local` gives these errors
 | `ConnectionRefused` | A connect to a socket file with no listener, for example the file of a closed listener |
 | `ResourceBusy` | A connect to a live listener whose queue of connections that wait for an accept is full. Connect again later. See [A busy listener](#a-busy-listener) |
 | `OutOfMemory` | Each resource slot of the driver is in use (`Config::resources`) |
+
+Windows gives other causes for some of these kinds: see [Windows](#windows).
 
 A refusal gives a `Reason`, as on TCP: `Operations`, `Queue`, `Resource`, or `Buffers`.
 
@@ -166,6 +169,73 @@ lock file (see [The lock of the path](#the-lock-of-the-path)). A next bind at th
 | [epoll](epoll.md) (Linux) | System calls on the thread of the driver | One nonblocking call when epoll reports the socket ready, as for TCP |
 | [kqueue](kqueue.md) (macOS) | System calls on the thread of the driver | One nonblocking call when kqueue reports the socket ready, as for TCP |
 
+| [IOCP](iocp.md) (Windows) | `CreateNamedPipeW` and `CreateFileW` on the thread of the driver | Overlapped `ConnectNamedPipe`, `ReadFile`, and `WriteFile` on the port. No half-close |
+
 The results and the errors are the same on each backend, but for the differences of the systems
-that this page states: the path length, the source of the identity of the peer, and the busy
-listener of another program on macOS.
+that this page states: the path length, the source of the identity of the peer, the busy
+listener of another program on macOS, and the named pipes of Windows.
+
+## Windows
+
+On Windows, a local stream is a byte-mode named pipe. The path of `bind_local` and `connect_local`
+is a pipe name, `\\.\pipe\<name>`, with at most 256 units in all. Each other path gives
+`InvalidInput`. A pipe name has no file, and the name ends when the last instance of the pipe
+closes.
+
+The bind makes the first instance of the pipe:
+
+- `FILE_FLAG_FIRST_PIPE_INSTANCE`: the bind gives `AddrInUse` while an instance of the name
+  exists, also an instance that another process made first. So no process can take the clients of
+  the listener by a pipe of the same name that it makes before the bind. No name is stale, so
+  `Stale::Replace` binds as `Stale::Refuse`.
+- `PIPE_REJECT_REMOTE_CLIENTS`: a client on another computer cannot connect.
+- The security descriptor `O:<user>D:P(A;;GA;;;<user>)`: only the user of the process of the
+  listener can open the pipe, and an open of another user gives `PermissionDenied`.
+
+The listener holds 64 instances that wait for clients, as the queue of a listening socket holds
+connections: a burst of 64 clients connects before an accept. A client takes the first waiting
+instance, in the order in which the listener made them. An accept is one overlapped
+`ConnectNamedPipe` on the first instance. When it has its client, the stream takes that instance,
+and the listener makes a new instance after the others. A client that connects while each of the
+64 instances has a client that no accept took gets `ResourceBusy`, the Windows form of a full
+backlog: connect again later. A dropped accept leaves its client in the first instance, and the
+next accept gives it at once. Each waiting instance is one kernel object and one handle on the
+port. The 64 KiB buffer of each direction is a quota that only bytes in the pipe use, and an
+instance takes no resource slot of the driver before its accept.
+
+`connect_local` opens the pipe with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the server
+can read the identity of the client, and cannot act as the client. A connect to a pipe name with no
+instance gives `NotFound`.
+
+A named pipe has no half-close: `shutdown_write` refuses with `Reason::Unsupported`, and the close
+of one end is the end of the stream for the other end, after each byte that went before it.
+`recv_selected` on a named pipe gives `Unsupported`.
+
+`Driver::local_peer` gives the identity of the peer, as on Linux and macOS: of the client for an
+accepted stream, and of the server for a connected stream.
+
+| Stream | `Peer::process()` | `Peer::user()` |
+| --- | --- | --- |
+| Accepted | `GetNamedPipeClientProcessId`: the process that connected, which the system recorded at the connect | The SID of the user of the token of the client. The thread of the driver impersonates the client, at the identification level, reads its token, and goes back to its own identity |
+| Connected | `GetNamedPipeServerProcessId`: the process that made the pipe, which the system recorded at the bind | The owner of the pipe (`GetSecurityInfo`), which its server set. A process with no privilege to restore files or to take ownership cannot set another user as an owner, and a listener of the driver sets the user of its process |
+
+`Peer::process()` is always `Some` on Windows. `Peer::user()` is a `Sid`, whose `Display` form is
+the string form, for example `S-1-5-21-…-500`.
+
+Windows has the user of a client only when it has the security context of the client. The driver
+reads the user one time and keeps it for the life of the stream, as Unix records it at the
+connect, so a later write of the client under another identity does not change it:
+
+- A client of the driver opens the pipe with static tracking, so the system takes its context at
+  the open, and the driver reads its user at the accept.
+- A client that opens the pipe with no security quality of service, the default of `CreateFileW`,
+  of `std::fs`, and of .NET, has dynamic tracking: the system takes its context at its first write.
+  The driver reads its user at the first receive that takes its data. Until then, `local_peer`
+  gives an `io::Error` whose `raw_os_error()` is `ERROR_CANNOT_IMPERSONATE` (1368). Receive the
+  first bytes, then check the user, before you act on them.
+
+The driver never reads the user from the process of the client, because the system can give its
+process ID to another process after the client ends. Windows has no group in the peer. A client checks
+the user of its server before it sends a secret, so it does not talk to a process of another user
+that took the name. A listener authorizes a client by its user, which the security descriptor
+already limits to the user of the listener.

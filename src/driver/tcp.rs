@@ -1583,14 +1583,10 @@ impl Driver {
         let Some(owned) = self.resources.get(resource) else {
             return true;
         };
-        let Some(fd) = owned.fd.as_ref().map(|fd| number(borrow(fd))) else {
+        let Some(fd) = owned.number() else {
             return true;
         };
-        #[cfg(unix)]
         let pipe = owned.medium == Medium::Pipe;
-        // On Windows, the driver owns no pipe end yet.
-        #[cfg(target_os = "windows")]
-        let pipe = false;
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return true;
         };

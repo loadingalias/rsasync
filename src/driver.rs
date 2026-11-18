@@ -62,7 +62,6 @@ mod file;
 mod home;
 #[cfg(target_os = "windows")]
 mod iocp;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod local;
 #[cfg(unix)]
 mod pipe;
@@ -129,7 +128,8 @@ pub use capability::{Backend, Call, Feature, Features, Report, Route};
 #[cfg(target_os = "windows")]
 pub use file::NvmePath;
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub use local::Sid;
 pub use local::{LocalListener, LocalStream, Peer, Stale};
 #[cfg(unix)]
 pub use pipe::{PipeReader, PipeWriter};
@@ -725,10 +725,16 @@ struct Owned {
     /// (skip-on-success).
     #[cfg(target_os = "windows")]
     skips: bool,
-    /// The handles of the file or the directory of the slot, on Windows, where `fd` holds only
-    /// sockets.
+    /// The handles of the file, the directory, or the named pipe of the slot, on Windows, where
+    /// `fd` holds only sockets.
     #[cfg(target_os = "windows")]
     file: Option<file::Handles>,
+    /// What a pipe listener keeps to make its next instance, on Windows.
+    #[cfg(target_os = "windows")]
+    listening: Option<Box<local::Listening>>,
+    /// What the driver knows of the user of the client of an accepted pipe stream, on Windows.
+    #[cfg(target_os = "windows")]
+    client: Option<local::Client>,
     /// The lock file of a local listener, whose lock lives while the socket lives.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     lock: Option<OwnedFd>,
@@ -741,8 +747,7 @@ enum Medium {
     #[default]
     Stream,
     /// A pipe end: its operations are reads and writes, because a receive and a send need a
-    /// socket. It has no half-close.
-    #[cfg(unix)]
+    /// socket. It has no half-close. On Windows, a named pipe of a local stream.
     Pipe,
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
     Udp,
@@ -757,10 +762,25 @@ impl Owned {
         self.fd.is_some()
     }
 
-    /// Whether the slot holds a resource: a socket, or a file or a directory.
+    /// Whether the slot holds a resource: a socket, or a file, a directory, or a named pipe.
     #[cfg(target_os = "windows")]
     const fn used(&self) -> bool {
         self.fd.is_some() || self.file.is_some()
+    }
+
+    /// The number of the descriptor of the slot in an entry.
+    #[cfg(unix)]
+    fn number(&self) -> Option<i32> {
+        self.fd.as_ref().map(|fd| number(borrow(fd)))
+    }
+
+    /// The number of the socket or the handle of the slot in an entry.
+    #[cfg(target_os = "windows")]
+    fn number(&self) -> Option<i32> {
+        self.fd.as_ref().map(|fd| number(borrow(fd))).or_else(|| {
+            let handles = self.file.as_ref()?;
+            file::windows::number(std::os::windows::io::AsRawHandle::as_raw_handle(&handles.file))
+        })
     }
 }
 
@@ -859,27 +879,33 @@ impl Resources {
         })
     }
 
-    /// Takes the handles of a file or a directory that an open gave into the first free slot, and
-    /// associates them with the port. Refuses with them when each slot that no spawn keeps is in
-    /// use or the port does not take them.
+    /// Takes the handles of a file, a directory, or a named pipe of `medium` into the first free
+    /// slot, and with `associate` associates them with the port. Refuses with them when each slot
+    /// that no spawn keeps is in use or the port does not take them.
     #[cfg(target_os = "windows")]
-    fn adopt_file(&mut self, file: file::Handles) -> Result<Resource, (Reason, file::Handles)> {
+    fn adopt_handles(
+        &mut self,
+        file: file::Handles,
+        medium: Medium,
+        associate: bool,
+    ) -> Result<Resource, (Reason, file::Handles)> {
         if self.reserved > 0 && self.free() <= self.reserved {
             return Err((Reason::Resources, file));
         }
         let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| !slot.used()) else {
             return Err((Reason::Resources, file));
         };
-        let associated = self.registrar.add_file(&file.file).is_ok()
-            && file
-                .through
-                .as_ref()
-                .is_none_or(|through| self.registrar.add_file(through).is_ok());
+        let associated = !associate
+            || self.registrar.add_file(&file.file).is_ok()
+                && file
+                    .through
+                    .as_ref()
+                    .is_none_or(|through| self.registrar.add_file(through).is_ok());
         if !associated {
             return Err((Reason::Register, file));
         }
         slot.file = Some(file);
-        slot.medium = Medium::File;
+        slot.medium = medium;
         slot.skips = false;
         Ok(Resource {
             index,
@@ -919,9 +945,14 @@ impl Resources {
         {
             slot.exclusive = None;
         }
-        // A file closes here. It stays associated with its port until then, as a socket does.
+        // A file or a pipe closes here. It stays associated with its port until then, as a socket
+        // does.
         #[cfg(target_os = "windows")]
-        drop(slot.file.take());
+        {
+            drop(slot.file.take());
+            slot.listening = None;
+            slot.client = None;
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             slot.lock = None;
@@ -1843,7 +1874,7 @@ impl Driver {
                 .and_then(|resource| self.resources.get(resource))
                 .map(|owned| iocp::Token {
                     skips: owned.skips,
-                    file: owned.medium == Medium::File,
+                    file: owned.file.is_some(),
                 });
             // SAFETY: the entry of the slot keeps the resources in place until the terminal event
             // of `id`, and nothing changes the variant of their payload before it. The caller keeps
@@ -2171,6 +2202,11 @@ fn finish(
                 // SAFETY: the receive named the capacity of the loan, and the kernel wrote `count`
                 // bytes at its start, at most that capacity.
                 unsafe { loan.set_filled(count) };
+                // The first data of a client of a pipe gives its user.
+                #[cfg(target_os = "windows")]
+                if count > 0 {
+                    local::first_data(resources, tag.resource);
+                }
             }
         }
         Kind::Selected => {
@@ -2186,6 +2222,16 @@ fn finish(
                 unsafe { loan.set_filled(count.unwrap_or(0)) };
                 held.loan = Some(loan);
             }
+        }
+        // The accept of a pipe listener takes its instance, and the listener makes the next one.
+        #[cfg(target_os = "windows")]
+        Kind::Accept
+            if tag
+                .resource
+                .and_then(|listener| resources.get(listener))
+                .is_some_and(|owned| owned.medium == Medium::Pipe) =>
+        {
+            local::accepted(held, tag, cqe.res, abandoned, resources);
         }
         Kind::Accept => {
             if cqe.res >= 0 {

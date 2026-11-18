@@ -16,7 +16,7 @@ results.
 The driver needs the `std` feature, and Linux on x86_64 or aarch64, macOS on aarch64, or Windows on
 x86_64. On Linux, it runs on io_uring, and on [epoll](epoll.md) where the kernel refuses io_uring,
 with the same operations. On macOS, it runs TCP, UDP, and files on [kqueue](kqueue.md), and on
-Windows TCP, UDP, and files on an [I/O completion port](iocp.md). The other operations of this page
+Windows TCP, UDP, files, and local streams (named pipes) on an [I/O completion port](iocp.md). The other operations of this page
 have no macOS or Windows form yet. It does not need
 the `local` feature, which holds the local tasks of `rsasync::task`, a scheduler. It starts no helper
 thread. Before Linux 6.9, a change of the length of a file runs on your

@@ -48,6 +48,13 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 | `Call::File` (each other file and directory operation: open, length, preallocation, sync, rename, and unlink, and on Windows the NVMe report) | The io_uring backend | `Route::BlockingService`, on epoll, kqueue, and IOCP |
 
 On epoll, kqueue, and IOCP, no feature is probed, so each call takes the route of the last column.
+
+The identity of the peer of a local stream (`Driver::local_peer`) has one rule that only Windows
+has: Windows gives the user of a named pipe client only after its security context exists. A
+client of the driver gives its user at the accept. A client of dynamic tracking, the default of
+`CreateFileW`, gives it at the first receive that takes its data, and before it `local_peer` gives
+`ERROR_CANNOT_IMPERSONATE` (1368): receive the first bytes, then check the user (see
+[local streams on Windows](local-streams.md#windows)).
 On IOCP, `Call::Bind` and `Call::BindUdp` are `Route::SystemCall`, and `Call::SetFileLen` is
 `Route::BlockingService`, because Windows has no overlapped form of a length change.
 

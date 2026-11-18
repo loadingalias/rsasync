@@ -741,7 +741,10 @@ impl Port {
             // SAFETY: the packet of the call came, so the kernel wrote its status and writes no more.
             let status = unsafe { status(overlapped) };
             if slot.file {
-                let result = if sys::nt_error(status) {
+                // A write that failed after it moved bytes gives their count, as a send does, so
+                // the driver reports the exact progress of a write to a pipe.
+                let writes = matches!(opcode, ring::IORING_OP_WRITE | ring::IORING_OP_WRITEV);
+                let result = if sys::nt_error(status) && !(writes && bytes > 0) {
                     Err(file_failure(fd, overlapped))
                 } else {
                     Ok(bytes)
@@ -849,7 +852,16 @@ impl Port {
         };
         let opcode = slot.sqe.opcode;
         let result = match result {
-            Err(sys::ERROR_HANDLE_EOF) if matches!(opcode, ring::IORING_OP_READ | ring::IORING_OP_READV) => Ok(0),
+            // The end of a file, and the close of the other end of a pipe, are the end of the
+            // bytes.
+            Err(sys::ERROR_HANDLE_EOF | sys::ERROR_BROKEN_PIPE)
+                if matches!(opcode, ring::IORING_OP_READ | ring::IORING_OP_READV) =>
+            {
+                Ok(0)
+            }
+            // The client connected before the accept waited, or it connected and closed: the
+            // accept takes it, and the stream reads the end of the bytes.
+            Err(sys::ERROR_PIPE_CONNECTED | sys::ERROR_NO_DATA) if opcode == ring::IORING_OP_ACCEPT => Ok(0),
             // A file system with no sparse files has no hole punch, and `std::io` reads this error
             // as `Unsupported`.
             Err(sys::ERROR_INVALID_FUNCTION | sys::ERROR_NOT_SUPPORTED)
@@ -879,7 +891,7 @@ impl Port {
         let vectored = matches!(opcode, ring::IORING_OP_READV | ring::IORING_OP_WRITEV);
         let posted = match result {
             _ if vectored && slot.done > 0 => i32::try_from(slot.done).unwrap_or(i32::MAX),
-            Ok(_) if vectored || opcode == ring::IORING_OP_FALLOCATE => 0,
+            Ok(_) if vectored || matches!(opcode, ring::IORING_OP_FALLOCATE | ring::IORING_OP_ACCEPT) => 0,
             Ok(bytes) => i32::try_from(bytes).unwrap_or(i32::MAX),
             Err(error) => error.saturating_neg(),
         };
@@ -1153,13 +1165,21 @@ const fn step_len(len: u32, done: u32) -> u32 {
 #[expect(unsafe_code, reason = "the caller keeps the memory of the entry and the OVERLAPPED")]
 unsafe fn file_call(slot: &Slot, overlapped: *mut Overlapped) -> Returned {
     let file = handle(socket(slot.sqe.fd));
-    let offset = slot.sqe.off.saturating_add(u64::from(slot.done));
+    // The entry of a stream read or write has the offset `u64::MAX`, the position of the file on a
+    // ring. A pipe has no position, and `0xFFFFFFFF:0xFFFFFFFF` in an `OVERLAPPED` means "the end of
+    // the file", which a read refuses, so such an entry has the offset 0.
+    let offset = match slot.sqe.off {
+        u64::MAX => 0,
+        offset => offset.saturating_add(u64::from(slot.done)),
+    };
     // SAFETY: no call of the slot runs, so nothing else writes its `OVERLAPPED`.
     #[expect(clippy::cast_possible_truncation, reason = "the halves of the offset")]
     unsafe {
         (*overlapped).offset = [offset as u32, (offset >> 32) as u32];
     }
     let succeeded = match slot.sqe.opcode {
+        // A pipe has no receive into a selected buffer on this backend.
+        ring::IORING_OP_READ if selects(&slot.sqe) => return Returned::Failed(sys::ERROR_CALL_NOT_IMPLEMENTED),
         // SAFETY: the caller's contract: the buffer holds `len` bytes.
         ring::IORING_OP_READ => unsafe {
             sys::ReadFile(
@@ -1215,6 +1235,9 @@ unsafe fn file_call(slot: &Slot, overlapped: *mut Overlapped) -> Returned {
             // caller keeps the `OVERLAPPED`.
             unsafe { sys::DeviceIoControl(file, code, input, len, ptr::null_mut(), 0, ptr::null_mut(), overlapped) }
         }
+        // The accept of a pipe listener: it waits for a client of the instance of the listener.
+        // SAFETY: the caller keeps the `OVERLAPPED`.
+        ring::IORING_OP_ACCEPT => unsafe { sys::ConnectNamedPipe(file, overlapped) },
         _ => return Returned::Failed(sys::ERROR_INVALID_PARAMETER),
     };
     returned(succeeded != 0, 0)

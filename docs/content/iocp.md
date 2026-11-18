@@ -1,9 +1,9 @@
 # The IOCP backend
 
-On Windows, the driver runs on an I/O completion port (IOCP). TCP, UDP, and files have the same API
-and the same ownership rules as on io_uring and epoll: the terminal event of an operation releases
+On Windows, the driver runs on an I/O completion port (IOCP). TCP, UDP, files, and local streams
+have the same API and the same ownership rules as on io_uring and epoll: the terminal event of an operation releases
 its buffer and its charge, and a dropped or forgotten future ends only the interest. This page tells
-how each TCP, UDP, and file operation runs on the port, when the port skips a packet, which file
+how each TCP, UDP, file, and local stream operation runs on the port, when the port skips a packet, which file
 operations run on your blocking service, and what differs from Linux. rsasync is in development,
 and the IOCP backend is not in a published release yet.
 
@@ -133,6 +133,18 @@ disk, or when the volume has no local disk. A job reads the driver service of th
 each disk (`nvmedisk` for the native path, `disk` for the disk class driver over the SCSI
 translation of the port driver). It never infers the path from the version of the system.
 
+## Local streams
+
+A local stream is a byte-mode named pipe, with the API of
+[local streams on the driver](local-streams.md#windows). The bind (`CreateNamedPipeW`) and the
+connect (`CreateFileW`) are calls on the thread of the driver, which end at once. An accept is one
+overlapped `ConnectNamedPipe` on the instance of the listener, and a receive, a send, and a
+vectored send are overlapped `ReadFile` and `WriteFile` calls, as for a file: a vectored send is one
+call for each region, in order. A pipe never skips packets, as a file does not. A cancel of a
+waiting accept, for example at the close of its listener, is `CancelIoEx`, and the instance stays
+owned until the packet of the accept. A read after the close of the other end gives the end of the
+stream (`ERROR_BROKEN_PIPE`), and a write that moved bytes before it failed gives their count.
+
 ## Skip-on-success
 
 A socket skips the packet of a call that ends at once (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`) only
@@ -184,5 +196,5 @@ inspection and change, preallocation, sync, rename, unlink, and the NVMe report.
 
 ## Limits
 
-- TCP, UDP, and files only. Pipes, local streams, processes, and signals have no Windows form yet.
+- TCP, UDP, files, and local streams only. Pipes, processes, and signals have no Windows form yet.
 - Windows x86_64 only. Windows on aarch64 has no run evidence.

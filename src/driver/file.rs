@@ -725,7 +725,7 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
                 // No caller takes the file, so the drops close its handles.
                 return;
             }
-            match resources.adopt_file(Handles { file, through }) {
+            match resources.adopt_handles(Handles { file, through }, Medium::File, true) {
                 Ok(resource) => held.accepted = Some(resource),
                 Err((_, _closed)) => held.error = Some(io::ErrorKind::OutOfMemory),
             }
