@@ -794,11 +794,15 @@ fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStr
     (stream, peer)
 }
 
-/// Submits and enters the kernel until it posted at least `count` completions, and gives them.
-/// They stay in the ring for the driver.
+/// Submits and enters the kernel until it posted at least `count` completions of operations and
+/// cancels, and gives them. They stay in the ring for the driver. A control entry of the driver
+/// has bit 62 in its user data (`Table::complete`), and its completion is not one of them. On
+/// Linux, a wait leaves the poll of the interrupt descriptor in the ring. The late wake of a job
+/// can end that poll after the turn that took the result of the job.
 pub(super) fn posted(driver: &mut Driver, count: usize) -> Vec<Cqe> {
     loop {
-        let ready = driver.queue.peek();
+        let mut ready = driver.queue.peek();
+        ready.retain(|cqe| cqe.user_data & (1 << 62) == 0);
         if ready.len() >= count {
             return ready;
         }
