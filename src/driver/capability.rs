@@ -23,6 +23,11 @@ pub enum Backend {
     /// ends it, by the NT status of the call. Each other file operation has no overlapped form, so
     /// it runs on the blocking service ([`Route::BlockingService`]).
     Iocp,
+    /// IoRing, on Windows: each read, write, and sync of a file is an entry of an I/O ring of
+    /// version 3 or later, and its completion queue entry ends it ([`Route::Ring`]). Sockets and
+    /// named pipes run as on [`Backend::Iocp`]. The ring has no hole punch, so a hole punch runs on
+    /// the blocking service, as each other file operation does.
+    IoRing,
     /// kqueue, on macOS: the driver runs each socket and pipe operation as one nonblocking call on
     /// its own thread when kqueue reports its descriptor ready, as on epoll. UDP has no segmentation
     /// offload and no coalesced receive: a send with a segment size gives
@@ -151,14 +156,17 @@ pub enum Call {
     SetFileLen,
     /// The exit of a `Child`, on Linux and macOS: the reap of the child and its status.
     WaitChild,
-    /// The operations on the bytes of a file: the positional and vectored reads and writes, and the
-    /// hole punch.
+    /// The operations on the bytes of a file: the positional and vectored reads and writes.
     FileData,
+    /// [`Driver::punch_hole`](super::Driver::punch_hole): a hole punch in a file.
+    PunchHole,
+    /// [`Driver::sync`](super::Driver::sync): the sync that makes the writes of a file durable.
+    SyncFile,
     /// [`Driver::sync_directory`](super::Driver::sync_directory): the sync that makes the creates,
     /// renames, and unlinks of a directory durable.
     SyncDirectory,
     /// Each other operation of a file or a directory: open, length inspection, preallocation,
-    /// sync, rename, and unlink. On Windows, also the report of the device of a file.
+    /// rename, and unlink. On Windows, also the report of the device of a file.
     File,
 }
 
@@ -166,7 +174,7 @@ pub enum Call {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Route {
-    /// An entry of the ring.
+    /// An entry of the ring: io_uring on Linux, and the I/O ring on Windows ([`Backend::IoRing`]).
     Ring,
     /// System calls on the thread of the driver, which end at once.
     SystemCall,
@@ -188,12 +196,14 @@ pub enum Route {
 }
 
 /// Each call, in the order of the report.
-const CALLS: [Call; 7] = [
+const CALLS: [Call; 9] = [
     Call::Bind,
     Call::BindUdp,
     Call::SetFileLen,
     Call::WaitChild,
     Call::FileData,
+    Call::PunchHole,
+    Call::SyncFile,
     Call::SyncDirectory,
     Call::File,
 ];
@@ -224,7 +234,8 @@ impl Report {
     }
 
     /// The backend that the caller required with [`Config::backend`](super::Config::backend), or
-    /// `None` for the permissive selection: io_uring, and epoll when the kernel refuses io_uring.
+    /// `None` for the permissive selection: on Linux io_uring, and epoll when the kernel refuses
+    /// io_uring; on Windows IoRing for files where its probe passes, and IOCP else.
     #[must_use]
     pub const fn requested(&self) -> Option<Backend> {
         self.requested
@@ -239,6 +250,13 @@ impl Report {
     /// The error number with which the kernel refused to create a ring (`EPERM` or `ENOSYS`), when
     /// the permissive selection runs epoll for that reason. `EPERM` comes, for example, from the
     /// default seccomp profile of a container or from `kernel.io_uring_disabled`.
+    ///
+    /// On Windows, the error of the step of the IoRing probe that refused the ring, when the
+    /// permissive selection runs IOCP for files for that reason. It is an `HRESULT`: a Win32
+    /// error is in its `HRESULT_FROM_WIN32` form, for example `0x8007007F` for a function that the
+    /// system does not have, and an NT status is in its `HRESULT_FROM_NT` form. An I/O ring of a
+    /// version before 3 gives `IORING_E_VERSION_NOT_SUPPORTED` (`0x80460003`), and a ring with no
+    /// read, write, flush, or cancel gives `0x80070032` (`ERROR_NOT_SUPPORTED`).
     #[must_use]
     pub const fn fallback(&self) -> Option<i32> {
         self.fallback
@@ -257,24 +275,29 @@ impl Report {
         self.probed
     }
 
-    /// The route of `call` on this kernel and backend. A probe runs only on io_uring, so on epoll
-    /// no feature is probed.
+    /// The route of `call` on this kernel and backend. A feature probe runs only on io_uring, so on
+    /// epoll no feature is probed.
     #[must_use]
     pub const fn route(&self, call: Call) -> Route {
+        let uring = matches!(self.backend, Backend::IoUring);
+        let windows = matches!(self.backend, Backend::Iocp | Backend::IoRing);
         let ring = match call {
             Call::Bind => self.probed.contains(Feature::Bind) && self.probed.contains(Feature::Listen),
             Call::BindUdp => self.probed.contains(Feature::Bind),
             Call::SetFileLen => self.probed.contains(Feature::Truncate),
             Call::WaitChild => self.probed.contains(Feature::ChildWait),
-            Call::FileData | Call::SyncDirectory | Call::File => matches!(self.backend, Backend::IoUring),
+            Call::FileData | Call::SyncFile => uring || matches!(self.backend, Backend::IoRing),
+            Call::PunchHole | Call::SyncDirectory | Call::File => uring,
         };
-        let iocp = matches!(self.backend, Backend::Iocp);
         match (ring, call) {
             (true, _) => Route::Ring,
-            (false, Call::FileData) if iocp => Route::Port,
-            (false, Call::SyncDirectory) if iocp => Route::Unsupported,
+            (false, Call::FileData | Call::PunchHole) if matches!(self.backend, Backend::Iocp) => Route::Port,
+            (false, Call::SyncDirectory) if windows => Route::Unsupported,
             (false, Call::Bind | Call::BindUdp) => Route::SystemCall,
-            (false, Call::SetFileLen | Call::FileData | Call::SyncDirectory | Call::File) => Route::BlockingService,
+            (
+                false,
+                Call::SetFileLen | Call::FileData | Call::PunchHole | Call::SyncFile | Call::SyncDirectory | Call::File,
+            ) => Route::BlockingService,
             (false, Call::WaitChild) => Route::Poll,
         }
     }

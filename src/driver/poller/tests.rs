@@ -71,6 +71,17 @@ fn an_epoll_driver_reports_its_backend_and_refuses_a_file_operation_with_no_serv
     assert_eq!(refused.reason(), Reason::Blocking);
 }
 
+/// A strict requirement of a backend that Linux does not have refuses before a driver exists, with
+/// the kind `Unsupported`.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_strict_backend_that_linux_does_not_have_refuses_before_a_driver_exists() {
+    for other in [Backend::Kqueue, Backend::Iocp, Backend::IoRing] {
+        let refused = Driver::new(Config::new().backend(other));
+        assert_matches!(refused, Err(Error::Refused(error)) if error.kind() == io::ErrorKind::Unsupported, "{other:?}");
+    }
+}
+
 /// With `kernel.io_uring_disabled` set to 2 (Linux 6.6), the permissive selection runs epoll and
 /// reports the `EPERM` of the ring, and a stream works on it. A strict requirement of io_uring
 /// refuses before a driver exists.
@@ -162,7 +173,7 @@ fn a_kqueue_driver_reports_its_backend_and_a_strict_other_backend_refuses() {
         let refused = driver.open_file(&path, OpenOptions::new()).unwrap_err();
         assert_eq!(refused.reason(), Reason::Blocking);
     }
-    for other in [Backend::IoUring, Backend::Epoll, Backend::Iocp] {
+    for other in [Backend::IoUring, Backend::Epoll, Backend::Iocp, Backend::IoRing] {
         let refused = Driver::new(Config::new().backend(other));
         assert_matches!(refused, Err(Error::Refused(_)), "{other:?} did not refuse");
     }

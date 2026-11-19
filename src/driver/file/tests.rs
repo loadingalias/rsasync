@@ -1,6 +1,10 @@
 use alloc::vec::Vec;
 use core::alloc::Layout;
+use core::future::Future as _;
 use core::num::{NonZeroU32, NonZeroU64};
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use std::fs;
 use std::io;
 #[cfg(unix)]
@@ -147,6 +151,48 @@ pub(in crate::driver) fn a_short_read_gives_its_exact_extent_and_the_exact_read_
     let (result, buffer) = drive(&mut driver, exact).unwrap();
     result.unwrap();
     assert_eq!(&buffer.bytes()[1..], numbered(0, 10));
+}
+
+/// Two reads of one file that start in one turn each end with their own bytes: the end of one does
+/// not hide the end of the other. A read of a file in the cache ends in the turn that submits it,
+/// so on IoRing both completion queue entries wait before one packet of the ring.
+pub(in crate::driver) fn two_reads_started_in_one_turn_each_end_with_their_bytes(backend: Backend) {
+    /// The turns, 1 ms apart, in which both reads end: a read in the cache ends in its first turn,
+    /// and a job of the blocking service in a few.
+    const TURNS: usize = 1000;
+    let scratch = Scratch::new("together");
+    fs::write(scratch.join("data"), numbered(0, 8192)).unwrap();
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), OpenOptions::new());
+    let mut reads = [0, 4096].map(|offset| {
+        driver
+            .read_at(&file, Backing::from(Vec::with_capacity(4096)), offset)
+            .unwrap()
+    });
+    let mut ended = [None, None];
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..TURNS {
+        driver.turn().unwrap();
+        for (read, ended) in reads.iter_mut().zip(&mut ended) {
+            if ended.is_none()
+                && let Poll::Ready(output) = Pin::new(read).poll(&mut cx)
+            {
+                *ended = Some(output);
+            }
+        }
+        if ended.iter().all(Option::is_some) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let [Some(first), Some(second)] = ended else {
+        let count = ended.iter().filter(|ended| ended.is_some()).count();
+        panic!("{count} of 2 reads ended in {TURNS} turns");
+    };
+    for ((count, buffer), offset) in [first, second].map(Result::unwrap).into_iter().zip([0, 4096]) {
+        assert_eq!(count.unwrap(), 4096);
+        assert_eq!(buffer.bytes(), numbered(offset, 4096));
+    }
 }
 
 /// A direct-I/O file refuses a buffer, a length, or an offset that does not have its alignment,

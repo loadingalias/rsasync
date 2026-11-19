@@ -1,25 +1,40 @@
-# The IOCP backend
+# The IOCP and IoRing backends
 
-On Windows, the driver runs on an I/O completion port (IOCP). TCP, UDP, files, and local streams
-have the same API and the same ownership rules as on io_uring and epoll: the terminal event of an operation releases
-its buffer and its charge, and a dropped or forgotten future ends only the interest. This page tells
-how each TCP, UDP, file, and local stream operation runs on the port, when the port skips a packet, which file
-operations run on your blocking service, and what differs from Linux. rsasync is in development,
-and the IOCP backend is not in a published release yet.
+On Windows, the driver runs on an I/O completion port (IOCP). Where the system has an I/O ring
+(IoRing) of version 3 or later, the reads, writes, and syncs of files run on the ring, and all else
+stays on the port. TCP, UDP, files, and local streams have the same API and the same ownership rules
+as on io_uring and epoll: the terminal event of an operation releases its buffer and its charge, and
+a dropped or forgotten future ends only the interest. This page tells how each TCP, UDP, file, and
+local stream operation runs, when the port skips a packet, which file operations run on your
+blocking service, and what differs from Linux. rsasync is in development, and these backends are
+not in a published release yet.
 
 ## Select the backend
 
-IOCP is the one backend of the driver on Windows x86_64 (`x86_64-pc-windows-msvc`).
-`Config::new()` selects it, and `report().backend()` gives `Backend::Iocp`.
-`Config::new().backend(Backend::IoUring)` or `Backend::Epoll` makes `Driver::new` refuse with
-`Error::Refused`. A feature of `Config::require` is a feature of io_uring, so a Windows driver with a
-required feature refuses with `Error::Unsupported`.
+The driver has two backends on Windows x86_64 (`x86_64-pc-windows-msvc`):
+
+| `Config` | The system has IoRing version 3 or later | The system has no such ring |
+| --- | --- | --- |
+| `Config::new()`, the permissive selection | `Backend::IoRing` | `Backend::Iocp`, and `report().fallback()` gives the `HRESULT` of the refusal |
+| `Config::new().backend(Backend::IoRing)` | `Backend::IoRing` | `Driver::new` gives `Error::Refused` with that `HRESULT`, and no driver exists |
+| `Config::new().backend(Backend::Iocp)` | `Backend::Iocp` | `Backend::Iocp` |
+
+`Backend::IoRing` differs from `Backend::Iocp` only in its files ([IoRing files](#ioring-files)).
+Require `Backend::Iocp` to run each file operation on the port also on a system with a ring, for
+example to measure one against the other. `Config::new().backend(Backend::IoUring)`,
+`Backend::Epoll`, or `Backend::Kqueue` makes `Driver::new` refuse with `Error::Refused`, with the
+kind `Unsupported`. A feature of `Config::require` is a feature of io_uring, so a Windows driver
+with a required feature refuses with `Error::Unsupported`.
 
 ```rust
 use rsasync::driver::{Backend, Config, Driver};
 
 let driver = Driver::new(Config::new())?;
-assert_eq!(driver.report().backend(), Backend::Iocp);
+let report = driver.report();
+if report.backend() == Backend::Iocp {
+    // No IoRing of version 3: the files run on the port.
+    println!("IoRing refused with {:?}", report.fallback().map(|error| format!("{error:#010X}")));
+}
 ```
 
 ## How each operation runs
@@ -84,12 +99,14 @@ Windows refuses to send the CE codepoint (`WSAEINVAL`), and it has one IPv4 loop
 
 ## Files
 
-Files run on the port with the API of [files on the driver](files.md). A read, a write, and a hole
-punch are overlapped calls on the port (`Route::Port` for `Call::FileData`). Windows has no
-overlapped form of the other file calls, so each one runs as a job of the
-[blocking service](blocking-service.md) that `Driver::use_blocking` gives (`Route::BlockingService`
-for `Call::File` and `Call::SetFileLen`). With no service, such a call refuses with
-`Reason::Blocking`. Give the driver a service before the first open:
+On `Backend::Iocp`, files run on the port with the API of [files on the driver](files.md). A read,
+a write, and a hole punch are overlapped calls on the port (`Route::Port` for `Call::FileData` and
+`Call::PunchHole`). Windows has no overlapped form of the other file calls, so each one runs as a
+job of the [blocking service](blocking-service.md) that `Driver::use_blocking` gives
+(`Route::BlockingService` for `Call::SyncFile`, `Call::File`, and `Call::SetFileLen`). With no
+service, such a call refuses with `Reason::Blocking`. On `Backend::IoRing`, the reads, the writes,
+and the syncs are entries of the ring instead ([IoRing files](#ioring-files)). Give the driver a
+service before the first open, on both backends:
 
 ```rust
 use core::num::NonZeroU64;
@@ -106,7 +123,7 @@ driver.use_blocking(service.submitter());
 
 | Operation | On IOCP |
 | --- | --- |
-| Open and directory open | A job: one `CreateFileW` with `FILE_FLAG_OVERLAPPED`, which lets other handles read, write, rename, and delete the file. A file with writes gets a second handle of the same file with `FILE_FLAG_WRITE_THROUGH` (`ReOpenFile`), for the durable writes. A directory open uses `FILE_FLAG_BACKUP_SEMANTICS`. The driver associates each handle with its port |
+| Open and directory open | A job: one `CreateFileW` with `FILE_FLAG_OVERLAPPED`, which lets other handles read, write, rename, and delete the file. A file with writes gets a second handle of the same file with `FILE_FLAG_WRITE_THROUGH` (`ReOpenFile`), for the durable writes. A directory open uses `FILE_FLAG_BACKUP_SEMANTICS`. On `Backend::Iocp`, the driver associates each handle with its port |
 | Read and write | One overlapped `ReadFile` or `WriteFile` at the offset of the `OVERLAPPED`. A read at or after the end of the file gives 0 |
 | Durable write (`WriteMode::DataSync`) | One overlapped `WriteFile` on the write-through handle |
 | Vectored read and write | One overlapped call for each region, in order: the next region starts at the packet of the one before it. A short or failed region ends the operation, with the bytes before it |
@@ -124,6 +141,52 @@ handle that the driver closed, and the port skips packets only on a handle that 
 duplicated. So each overlapped file call that does not fail at once ends at its packet, and the file
 cases pass the same on both forms of the suites. A transfer moves at most `i32::MAX` bytes in one
 operation, and the rest stays for the next one, as on Linux.
+
+### IoRing files
+
+On `Backend::IoRing`, the driver keeps one I/O ring beside its port, and no file is on the port:
+the ring refuses a read or a write of a file on a port with `E_INVALIDARG` (`0x80070057`). Sockets
+and local streams stay on the port, as on `Backend::Iocp`.
+
+| Operation | On IoRing |
+| --- | --- |
+| Read and write | One entry of the ring (`BuildIoRingReadFile`, `BuildIoRingWriteFile`) at the offset of the operation. Its completion queue entry ends it and gives its count of bytes. A read at or after the end of the file gives 0 |
+| Durable write (`WriteMode::DataSync`) | One write entry on the write-through handle. The ring refuses its own write-through flag on a handle that the cache holds (`ERROR_NOT_SUPPORTED_WITH_CACHED_HANDLE`), so the driver keeps the write-through handle |
+| Vectored read and write | One entry for each region, in order: the next region starts at the completion queue entry of the one before it |
+| Sync | One flush entry with `FILE_FLUSH_DEFAULT` for each `SyncMode`, which the SDK header `winbase.h` defines as "same as WIN32 FlushFileBuffers(); Flushes data, metadata, AND sends a SYNC command to the hardware" (`Route::Ring` for `Call::SyncFile`) |
+| Hole punch | A job: `FSCTL_SET_SPARSE`, then `FSCTL_SET_ZERO_DATA`, each an overlapped `DeviceIoControl` on a handle that no port holds, which the job waits for on its own event (`Route::BlockingService` for `Call::PunchHole`) |
+| Each other file call | A job, as on `Backend::Iocp` |
+| Cancel | One cancel entry (`BuildIoRingCancelRequest`). The operation still ends at its own completion queue entry, with `ERROR_OPERATION_ABORTED` (995) when the cancel stopped it, and the driver keeps its buffer until then |
+
+The kernel signals an event when the completion queue of the ring goes from empty to not empty. A
+wait completion packet turns that signal into one packet on the port, so the one port wait of the
+driver also wakes for the ring, with no thread. At that packet, the driver takes each entry of the
+completion queue before it waits again. The completion queue has an entry for each operation that
+the driver can have in flight, so it never fills.
+
+The probe runs at `Driver::new`, and it reads facts of the system, never its version. It takes the
+functions of the ring from `kernel32.dll` at run time, so a program still loads on a system with no
+ring. Each step that fails gives the `HRESULT` of `report().fallback()`:
+
+| Step | Refusal |
+| --- | --- |
+| The functions of the ring and of the wait completion packet exist | `0x8007007F` (`ERROR_PROC_NOT_FOUND`): no IoRing, as before Windows build 22000 |
+| `QueryIoRingCapabilities` gives a kernel ring with a completion event | `0x80070032` (`ERROR_NOT_SUPPORTED`) for a ring that the system emulates in user mode, or one with no completion event |
+| `CreateIoRing` makes a ring of version 3 | `0x80460003` (`IORING_E_VERSION_NOT_SUPPORTED`) on a system with only version 1 or 2, which have no write or flush |
+| `IsIoRingOpSupported` gives the read, the write, the flush, and the cancel | `0x80070032` |
+| The completion event and the wait completion packet start | The `HRESULT` of the call |
+
+The probed versions:
+
+| System | IoRing | Files |
+| --- | --- | --- |
+| Windows Server 2025, build 10.0.26100.33822 | Version 4 at most, with each operation of the probe | Reads, writes, and syncs on the ring; the rest as on IOCP |
+| Windows 11 | Not run | Not run |
+
+A close of the ring ends no operation: the kernel still writes the buffer of an operation after the
+close. So the drop of a driver closes its ring only when no operation of the ring runs, and else
+leaks the ring, as it leaks the buffers of such an operation. `Driver::teardown` cancels each
+operation and waits for each completion queue entry first.
 
 ### Native NVMe
 
@@ -170,7 +233,8 @@ that ends it. At most one wake packet waits in the port.
 
 The driver starts no thread, and `report().helper_threads()` gives 0. The file calls with no
 overlapped form run on the threads of your blocking service: open, directory open, length
-inspection and change, preallocation, sync, rename, unlink, and the NVMe report.
+inspection and change, preallocation, sync, rename, unlink, and the NVMe report. On
+`Backend::IoRing`, the sync is an entry of the ring, and the hole punch is a job too.
 
 ## Differences from Linux
 
@@ -198,3 +262,5 @@ inspection and change, preallocation, sync, rename, unlink, and the NVMe report.
 
 - TCP, UDP, files, and local streams only. Pipes, processes, and signals have no Windows form yet.
 - Windows x86_64 only. Windows on aarch64 has no run evidence.
+- IoRing has run evidence only on Windows Server 2025. Windows 11 is not run.
+- The ring registers no file handle and no buffer: each entry names its handle and its buffer.

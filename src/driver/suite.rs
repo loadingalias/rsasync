@@ -27,9 +27,13 @@
 //! socket that passes the installed-provider check skips the packet of a call that ends at once,
 //! and `Backend::Packets` gives it with no skip, so each call that does not fail at once ends at
 //! its packet. A file never skips packets, so its cases run the same on both, and each file
-//! operation with no overlapped form runs on a blocking service of the case. Only the TCP, UDP,
-//! and file cases run on Windows: its pipes, local streams, processes, and signals have no IOCP
-//! form yet. The cases whose kernel facts differ on Windows state the
+//! operation with no overlapped form runs on a blocking service of the case. Both pin
+//! `Config::backend(Backend::Iocp)`, so the file path of IOCP runs on a host that has an I/O ring
+//! too. `Backend::IoRing` pins the IoRing backend: the cases of the `files` block run there, with
+//! each read, write, and sync of a file as an entry of the ring, and each other file operation,
+//! also a hole punch, on a blocking service of the case. Only the TCP, UDP, local stream, and file
+//! cases run on Windows: its pipes, processes, and signals have no IOCP form yet. The cases whose
+//! kernel facts differ on Windows state the
 //! difference beside their bodies: a send there goes whole or fails, so a send goes in part only at
 //! a reset of its connection, and a cancel of a send that runs aborts the connection. The two cases
 //! of a send that waits in the driver at close and at teardown run only on Linux: the wait queue
@@ -43,8 +47,9 @@
 //!
 //! The body of a case stays beside the code of its surface, and this index gives each body its
 //! tests: `<suite>::kernel::<case>`, `<suite>::injected::<case>`, and `<suite>::epoll::<case>` on
-//! Linux, `<suite>::kqueue::<case>` on macOS, and `<suite>::iocp::<case>` and
-//! `<suite>::packets::<case>` on Windows. A case runs once, as
+//! Linux, `<suite>::kqueue::<case>` on macOS, and `<suite>::iocp::<case>`,
+//! `<suite>::packets::<case>`, and, for a file case, `<suite>::io_ring::<case>` on Windows. A case
+//! runs once, as
 //! `<suite>::once::<case>`, when the seam can change none of its inputs: a refusal makes no
 //! completion, and a signal reaches its stream through the wake descriptor of the driver, not
 //! through a completion. Two cases run only under injection, as `law::injected_only::<case>`,
@@ -69,10 +74,10 @@
 //! | IOCP, initiating call returns `STATUS_PENDING` | On Windows, `law::iocp` and `law::packets`, for example `a_dropped_accept_leaves_its_connection_to_the_next_accept`; after `CancelIoEx`, `a_cancelled_receive_keeps_its_buffer_until_its_packet`; for a file write, `a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet` |
 //! | IOCP, immediate return with an error status | On Windows, `a_refused_datagram_ends_its_batch_and_the_report_counts_the_datagrams_before_it`: the stack refuses a datagram above 65507 bytes at once |
 //! | IOCP, immediate return with any other status | On Windows, with skip-on-success in `law::iocp` and with a packet in `law::packets`: `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order`, whose receive ends at once with its bytes. The warning status of an oversized datagram comes in the packet of `an_oversized_datagram_gives_the_truncation_outcome`: on Windows Server 2025, the receive of a datagram that waits returns pending, so no case makes the warning at once |
-//! | Windows IoRing | No IoRing backend: R508 adds it |
+//! | Windows IoRing | On Windows, `law::io_ring`: `a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet`, whose write ends at its completion queue entry, which the packet of the ring brings, and `two_reads_started_in_one_turn_each_end_with_their_bytes`, whose two entries end in one drain of the completion queue |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
 //! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. On kqueue, each case of `law::kqueue`, for example `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order` |
-//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll and kqueue, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion`. On IOCP, each file case that opens, syncs, or changes the length or the space of a file |
+//! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll and kqueue, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion`. On IOCP, each file case that opens, syncs, or changes the length or the space of a file, and on IoRing each one that opens, changes the length or the space, or punches a hole |
 //! | Child wait | `a_dropped_wait_and_child_leave_no_zombie_after_the_exit` |
 //!
 //! A cancel result is not a terminal event: `law::injected_only` and the table cases show it, with
@@ -197,6 +202,10 @@ pub(super) enum Backend {
     /// case.
     #[cfg(target_os = "windows")]
     Packets,
+    /// The completion port with the I/O ring of the files: each read, write, and sync of a file is
+    /// an entry of the ring, and each other file operation runs on a blocking service of the case.
+    #[cfg(target_os = "windows")]
+    IoRing,
     /// The kqueue poller, as its nonblocking calls end. Each file operation runs on a blocking
     /// service of the case.
     #[cfg(target_os = "macos")]
@@ -215,7 +224,11 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
 /// A driver of `config` that takes its completions from `backend`.
 #[cfg(target_os = "windows")]
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
-    let mut driver = super::tests::driver(config);
+    let selected = match backend {
+        Backend::IoRing => super::Backend::IoRing,
+        Backend::Iocp | Backend::Packets => super::Backend::Iocp,
+    };
+    let mut driver = super::tests::driver(config.backend(selected));
     if backend == Backend::Packets {
         driver.resources.registrar.packets.set(true);
     }
@@ -248,72 +261,37 @@ fn service() -> &'static Service {
 }
 
 /// Gives each case a test on each backend of the target: on Linux, the kernel, the injection, and
-/// epoll; on macOS, kqueue; on Windows, the port with and with no skip-on-success. A case with a
-/// `cfg` runs only where it holds, for example a case of files or pipes only on Linux.
+/// epoll; on macOS, kqueue; on Windows, the port with and with no skip-on-success. Each case of the
+/// `files` block also has a test on IoRing on Windows, which differs from IOCP only in its files. A
+/// case with a `cfg` runs only where it holds, for example a case of pipes only on Linux.
 macro_rules! cases {
-    ($($(#[$meta:meta])* $($module:ident)::+ => $case:ident),* $(,)?) => {
-        #[cfg(target_os = "linux")]
-        mod kernel {
-            $(
-                $(#[$meta])*
-                #[test]
-                fn $case() {
-                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Kernel);
-                }
-            )*
+    (
+        files { $($(#[$fmeta:meta])* $($fmodule:ident)::+ => $fcase:ident),* $(,)? }
+        $($(#[$meta:meta])* $($module:ident)::+ => $case:ident),* $(,)?
+    ) => {
+        cases! {
+            @all
+            [$($(#[$fmeta])* $($fmodule)::+ => $fcase,)*]
+            [$($(#[$meta])* $($module)::+ => $case,)*]
         }
-
-        #[cfg(target_os = "linux")]
-        mod injected {
+    };
+    (@all [$($files:tt)*] [$($others:tt)*]) => {
+        cases!(@backend kernel, target_os = "linux", Kernel; $($files)* $($others)*);
+        cases!(@backend injected, target_os = "linux", Injected; $($files)* $($others)*);
+        cases!(@backend epoll, target_os = "linux", Epoll; $($files)* $($others)*);
+        cases!(@backend iocp, target_os = "windows", Iocp; $($files)* $($others)*);
+        cases!(@backend packets, target_os = "windows", Packets; $($files)* $($others)*);
+        cases!(@backend io_ring, target_os = "windows", IoRing; $($files)*);
+        cases!(@backend kqueue, target_os = "macos", Kqueue; $($files)* $($others)*);
+    };
+    (@backend $name:ident, $cfg:meta, $backend:ident; $($(#[$meta:meta])* $($module:ident)::+ => $case:ident,)*) => {
+        #[cfg($cfg)]
+        mod $name {
             $(
                 $(#[$meta])*
                 #[test]
                 fn $case() {
-                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Injected);
-                }
-            )*
-        }
-
-        #[cfg(target_os = "linux")]
-        mod epoll {
-            $(
-                $(#[$meta])*
-                #[test]
-                fn $case() {
-                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Epoll);
-                }
-            )*
-        }
-
-        #[cfg(target_os = "windows")]
-        mod iocp {
-            $(
-                $(#[$meta])*
-                #[test]
-                fn $case() {
-                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Iocp);
-                }
-            )*
-        }
-
-        #[cfg(target_os = "windows")]
-        mod packets {
-            $(
-                $(#[$meta])*
-                #[test]
-                fn $case() {
-                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Packets);
-                }
-            )*
-        }
-
-        #[cfg(target_os = "macos")]
-        mod kqueue {
-            $(
-                $(#[$meta])*
-                #[test]
-                fn $case() {
-                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::Kqueue);
+                    crate::driver::$($module::)+$case(crate::driver::suite::Backend::$backend);
                 }
             )*
         }
@@ -338,10 +316,19 @@ macro_rules! once {
 /// The ownership law.
 mod law {
     cases! {
+        files {
+            // Short I/O.
+            file::tests => a_short_read_gives_its_exact_extent_and_the_exact_read_reports_incomplete_progress,
+            // Completions that come together: each one ends its operation.
+            file::tests => two_reads_started_in_one_turn_each_end_with_their_bytes,
+            // An abandoned file write.
+            file::tests => a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion,
+            #[cfg(target_os = "windows")]
+            file::tests => a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet,
+        }
         // Short I/O.
         tests => a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once,
         tests => a_vectored_send_gives_its_exact_progress_across_regions,
-        file::tests => a_short_read_gives_its_exact_extent_and_the_exact_read_reports_incomplete_progress,
         // Failed I/O.
         tests => a_connect_to_a_port_with_no_listener_is_refused,
         tests => a_selecting_receive_with_no_free_buffer_gives_enobufs,
@@ -354,8 +341,8 @@ mod law {
         #[cfg(unix)]
         tests => a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion,
         tests => a_forgotten_receive_leaves_its_bytes_to_the_next_receive_which_gives_them_before_it_submits,
-        // Abandoned operations: a stream receive and send, a datagram receive, a file write, a
-        // spawn, and a child wait.
+        // Abandoned operations: a stream receive and send, a datagram receive, a spawn, and a child
+        // wait.
         tests => a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order,
         tests => a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds,
         tests => a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count,
@@ -372,9 +359,6 @@ mod law {
         #[cfg(target_os = "windows")]
         local::windows::tests => a_numbered_stream_crosses_a_named_pipe_with_no_gap_through_the_abandoned_operations,
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
-        file::tests => a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion,
-        #[cfg(target_os = "windows")]
-        file::tests => a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet,
         #[cfg(unix)]
         process::tests => a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy,
         #[cfg(unix)]
@@ -504,19 +488,20 @@ mod law {
 /// The operations of the initial surface.
 mod operation {
     cases! {
-        // File.
-        file::tests => a_misaligned_direct_io_buffer_refuses_before_submission,
-        file::tests => vectored_writes_and_reads_keep_the_order_of_their_regions,
-        file::tests => a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before,
-        file::tests => a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks,
-        file::tests => a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks,
-        file::tests => an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay,
-        file::tests => a_write_after_the_end_of_an_extending_allocation_keeps_each_byte,
-        file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
-        #[cfg(target_os = "windows")]
-        file::tests => the_nvme_report_of_a_file_follows_the_driver_of_its_disk,
-        #[cfg(target_os = "windows")]
-        file::tests => a_file_at_a_path_longer_than_max_path_opens_writes_and_reads_back,
+        files {
+            file::tests => a_misaligned_direct_io_buffer_refuses_before_submission,
+            file::tests => vectored_writes_and_reads_keep_the_order_of_their_regions,
+            file::tests => a_length_change_runs_on_the_ring_from_linux_6_9_and_on_the_blocking_service_before,
+            file::tests => a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks,
+            file::tests => a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks,
+            file::tests => an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay,
+            file::tests => a_write_after_the_end_of_an_extending_allocation_keeps_each_byte,
+            file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
+            #[cfg(target_os = "windows")]
+            file::tests => the_nvme_report_of_a_file_follows_the_driver_of_its_disk,
+            #[cfg(target_os = "windows")]
+            file::tests => a_file_at_a_path_longer_than_max_path_opens_writes_and_reads_back,
+        }
         // TCP.
         tests => each_socket_option_reads_back_the_value_that_was_set,
         tests => a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere,

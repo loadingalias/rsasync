@@ -9,8 +9,9 @@ releases are on crates.io.
 
 The service needs the `std` feature (on by default) and a target where `std` starts threads. It
 needs no scheduler and no driver. The driver uses it too, for a file call that the kernel has no
-ring operation for, for each file call on [epoll](epoll.md) and [kqueue](kqueue.md), and for each
-file call with no overlapped form on [IOCP](iocp.md#files): see
+ring operation for, for each file call on [epoll](epoll.md) and [kqueue](kqueue.md), for each
+file call with no overlapped form on [IOCP](iocp.md#files), and for each file call that the I/O
+ring does not have on [IoRing](iocp.md#ioring-files): see
 [Length and space](files.md#length-and-space).
 
 ## Start a service and submit a job

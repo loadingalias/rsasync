@@ -2227,6 +2227,58 @@ fn a_strict_requirement_refuses_before_the_driver_is_ready() {
     }
 }
 
+/// On Windows, the report gives the route of each file call on each backend, as the IoRing row of
+/// the design states: IoRing runs the reads, the writes, and the syncs of a file on its ring, and a
+/// hole punch on the blocking service, and IOCP runs the reads, the writes, and the hole punches on
+/// the port. Where the probe refuses the ring, a strict IoRing driver refuses before it exists, and
+/// the permissive driver runs IOCP and gives the `HRESULT` of the refusal. The test prints the
+/// report.
+#[test]
+#[cfg(target_os = "windows")]
+fn each_windows_backend_reports_the_route_of_each_file_call() {
+    use super::{Backend, Call, Error, Report, Route};
+    use Route::{BlockingService as Service, Port, Ring, Unsupported};
+
+    let routes = |report: Report| {
+        [
+            Call::FileData,
+            Call::PunchHole,
+            Call::SyncFile,
+            Call::SyncDirectory,
+            Call::File,
+            Call::SetFileLen,
+        ]
+        .map(|call| report.route(call))
+    };
+    let permissive = driver(Config::new()).report();
+    std::println!("capability report: {permissive:#?}");
+    let iocp = driver(Config::new().backend(Backend::Iocp)).report();
+    assert_eq!(
+        (iocp.requested(), iocp.backend(), iocp.fallback()),
+        (Some(Backend::Iocp), Backend::Iocp, None)
+    );
+    assert_eq!(routes(iocp), [Port, Port, Service, Unsupported, Service, Service]);
+    match Driver::new(Config::new().backend(Backend::IoRing)) {
+        Ok(strict) => {
+            let report = strict.report();
+            assert_eq!(
+                (report.requested(), report.backend(), report.fallback()),
+                (Some(Backend::IoRing), Backend::IoRing, None)
+            );
+            assert_eq!(routes(report), [Ring, Service, Ring, Unsupported, Service, Service]);
+            assert_eq!((permissive.backend(), permissive.fallback()), (Backend::IoRing, None));
+        }
+        Err(Error::Refused(error)) => {
+            assert_eq!(
+                (permissive.backend(), permissive.fallback()),
+                (Backend::Iocp, error.raw_os_error())
+            );
+            assert_eq!(routes(permissive), routes(iocp));
+        }
+        Err(error) => panic!("the driver did not start: {error}"),
+    }
+}
+
 /// A new driver registers no file and no buffer, and it starts no submission poller: the view of
 /// the kernel of its ring (`/proc/self/fdinfo`) shows none.
 #[test]

@@ -137,11 +137,12 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 ## Windows
 
 The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
-[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP, UDP, and files on Windows
-x86_64, on an [I/O completion port](iocp.md), in driver-only use. The files run on NTFS, with the
-file calls that have no overlapped form on your blocking service ([Files](iocp.md#files)). Pipes,
-local streams, processes, and signals of the driver have no Windows form yet. CI does not run on
-Windows.
+[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP, UDP, files, and local
+streams on Windows x86_64, on an [I/O completion port](iocp.md), in driver-only use. Where the
+system has an I/O ring of version 3, the reads, writes, and syncs of files run on the ring
+([IoRing files](iocp.md#ioring-files)). The files run on NTFS, with the other file calls on your
+blocking service ([Files](iocp.md#files)). Pipes, processes, and signals of the driver have no
+Windows form yet. CI does not run on Windows.
 
 On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
 Windows Server 2025, OS build 10.0.26100.33822. The tests use Tokio sockets. Revision `285cc44` has
@@ -175,7 +176,13 @@ device declarations. On that host, the disk is an EBS volume behind the AWS NVMe
 the driver service of the disk says. No run shows `NvmePath::Native`, which needs a host with the
 native NVMe path on. A directory sync gives `Unsupported` on Windows.
 
-Windows on aarch64 has no run evidence yet.
+IoRing files then passed in run `20261119T130017Z-65169` of revision `ba8c9c5`, on the same
+instance type and OS build: `cargo xtask test` ran 285 tests of the workspace and the doctests.
+They include the 14 file cases of the driver suites on IoRing, and the same cases on the port with
+`Backend::Iocp`. The permissive selection gave `Backend::IoRing`. In the same run, the header check
+matched 22 values, 22 layouts, and 15 signatures of the IoRing and loader declarations.
+
+Windows 11 is not run, and Windows on aarch64 has no run evidence yet.
 
 ## WebAssembly
 

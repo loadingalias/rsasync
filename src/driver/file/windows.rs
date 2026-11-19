@@ -2,7 +2,8 @@
 //! blocking service, as on epoll and kqueue ([`run_file`]): an open, a length inspection or
 //! change, a preallocation, a sync, a rename, and an unlink. The device report of a file
 //! ([`nvme_path`]) runs there too. The reads, the writes, and the hole punches are overlapped calls
-//! on the port (`iocp`).
+//! on the port (`iocp`). On IoRing, the reads, the writes, and the syncs are entries of the I/O ring
+//! (`iocp::ring`), and a hole punch is a job too, because the file is not on the port.
 
 use alloc::vec::Vec;
 use core::ffi::{c_int, c_void};
@@ -229,6 +230,7 @@ pub(crate) fn run_file(sqe: &Sqe) -> i32 {
             ring::IORING_OP_OPENAT => open(&mut *pointer::<Opening>(sqe.addr)),
             ring::IORING_OP_FSYNC => status(sys::FlushFileBuffers(file)),
             ring::IORING_OP_FTRUNCATE => set_end(file, sqe.off),
+            ring::IORING_OP_FALLOCATE if sqe.len & ring::FALLOC_FL_PUNCH_HOLE != 0 => punch(file, sqe.off, sqe.addr),
             ring::IORING_OP_FALLOCATE => allocate(file, sqe.off, sqe.addr, sqe.len & ring::FALLOC_FL_KEEP_SIZE == 0),
             ring::IORING_OP_STATX => match standard(file) {
                 Ok(info) => {
@@ -384,6 +386,86 @@ fn allocate(file: sys::Handle, offset: u64, len: u64, extend: bool) -> i32 {
         Ok(())
     });
     result.err().unwrap_or(0)
+}
+
+/// Punches a hole of `len` bytes at `offset` in the file `file`, which no port holds, on
+/// [`Backend::IoRing`](crate::driver::Backend::IoRing): it makes the file sparse
+/// (`FSCTL_SET_SPARSE`), and then frees the clusters of the range (`FSCTL_SET_ZERO_DATA`). The
+/// results are those of the punch on the port: a range of 0 bytes, or a range past the largest
+/// offset, gives `ERROR_INVALID_PARAMETER`, and a file system with no sparse files gives
+/// `ERROR_CALL_NOT_IMPLEMENTED`, which `std::io` reads as `Unsupported`.
+fn punch(file: sys::Handle, offset: u64, len: u64) -> i32 {
+    let Some(end) = offset
+        .checked_add(len)
+        .filter(|_| len > 0)
+        .and_then(|end| i64::try_from(end).ok())
+    else {
+        return -sys::ERROR_INVALID_PARAMETER;
+    };
+    let range = sys::FileZeroDataInformation {
+        offset: offset.cast_signed(),
+        end,
+    };
+    match zero_control(file, sys::FSCTL_SET_SPARSE, None) {
+        Err(sys::ERROR_INVALID_FUNCTION | sys::ERROR_NOT_SUPPORTED) => -sys::ERROR_CALL_NOT_IMPLEMENTED,
+        Err(error) => error.saturating_neg(),
+        Ok(()) => zero_control(file, sys::FSCTL_SET_ZERO_DATA, Some(&range)).map_or_else(i32::saturating_neg, |()| 0),
+    }
+}
+
+/// Runs the control `code` of a hole punch, with `range` as its input, on the overlapped file
+/// `file`, which no port holds, and waits for its end on an event of its own. Gives the Win32
+/// error of a failure.
+#[expect(
+    unsafe_code,
+    reason = "the call reads the input and writes the OVERLAPPED, which live until its end"
+)]
+fn zero_control(file: sys::Handle, code: u32, range: Option<&sys::FileZeroDataInformation>) -> Result<(), i32> {
+    // SAFETY: the call names no memory, and gives a new handle or null.
+    let event = unsafe { sys::CreateEventW(ptr::null_mut(), 1, 0, ptr::null()) };
+    if event.is_null() {
+        return Err(last_error().saturating_neg());
+    }
+    // SAFETY: the call gave a new handle that nothing else owns.
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    let mut overlapped = sys::Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: [0; 2],
+        event: event.as_raw_handle(),
+    };
+    let (input, input_len) = range.map_or((ptr::null(), 0), |range| {
+        (
+            ptr::from_ref(range).cast::<c_void>(),
+            u32::try_from(size_of_val(range)).unwrap_or(0),
+        )
+    });
+    let mut returned = 0;
+    // SAFETY: the input and the `OVERLAPPED` live until the wait below ends the call, the control
+    // writes no output, and the event signals the end of the call, because no port holds the file.
+    let done = unsafe {
+        sys::DeviceIoControl(
+            file,
+            code,
+            input,
+            input_len,
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            &raw mut overlapped,
+        )
+    };
+    if done == 0 {
+        let error = last_error().saturating_neg();
+        if error != sys::ERROR_IO_PENDING {
+            return Err(error);
+        }
+    }
+    // SAFETY: as above. The wait returns at the end of the call.
+    if unsafe { sys::GetOverlappedResult(file, &raw mut overlapped, &raw mut returned, 1) } == 0 {
+        return Err(last_error().saturating_neg());
+    }
+    Ok(())
 }
 
 /// Whether the native NVMe path of Windows Server 2025 serves each disk of the volume of the open

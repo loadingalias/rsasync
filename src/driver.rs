@@ -1,9 +1,10 @@
 //! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
 //! nonblocking turns. No scheduler runs. On Linux, the driver runs on io_uring, or on epoll where the
 //! kernel refuses io_uring. On macOS, it runs TCP, UDP, local streams, pipes, child processes, and
-//! signal streams on kqueue, and files on the blocking service. On Windows, it runs TCP, UDP, and
-//! files on an I/O completion port, and the file calls with no overlapped form on the blocking
-//! service ([`Backend`]). Each backend has
+//! signal streams on kqueue, and files on the blocking service. On Windows, it runs TCP, UDP, local
+//! streams, and files on an I/O completion port, with the reads, writes, and syncs of files on an
+//! I/O ring where the system has one, and the other file calls on the blocking service
+//! ([`Backend`]). Each backend has
 //! the same operations and the same ownership rules.
 //!
 //! A [`Driver`] is the home of each operation that it accepts, from the submission to the
@@ -182,6 +183,11 @@ impl Config {
     /// [`Driver::new`] refuse with [`Error::Refused`], before a driver exists. With no
     /// requirement, the driver runs io_uring, and it runs epoll when the creation of the ring
     /// fails with `EPERM` or `ENOSYS`. [`Report::backend`] and [`Report::fallback`] state it.
+    ///
+    /// On Windows, [`Backend::IoRing`] runs the reads, writes, and syncs of files on an I/O ring,
+    /// and a system whose probe refuses the ring makes [`Driver::new`] refuse with
+    /// [`Error::Refused`]. [`Backend::Iocp`] runs each file operation as on a system with no ring.
+    /// With no requirement, the driver runs IoRing where the probe passes, and IOCP else.
     #[must_use]
     pub const fn backend(self, backend: Backend) -> Self {
         Self {
@@ -249,7 +255,10 @@ impl Default for Config {
 pub enum Error {
     /// The kernel or its policy refuses io_uring (`EPERM` or `ENOSYS`), for example under the
     /// default seccomp profile of a container or with `kernel.io_uring_disabled`, and
-    /// [`Config::backend`] requires [`Backend::IoUring`].
+    /// [`Config::backend`] requires [`Backend::IoUring`]. On Windows, the IoRing probe refuses the
+    /// ring and [`Config::backend`] requires [`Backend::IoRing`]: the error is the `HRESULT` of
+    /// [`Report::fallback`]. [`Config::backend`] also refuses with this error, of the kind
+    /// `Unsupported`, a backend that the system does not have.
     Refused(io::Error),
     /// A limit of [`Config`] is 0 or above what the kernel takes.
     Config,
@@ -262,7 +271,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Refused(error) => write!(f, "the kernel refuses io_uring: {error}"),
+            Self::Refused(error) => write!(f, "the system refuses the required backend: {error}"),
             Self::Config => f.write_str("a limit of the driver configuration is 0 or too large"),
             Self::System(error) => write!(f, "the driver did not start: {error}"),
             Self::Unsupported(missing) => write!(f, "the kernel has no required feature of {missing:?}"),
@@ -895,7 +904,9 @@ impl Resources {
         let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| !slot.used()) else {
             return Err((Reason::Resources, file));
         };
+        // The ring refuses a file on a port, so a driver with a ring keeps its files off the port.
         let associated = !associate
+            || medium == Medium::File && self.registrar.ring
             || self.registrar.add_file(&file.file).is_ok()
                 && file
                     .through
@@ -1224,26 +1235,42 @@ impl Driver {
         Self::start_backend(config, completions)
     }
 
-    /// Starts the port of a valid `config` with room for `completions` operations in flight.
+    /// Starts the port of a valid `config` with room for `completions` operations in flight, and
+    /// the ring of its files where the IoRing probe passes, or where the caller requires it.
     #[cfg(target_os = "windows")]
     fn start_backend(config: Config, completions: u32) -> Result<Self, Error> {
-        // IOCP is the one backend of Windows, and a feature is a feature of io_uring.
-        if config.backend.is_some_and(|backend| backend != Backend::Iocp) {
+        // IOCP and IoRing are the backends of Windows, and a feature is a feature of io_uring.
+        if config
+            .backend
+            .is_some_and(|backend| !matches!(backend, Backend::Iocp | Backend::IoRing))
+        {
             return Err(Error::Refused(io::ErrorKind::Unsupported.into()));
         }
         if !config.required.is_empty() {
             return Err(Error::Unsupported(config.required));
         }
-        let selection = capability::Selection {
+        let mut port =
+            iocp::Port::new(config.submissions, completions, config.operations).map_err(|error| {
+                match error.kind() {
+                    io::ErrorKind::InvalidInput => Error::Config,
+                    _ => Error::System(error),
+                }
+            })?;
+        let mut selection = capability::Selection {
             requested: config.backend,
-            backend: Backend::Iocp,
+            backend: Backend::IoRing,
             fallback: None,
         };
-        let port = iocp::Port::new(config.submissions, completions, config.operations);
-        let port = port.map_err(|error| match error.kind() {
-            io::ErrorKind::InvalidInput => Error::Config,
-            _ => Error::System(error),
-        })?;
+        if config.backend == Some(Backend::Iocp) {
+            selection.backend = Backend::Iocp;
+        } else if let Err(error) = port.start_ring() {
+            // The permissive selection runs the files on the port where the probe refuses the ring.
+            if config.backend.is_some() {
+                return Err(Error::Refused(io::Error::from_raw_os_error(error)));
+            }
+            selection.backend = Backend::Iocp;
+            selection.fallback = Some(error);
+        }
         let (wake, registrar) = (port.wake(), port.registrar());
         let table = Table::new(config.operations);
         let shared = Arc::new(Shared {
@@ -1335,6 +1362,13 @@ impl Driver {
     /// or epoll where the kernel refuses io_uring.
     #[cfg(target_os = "linux")]
     fn start_backend(config: Config, completions: u32) -> Result<Self, Error> {
+        // io_uring and epoll are the backends of Linux.
+        if config
+            .backend
+            .is_some_and(|backend| !matches!(backend, Backend::IoUring | Backend::Epoll))
+        {
+            return Err(Error::Refused(io::ErrorKind::Unsupported.into()));
+        }
         let (wake, interrupt) = (eventfd().map_err(Error::System)?, eventfd().map_err(Error::System)?);
         let wake = fs::File::from(wake);
         let mut selection = capability::Selection {
@@ -1870,11 +1904,14 @@ impl Driver {
                 generation: resource.generation,
             });
             #[cfg(target_os = "windows")]
+            let ring = self.resources.registrar.ring;
+            #[cfg(target_os = "windows")]
             let token = resource
                 .and_then(|resource| self.resources.get(resource))
                 .map(|owned| iocp::Token {
                     skips: owned.skips,
                     file: owned.file.is_some(),
+                    ring: ring && owned.medium == Medium::File,
                 });
             // SAFETY: the entry of the slot keeps the resources in place until the terminal event
             // of `id`, and nothing changes the variant of their payload before it. The caller keeps

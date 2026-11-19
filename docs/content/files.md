@@ -4,7 +4,8 @@ This page is the reference for files on the driver, `rsasync::driver::Driver`: o
 vectored reads and writes, the exact read, direct I/O, length and space, durability, names and
 directories, and close. It also tells what happens when you drop a future. Files run on io_uring
 and [epoll](epoll.md) on Linux, on [kqueue](kqueue.md) on macOS, and on an
-[I/O completion port](iocp.md#files) on Windows, with the same API.
+[I/O completion port](iocp.md#files) on Windows, with the reads, writes, and syncs on an
+[I/O ring](iocp.md#ioring-files) where the system has one, with the same API.
 [Drive the I/O driver yourself](driver-only.md) tells how to start, turn, and end the driver.
 
 Each file operation is positional, with an explicit offset. So several operations of one file can
@@ -185,6 +186,8 @@ for it:
 
 On epoll and kqueue, each file operation is such a job, `set_file_len` too. On IOCP, each file
 operation with no overlapped form is such a job, `set_file_len` too (see [Files](iocp.md#files)).
+On IoRing, each file operation that the ring does not have is such a job, the hole punch too (see
+[IoRing files](iocp.md#ioring-files)).
 
 `Driver::allocate` reserves the blocks of a range (`fallocate`), so that a later write there does
 not fail for space. `Length::Keep` keeps the length. `Length::Extend` makes the length the end of
@@ -221,7 +224,7 @@ this table gives:
 
 | Result | Call | Linux | macOS | Windows |
 | --- | --- | --- | --- | --- |
-| Durable contents | `Driver::sync(&file, SyncMode::Data)` or `SyncMode::All` after the writes, or each write with `WriteMode::DataSync` | `fdatasync`, `fsync`, and `RWF_DSYNC` | `F_FULLFSYNC` for each of them | `FlushFileBuffers` for a sync, and a write through the write-through handle of the file (`FILE_FLAG_WRITE_THROUGH`) for `WriteMode::DataSync` |
+| Durable contents | `Driver::sync(&file, SyncMode::Data)` or `SyncMode::All` after the writes, or each write with `WriteMode::DataSync` | `fdatasync`, `fsync`, and `RWF_DSYNC` | `F_FULLFSYNC` for each of them | `FlushFileBuffers` for a sync, or on IoRing a flush entry with `FILE_FLUSH_DEFAULT`, which the SDK defines as `FlushFileBuffers`, and a write through the write-through handle of the file (`FILE_FLAG_WRITE_THROUGH`) for `WriteMode::DataSync` |
 | Durable namespace change | `Driver::sync_directory(&directory)` on the parent directory, after a create, a rename, or an unlink | `fsync` of the directory | `F_FULLFSYNC` of the directory | Unsupported: the sync gives `Unsupported` at once |
 
 On macOS, a plain `fsync` leaves the bytes in the cache of the device, so the driver never uses it
@@ -233,7 +236,7 @@ durable on NTFS, so `Driver::sync_directory` gives `Unsupported`, and the
 [capability report](capability-report.md#routes) gives `Route::Unsupported` for
 `Call::SyncDirectory`. A program that needs a durable namespace change on Windows cannot get it
 from the driver. The open of a file with writes makes the write-through handle, so that a
-`WriteMode::DataSync` write is one overlapped call.
+`WriteMode::DataSync` write is one overlapped call, or one entry of the ring on IoRing.
 
 A sync covers the writes that ended before it. Start it after their futures are ready.
 

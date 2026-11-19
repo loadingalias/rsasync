@@ -175,8 +175,10 @@ pub(crate) enum Op {
     Write(WriteMode),
     /// A hole punch. It gives only its result.
     Punch,
-    /// An operation that gives only its result: a sync, a change of length or space, a `statx`, a
-    /// rename, or an unlink.
+    /// A sync of the writes of a file. It gives only its result.
+    Sync,
+    /// An operation that gives only its result: a change of length or space, a `statx`, a rename,
+    /// or an unlink.
     Plain,
     /// An operation that runs alone on its file, because it is more than one call
     /// ([`Driver::allocate`]): on macOS, a preallocation that extends the length, and on Windows,
@@ -189,7 +191,9 @@ impl Op {
     /// The call of the report that names the route of the operation.
     const fn call(self) -> Call {
         match self {
-            Self::Read | Self::ReadVectored | Self::Write(_) | Self::Punch => Call::FileData,
+            Self::Read | Self::ReadVectored | Self::Write(_) => Call::FileData,
+            Self::Punch => Call::PunchHole,
+            Self::Sync => Call::SyncFile,
             _ => Call::File,
         }
     }
@@ -742,7 +746,7 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
                 buffers.fill(count);
             }
         }
-        Op::Write(_) | Op::Punch | Op::Plain => {}
+        Op::Write(_) | Op::Punch | Op::Sync | Op::Plain => {}
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Op::Alone => {}
     }
@@ -1313,7 +1317,9 @@ impl Driver {
     /// On macOS, `F_PUNCHHOLE` frees the whole blocks of the file system in the range, and then
     /// the job writes zeros into the bytes of the range in its first and last block, before the
     /// end of the file. On Windows, the punch makes the file sparse (`FSCTL_SET_SPARSE`), and then
-    /// `FSCTL_SET_ZERO_DATA` frees the clusters of the range, both overlapped calls on the port.
+    /// `FSCTL_SET_ZERO_DATA` frees the clusters of the range, both overlapped calls on the port. On
+    /// [`Backend::IoRing`](super::Backend::IoRing), the file is not on the port, so the two calls
+    /// run as a job of the blocking service ([`Call::PunchHole`]).
     ///
     /// # Errors
     ///
@@ -1330,8 +1336,10 @@ impl Driver {
     }
 
     /// Makes the writes of `file` that ended before it durable, as `mode` says
-    /// (`IORING_OP_FSYNC`, `F_FULLFSYNC` on macOS, and `FlushFileBuffers` on Windows). A drop of the
-    /// future does not cancel it.
+    /// (`IORING_OP_FSYNC`, `F_FULLFSYNC` on macOS, and `FlushFileBuffers` on Windows). On
+    /// [`Backend::IoRing`](super::Backend::IoRing), it is a flush entry of the I/O ring with
+    /// `FILE_FLUSH_DEFAULT`, which the SDK defines as `FlushFileBuffers`, for each mode. A drop of
+    /// the future does not cancel it.
     ///
     /// # Errors
     ///
@@ -1596,7 +1604,7 @@ impl Driver {
     /// Starts a sync of `resource`: `fdatasync` when `data` holds, else `fsync`.
     fn fsync<'a>(&mut self, resource: Resource, data: bool) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let entry = move |fd, _: &mut Held| Sqe::fsync(fd, data);
-        let completion = self.begin_file(Some(resource), Op::Plain, (), |()| Held::default(), entry, false)?;
+        let completion = self.begin_file(Some(resource), Op::Sync, (), |()| Held::default(), entry, false)?;
         Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
     }
 
@@ -1897,6 +1905,7 @@ impl Driver {
                     let token = super::iocp::Token {
                         skips: false,
                         file: true,
+                        ring: self.resources.registrar.ring,
                     };
                     // SAFETY: the entry names only the resources of its operation, which the home
                     // keeps until its terminal event, and its file, which stays open until its

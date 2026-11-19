@@ -10,7 +10,7 @@ kqueue backend is not in a published release yet.
 
 kqueue is the one backend of the driver on macOS on aarch64 (`aarch64-apple-darwin`).
 `Config::new()` selects it, and `report().backend()` gives `Backend::Kqueue`.
-`Config::new().backend(Backend::IoUring)`, `Backend::Epoll`, or `Backend::Iocp` makes `Driver::new`
+`Config::new().backend(Backend::IoUring)`, `Backend::Epoll`, `Backend::Iocp`, or `Backend::IoRing` makes `Driver::new`
 refuse with `Error::Refused`, with the kind `Unsupported`. A feature of `Config::require` is a
 feature of io_uring, so a macOS driver with a required feature refuses with `Error::Unsupported`.
 

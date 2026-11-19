@@ -76,8 +76,8 @@ pub mod clock;
 pub mod task;
 pub mod timer;
 
-/// Driver-only use of the driver: on io_uring or epoll on Linux, on kqueue on macOS, and on IOCP on
-/// Windows.
+/// Driver-only use of the driver: on io_uring or epoll on Linux, on kqueue on macOS, and on IOCP,
+/// with IoRing for files where the system has it, on Windows.
 #[cfg(all(
     any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),

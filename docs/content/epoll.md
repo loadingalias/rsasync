@@ -14,6 +14,7 @@ rsasync is in development, and the epoll backend is not in a published release y
 | `Config::new()`, the permissive selection | epoll, and `report().fallback()` gives the error number | io_uring |
 | `Config::new().backend(Backend::IoUring)` | `Driver::new` gives `Error::Refused`, and no driver exists | io_uring |
 | `Config::new().backend(Backend::Epoll)` | epoll | epoll |
+| `Config::new().backend(Backend::Kqueue)`, `Backend::Iocp`, or `Backend::IoRing` | `Driver::new` gives `Error::Refused` with the kind `Unsupported` | `Driver::new` gives `Error::Refused` with the kind `Unsupported` |
 
 The [capability report](capability-report.md) states the selection:
 

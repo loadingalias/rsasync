@@ -13,7 +13,8 @@
 //! `GetFinalPathNameByHandleW`, `GetFullPathNameW`), `winbase.h` (`ReOpenFile`, `MoveFileExW`,
 //! `SetFileInformationByHandle`, `GetFileInformationByHandleEx`, and the file flags),
 //! `minwinbase.h` (`FILE_INFO_BY_HANDLE_CLASS` and its structures), `winnt.h` (the access rights
-//! and the share modes), `ioapiset.h` (`DeviceIoControl`, `GetOverlappedResult`), `winioctl.h`
+//! and the share modes), `synchapi.h` (`CreateEventW`), `libloaderapi.h` (`GetModuleHandleW`,
+//! `GetProcAddress`), `ioapiset.h` (`DeviceIoControl`, `GetOverlappedResult`), `winioctl.h`
 //! (the control codes and their structures), `cfgmgr32.h` (the device functions), `devpkey.h`
 //! (the device properties), and `ntddstor.h` (`GUID_DEVINTERFACE_DISK`). The named pipe items agree
 //! with `namedpipeapi.h` and `winbase.h` (the pipe functions and modes), `processthreadsapi.h`
@@ -566,6 +567,14 @@ unsafe extern "system" {
     ) -> i32;
     /// `BOOL FlushFileBuffers(HANDLE hFile)`.
     pub(crate) fn FlushFileBuffers(file: Handle) -> i32;
+    /// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL
+    /// bInitialState, LPCWSTR lpName)`.
+    pub(crate) fn CreateEventW(security: *mut c_void, manual: i32, initial: i32, name: *const u16) -> Handle;
+    /// `HMODULE GetModuleHandleW(LPCWSTR lpModuleName)`.
+    pub(crate) fn GetModuleHandleW(name: *const u16) -> Handle;
+    /// `FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)`: the address of an export, or
+    /// null.
+    pub(crate) fn GetProcAddress(module: Handle, name: *const c_char) -> *const c_void;
     /// `BOOL SetFileInformationByHandle(HANDLE hFile, FILE_INFO_BY_HANDLE_CLASS
     /// FileInformationClass, LPVOID lpFileInformation, DWORD dwBufferSize)`.
     pub(crate) fn SetFileInformationByHandle(file: Handle, class: c_int, information: *const c_void, len: u32) -> i32;

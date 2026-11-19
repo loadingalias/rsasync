@@ -59,7 +59,20 @@
 //! or after the end of the file reads 0 bytes. The calls that have no overlapped form, such as an
 //! open, a sync, or a length change, run as jobs of the blocking service (`file::windows`), and
 //! the port posts the completion of each job when it returns.
+//!
+//! # IoRing
+//!
+//! On [`Backend::IoRing`](super::Backend::IoRing), the port also owns an I/O ring ([`io_ring`]), and
+//! the files are not on the port, because the ring refuses a read or a write of a file on a port
+//! (`E_INVALIDARG`, probed on Windows Server 2025, 2026-11-19). Each read, write, region of a
+//! vectored read or write, and sync of a file is one entry of the ring, with the index of its slot
+//! as its user data, and its completion queue entry ends it. A cancel of such an entry is an entry
+//! of the ring too, which keeps its slot until its own completion queue entry and posts its
+//! result. The completion event of the ring queues one packet with the key [`RING`], and at that
+//! packet the port takes each completion queue entry. A hole punch has no form on the ring, so it
+//! runs as a job of the blocking service, on a file that no port holds.
 
+pub(crate) mod io_ring;
 pub(crate) mod sys;
 
 use alloc::boxed::Box;
@@ -67,7 +80,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::ffi::{c_char, c_int};
+use core::ffi::{c_char, c_int, c_void};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Waker};
@@ -91,6 +104,9 @@ const SOCKET: usize = 0;
 /// The key of the packet of a wake.
 const WAKE: usize = 1;
 
+/// The key of the packet of the completion event of the ring.
+const RING: usize = 2;
+
 /// The packets that one wait removes at most.
 const EVENTS: usize = 128;
 
@@ -107,6 +123,8 @@ pub(crate) struct Token {
     pub(crate) skips: bool,
     /// The handle is a file or a directory, not a socket.
     pub(crate) file: bool,
+    /// The handle is a file of the ring, which no port holds.
+    pub(crate) ring: bool,
 }
 
 /// The most bytes that one file operation moves: a completion gives its count as an `i32`, so the
@@ -156,6 +174,8 @@ impl Wake {
 #[derive(Debug)]
 pub(crate) struct Registrar {
     port: Arc<Shared>,
+    /// The port has a ring, so no file is on the port.
+    pub(crate) ring: bool,
     /// The test seam of a failed association: the next association fails with this error.
     #[cfg(test)]
     pub(crate) fail: core::cell::Cell<Option<i32>>,
@@ -265,6 +285,8 @@ struct Slot {
     skips: bool,
     /// The entry is an operation of a file.
     file: bool,
+    /// The entry is an entry of the ring.
+    ring: bool,
     /// The bytes that the regions of a vectored file operation moved before its current call.
     done: u32,
     /// The current call of a file operation of more than one: its region, or the step of a hole
@@ -323,6 +345,14 @@ const fn terminal(returned: Returned, status: u32, skips: bool) -> Terminal {
 /// A completion port of one driver.
 pub(crate) struct Port {
     shared: Arc<Shared>,
+    /// The ring of the files, on [`Backend::IoRing`](super::Backend::IoRing).
+    ring: Option<io_ring::Ring>,
+    /// The drain of the ring runs: the next region of a vectored operation waits in `later` until
+    /// the completion queue is empty, so the drain ends after the entries that were in flight at
+    /// its start.
+    draining: bool,
+    /// The slots whose next entry of the ring waits for the end of the drain.
+    later: Vec<u32>,
     /// The entries that the driver pushed, with their sockets, which the next submit takes.
     queue: VecDeque<(Sqe, Option<Token>)>,
     entries: u32,
@@ -380,6 +410,9 @@ impl Port {
                 port,
                 posted: AtomicBool::new(false),
             }),
+            ring: None,
+            draining: false,
+            later: Vec::new(),
             queue: VecDeque::with_capacity(entries as usize),
             entries,
             overlapped: (0..completions).map(|_| UnsafeCell::new(idle())).collect(),
@@ -404,6 +437,16 @@ impl Port {
         })
     }
 
+    /// Starts the ring of the files, with a completion queue entry for each slot. Gives the
+    /// `HRESULT` of the step of the probe that refused it ([`io_ring::Ring::new`]).
+    pub(crate) fn start_ring(&mut self) -> Result<(), i32> {
+        let slots = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
+        self.ring = Some(io_ring::Ring::new(self.shared.handle(), slots, RING)?);
+        // Each slot waits at most once in a drain.
+        self.later = Vec::with_capacity(self.slots.len());
+        Ok(())
+    }
+
     /// The wake of this port.
     pub(crate) fn wake(&self) -> Wake {
         Wake(Arc::clone(&self.shared))
@@ -413,6 +456,7 @@ impl Port {
     pub(crate) fn registrar(&self) -> Registrar {
         Registrar {
             port: Arc::clone(&self.shared),
+            ring: self.ring.is_some(),
             #[cfg(test)]
             fail: core::cell::Cell::new(None),
             #[cfg(test)]
@@ -498,6 +542,7 @@ impl Port {
     /// An error of `GetQueuedCompletionStatusEx` other than the end of its time.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
         let taken = self.take();
+        self.submit_ring()?;
         self.poll_jobs();
         let mut woke = self.poll(0)?;
         while wait > 0 && !woke && self.completions.len() < wait as usize {
@@ -554,6 +599,7 @@ impl Port {
                     sqe,
                     skips: token.is_some_and(|token| token.skips),
                     file: token.is_some_and(|token| token.file),
+                    ring: token.is_some_and(|token| token.ring),
                     done: 0,
                     step: 0,
                     queued: false,
@@ -582,10 +628,7 @@ impl Port {
         };
         match sqe.opcode {
             ring::IORING_OP_NOP => self.post(index, 0, 0),
-            ring::IORING_OP_ASYNC_CANCEL => {
-                let result = self.cancel(sqe.addr);
-                self.post(index, result, 0);
-            }
+            ring::IORING_OP_ASYNC_CANCEL => self.cancel(index, sqe.addr),
             ring::IORING_OP_SHUTDOWN => {
                 // SAFETY: the call takes the open socket of the entry and no memory.
                 let shut = unsafe { sys::shutdown(socket(sqe.fd), sqe.len.cast_signed()) };
@@ -602,6 +645,7 @@ impl Port {
             | ring::IORING_OP_READ
             | ring::IORING_OP_WRITE
             | ring::IORING_OP_READV
+            | ring::IORING_OP_FSYNC
             | ring::IORING_OP_FALLOCATE => self.call(index),
             // The driver submits no other entry on this backend.
             _ => self.post(index, -sys::WSAEINVAL, 0),
@@ -615,6 +659,10 @@ impl Port {
         reason = "no call of the slot runs, so the kernel does not use its OVERLAPPED"
     )]
     fn call(&mut self, index: u32) {
+        if self.slots[index as usize].as_ref().is_some_and(|slot| slot.ring) {
+            self.ring_call(index);
+            return;
+        }
         let overlapped = self.overlapped[index as usize].get();
         let Some(slot) = self.slots[index as usize].as_mut() else {
             return;
@@ -728,6 +776,10 @@ impl Port {
                 // A wake that comes after this store posts a new packet.
                 self.shared.posted.store(false, Ordering::Release);
                 woke = true;
+                continue;
+            }
+            if key == RING {
+                self.drain()?;
                 continue;
             }
             let Some(index) = self.index_of(overlapped) else {
@@ -1004,27 +1056,167 @@ impl Port {
         }
     }
 
-    /// Cancels the call of the entry of `user_data`. Gives the result of the cancel: 0, or the
-    /// negative error of `CancelIoEx`, for example `ERROR_NOT_FOUND` for a call whose packet waits
-    /// in the port. The target ends at its own packet.
+    /// Cancels the call of the entry of `user_data` for the cancel entry of `index`. On the port,
+    /// it posts the result of `CancelIoEx` at once: 0, or the negative error, for example
+    /// `ERROR_NOT_FOUND` for a call whose packet waits in the port. On the ring, the cancel is an
+    /// entry of the ring, which keeps its slot until its own completion queue entry gives its
+    /// result. The target ends at its own terminal event in each case.
     #[expect(
         unsafe_code,
         reason = "the call takes the socket and the OVERLAPPED of a running call"
     )]
-    fn cancel(&mut self, user_data: u64) -> i32 {
+    fn cancel(&mut self, index: u32, user_data: u64) {
         let target = self.slots.iter().position(|slot| {
             slot.as_ref()
                 .is_some_and(|slot| slot.sqe.user_data == user_data && slot.queued)
         });
-        let Some((index, fd)) = target.and_then(|index| Some((index, self.slots[index].as_ref()?.sqe.fd))) else {
-            return -sys::ERROR_NOT_FOUND;
+        let Some((target, fd, on_ring)) = target.and_then(|target| {
+            let slot = self.slots[target].as_ref()?;
+            Some((target, slot.sqe.fd, slot.ring))
+        }) else {
+            self.post(index, -sys::ERROR_NOT_FOUND, 0);
+            return;
         };
+        if on_ring {
+            let built = match (self.ring.as_mut(), u32::try_from(target)) {
+                (Some(ring), Ok(target)) => ring.cancel(handle(socket(fd)), target, index),
+                _ => Err(sys::ERROR_INVALID_PARAMETER),
+            };
+            match (built, self.slots[index as usize].as_mut()) {
+                (Ok(()), Some(slot)) => {
+                    slot.ring = true;
+                    slot.queued = true;
+                }
+                (Ok(()), None) => {}
+                (Err(error), _) => self.post(index, error.saturating_neg(), 0),
+            }
+            return;
+        }
         // SAFETY: the socket is open until the terminal event of its call, and the `OVERLAPPED`
         // stays in place until its packet.
-        if unsafe { sys::CancelIoEx(handle(socket(fd)), self.overlapped[index].get()) } == 0 {
-            return last_error();
+        let result = if unsafe { sys::CancelIoEx(handle(socket(fd)), self.overlapped[target].get()) } == 0 {
+            last_error()
+        } else {
+            0
+        };
+        self.post(index, result, 0);
+    }
+
+    /// Builds the entry of the ring of the file entry of `index`: a read, a write, the current
+    /// region of a vectored read or write, or a sync, at the offset of the entry. A refusal ends
+    /// the operation with its error, as a failed region does. During a drain, the entry waits for
+    /// the end of the drain.
+    #[expect(
+        unsafe_code,
+        reason = "the driver keeps the buffer, the regions, and the file of the entry until its completion"
+    )]
+    fn ring_call(&mut self, index: u32) {
+        if self.draining {
+            self.later.push(index);
+            return;
         }
-        0
+        let (Some(slot), Some(io_ring)) = (self.slots[index as usize].as_mut(), self.ring.as_mut()) else {
+            return;
+        };
+        let file = handle(socket(slot.sqe.fd));
+        let offset = slot.sqe.off.saturating_add(u64::from(slot.done));
+        let built = match slot.sqe.opcode {
+            // SAFETY: the driver keeps the buffer of `len` bytes and the file until the completion.
+            ring::IORING_OP_READ => unsafe {
+                io_ring.read(file, pointer(slot.sqe.addr), slot.sqe.len.min(FILE_MAX), offset, index)
+            },
+            // SAFETY: as above, for the bytes of a write.
+            ring::IORING_OP_WRITE => unsafe {
+                io_ring.write(
+                    file,
+                    pointer::<c_void>(slot.sqe.addr).cast_const(),
+                    slot.sqe.len.min(FILE_MAX),
+                    offset,
+                    index,
+                )
+            },
+            ring::IORING_OP_READV | ring::IORING_OP_WRITEV => match region(slot) {
+                Some(region) if slot.sqe.opcode == ring::IORING_OP_READV => {
+                    // SAFETY: the driver keeps the region of its `len` bytes until the completion.
+                    unsafe { io_ring.read(file, region.buf.cast(), step_len(region.len, slot.done), offset, index) }
+                }
+                Some(region) => {
+                    // SAFETY: as above.
+                    unsafe {
+                        io_ring.write(
+                            file,
+                            region.buf.cast_const().cast(),
+                            step_len(region.len, slot.done),
+                            offset,
+                            index,
+                        )
+                    }
+                }
+                None => Err(sys::ERROR_INVALID_PARAMETER),
+            },
+            ring::IORING_OP_FSYNC => io_ring.flush(file, index),
+            _ => Err(sys::ERROR_INVALID_PARAMETER),
+        };
+        match built {
+            Ok(()) => slot.queued = true,
+            Err(error) => self.file_ended(index, Err(error)),
+        }
+    }
+
+    /// Takes each entry of the completion queue of the ring and ends its call, then associates the
+    /// packet of the ring again, and builds and submits the entries that the ends started: the
+    /// next region of a vectored operation. The drain takes entries until the queue is empty,
+    /// because an entry that stays makes the next completion signal nothing.
+    fn drain(&mut self) -> io::Result<()> {
+        // No entry starts during the drain, so the queue is empty after the entries that were in
+        // flight at its start.
+        let in_flight = self.ring.as_ref().map_or(0, io_ring::Ring::in_flight);
+        self.draining = true;
+        for _ in 0..=in_flight {
+            let Some((index, result)) = self.ring.as_mut().and_then(io_ring::Ring::pop) else {
+                break;
+            };
+            self.ring_ended(index, result);
+        }
+        self.draining = false;
+        if let Some(ring) = self.ring.as_ref() {
+            ring.arm(self.shared.handle()).map_err(io::Error::from_raw_os_error)?;
+        }
+        // The list keeps its capacity for the next drain.
+        let mut later = core::mem::take(&mut self.later);
+        for index in later.drain(..) {
+            self.ring_call(index);
+        }
+        self.later = later;
+        self.submit_ring()
+    }
+
+    /// The entry of the ring of `index` ended with `result`, the transferred bytes or a Win32
+    /// error, at its completion queue entry. A cancel posts its result, and a file entry ends as
+    /// on the port.
+    fn ring_ended(&mut self, index: u32, result: Result<u32, c_int>) {
+        let Some(slot) = self
+            .slots
+            .get_mut(index as usize)
+            .and_then(Option::as_mut)
+            .filter(|slot| slot.ring && slot.queued)
+        else {
+            return;
+        };
+        slot.queued = false;
+        if slot.sqe.opcode == ring::IORING_OP_ASYNC_CANCEL {
+            self.post(index, result.map_or_else(c_int::saturating_neg, |_| 0), 0);
+        } else {
+            self.file_ended(index, result);
+        }
+    }
+
+    /// Submits the entries that the ring built, as a ring takes the entries of its submission
+    /// queue.
+    fn submit_ring(&mut self) -> io::Result<()> {
+        self.ring
+            .as_mut()
+            .map_or(Ok(()), |ring| ring.submit().map_err(io::Error::from_raw_os_error))
     }
 }
 
@@ -1035,6 +1227,7 @@ impl core::fmt::Debug for Port {
             .field("unsubmitted", &self.queue.len())
             .field("in_flight", &(self.slots.len() - self.free.len()))
             .field("completions", &self.completions.len())
+            .field("ring", &self.ring.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1043,7 +1236,7 @@ impl Drop for Port {
     /// The kernel can still write the `OVERLAPPED` of a call that runs, until its packet, also after
     /// its socket closes, so the array leaks then.
     fn drop(&mut self) {
-        if self.slots.iter().flatten().any(|slot| slot.queued) {
+        if self.slots.iter().flatten().any(|slot| slot.queued && !slot.ring) {
             Box::leak(core::mem::take(&mut self.overlapped));
         }
     }
