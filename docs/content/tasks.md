@@ -5,6 +5,11 @@ can hold `!Send` state, such as an `Rc`. rsasync is in development, and the task
 not in a published release yet. They need the `local` feature, which is on by default and turns on
 the `std` feature.
 
+A `LocalOwner` runs tasks with no driver and no other thread. On Linux, the
+[runtime](runtime.md) gives each of its workers, and each call of its `block_on`, an owner with a
+driver, timers, and a generator. Its tasks reach them with `task::with_driver` and
+`task::with_generator`, and `Handle::spawn_on` spawns on a worker from any thread.
+
 ## Run tasks on a local owner
 
 1. Make a `LocalOwner` with `LocalOwner::new(&budget, slots)`. `slots` is the number of tasks that
@@ -31,6 +36,7 @@ it allocates nothing, and `SpawnRefused` gives the future back with its reason:
 | `Budget(Exhausted)` | The budget has fewer free units than the task | Free units, or spawn a smaller future |
 | `Closed` | `block_on` is at its end and cancels its tasks, or it failed and drops them | Do the work in the root future, or before the end |
 | `NoOwner` | No `block_on` runs on this thread | Spawn from the root future or from a task |
+| `NoWorker` | `Handle::spawn_on` names no worker of the runtime | Use an index below `handle.workers()` |
 
 `SpawnRefused::into_future` gives the future back, so the caller can run it in place, keep it, or
 drop it.

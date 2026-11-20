@@ -23,7 +23,7 @@ fn budget() -> Budget {
 }
 
 /// Gives `Pending` one time, after it wakes its own task, so the owner polls the other tasks.
-pub(super) async fn yield_once() {
+pub(crate) async fn yield_once() {
     let mut yielded = false;
     poll_fn(|cx| {
         if yielded {
@@ -552,7 +552,12 @@ fn the_owner_parks_at_most_until_the_deadline_and_the_coarsening_of_the_next_tim
     let (clock, timers) = timed(&budget, 4, resolution);
     let coarsening = timers.max_coarsening();
     let thread = crate::sync::thread::current();
-    let local = Rc::new(super::owner::Local::new(&budget, 1, super::slot::Home::Thread(thread)).unwrap());
+    let home = super::slot::Home::new(
+        thread,
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        None,
+    );
+    let local = Rc::new(super::owner::Local::new(&budget, 1, home, 0).unwrap());
     local.use_timers(timers, clock).unwrap();
     let waiting = Rc::new(Cell::new(None));
     let mut home = Record {

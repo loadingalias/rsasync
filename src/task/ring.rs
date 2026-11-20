@@ -11,7 +11,12 @@
 //!   of the home. The wait polls it in the ring.
 //!
 //! The outbox has a fixed room, and so does the table of messages of the driver. A home that gets
-//! no room gets a write of its interrupt descriptor, so no wake waits for room.
+//! no room gets a write of its interrupt descriptor, so no wake waits for room. On epoll, a message
+//! fails with `EBADFD`, and the driver writes the interrupt descriptor of its home instead.
+//!
+//! The driver is in the owner, so a task reaches it with `with_driver`. A worker has its driver
+//! from its start. The owner of `block_on` makes its driver at the first operation that needs a
+//! home, and its home gets its ring then (`slot`).
 
 use alloc::rc::Rc;
 use core::future::Future;
@@ -22,27 +27,36 @@ use super::owner::{Enter, Local, Park, Until};
 use super::slot::Home;
 use crate::capacity::Budget;
 use crate::clock::NativeClock;
-use crate::driver::{self, Driver};
-use crate::sync::Arc;
+use crate::driver::{self, Config, Driver};
+use crate::sync::{Arc, thread};
 use crate::time::TimeError;
 use crate::timer::Timers;
 
 /// A local owner whose home waits in the ring of its driver.
-#[cfg_attr(not(test), expect(dead_code, reason = "R304 places workers with it"))]
 pub(crate) struct RingOwner {
     local: Rc<Local>,
-    driver: Driver,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "R304 places workers with it"))]
 impl RingOwner {
     /// Makes an owner with `slots` task slots, on this thread, whose home is `driver`.
     pub(crate) fn new(budget: &Budget, slots: u32, driver: Driver) -> Result<Self, Refused> {
-        let local = Local::new(budget, slots, Home::Ring(driver.home()))?;
-        Ok(Self {
-            local: Rc::new(local),
-            driver,
-        })
+        let local = Local::new(
+            budget,
+            slots,
+            Home::new(thread::current(), Some(driver.home())),
+            driver::MESSAGES,
+        )?;
+        local.driver.replace(Some(driver));
+        local.sends.set(true);
+        Ok(Self { local: Rc::new(local) })
+    }
+
+    /// Makes an owner with `slots` task slots, on this thread, that makes its driver with `config`
+    /// at the first operation that needs a home (`with_driver`).
+    pub(crate) fn lazy(budget: &Budget, slots: u32, config: Config) -> Result<Self, Refused> {
+        let local = Local::new(budget, slots, Home::new(thread::current(), None), driver::MESSAGES)?;
+        local.lazy.set(Some(config));
+        Ok(Self { local: Rc::new(local) })
     }
 
     /// Gives the owner a timer storage, which `clock` drives, as `LocalOwner::use_timers` does.
@@ -50,38 +64,71 @@ impl RingOwner {
         self.local.use_timers(timers, clock)
     }
 
+    /// Gives the owner the generator from which its tasks take random values.
+    pub(crate) fn use_generator(&mut self, generator: rscrypto::ChaCha20Rng) {
+        self.local.generator.replace(Some(generator));
+    }
+
+    /// The side of this owner that another thread uses to spawn on it.
+    pub(crate) fn placer(&self, budget: &Budget) -> super::factory::Placer {
+        super::factory::Placer::new(self.local.shared(), budget)
+    }
+
     /// Makes this thread the owner, and polls `root`, the tasks of the owner, and the driver until
-    /// `root` gives its output, as `LocalOwner::block_on` does.
+    /// `root` gives its output, as `LocalOwner::block_on` does. Then it tears the driver down: it
+    /// cancels each operation that the driver homes, drives it until each terminal event, and
+    /// closes each resource that remains.
     ///
     /// # Errors
     ///
-    /// A failure of the driver ends the loop. Each live task then ends with `OwnerFailed`.
+    /// A failure of the driver. If it ends the loop, each live task ends with `OwnerFailed`. If the
+    /// teardown fails, the output of `root` drops.
     pub(crate) fn block_on<F: Future>(&mut self, root: F) -> io::Result<F::Output> {
         let mut enter = Enter::new(&self.local);
-        let output = self.local.block_on(root, &mut Drive(&mut self.driver));
-        self.driver.settle_messages();
+        let output = self.local.block_on(root, &mut Drive);
         enter.ended = output.is_ok();
-        output
+        let output = output?;
+        // The tasks ended, so no wake of this owner needs its ring after the teardown. The report
+        // counts the operations that the teardown cancelled, which their futures already saw.
+        if let Some(driver) = self.local.driver.take() {
+            let _cancelled = driver.teardown()?;
+        }
+        Ok(output)
     }
 }
 
-/// The work and the wait of a home with a ring.
-struct Drive<'a>(&'a mut Driver);
+/// The work and the wait of a home that can have a ring: the driver of the owner, while it has
+/// one, and else its thread.
+struct Drive;
 
-impl Park for Drive<'_> {
+impl Park for Drive {
     type Error = io::Error;
 
     fn drive(&mut self, local: &Local) -> io::Result<bool> {
-        flush(local, self.0);
-        Ok(self.0.turn()?.more())
+        let mut driver = local.driver.borrow_mut();
+        let Some(driver) = driver.as_mut() else {
+            return Ok(false);
+        };
+        flush(local, driver);
+        Ok(driver.turn()?.more())
     }
 
     fn park(&mut self, local: &Local, until: Option<Until>) -> io::Result<()> {
+        // The home got its ring in this turn. A wake that did not see the ring unparked the thread,
+        // so the next turn takes the list and the root flag before a wait in the ring.
+        if local.switched.take() {
+            return Ok(());
+        }
+        let mut driver = local.driver.borrow_mut();
+        let Some(driver) = driver.as_mut() else {
+            let Ok(()) = super::owner::Thread.park(local, until);
+            return Ok(());
+        };
         // The turn of `drive` can wake a task of another home after its own flush.
-        flush(local, self.0);
+        flush(local, driver);
         match until {
-            Some(until) => self.0.wait_for(until.remaining()),
-            None => self.0.wait(),
+            Some(until) => driver.wait_for(until.remaining()),
+            None => driver.wait(),
         }
     }
 }
@@ -96,7 +143,7 @@ fn flush(local: &Local, driver: &mut Driver) {
     }
 }
 
-/// Puts `home` in the outbox of the owner of this thread. Gives `false` if the owner has no ring
+/// Puts `home` in the outbox of the owner of this thread. Gives `false` if the owner has no driver
 /// or its outbox has no room: the caller then writes the interrupt descriptor of `home`.
 pub(super) fn post(home: &Arc<driver::Home>) -> bool {
     super::CURRENT.with(|current| {
@@ -106,6 +153,9 @@ pub(super) fn post(home: &Arc<driver::Home>) -> bool {
         let Some(local) = current.as_ref() else {
             return false;
         };
+        if !local.sends.get() {
+            return false;
+        }
         let Ok(mut outbox) = local.outbox.try_borrow_mut() else {
             return false;
         };
@@ -115,6 +165,24 @@ pub(super) fn post(home: &Arc<driver::Home>) -> bool {
         outbox.push(Arc::clone(home));
         true
     })
+}
+
+impl Local {
+    /// Calls `f` with the driver of this owner. The owner of `block_on` makes its driver here the
+    /// first time, and its home gets its ring.
+    pub(super) fn with_driver<R>(&self, f: impl FnOnce(&mut Driver) -> R) -> Result<R, super::DriverRefused> {
+        let mut slot = self.driver.try_borrow_mut().map_err(|_| super::DriverRefused::InUse)?;
+        if slot.is_none() {
+            let config = self.lazy.get().ok_or(super::DriverRefused::NoDriver)?;
+            let driver = Driver::new(config).map_err(super::DriverRefused::Start)?;
+            self.shared().set_ring(driver.home());
+            self.sends.set(true);
+            self.switched.set(true);
+            *slot = Some(driver);
+        }
+        let driver = slot.as_mut().expect("the owner has its driver");
+        Ok(f(driver))
+    }
 }
 
 #[cfg(test)]

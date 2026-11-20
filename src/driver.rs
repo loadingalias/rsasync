@@ -84,7 +84,7 @@ mod sys;
 mod tcp;
 #[cfg(test)]
 #[cfg(not(loom))]
-mod tests;
+pub(crate) mod tests;
 mod udp;
 
 use alloc::boxed::Box;

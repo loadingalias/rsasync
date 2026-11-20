@@ -1,0 +1,459 @@
+//! The placement of the workers: the request, its resolution on the facts of the host, and the
+//! report of each worker.
+//!
+//! The resolution reads only the [`Host`], so it makes the same plan from the same facts. It runs
+//! before a worker starts, and a strict request that falls back refuses there. Each worker then
+//! applies its own plan on its thread (`worker`).
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::fmt;
+
+use super::topology::Host;
+
+/// The most CPUs, and the largest CPU index plus 1, that a placement handles.
+pub const MAX_CPUS: u32 = 4096;
+
+/// The words of a CPU set.
+const WORDS: usize = MAX_CPUS as usize / 64;
+
+/// A set of CPUs, each below [`MAX_CPUS`], in the form of the affinity mask of Linux.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CpuSet {
+    words: [u64; WORDS],
+}
+
+impl CpuSet {
+    /// The empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { words: [0; WORDS] }
+    }
+
+    /// Adds `cpu`. Gives `false`, and adds nothing, if `cpu` is not below [`MAX_CPUS`].
+    pub fn insert(&mut self, cpu: u32) -> bool {
+        let Some(word) = self.words.get_mut((cpu / 64) as usize) else {
+            return false;
+        };
+        *word |= 1 << (cpu % 64);
+        true
+    }
+
+    /// Whether the set has `cpu`.
+    #[must_use]
+    pub fn contains(&self, cpu: u32) -> bool {
+        self.words
+            .get((cpu / 64) as usize)
+            .is_some_and(|word| word & (1 << (cpu % 64)) != 0)
+    }
+
+    /// The CPUs of the set.
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.words.iter().map(|word| word.count_ones()).sum()
+    }
+
+    /// Whether the set has no CPU.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
+
+    /// The CPUs of the set, in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..).zip(self.words).flat_map(|(index, word)| {
+            (0..64_u32)
+                .filter(move |bit| word & (1 << bit) != 0)
+                .map(move |bit| index * 64 + bit)
+        })
+    }
+
+    /// The words of the mask, for the system calls of affinity.
+    pub(super) const fn words(&self) -> &[u64; WORDS] {
+        &self.words
+    }
+
+    /// The words of the mask, for `sched_getaffinity`.
+    pub(super) const fn words_mut(&mut self) -> &mut [u64; WORDS] {
+        &mut self.words
+    }
+
+    /// The CPUs of both sets.
+    fn and(&self, other: &Self) -> Self {
+        let mut words = self.words;
+        for (word, other) in words.iter_mut().zip(other.words) {
+            *word &= other;
+        }
+        Self { words }
+    }
+}
+
+impl Default for CpuSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The CPU list form of Linux, such as `0-3,8`.
+impl fmt::Debug for CpuSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut cpus = self.iter().peekable();
+        let mut first = true;
+        while let Some(start) = cpus.next() {
+            let mut end = start;
+            while cpus.next_if(|cpu| Some(*cpu) == end.checked_add(1)).is_some() {
+                end += 1;
+            }
+            if !first {
+                f.write_str(",")?;
+            }
+            first = false;
+            if start == end {
+                write!(f, "{start}")?;
+            } else {
+                write!(f, "{start}-{end}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where the workers run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Placement {
+    /// Binds each worker to the CPUs that share one last-level cache, and spreads the workers over
+    /// those domains in proportion to their physical cores. The kernel chooses the core in the
+    /// domain, so a worker can leave a busy core. On a host with one domain, it binds nothing. With
+    /// no cache facts, the NUMA nodes are the domains.
+    Domain,
+    /// Pins each worker to one CPU: one CPU of each physical core first, and the SMT siblings
+    /// last, spread over the NUMA nodes and then over the cache domains of each node. Use it for a
+    /// host, or a CPU set, that the process owns: a pinned worker cannot leave a busy core.
+    Dedicated,
+    /// Pins worker `i` to CPU `cpus[i]`.
+    Exact(Box<[u32]>),
+    /// Binds nothing.
+    Unpinned,
+}
+
+/// Whether a placement can fall back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// A plan that falls back refuses before a worker starts, and a worker whose placement the
+    /// system refuses fails its start.
+    Strict,
+    /// A worker whose plan falls back runs unpinned, and its report gives the [`Fallback`].
+    Permissive,
+}
+
+/// The placement that one worker asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Request {
+    /// [`Placement::Domain`].
+    Domain,
+    /// [`Placement::Dedicated`].
+    Dedicated,
+    /// [`Placement::Exact`], with the CPU of this worker.
+    Exact(u32),
+    /// [`Placement::Unpinned`].
+    Unpinned,
+}
+
+/// Why a worker runs unpinned although it asked for a binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Fallback {
+    /// The host has one cache domain, so `Domain` binds nothing.
+    OneDomain,
+    /// The host gave no CPU set or no topology.
+    NoTopology,
+    /// The CPU is not in the CPU set of the process.
+    NotAllowed(u32),
+    /// The system refused the binding, with this error code.
+    Refused(i32),
+}
+
+/// The requested, resolved, and applied placement of one worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub(super) request: Request,
+    pub(super) target: Option<CpuSet>,
+    pub(super) applied: Option<CpuSet>,
+    pub(super) fallback: Option<Fallback>,
+    pub(super) node: Option<u32>,
+}
+
+impl Placed {
+    /// What the worker asked for.
+    #[must_use]
+    pub const fn request(&self) -> Request {
+        self.request
+    }
+
+    /// The CPUs that the plan resolved for the worker, or `None` for no binding.
+    #[must_use]
+    pub const fn resolved(&self) -> Option<&CpuSet> {
+        self.target.as_ref()
+    }
+
+    /// The CPUs that the thread of the worker runs on, as the system reports them after the
+    /// binding, or `None` if the worker runs unpinned.
+    #[must_use]
+    pub const fn applied(&self) -> Option<&CpuSet> {
+        self.applied.as_ref()
+    }
+
+    /// Why the worker runs unpinned although it asked for a binding.
+    #[must_use]
+    pub const fn fallback(&self) -> Option<Fallback> {
+        self.fallback
+    }
+
+    /// The NUMA node of each CPU of the binding, if they share one. The worker allocates its
+    /// tables and its driver after the binding, so their memory is on this node.
+    #[must_use]
+    pub const fn node(&self) -> Option<u32> {
+        self.node
+    }
+}
+
+/// Why a plan is invalid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PlanError {
+    /// The task slots are 0, or more than 2^16.
+    TaskSlots,
+    /// More workers than [`super::MAX_WORKERS`].
+    TooManyWorkers,
+    /// `Dedicated` or `Exact` has fewer CPUs than workers.
+    TooFewCpus {
+        /// The workers.
+        workers: u32,
+        /// The CPUs.
+        cpus: u32,
+    },
+    /// `Exact` names this CPU two times.
+    DuplicateCpu(u32),
+    /// `Exact` names a CPU that is not below [`MAX_CPUS`].
+    NoSuchCpu(u32),
+    /// The selection is strict, and the plan of this worker falls back.
+    Refused {
+        /// The worker.
+        worker: u32,
+        /// Its fallback.
+        fallback: Fallback,
+    },
+}
+
+impl fmt::Display for PlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TaskSlots => f.write_str("an owner has from 1 to 2^16 task slots"),
+            Self::TooManyWorkers => write!(f, "a runtime has at most {} workers", super::MAX_WORKERS),
+            Self::TooFewCpus { workers, cpus } => write!(f, "{workers} workers need more than {cpus} CPUs"),
+            Self::DuplicateCpu(cpu) => write!(f, "the CPU list names CPU {cpu} two times"),
+            Self::NoSuchCpu(cpu) => write!(f, "CPU {cpu} is not below {MAX_CPUS}"),
+            Self::Refused { worker, fallback } => {
+                write!(f, "the strict placement of worker {worker} falls back: {fallback:?}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for PlanError {}
+
+/// Resolves `placement` for `workers` workers on `host`.
+pub(super) fn resolve(
+    placement: &Placement,
+    selection: Selection,
+    workers: u32,
+    host: &Host,
+) -> Result<Vec<Placed>, PlanError> {
+    let count = workers as usize;
+    let mut plans = Vec::new();
+    plans.reserve_exact(count);
+    match placement {
+        Placement::Unpinned => plans.extend((0..count).map(|_| unpinned(Request::Unpinned, None))),
+        Placement::Domain => domain(host, count, &mut plans),
+        Placement::Dedicated if host.allowed.is_none() => {
+            plans.extend((0..count).map(|_| unpinned(Request::Dedicated, Some(Fallback::NoTopology))));
+        }
+        Placement::Dedicated => {
+            let order = dedicated(host);
+            if order.len() < count {
+                return Err(PlanError::TooFewCpus {
+                    workers,
+                    cpus: u32::try_from(order.len()).unwrap_or(u32::MAX),
+                });
+            }
+            plans.extend(
+                order
+                    .iter()
+                    .take(count)
+                    .map(|cpu| pinned(Request::Dedicated, *cpu, host)),
+            );
+        }
+        Placement::Exact(cpus) => {
+            if cpus.len() < count {
+                return Err(PlanError::TooFewCpus {
+                    workers,
+                    cpus: u32::try_from(cpus.len()).unwrap_or(u32::MAX),
+                });
+            }
+            for (index, cpu) in cpus.iter().copied().enumerate().take(count) {
+                if cpu >= MAX_CPUS {
+                    return Err(PlanError::NoSuchCpu(cpu));
+                }
+                if cpus[..index].contains(&cpu) {
+                    return Err(PlanError::DuplicateCpu(cpu));
+                }
+                plans.push(match &host.allowed {
+                    Some(allowed) if !allowed.contains(cpu) => {
+                        unpinned(Request::Exact(cpu), Some(Fallback::NotAllowed(cpu)))
+                    }
+                    _ => pinned(Request::Exact(cpu), cpu, host),
+                });
+            }
+        }
+    }
+    if selection == Selection::Strict
+        && let Some((worker, fallback)) = (0..)
+            .zip(&plans)
+            .find_map(|(worker, plan)| Some((worker, plan.fallback?)))
+    {
+        return Err(PlanError::Refused { worker, fallback });
+    }
+    Ok(plans)
+}
+
+fn unpinned(request: Request, fallback: Option<Fallback>) -> Placed {
+    Placed {
+        request,
+        target: None,
+        applied: None,
+        fallback,
+        node: None,
+    }
+}
+
+fn pinned(request: Request, cpu: u32, host: &Host) -> Placed {
+    let mut target = CpuSet::new();
+    target.insert(cpu);
+    Placed {
+        request,
+        node: host.node_of(&target),
+        target: Some(target),
+        applied: None,
+        fallback: None,
+    }
+}
+
+/// Binds each worker to one domain, which the domain with the fewest workers for each of its
+/// physical cores gets, the first of them on a tie.
+fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) {
+    let Some(allowed) = &host.allowed else {
+        plans.extend((0..count).map(|_| unpinned(Request::Domain, Some(Fallback::NoTopology))));
+        return;
+    };
+    let domains = host.domains_of(allowed);
+    if domains.len() < 2 {
+        let fallback = if domains.is_empty() {
+            Fallback::NoTopology
+        } else {
+            Fallback::OneDomain
+        };
+        plans.extend((0..count).map(|_| unpinned(Request::Domain, Some(fallback))));
+        return;
+    }
+    let cores: Vec<u64> = domains
+        .iter()
+        .map(|domain| u64::from(host.cores_in(domain).max(1)))
+        .collect();
+    let mut assigned = alloc::vec![0_u64; domains.len()];
+    for _ in 0..count {
+        let mut best = 0;
+        for candidate in 1..domains.len() {
+            // `assigned / cores` is smaller for the candidate, in exact integer form.
+            if (assigned[candidate] + 1) * cores[best] < (assigned[best] + 1) * cores[candidate] {
+                best = candidate;
+            }
+        }
+        assigned[best] += 1;
+        let target = domains[best].clone();
+        plans.push(Placed {
+            request: Request::Domain,
+            node: host.node_of(&target),
+            target: Some(target),
+            applied: None,
+            fallback: None,
+        });
+    }
+}
+
+/// The CPUs of `Dedicated` in the order of the workers: one CPU of each physical core, spread over
+/// the nodes and then over the domains of each node, and then the next sibling of each core in the
+/// same order.
+fn dedicated(host: &Host) -> Vec<u32> {
+    let Some(allowed) = &host.allowed else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut seen = CpuSet::new();
+    for cpu in allowed.iter() {
+        if seen.contains(cpu) {
+            continue;
+        }
+        let siblings: Vec<u32> = host
+            .core_of(cpu)
+            .map_or_else(|| alloc::vec![cpu], |core| core.and(allowed).iter().collect());
+        for sibling in &siblings {
+            seen.insert(*sibling);
+        }
+        let node = host.node.get(cpu as usize).copied().flatten();
+        let domain = host.domain.get(cpu as usize).copied().flatten();
+        let at = match nodes.iter().position(|(id, _)| *id == node) {
+            Some(at) => at,
+            None => {
+                nodes.push((node, Vec::new()));
+                nodes.len() - 1
+            }
+        };
+        let domains = &mut nodes[at].1;
+        match domains.iter_mut().find(|(id, _)| *id == domain) {
+            Some((_, cores)) => cores.push(siblings),
+            None => domains.push((domain, alloc::vec![siblings])),
+        }
+    }
+    let cores = interleave(
+        nodes
+            .into_iter()
+            .map(|(_, domains)| interleave(domains.into_iter().map(|(_, cores)| cores).collect()))
+            .collect(),
+    );
+    let rounds = cores.iter().map(Vec::len).max().unwrap_or(0);
+    (0..rounds)
+        .flat_map(|round| cores.iter().filter_map(move |core| core.get(round).copied()))
+        .collect()
+}
+
+/// The CPUs of one physical core, in ascending order.
+type Core = Vec<u32>;
+/// The cores of one cache domain, with the label of the domain.
+type Domain = (Option<u32>, Vec<Core>);
+/// The domains of one NUMA node, with the node.
+type Node = (Option<u32>, Vec<Domain>);
+
+/// The items of `groups` in turn: the first of each group, then the second of each, and so on.
+fn interleave<T>(groups: Vec<Vec<T>>) -> Vec<T> {
+    let mut groups: Vec<_> = groups.into_iter().map(Vec::into_iter).collect();
+    let mut items = Vec::new();
+    loop {
+        let before = items.len();
+        items.extend(groups.iter_mut().filter_map(Iterator::next));
+        if items.len() == before {
+            return items;
+        }
+    }
+}

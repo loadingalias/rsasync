@@ -31,6 +31,13 @@ fn owner(slots: usize) -> RingOwner {
     RingOwner::new(&budget, slots, driver).unwrap()
 }
 
+/// The driver of `owner`, which a worker has from its start.
+fn driver(owner: &RingOwner) -> core::cell::RefMut<'_, Driver> {
+    core::cell::RefMut::map(owner.local.driver.borrow_mut(), |driver| {
+        driver.as_mut().expect("a worker has its driver")
+    })
+}
+
 /// Gives its waker to `wakers` at its first poll, and ends at its next poll.
 fn pend_once(wakers: mpsc::Sender<Waker>) -> impl Future<Output = ()> {
     let mut sent = false;
@@ -52,7 +59,7 @@ fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
     const TASKS: usize = 16;
     const THREADS: usize = 4;
     let mut owner = owner(TASKS);
-    let home = owner.driver.home();
+    let home = driver(&owner).home();
     owner
         .block_on(async move {
             for _batch in 0..2 {
@@ -97,7 +104,7 @@ fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {
     let (wakers, received) = mpsc::channel::<Vec<Waker>>();
     let target = thread::spawn(move || {
         let mut owner = owner(TASKS);
-        let home = owner.driver.home();
+        let home = driver(&owner).home();
         owner
             .block_on(async move {
                 let (sender, receiver) = mpsc::channel();
@@ -173,14 +180,12 @@ fn a_busy_owner_completes_a_burst_and_a_close_while_its_task_runs() {
     let mut owner = owner(2);
     let receive = |owner: &mut RingOwner| {
         let (read, write) = io::pipe().expect("the test host makes a pipe");
-        let reader = owner
-            .driver
+        let reader = driver(owner)
             .adopt_reader(OwnedFd::from(read))
             .expect("the test driver has room");
         // The future borrows its reader for the rest of the test.
         let reader = Box::leak(Box::new(reader));
-        let future = owner
-            .driver
+        let future = driver(owner)
             .recv(reader, Backing::from(Vec::with_capacity(64)))
             .expect("the test driver has room");
         (future, write)

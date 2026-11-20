@@ -97,6 +97,26 @@ through the system calls of musl.
 Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C libraries, as
 [The io_uring driver on Linux](#the-io_uring-driver-on-linux) shows for the driver.
 
+## The runtime on Linux
+
+The [runtime](runtime.md), `rsasync::runtime`, is on Linux only. On 2026-11-20, `cargo xtask test`
+passed with glibc on two AWS EC2 hosts:
+
+| Distribution | Architecture | Kernel | Instance |
+| --- | --- | --- | --- |
+| Debian 12 | x86_64 | `6.1.0-56-cloud-amd64` | c8i.4xlarge, 8 cores with SMT |
+| Ubuntu 26.04 | aarch64 | `7.0.0-1018-aws` | c8g.4xlarge, 16 cores |
+
+Each run passed 463 tests and the doctests. The runtime tests check a start that fails at one
+worker of four at the descriptor limit, the factory spawn and its refusals, a cancel of a factory
+spawn before and after its worker places it, `Dedicated` placement on one CPU of each physical core,
+an `Exact` CPU outside the CPU set, the release of the operations of `block_on` before it returns,
+a root that starts no driver, a wake after the first operation, and the generator of each owner.
+They run on io_uring, and the factory spawn, the release, and the wake also run on epoll. The final
+form of two of these tests, the failed start and the release, ran only on the x86_64 host. No host
+with two NUMA nodes or two cache domains ran them, so the spread of `Domain` and `Dedicated` over
+nodes and domains has only the test of the plan on the facts of such a host.
+
 ## macOS
 
 The driver runs TCP, UDP, local streams, [pipes](pipes.md), [child processes](processes.md),

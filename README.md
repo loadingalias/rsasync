@@ -36,9 +36,13 @@ this evidence.
   the event loop of a host, terminal teardown, and TCP accept, receive (into an owned buffer or into
   a buffer that the kernel selects), and send.
 
+- The local workers of `rsasync::runtime` on Linux 6.1 (Debian 12, x86_64) and Linux 7.0 (Ubuntu
+  26.04, aarch64), on io_uring and epoll: a start that reports each worker, `block_on` that releases
+  each operation before it returns, the factory spawn on a worker, placement, and seeded generators.
+
 `rsasync::task` runs local tasks on one thread, behind the `local` feature, which is on by default.
-The work-stealing pool, the other backends of the driver, and the other platforms come later. Each
-alpha can change the API.
+The work-stealing pool, the local workers on macOS and Windows, and the other platforms come later.
+Each alpha can change the API.
 
 Part of one family on [rscrypto](https://github.com/loadingalias/rscrypto): rsasync (runtime),
 rsnetwork (networking), and rsauthnz (auth). Apache-2.0. Develop with `cargo xtask fix`,

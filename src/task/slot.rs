@@ -43,6 +43,19 @@
 //! - A home with a ring waits in its ring. A thread whose owner has a ring puts the home in the
 //!   outbox of that owner, which sends a message from its own ring after the poll (`ring`). Each
 //!   other thread writes the interrupt descriptor of the home, which the wait polls in its ring.
+//!
+//! The owner of `block_on` gets its ring at its first operation that needs one, while a wake from
+//! another thread can run. A wake that reads no ring unparks the thread, which then does not park
+//! again. So the owner sets the ring, and then takes the list and the root flag with a
+//! read-modify-write before it waits in the ring (`Shared::set_ring`). A push or a root wake before
+//! that read-modify-write is in the order of the list or of the flag before it, so the owner sees
+//! it. A push or a root wake after it reads its `Release` with `Acquire`, so it sees the ring.
+//!
+//! # The free slots
+//!
+//! `vacant` counts the free slots that no spawn reserved. A spawn on the owner, and a factory spawn
+//! from another thread, each take one before they take a slot, and the end of a task gives it back.
+//! So the free list of the owner always has a slot for each reservation.
 
 use alloc::boxed::Box;
 use core::cell::Cell;
@@ -71,21 +84,82 @@ const GENERATION_SHIFT: u32 = 8;
 const END: u32 = u32::MAX;
 
 /// The native signal of the home of an owner: it ends the park or the wait of the home.
-pub(super) enum Home {
-    /// A home that parks its thread.
-    Thread(thread::Thread),
-    /// A home that waits in the ring of its driver.
+pub(super) struct Home {
+    /// The thread of the owner, which parks while the owner has no ring.
+    thread: thread::Thread,
+    /// The ring of the driver of the owner, which the owner sets one time.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    Ring(Arc<driver::Home>),
+    ring: late::Ring,
 }
 
 impl Home {
-    /// The room of the outbox of an owner with this home: a home with no ring sends no message.
-    pub(super) const fn outbox(&self) -> usize {
-        match self {
-            Self::Thread(_) => 0,
+    /// The home of an owner on `thread`, which waits in `ring` if it has one.
+    pub(super) fn new(
+        thread: thread::Thread,
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))] ring: Option<
+            Arc<driver::Home>,
+        >,
+    ) -> Self {
+        Self {
+            thread,
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            Self::Ring(_) => driver::MESSAGES,
+            ring: late::Ring::new(ring),
+        }
+    }
+}
+
+/// The ring of a home, which its owner sets one time. Its reference lives until the home drops,
+/// so a wake that reads it can use it while the home lives.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod late {
+    use alloc::boxed::Box;
+    use core::ptr;
+
+    use crate::driver;
+    use crate::sync::{
+        Arc,
+        atomic::{AtomicPtr, Ordering},
+    };
+
+    pub(super) struct Ring(AtomicPtr<Arc<driver::Home>>);
+
+    impl Ring {
+        pub(super) fn new(home: Option<Arc<driver::Home>>) -> Self {
+            Self(AtomicPtr::new(home.map_or(ptr::null_mut(), into_raw)))
+        }
+
+        /// Sets the ring. The caller then reads the remote-ready list and the root flag with a
+        /// read-modify-write, which orders this store before each later wake.
+        pub(super) fn set(&self, home: Arc<driver::Home>) {
+            // Ordering: `Relaxed`: the read-modify-writes of the owner after this store publish it.
+            let before = self.0.swap(into_raw(home), Ordering::Relaxed);
+            assert!(before.is_null(), "a home gets its ring one time");
+        }
+
+        #[expect(unsafe_code, reason = "the pointer owns its box until the drop of this cell")]
+        pub(super) fn get(&self) -> Option<&Arc<driver::Home>> {
+            // Ordering: `Acquire` reads the store of `set`, after the wake read the
+            // read-modify-write of the owner that follows it.
+            let home = self.0.load(Ordering::Acquire);
+            // SAFETY: a pointer that is not null came from `Box::into_raw`, and this cell owns the
+            // box until it drops, which is after each borrow of `&self` ends.
+            unsafe { home.as_ref() }
+        }
+    }
+
+    fn into_raw(home: Arc<driver::Home>) -> *mut Arc<driver::Home> {
+        Box::into_raw(Box::new(home))
+    }
+
+    impl Drop for Ring {
+        #[expect(unsafe_code, reason = "the pointer owns the box of `into_raw`")]
+        fn drop(&mut self) {
+            // Ordering: `Relaxed`: the drop has the cell alone, after the last release of the home.
+            let home = self.0.load(Ordering::Relaxed);
+            if !home.is_null() {
+                // SAFETY: the pointer came from `Box::into_raw`, and this is its only release.
+                drop(unsafe { Box::from_raw(home) });
+            }
         }
     }
 }
@@ -98,19 +172,57 @@ pub(super) struct Shared {
     remote: AtomicU32,
     /// The root future of `block_on` was woken.
     root: AtomicBool,
+    /// The free slots that no spawn reserved.
+    vacant: AtomicU32,
     /// The signal of the home, which a push to an empty list sends.
     home: Home,
 }
 
 impl Shared {
     pub(super) fn new(words: Box<[AtomicU64]>, next: Box<[AtomicU32]>, home: Home) -> Self {
+        let slots = u32::try_from(words.len()).expect("an owner has at most 2^16 slots");
         Self {
             words,
             next,
             remote: AtomicU32::new(END),
             root: AtomicBool::new(false),
+            vacant: AtomicU32::new(slots),
             home,
         }
+    }
+
+    /// Reserves a free slot for a spawn, from any thread. Gives `false` if each free slot is
+    /// reserved. The owner then takes a slot from its free list for the reservation.
+    pub(super) fn reserve_slot(&self) -> bool {
+        // Ordering: `Relaxed`: the count publishes no data. The free list of the owner has a slot
+        // for each reservation, because the owner frees a slot before it gives its unit back.
+        let mut vacant = self.vacant.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = vacant.checked_sub(1) else {
+                return false;
+            };
+            match self
+                .vacant
+                .compare_exchange_weak(vacant, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(actual) => vacant = actual,
+            }
+        }
+    }
+
+    /// Gives back the reservation of a slot: the owner freed the slot, or a spawn that reserved
+    /// it did not take it.
+    pub(super) fn release_slot(&self) {
+        // Ordering: `Relaxed`, as in `reserve_slot`.
+        self.vacant.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Gives the home its ring, the first time the owner needs one. The next turn of the owner then
+    /// takes the list and the root flag before it waits in the ring.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn set_ring(&self, home: Arc<driver::Home>) {
+        self.home.ring.set(home);
     }
 
     /// The generation of the task in `slot`, or of its next task if the slot is free. Only the
@@ -166,11 +278,12 @@ impl Shared {
         loop {
             // Ordering: `Relaxed`: the release of the change of the head publishes the link.
             self.next[slot as usize].store(head, Ordering::Relaxed);
-            // Ordering: `Release` publishes the link and the change of the slot word to the owner,
-            // which takes the list with `Acquire`.
+            // Ordering: `AcqRel`. `Release` publishes the link and the change of the slot word to
+            // the owner, which takes the list with `Acquire`. `Acquire` reads the release of that
+            // take, so a push after it sees a ring that the owner set before it.
             match self
                 .remote
-                .compare_exchange_weak(head, slot, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange_weak(head, slot, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => break,
                 Err(actual) => head = actual,
@@ -187,15 +300,14 @@ impl Shared {
         if ptr::eq(current, self) {
             return;
         }
-        match &self.home {
-            Home::Thread(thread) => thread.unpark(),
-            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            Home::Ring(home) => {
-                if current.is_null() || !super::ring::post(home) {
-                    home.interrupt();
-                }
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        if let Some(home) = self.home.ring.get() {
+            if current.is_null() || !super::ring::post(home) {
+                home.interrupt();
             }
+            return;
         }
+        self.home.thread.unpark();
     }
 
     /// Whether the remote-ready list has a slot. Only the owner calls it, before it parks: a push
@@ -207,8 +319,9 @@ impl Shared {
 
     /// Takes each slot of the remote-ready list, and gives it to `each`. Only the owner calls it.
     pub(super) fn harvest(&self, mut each: impl FnMut(u32)) {
-        // Ordering: `Acquire` reads the release of each push.
-        let mut slot = self.remote.swap(END, Ordering::Acquire);
+        // Ordering: `AcqRel`. `Acquire` reads the release of each push. `Release` orders a ring
+        // that the owner set before this take before each later push, which reads it.
+        let mut slot = self.remote.swap(END, Ordering::AcqRel);
         while slot != END {
             // Ordering: `Relaxed`: the swap above read the release of the push of this link. The
             // slot stays scheduled, so no push changes the link before its poll.
@@ -268,17 +381,19 @@ impl Shared {
 
     /// Wakes the root future of `block_on`. Only the wake that sets the flag signals the home.
     pub(super) fn wake_root(&self) {
-        // Ordering: `Release` orders the event of the wake before the poll of the root, which takes
-        // the flag with `Acquire`.
-        if !self.root.swap(true, Ordering::Release) {
+        // Ordering: `AcqRel`. `Release` orders the event of the wake before the poll of the root,
+        // which takes the flag with `Acquire`. `Acquire` reads the release of that take, as a push
+        // reads the take of the list.
+        if !self.root.swap(true, Ordering::AcqRel) {
             self.signal();
         }
     }
 
     /// Takes the flag of the root future. Gives `true` if it was woken.
     pub(super) fn take_root(&self) -> bool {
-        // Ordering: `Acquire` reads the release of the wake.
-        self.root.swap(false, Ordering::Acquire)
+        // Ordering: `AcqRel`: `Acquire` reads the release of the wake, and `Release` orders a ring
+        // that the owner set before this take before each later wake.
+        self.root.swap(false, Ordering::AcqRel)
     }
 
     /// Whether the root future was woken, and no poll took the flag yet.

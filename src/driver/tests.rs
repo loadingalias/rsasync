@@ -91,7 +91,7 @@ fn wait_readable(driver: &Driver) {
 /// reads it in the task work of the ring, as Linux 7.0 does for each pipe. A read of a blocking
 /// pipe on 6.1 goes to an io-wq worker instead, because 6.1 pipes lack `FMODE_NOWAIT`.
 #[cfg(unix)]
-fn pipe() -> (OwnedFd, File) {
+pub(crate) fn pipe() -> (OwnedFd, File) {
     let (read, write) = std::io::pipe().expect("the test host makes a pipe");
     let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
     let nonblocking = super::pipe::set_nonblocking(read.as_fd(), true);
@@ -103,13 +103,13 @@ fn pipe() -> (OwnedFd, File) {
 }
 
 /// The order of the events of a test, from any thread.
-pub(super) type Log = Arc<Mutex<Vec<&'static str>>>;
+pub(crate) type Log = Arc<Mutex<Vec<&'static str>>>;
 
 pub(super) fn note(log: &Log, what: &'static str) {
     log.lock().expect("no test thread panics with the log").push(what);
 }
 
-pub(super) fn taken(log: &Log) -> Vec<&'static str> {
+pub(crate) fn taken(log: &Log) -> Vec<&'static str> {
     mem::take(&mut *log.lock().expect("no test thread panics with the log"))
 }
 
@@ -118,7 +118,7 @@ pub(super) fn taken(log: &Log) -> Vec<&'static str> {
     unsafe_code,
     reason = "the test maps its own block into a backing, as a library does"
 )]
-pub(super) fn recorded(log: &Log, capacity: usize) -> Backing {
+pub(crate) fn recorded(log: &Log, capacity: usize) -> Backing {
     let mut block = ManuallyDrop::new(Vec::<u8>::with_capacity(capacity));
     let ptr = NonNull::new(block.as_mut_ptr()).expect("a vector gives a pointer that is not null");
     let data = Arc::into_raw(Arc::clone(log)).cast::<()>();

@@ -14,7 +14,8 @@ default = ["std", "local"]
 # Without `std`, the crate needs only `core` and `alloc`.
 std = ["rstypes/std", "dep:rsnetwork-udp"]
 # The local tasks of `rsasync::task`: a scheduler. Without it, the driver builds with no scheduler.
-local = ["std"]
+# On Linux, it also gives `rsasync::runtime`, whose workers take their generators from rscrypto.
+local = ["std", "dep:rscrypto"]
 
 [dependencies]
 # The shared types. Users reach them through this crate and never name it.
@@ -22,6 +23,11 @@ rstypes = { path = "rstypes", version = "=0.1.0-alpha.2", default-features = fal
 # The datagram layer that the networking family shares: `rsasync::datagram`, and the socket
 # declarations of the driver. The crate selects its items for each target.
 rsnetwork-udp = { path = "rsnetwork-udp", version = "=0.1.0-alpha.2", optional = true }
+
+# The seeded generator of the runtime: the family's only source of random values. This feature
+# alone has no dependency. The runtime reads the seed from the system itself.
+[target.'cfg(target_os = "linux")'.dependencies]
+rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"], optional = true }
 
 # The exploration tests (`cargo xtask explore`) use loom. A build without
 # `--cfg loom` compiles none of it.

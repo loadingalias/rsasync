@@ -21,7 +21,7 @@ use std::panic::catch_unwind;
 
 use super::slot::{Home, RootRef, Shared, TaskRef};
 use super::waiting::List;
-use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, Refused, SpawnRefused};
+use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, Refused, SpawnRefused, Target};
 use crate::capacity::{Budget, Permit};
 use crate::channel::oneshot;
 use crate::clock::NativeClock;
@@ -35,7 +35,7 @@ use crate::time::{Instant, TimeError};
 use crate::timer::Timers;
 
 /// The largest number of task slots of one owner.
-const MAX_SLOTS: u32 = 1 << 16;
+pub(crate) const MAX_SLOTS: u32 = 1 << 16;
 /// The most timers that one turn of an owner fires. The others fire in the turns that follow.
 const TIMERS_PER_TURN: u32 = 64;
 
@@ -125,7 +125,7 @@ impl<F: Future> Task for TaskCell<F> {
 /// Drops `value`, which holds code of a task, such as an output or a panic payload. A panic of
 /// that drop is contained, and its payload drops in the same way. The payload of a panic of that
 /// second drop leaks: one allocation, so that the owner continues.
-fn discard<T>(value: T) {
+pub(super) fn discard<T>(value: T) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(value)))
         && let Err(second) = catch_unwind(AssertUnwindSafe(|| drop(payload)))
     {
@@ -197,6 +197,14 @@ fn items<X>(count: u32, make: impl Fn(u32) -> X) -> Result<Box<[X]>, Refused> {
     Ok(items.into_boxed_slice())
 }
 
+/// The charge of a task of `F`: its cell, its outcome, and the reference of its waker, which holds
+/// two counts. A size too large for a budget saturates, and the budget refuses it.
+pub(super) fn task_size<F: Future>() -> u64 {
+    (size_of::<TaskCell<F>>() as u64)
+        .saturating_add(oneshot::size::<Outcome<F::Output>>() as u64)
+        .saturating_add((size_of::<TaskRef>() + 2 * size_of::<usize>()) as u64)
+}
+
 pub(super) struct Local {
     shared: Arc<Shared>,
     budget: Budget,
@@ -205,9 +213,26 @@ pub(super) struct Local {
     /// The local ready queue. It holds at most one entry for each slot.
     queue: RefCell<VecDeque<u32>>,
     /// The homes with a ring that a wake on this thread signals with a message from the ring of
-    /// this owner (`ring`). It has no room if this home has no ring.
+    /// this owner (`ring`). It has no room if this home can have no ring.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) outbox: RefCell<Vec<Arc<crate::driver::Home>>>,
+    /// The driver of this owner, the home of the operations of its tasks (`ring`).
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) driver: RefCell<Option<crate::driver::Driver>>,
+    /// The limits of the driver that this owner makes at the first operation that needs a home,
+    /// if it has no driver.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) lazy: Cell<Option<crate::driver::Config>>,
+    /// The owner has a driver, so the messages of its outbox go out at its next turn or wait.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) sends: Cell<bool>,
+    /// The home got its ring after the last turn, so the next park returns at once: the turn
+    /// after it takes the list and the root flag before a wait in the ring (`slot`).
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) switched: Cell<bool>,
+    /// The generator of this owner, from which its tasks take random values.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) generator: RefCell<Option<rscrypto::ChaCha20Rng>>,
     live: Cell<u32>,
     /// The end of `block_on` refuses new spawns.
     closed: Cell<bool>,
@@ -220,7 +245,9 @@ pub(super) struct Local {
 }
 
 impl Local {
-    pub(super) fn new(budget: &Budget, slots: u32, home: Home) -> Result<Self, Refused> {
+    /// Makes the tables of an owner with `slots` task slots, and an outbox with room for `outbox`
+    /// homes: zero for a home that never has a ring.
+    pub(super) fn new(budget: &Budget, slots: u32, home: Home, outbox: usize) -> Result<Self, Refused> {
         if slots == 0 {
             return Err(Refused::Zero);
         }
@@ -231,7 +258,6 @@ impl Local {
         // queue. Each place in the outbox is one pointer.
         let slot_size =
             size_of::<AtomicU64>() + size_of::<AtomicU32>() + size_of::<Cell<Option<Entry>>>() + 2 * size_of::<u32>();
-        let outbox = home.outbox();
         let size = slot_size
             .checked_mul(slots as usize)
             .and_then(|size| size.checked_add(size_of::<Shared>() + size_of::<Self>()))
@@ -264,6 +290,16 @@ impl Local {
             queue: RefCell::new(queue),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             outbox,
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            driver: RefCell::new(None),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            lazy: Cell::new(None),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            sends: Cell::new(false),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            switched: Cell::new(false),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            generator: RefCell::new(None),
             live: Cell::new(0),
             closed: Cell::new(false),
             poll_budget: Cell::new(super::DEFAULT_POLL_BUDGET.get()),
@@ -284,33 +320,50 @@ impl Local {
                 reason: Reason::Closed,
             });
         }
-        let Some(slot) = self.free.borrow_mut().pop() else {
-            return Err(SpawnRefused {
-                future,
-                reason: Reason::NoSlot,
-            });
-        };
-        // The cell, the outcome, and the reference of the waker, which holds two counts. A size
-        // too large for a budget saturates, and the budget refuses it.
         let outcome = oneshot::size::<Outcome<F::Output>>() as u64;
-        let size = (size_of::<TaskCell<F>>() as u64)
-            .saturating_add(outcome)
-            .saturating_add((size_of::<TaskRef>() + 2 * size_of::<usize>()) as u64);
-        let reserved = self.budget.reserve(size).and_then(|mut charge| {
+        let reserved = self.budget.reserve(task_size::<F>()).and_then(|mut charge| {
             let outcome = charge.split(outcome)?;
             Ok((charge, outcome))
         });
         let (charge, outcome) = match reserved {
             Ok(charges) => charges,
             Err(exhausted) => {
-                self.free.borrow_mut().push(slot);
                 return Err(SpawnRefused {
                     future,
                     reason: Reason::Budget(exhausted),
                 });
             }
         };
+        if !self.shared.reserve_slot() {
+            return Err(SpawnRefused {
+                future,
+                reason: Reason::NoSlot,
+            });
+        }
         let (sender, receiver) = oneshot::with_charge(outcome);
+        let identity = self.place(future, sender, charge);
+        Ok(JoinHandle {
+            receiver,
+            cancel: CancelHandle(Target::Local(identity)),
+        })
+    }
+
+    /// Puts `future` in a free slot, after a spawn reserved the slot (`Shared::reserve_slot`) and
+    /// `charge`, and schedules it. Gives the identity of the task.
+    pub(super) fn place<F>(
+        &self,
+        future: F,
+        sender: oneshot::Sender<Outcome<F::Output>>,
+        charge: Permit,
+    ) -> alloc::sync::Arc<TaskRef>
+    where
+        F: Future + 'static,
+    {
+        let slot = self
+            .free
+            .borrow_mut()
+            .pop()
+            .expect("the free list has a slot for each reservation");
         let identity = alloc::sync::Arc::new(TaskRef {
             shared: Arc::clone(&self.shared),
             slot,
@@ -326,10 +379,27 @@ impl Local {
         self.entries[slot as usize].set(Some(Entry { task, waker }));
         self.live.update(|live| live + 1);
         self.queue.borrow_mut().push_back(slot);
-        Ok(JoinHandle {
-            receiver,
-            cancel: CancelHandle(identity),
-        })
+        identity
+    }
+
+    /// Whether the `block_on` of this owner ended, or failed: it refuses each new task.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// Gives back the reservation of a slot that a factory spawn did not take, and wakes the first
+    /// waiting spawn.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn release_slot(&self) {
+        self.shared.release_slot();
+        self.waiting.wake_first();
+    }
+
+    /// The part of this owner that each thread can change.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
     }
 
     /// The scheduling choice: the next ready task, first in, first out.
@@ -373,7 +443,9 @@ impl Local {
     fn finish(&self, slot: u32, entry: Entry) {
         self.shared.end(slot);
         drop(entry);
+        // The slot is free before its reservation is, so each reservation finds a free slot.
         self.free.borrow_mut().push(slot);
+        self.shared.release_slot();
         self.live.update(|live| live - 1);
         self.waiting.wake_first();
     }
@@ -452,6 +524,7 @@ impl Local {
                 // A panic of the drop of one future does not stop the drop of the others.
                 discard(entry);
                 self.free.borrow_mut().push(slot);
+                self.shared.release_slot();
                 self.live.update(|live| live - 1);
             }
         }
