@@ -49,7 +49,10 @@
 //! again. So the owner sets the ring, and then takes the list and the root flag with a
 //! read-modify-write before it waits in the ring (`Shared::set_ring`). A push or a root wake before
 //! that read-modify-write is in the order of the list or of the flag before it, so the owner sees
-//! it. A push or a root wake after it reads its `Release` with `Acquire`, so it sees the ring.
+//! it. A push or a root wake after it reads its `Release` with `Acquire`, so it sees the ring. The
+//! cell of the ring (`late`) publishes it with `Release`, so a wake that finds it with no such
+//! order also sees it whole. When the owner ends, it detaches the ring: a kept waker then holds no
+//! descriptor of it, and a later wake does nothing.
 //!
 //! # The free slots
 //!
@@ -59,8 +62,12 @@
 
 use alloc::boxed::Box;
 use core::cell::Cell;
+
+use crate::capacity::Permit;
 use core::ptr;
 
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+use super::late::{Late, Read};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 use crate::driver;
 use crate::sync::{
@@ -87,9 +94,10 @@ const END: u32 = u32::MAX;
 pub(super) struct Home {
     /// The thread of the owner, which parks while the owner has no ring.
     thread: thread::Thread,
-    /// The ring of the driver of the owner, which the owner sets one time.
+    /// The ring of the driver of the owner, which the owner sets one time and detaches when it
+    /// ends, so a kept waker holds no descriptor of it.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    ring: late::Ring,
+    ring: Late<Arc<driver::Home>>,
 }
 
 impl Home {
@@ -103,63 +111,7 @@ impl Home {
         Self {
             thread,
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            ring: late::Ring::new(ring),
-        }
-    }
-}
-
-/// The ring of a home, which its owner sets one time. Its reference lives until the home drops,
-/// so a wake that reads it can use it while the home lives.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod late {
-    use alloc::boxed::Box;
-    use core::ptr;
-
-    use crate::driver;
-    use crate::sync::{
-        Arc,
-        atomic::{AtomicPtr, Ordering},
-    };
-
-    pub(super) struct Ring(AtomicPtr<Arc<driver::Home>>);
-
-    impl Ring {
-        pub(super) fn new(home: Option<Arc<driver::Home>>) -> Self {
-            Self(AtomicPtr::new(home.map_or(ptr::null_mut(), into_raw)))
-        }
-
-        /// Sets the ring. The caller then reads the remote-ready list and the root flag with a
-        /// read-modify-write, which orders this store before each later wake.
-        pub(super) fn set(&self, home: Arc<driver::Home>) {
-            // Ordering: `Relaxed`: the read-modify-writes of the owner after this store publish it.
-            let before = self.0.swap(into_raw(home), Ordering::Relaxed);
-            assert!(before.is_null(), "a home gets its ring one time");
-        }
-
-        #[expect(unsafe_code, reason = "the pointer owns its box until the drop of this cell")]
-        pub(super) fn get(&self) -> Option<&Arc<driver::Home>> {
-            // Ordering: `Acquire` reads the store of `set`, after the wake read the
-            // read-modify-write of the owner that follows it.
-            let home = self.0.load(Ordering::Acquire);
-            // SAFETY: a pointer that is not null came from `Box::into_raw`, and this cell owns the
-            // box until it drops, which is after each borrow of `&self` ends.
-            unsafe { home.as_ref() }
-        }
-    }
-
-    fn into_raw(home: Arc<driver::Home>) -> *mut Arc<driver::Home> {
-        Box::into_raw(Box::new(home))
-    }
-
-    impl Drop for Ring {
-        #[expect(unsafe_code, reason = "the pointer owns the box of `into_raw`")]
-        fn drop(&mut self) {
-            // Ordering: `Relaxed`: the drop has the cell alone, after the last release of the home.
-            let home = self.0.load(Ordering::Relaxed);
-            if !home.is_null() {
-                // SAFETY: the pointer came from `Box::into_raw`, and this is its only release.
-                drop(unsafe { Box::from_raw(home) });
-            }
+            ring: Late::new(ring),
         }
     }
 }
@@ -176,10 +128,12 @@ pub(super) struct Shared {
     vacant: AtomicU32,
     /// The signal of the home, which a push to an empty list sends.
     home: Home,
+    /// The charge of this part of the owner, which a waker can keep after the owner drops.
+    _charge: Permit,
 }
 
 impl Shared {
-    pub(super) fn new(words: Box<[AtomicU64]>, next: Box<[AtomicU32]>, home: Home) -> Self {
+    pub(super) fn new(words: Box<[AtomicU64]>, next: Box<[AtomicU32]>, home: Home, charge: Permit) -> Self {
         let slots = u32::try_from(words.len()).expect("an owner has at most 2^16 slots");
         Self {
             words,
@@ -188,6 +142,7 @@ impl Shared {
             root: AtomicBool::new(false),
             vacant: AtomicU32::new(slots),
             home,
+            _charge: charge,
         }
     }
 
@@ -221,8 +176,19 @@ impl Shared {
     /// Gives the home its ring, the first time the owner needs one. The next turn of the owner then
     /// takes the list and the root flag before it waits in the ring.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg_attr(
+        not(all(test, not(loom))),
+        expect(dead_code, reason = "the local I/O types of R307 build on it")
+    )]
     pub(super) fn set_ring(&self, home: Arc<driver::Home>) {
         self.home.ring.set(home);
+    }
+
+    /// Detaches the ring of the home when its owner ends: each later wake does nothing, and the
+    /// descriptors of the ring close when the last message to it completes.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn detach_ring(&self) {
+        self.home.ring.detach();
     }
 
     /// The generation of the task in `slot`, or of its next task if the slot is free. Only the
@@ -301,12 +267,16 @@ impl Shared {
             return;
         }
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        if let Some(home) = self.home.ring.get() {
+        match self.home.ring.with(|home| {
             if current.is_null() || !super::ring::post(home) {
                 home.interrupt();
             }
-            return;
+        }) {
+            Read::Empty => self.home.thread.unpark(),
+            // A detached home has no owner that waits.
+            Read::Value(()) | Read::Detached => {}
         }
+        #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         self.home.thread.unpark();
     }
 
@@ -408,6 +378,8 @@ pub(super) struct TaskRef {
     pub(super) shared: Arc<Shared>,
     pub(super) slot: u32,
     pub(super) generation: u64,
+    /// The charge of this identity, which a waker or a cancel handle can keep after the task.
+    pub(super) _charge: Permit,
 }
 
 impl alloc::task::Wake for TaskRef {

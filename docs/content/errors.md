@@ -32,8 +32,7 @@ The errors of `rsasync::task` (see [Tasks](tasks.md)).
 | `SpawnRefused` with `Reason::Closed` | `block_on` is at its end and cancels its tasks, or it failed and drops them | Do the work in the root future, or before the end |
 | `SpawnRefused` with `Reason::NoOwner` | No `block_on` runs on this thread | Spawn from the root future or from a task |
 | `SpawnRefused` with `Reason::NoWorker` | `Handle::spawn_on` names no worker of the runtime | Use an index below `handle.workers()` |
-| `DriverRefused` | `with_driver` found no owner, an owner with no driver, a driver in use, or a driver that did not start | See [Runtime](runtime.md#run-the-calling-thread-with-block_on) |
-| `GeneratorRefused` | `with_generator` found no owner, an owner with no generator, or a generator in use | See [Runtime](runtime.md#random-values) |
+| `GeneratorRefused` | `generator` found no owner, or an owner with no generator | See [Runtime](runtime.md#random-values) |
 | `Outcome::Panicked(Panic)` | A poll of the future, or its drop, panicked | `Panic::into_payload` gives the payload. The other tasks continue |
 | `Outcome::OwnerFailed(OwnerFailure)` | `block_on` ended with a panic before the task ended | Spawn the work again. The owner can run `block_on` again |
 

@@ -58,7 +58,7 @@ fn pend_once(wakers: mpsc::Sender<Waker>) -> impl Future<Output = ()> {
 fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
     const TASKS: usize = 16;
     const THREADS: usize = 4;
-    let mut owner = owner(TASKS);
+    let owner = owner(TASKS);
     let home = driver(&owner).home();
     owner
         .block_on(async move {
@@ -103,7 +103,7 @@ fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {
     const TASKS: usize = 8;
     let (wakers, received) = mpsc::channel::<Vec<Waker>>();
     let target = thread::spawn(move || {
-        let mut owner = owner(TASKS);
+        let owner = owner(TASKS);
         let home = driver(&owner).home();
         owner
             .block_on(async move {
@@ -126,7 +126,7 @@ fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {
     // The target then waits in its ring with near certainty. If it does not, it takes the wakes
     // before its wait, and the test still holds.
     thread::sleep(Duration::from_millis(50));
-    let mut sender = owner(1);
+    let sender = owner(1);
     let allocations = sender
         .block_on(async move {
             let before = allocations::count();
@@ -148,7 +148,7 @@ fn a_wake_from_a_blocking_service_thread_reaches_its_home() {
     let config = blocking::Config::new().threads(1).jobs(1).stack(256 << 10);
     let service = Service::new(&budget, config).unwrap();
     let submitter = service.submitter();
-    let mut owner = owner(1);
+    let owner = owner(1);
     let outcome = owner
         .block_on(async move {
             let task = spawn_local(async move {

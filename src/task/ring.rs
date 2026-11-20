@@ -64,9 +64,10 @@ impl RingOwner {
         self.local.use_timers(timers, clock)
     }
 
-    /// Gives the owner the generator from which its tasks take random values.
+    /// Gives the owner the generator from which it derives the generator of each caller of
+    /// `task::generator`.
     pub(crate) fn use_generator(&mut self, generator: rscrypto::ChaCha20Rng) {
-        self.local.generator.replace(Some(generator));
+        self.local.generator.replace(Some((generator, 0)));
     }
 
     /// The side of this owner that another thread uses to spawn on it.
@@ -77,23 +78,33 @@ impl RingOwner {
     /// Makes this thread the owner, and polls `root`, the tasks of the owner, and the driver until
     /// `root` gives its output, as `LocalOwner::block_on` does. Then it tears the driver down: it
     /// cancels each operation that the driver homes, drives it until each terminal event, and
-    /// closes each resource that remains.
+    /// closes each resource that remains. The owner ends with the call.
     ///
     /// # Errors
     ///
     /// A failure of the driver. If it ends the loop, each live task ends with `OwnerFailed`. If the
     /// teardown fails, the output of `root` drops.
-    pub(crate) fn block_on<F: Future>(&mut self, root: F) -> io::Result<F::Output> {
+    pub(crate) fn block_on<F: Future>(self, root: F) -> io::Result<F::Output> {
         let mut enter = Enter::new(&self.local);
         let output = self.local.block_on(root, &mut Drive);
         enter.ended = output.is_ok();
         let output = output?;
-        // The tasks ended, so no wake of this owner needs its ring after the teardown. The report
-        // counts the operations that the teardown cancelled, which their futures already saw.
-        if let Some(driver) = self.local.driver.take() {
+        // The slot stays borrowed through the teardown, and the owner makes no other driver: a
+        // waker that the teardown calls and that asks for the driver gets `InUse`.
+        self.local.lazy.set(None);
+        let mut slot = self.local.driver.borrow_mut();
+        if let Some(driver) = slot.take() {
+            // The report counts the operations that the teardown cancelled, which their futures saw.
             let _cancelled = driver.teardown()?;
         }
         Ok(output)
+    }
+}
+
+impl Drop for RingOwner {
+    /// Detaches the ring of the home: a waker that the caller keeps holds no descriptor of it.
+    fn drop(&mut self) {
+        self.local.shared().detach_ring();
     }
 }
 
@@ -170,6 +181,10 @@ pub(super) fn post(home: &Arc<driver::Home>) -> bool {
 impl Local {
     /// Calls `f` with the driver of this owner. The owner of `block_on` makes its driver here the
     /// first time, and its home gets its ring.
+    #[cfg_attr(
+        not(all(test, not(loom))),
+        expect(dead_code, reason = "the local I/O types of R307 build on it")
+    )]
     pub(super) fn with_driver<R>(&self, f: impl FnOnce(&mut Driver) -> R) -> Result<R, super::DriverRefused> {
         let mut slot = self.driver.try_borrow_mut().map_err(|_| super::DriverRefused::InUse)?;
         if slot.is_none() {

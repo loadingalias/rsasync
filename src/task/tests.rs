@@ -633,3 +633,27 @@ fn a_cancelled_timer_frees_its_place_and_wakes_nothing() {
         assert_matches!(task.join().await, Outcome::Cancelled);
     });
 }
+
+/// A waker and a cancel handle that the caller keeps after the task ended, and after the owner
+/// dropped, keep their charge until they drop.
+#[test]
+fn a_kept_waker_and_cancel_handle_keep_their_charge_until_they_drop() {
+    let budget = budget();
+    let start = budget.available();
+    let mut owner = LocalOwner::new(&budget, 1).unwrap();
+    let (waker, cancel) = owner.block_on(async {
+        let task = spawn_local(poll_fn(|cx| Poll::Ready(cx.waker().clone()))).unwrap();
+        let cancel = task.cancel_handle();
+        match task.join().await {
+            Outcome::Completed(waker) => (waker, cancel),
+            _ => panic!("the task completes"),
+        }
+    });
+    drop(owner);
+    assert!(
+        budget.available() < start,
+        "the kept waker and cancel handle hold their charge"
+    );
+    drop((waker, cancel));
+    assert_eq!(budget.available(), start);
+}

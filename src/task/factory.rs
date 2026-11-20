@@ -8,9 +8,15 @@
 //! with [`Outcome::Cancelled`]. Only an owner that closed drops such a job, so no waiting spawn of
 //! the owner needs that slot.
 //!
-//! A cancel can come before the job runs. The cancel stores its request and then reads the slot of
-//! the task. The job stores the slot and then reads the request. Both use `SeqCst`, so at least one
-//! of them sees the other, and the owner gets the cancel.
+//! A cancel can come before the job runs. The job reads the request before it calls the factory: a
+//! cancel that came first drops the factory uncalled, and the task ends with
+//! [`Outcome::Cancelled`]. Else the cancel stores its request and then reads the slot of the task,
+//! and the job stores the slot and then reads the request. Both use `SeqCst`, so at least one of
+//! them sees the other, and the owner drops the future before its first poll. A factory that
+//! panics before it sees a cancel ends the task with [`Outcome::Panicked`].
+//!
+//! The cancel cell holds its own part of the charge, because a cancel handle can keep it after the
+//! task ends.
 
 use alloc::boxed::Box;
 use core::any::Any;
@@ -30,6 +36,10 @@ use crate::sync::{
 
 /// The slot of a task that its job did not place yet.
 const UNPLACED: u32 = u32::MAX;
+
+/// The charge of the cancel cell of a factory spawn, and its two counts. The cell holds it, since a
+/// cancel handle can keep the cell after the task ends.
+const REMOTE: usize = size_of::<Remote>() + 2 * size_of::<usize>();
 
 /// The side of an owner that another thread uses to spawn on it.
 #[derive(Clone)]
@@ -60,8 +70,7 @@ impl Placer {
         F::Output: Send + 'static,
     {
         let outcome = oneshot::size::<Outcome<F::Output>>() as u64;
-        // The job, the cancel cell, and its two counts.
-        let job = size_of::<Spawn<Fa, F::Output>>() + size_of::<Remote>() + 2 * size_of::<usize>();
+        let job = size_of::<Spawn<Fa, F::Output>>() + REMOTE;
         let reserved = self
             .budget
             .reserve(task_size::<F>().saturating_add(job as u64))
@@ -87,11 +96,16 @@ impl Placer {
             });
         }
         let (sender, receiver) = oneshot::with_charge(outcome);
+        let mut charge = charge;
+        let remote_charge = charge
+            .split(REMOTE as u64)
+            .expect("the charge of a factory spawn holds its cancel cell");
         let remote = alloc::sync::Arc::new(Remote {
             shared: Arc::clone(&self.shared),
             requested: AtomicBool::new(false),
             slot: AtomicU32::new(UNPLACED),
             generation: AtomicU64::new(0),
+            _charge: remote_charge,
         });
         let job = Job(Box::new(Spawn {
             factory: Some(factory),
@@ -171,6 +185,13 @@ where
         if local.closed() {
             return;
         }
+        // A cancel that came first drops the factory uncalled, and the drop of this job ends the
+        // task with `Cancelled`. A cancel after this read finds the slot (`Remote::placed`).
+        if self.remote.cancelled() {
+            self.reserved = false;
+            local.release_slot();
+            return;
+        }
         let (Some(factory), Some(sender), Some(charge)) = (self.factory.take(), self.sender.take(), self.charge.take())
         else {
             return;
@@ -217,6 +238,7 @@ pub(super) struct Remote {
     slot: AtomicU32,
     /// The generation of the task in `slot`.
     generation: AtomicU64,
+    _charge: Permit,
 }
 
 impl Remote {
@@ -231,6 +253,12 @@ impl Remote {
             let generation = self.generation.load(Ordering::Relaxed);
             self.shared.wake(slot, generation, true);
         }
+    }
+
+    /// Whether a cancel came, as `placed` reads it.
+    fn cancelled(&self) -> bool {
+        // Ordering: `SeqCst`, as in `cancel`.
+        self.requested.load(Ordering::SeqCst)
     }
 
     /// Records the slot of the task, and requests its cancel if a cancel came before.

@@ -128,8 +128,8 @@ failed. The kernel can then still own buffers of that driver, and they leak.
 
 - The thread polls `root` and the tasks that `root` spawns with `spawn_local`. They can hold
   `!Send` state.
-- The owner makes its driver at the first operation that needs one: the first call of
-  `task::with_driver`. A root that only waits, for example on a channel, starts no driver.
+- The owner makes its driver at the first operation that needs one, so a root that only waits,
+  for example on a channel, starts no driver.
 - When `root` gives its output, `block_on` cancels each task that is still on the owner, and it
   waits until each one ended. Then it cancels each operation that its driver homes, drives the
   driver until each one reaches its terminal event, and closes each resource that remains. Then it
@@ -137,34 +137,12 @@ failed. The kernel can then still own buffers of that driver, and they leak.
 
 So no buffer of an operation of the call is in the kernel after `block_on` returns. Work that must
 outlive the root belongs on a worker. Each call gets its own owner, with its own task slots,
-timers, driver, and generator.
+timers, driver, and generator. A waker of the call that you keep after the return holds no
+descriptor of that driver, and a wake through it does nothing.
 
-```rust
-use rsasync::driver::OpenOptions;
-use rsasync::runtime::Runtime;
-use rsasync::task::with_driver;
-
-let runtime = Runtime::builder().build()?;
-runtime.block_on(async {
-    // The first operation makes the driver of this owner.
-    let file = with_driver(|driver| driver.open_file("data.bin".as_ref(), OpenOptions::new().read(true)))??
-        .await??;
-    with_driver(|driver| driver.close_file(file))??.await?;
-    Ok::<_, Box<dyn std::error::Error>>(())
-})??;
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-`task::with_driver(f)` calls `f` with the driver of the owner of the thread. The futures of the
-operations do not borrow the driver, so the task awaits them after `f` returns. The
-[driver](driver-only.md) pages give each operation. `with_driver` refuses with `DriverRefused`:
-
-| `DriverRefused` | When |
-| --- | --- |
-| `NoOwner` | No owner runs on this thread |
-| `NoDriver` | The owner is a `LocalOwner`, which has no driver |
-| `InUse` | The driver is in use on this thread: inside the closure of `with_driver`, or in a waker that a turn of the driver calls |
-| `Start(driver::Error)` | The driver did not start. A later call tries again |
+The tasks of an owner reach its driver only through types that own their resources, so no task
+can replace the driver that the owner waits in. rsasync has no such public type yet. Until it
+has, a task of the runtime does no I/O, and [driver-only use](driver-only.md) is the path for I/O.
 
 `block_on` gives a `BlockOnError` when the owner gets no task tables (`Owner`) or no timers
 (`Timers`, `Time`), or when its driver fails (`Driver`). A driver failure during the call ends each
@@ -189,9 +167,12 @@ inbox. A refusal keeps no reservation, and `SpawnRefused::into_future` gives the
 | `Budget(Exhausted)` | The budget has fewer free units than the task and its factory | Free units, or spawn a smaller future |
 | `Closed` | The worker stopped | Spawn before the drop of the runtime |
 
-A panic of the factory ends the task with `Outcome::Panicked`. A cancel works before the worker
-calls the factory and after: the task ends with `Outcome::Cancelled`. A factory that waits in the
-inbox when its worker stops also ends with `Outcome::Cancelled`, and the worker does not call it.
+A cancel works before the worker calls the factory and after, and the task ends with
+`Outcome::Cancelled`. The worker reads the cancel before it calls the factory: if the cancel came
+first, the factory drops and the worker never calls it. A later cancel drops the future before its
+first poll. A factory that panics before the worker sees a cancel ends the task with
+`Outcome::Panicked`. A factory that waits in the inbox when its worker stops also ends with
+`Outcome::Cancelled`, and the worker does not call it.
 
 A `Handle` can move to another thread, also to a task of a worker. Each handle holds a place in the
 inbox of each worker, so `handles` bounds them: `runtime.handle()` and `handle.try_clone()` refuse
@@ -256,28 +237,33 @@ restricted set also show this, and only the operator can tell them apart.
 
 The runtime has one generator, rscrypto's `ChaCha20Rng`, which `rsasync::runtime::ChaCha20Rng`
 names. Each owner derives its own generator from it: worker `i` takes the child `worker\0\0` with
-index `i`, and call `n` of `block_on` takes the child `block_on` with index `n`. So two owners
-never share a stream.
+index `i`, and call `n` of `block_on` takes the child `block_on` with index `n`.
 
-- With `seed(seed)`, two runtimes give each owner the same values. Use it to replay a run, and keep
-  a production seed secret.
+`task::generator(label)` gives a new generator that the caller owns: a child of the generator of
+the owner of the thread, with `label` and the next index of that owner. So:
+
+- No two calls share a stream, also two calls with one label.
+- No task can read, predict, or replace the generator of its owner, or the generator of another
+  task.
+- With `seed(seed)`, two runtimes give each call the same generator again when the calls of each
+  owner come in the same order. Use it to replay a run, and keep a production seed secret.
 - With no seed, the runtime reads a seed from the kernel with `getrandom(2)` at each start.
 
-`task::with_generator(f)` calls `f` with the generator of the owner of the thread. Derive the
-generator of a connection or of another child with `ChaCha20Rng::child`. `with_generator` refuses
-with `GeneratorRefused::NoOwner`, `NoGenerator` (a `LocalOwner` has none), or `InUse` (inside its
-own closure).
+Derive the generators of the connections or other children of a task from its own generator with
+`ChaCha20Rng::child`. `generator` refuses with `GeneratorRefused::NoOwner` on a thread with no
+owner, and with `NoGenerator` on a `LocalOwner`, which has no generator.
 
 ```rust
 use rsasync::runtime::{Runtime, WorkerId};
-use rsasync::task::{Outcome, with_generator};
+use rsasync::task::{Outcome, generator};
 
 let runtime = Runtime::builder().local_workers(2).seed([7; 32]).build()?;
 let mut handle = runtime.handle()?;
-let task = handle
-    .spawn_on(WorkerId::new(1), || async { with_generator(|generator| generator.next_u64()) })?;
+let task = handle.spawn_on(WorkerId::new(1), || async {
+    generator(b"example\0").map(|mut generator| generator.next_u64())
+})?;
 if let Outcome::Completed(draw) = task.join_blocking() {
-    // The same seed gives worker 1 this value again in each run.
+    // The same seed gives the first generator of worker 1 this value in each run.
     println!("{}", draw?);
 }
 # Ok::<(), Box<dyn std::error::Error>>(())

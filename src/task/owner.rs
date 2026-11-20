@@ -197,12 +197,15 @@ fn items<X>(count: u32, make: impl Fn(u32) -> X) -> Result<Box<[X]>, Refused> {
     Ok(items.into_boxed_slice())
 }
 
-/// The charge of a task of `F`: its cell, its outcome, and the reference of its waker, which holds
-/// two counts. A size too large for a budget saturates, and the budget refuses it.
+/// The charge of the identity of a task: the reference of its waker, which holds two counts.
+const IDENTITY: usize = size_of::<TaskRef>() + 2 * size_of::<usize>();
+
+/// The charge of a task of `F`: its cell, its outcome, and its identity. A size too large for a
+/// budget saturates, and the budget refuses it.
 pub(super) fn task_size<F: Future>() -> u64 {
     (size_of::<TaskCell<F>>() as u64)
         .saturating_add(oneshot::size::<Outcome<F::Output>>() as u64)
-        .saturating_add((size_of::<TaskRef>() + 2 * size_of::<usize>()) as u64)
+        .saturating_add(IDENTITY as u64)
 }
 
 pub(super) struct Local {
@@ -230,9 +233,9 @@ pub(super) struct Local {
     /// after it takes the list and the root flag before a wait in the ring (`slot`).
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) switched: Cell<bool>,
-    /// The generator of this owner, from which its tasks take random values.
+    /// The generator of this owner, and the index of its next child (`task::generator`).
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub(super) generator: RefCell<Option<rscrypto::ChaCha20Rng>>,
+    pub(super) generator: RefCell<Option<(rscrypto::ChaCha20Rng, u64)>>,
     live: Cell<u32>,
     /// The end of `block_on` refuses new spawns.
     closed: Cell<bool>,
@@ -264,7 +267,15 @@ impl Local {
             .and_then(|size| size.checked_add(outbox * size_of::<usize>()))
             .and_then(|size| u64::try_from(size).ok())
             .ok_or(Refused::TooLarge)?;
-        let charge = budget.reserve(size).map_err(Refused::Budget)?;
+        let mut charge = budget.reserve(size).map_err(Refused::Budget)?;
+        // The shared part, which a waker can keep after the owner drops, holds its own charge, and
+        // its reference holds two counts.
+        let shared = (size_of::<AtomicU64>() + size_of::<AtomicU32>()) * slots as usize
+            + size_of::<Shared>()
+            + 2 * size_of::<usize>();
+        let shared_charge = charge
+            .split(shared as u64)
+            .expect("the charge of the owner holds its shared part");
         let words = items(slots, |_| AtomicU64::new(0))?;
         let next = items(slots, |_| AtomicU32::new(0))?;
         let entries = items(slots, |_| Cell::new(None))?;
@@ -283,7 +294,7 @@ impl Local {
             RefCell::new(homes)
         };
         Ok(Self {
-            shared: Arc::new(Shared::new(words, next, home)),
+            shared: Arc::new(Shared::new(words, next, home, shared_charge)),
             budget: budget.clone(),
             entries,
             free: RefCell::new(free),
@@ -349,16 +360,20 @@ impl Local {
     }
 
     /// Puts `future` in a free slot, after a spawn reserved the slot (`Shared::reserve_slot`) and
-    /// `charge`, and schedules it. Gives the identity of the task.
+    /// `charge`, and schedules it. Gives the identity of the task, which holds its own part of the
+    /// charge: a waker or a cancel handle can keep it after the task ends.
     pub(super) fn place<F>(
         &self,
         future: F,
         sender: oneshot::Sender<Outcome<F::Output>>,
-        charge: Permit,
+        mut charge: Permit,
     ) -> alloc::sync::Arc<TaskRef>
     where
         F: Future + 'static,
     {
+        let identity_charge = charge
+            .split(IDENTITY as u64)
+            .expect("the charge of a task holds its identity");
         let slot = self
             .free
             .borrow_mut()
@@ -368,6 +383,7 @@ impl Local {
             shared: Arc::clone(&self.shared),
             slot,
             generation: self.shared.generation(slot),
+            _charge: identity_charge,
         });
         let waker = Waker::from(alloc::sync::Arc::clone(&identity));
         let task: Pin<Box<dyn Task>> = Box::pin(TaskCell {

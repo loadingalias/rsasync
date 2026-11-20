@@ -100,6 +100,10 @@ mod explore {
   in one run, and loom checks every run within it. The result then does not change with the
   environment.
 - Keep each model small: two or three threads, and few operations in each thread.
+- Do not let a model depend on the one total order of `SeqCst` loads and stores. Loom 0.7 treats
+  each `SeqCst` access as `AcqRel`, so such a protocol gets a false alarm. Put the two facts in one
+  atomic word and change it with read-modify-writes, as `src/task/late.rs` does, or use
+  `fence(SeqCst)`, which loom models.
 
 ## Run the tests
 

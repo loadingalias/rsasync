@@ -138,6 +138,11 @@ use crate::timer::{self, Timer, Timers};
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod factory;
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+mod late;
 mod owner;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod ring;
@@ -367,44 +372,33 @@ impl core::error::Error for TimerRefused {
 }
 
 /// Calls `f` with the driver of the owner of this thread: the home of each operation that `f`
-/// submits. A worker of a [`Runtime`](crate::runtime::Runtime) has its driver from its start. The
-/// owner of [`Runtime::block_on`](crate::runtime::Runtime::block_on) makes its driver here, the
-/// first time, so a root that only waits starts none. The futures of the operations do not borrow
-/// the driver, so a task awaits them after `f` returns.
+/// submits. A worker of a runtime has its driver from its start. The owner of `Runtime::block_on`
+/// makes its driver here, the first time, so a root that only waits starts none. The futures of
+/// the operations do not borrow the driver, so a task awaits them after `f` returns.
 ///
-/// ```no_run
-/// use rsasync::buffer::Backing;
-/// use rsasync::driver::OpenOptions;
-/// use rsasync::runtime::Runtime;
-/// use rsasync::task::with_driver;
-///
-/// let runtime = Runtime::builder().build()?;
-/// let read = runtime.block_on(async {
-///     // The first operation makes the driver of this owner.
-///     let open = with_driver(|driver| driver.open_file("data.bin".as_ref(), OpenOptions::new().read(true)))??;
-///     let file = open.await??;
-///     let buffer = Backing::from(Vec::with_capacity(4096));
-///     let (read, _buffer) = with_driver(|driver| driver.read_at(&file, buffer, 0))??.await?;
-///     with_driver(|driver| driver.close_file(file))??.await?;
-///     Ok::<_, Box<dyn std::error::Error>>(read?)
-/// })??;
-/// assert!(read <= 4096);
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
+/// The local I/O types build on it. No public path gives `&mut Driver`: safe code could replace
+/// the driver, and the owner would then wait in a ring that no wake signals.
 ///
 /// # Errors
 ///
 /// [`DriverRefused`] gives the reason, and `f` does not run.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub fn with_driver<R>(f: impl FnOnce(&mut crate::driver::Driver) -> R) -> Result<R, DriverRefused> {
+#[cfg_attr(
+    not(all(test, not(loom))),
+    expect(dead_code, reason = "the local I/O types of R307 build on it")
+)]
+pub(crate) fn with_driver<R>(f: impl FnOnce(&mut crate::driver::Driver) -> R) -> Result<R, DriverRefused> {
     current().ok_or(DriverRefused::NoOwner)?.with_driver(f)
 }
 
 /// Why [`with_driver`] did not call its closure.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg_attr(
+    not(all(test, not(loom))),
+    expect(dead_code, reason = "the local I/O types of R307 build on it")
+)]
 #[derive(Debug)]
-#[non_exhaustive]
-pub enum DriverRefused {
+pub(crate) enum DriverRefused {
     /// No owner runs on this thread.
     NoOwner,
     /// The owner of this thread has no driver: a [`LocalOwner`] runs no driver.
@@ -413,49 +407,37 @@ pub enum DriverRefused {
     /// of the driver that calls a waker.
     InUse,
     /// The driver did not start.
-    Start(crate::driver::Error),
+    Start(
+        #[cfg_attr(
+            all(test, not(loom)),
+            expect(dead_code, reason = "the local I/O types of R307 give it to the caller")
+        )]
+        crate::driver::Error,
+    ),
 }
 
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-impl fmt::Display for DriverRefused {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NoOwner => f.write_str("no owner runs on this thread"),
-            Self::NoDriver => f.write_str("the owner of this thread has no driver"),
-            Self::InUse => f.write_str("the driver of this thread is in use"),
-            Self::Start(error) => write!(f, "the driver did not start: {error}"),
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-impl core::error::Error for DriverRefused {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Start(error) => Some(error),
-            Self::NoOwner | Self::NoDriver | Self::InUse => None,
-        }
-    }
-}
-
-/// Calls `f` with the generator of the owner of this thread, the source of each random value of
-/// its tasks. Each owner of a [`Runtime`](crate::runtime::Runtime) has its own generator, which it
-/// derives from the generator of the runtime, so one seed gives each owner the same values again.
-/// Derive the generator of a connection or another child with
+/// Gives a new generator that the caller owns: a child of the generator of the owner of this
+/// thread, with `label` and the next index of the owner. Each owner of a
+/// [`Runtime`](crate::runtime::Runtime) has its own generator, which it derives from the generator
+/// of the runtime. So no two calls share a stream, no task reads, predicts, or replaces the
+/// generator of its owner, and one seed gives each call the same generator again when the calls of
+/// the owner come in the same order. Derive more children from it with
 /// [`ChaCha20Rng::child`](crate::runtime::ChaCha20Rng::child).
 ///
 /// # Errors
 ///
-/// [`GeneratorRefused`] gives the reason, and `f` does not run.
+/// [`GeneratorRefused`] gives the reason.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub fn with_generator<R>(f: impl FnOnce(&mut rscrypto::ChaCha20Rng) -> R) -> Result<R, GeneratorRefused> {
+pub fn generator(label: &[u8; 8]) -> Result<rscrypto::ChaCha20Rng, GeneratorRefused> {
     let local = current().ok_or(GeneratorRefused::NoOwner)?;
-    let mut generator = local.generator.try_borrow_mut().map_err(|_| GeneratorRefused::InUse)?;
-    let generator = generator.as_mut().ok_or(GeneratorRefused::NoGenerator)?;
-    Ok(f(generator))
+    let mut generator = local.generator.borrow_mut();
+    let (owner, next) = generator.as_mut().ok_or(GeneratorRefused::NoGenerator)?;
+    let child = owner.child(label, *next);
+    *next = next.checked_add(1).expect("an owner makes fewer than 2^64 generators");
+    Ok(child)
 }
 
-/// Why [`with_generator`] did not call its closure.
+/// Why [`generator()`] gave no generator.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -464,8 +446,6 @@ pub enum GeneratorRefused {
     NoOwner,
     /// The owner of this thread has no generator: a [`LocalOwner`] has none.
     NoGenerator,
-    /// The closure of `with_generator` runs on this thread.
-    InUse,
 }
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -474,7 +454,6 @@ impl fmt::Display for GeneratorRefused {
         f.write_str(match self {
             Self::NoOwner => "no owner runs on this thread",
             Self::NoGenerator => "the owner of this thread has no generator",
-            Self::InUse => "the generator of this thread is in use",
         })
     }
 }

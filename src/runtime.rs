@@ -57,7 +57,8 @@
 //! [`Builder::generator`], or the operating system. Worker `i` takes the child `worker\0\0` with
 //! index `i`, and call `n` of `block_on` takes the child `block_on` with index `n`. So one seed
 //! gives each owner the same values again, and no two owners share a stream.
-//! [`with_generator`](crate::task::with_generator) gives a task the generator of its owner.
+//! [`generator()`](crate::task::generator) gives a task a child of the generator of its owner,
+//! which the task owns, so no task can read or replace the generator of its owner.
 
 mod entropy;
 mod placement;
@@ -446,13 +447,14 @@ impl Runtime {
     /// Makes the calling thread a local owner for the call, and polls `root` there until it gives
     /// its output. `root` and the tasks that it spawns with
     /// [`spawn_local`](crate::task::spawn_local) can hold `!Send` state. The first operation that
-    /// needs a home makes the driver of the owner ([`with_driver`](crate::task::with_driver)), so a
-    /// root that only waits starts none.
+    /// needs a home makes the driver of the owner, so a root that only waits starts none. No public
+    /// type runs an operation on the driver of an owner yet.
     ///
     /// After `root` gives its output, `block_on` cancels each task that is still on the owner and
     /// waits until each one ended. It then cancels each operation that the driver homes, drives the
     /// driver until each one reaches its terminal event, closes each resource that remains, and
-    /// returns. Work that outlives the root belongs on a worker.
+    /// returns. Work that outlives the root belongs on a worker. A waker of the call that the caller
+    /// keeps holds no descriptor of the driver after the return, and a wake through it does nothing.
     ///
     /// # Errors
     ///

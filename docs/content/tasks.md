@@ -7,8 +7,8 @@ the `std` feature.
 
 A `LocalOwner` runs tasks with no driver and no other thread. On Linux, the
 [runtime](runtime.md) gives each of its workers, and each call of its `block_on`, an owner with a
-driver, timers, and a generator. Its tasks reach them with `task::with_driver` and
-`task::with_generator`, and `Handle::spawn_on` spawns on a worker from any thread.
+driver, timers, and a generator. `task::generator` gives a task a generator of its own, and
+`Handle::spawn_on` spawns on a worker from any thread.
 
 ## Run tasks on a local owner
 

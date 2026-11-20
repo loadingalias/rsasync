@@ -66,7 +66,7 @@ pub(super) fn timers(
 pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::Sender<Ready>) -> io::Result<()> {
     let budget = start.budget.clone();
     match prepare(start) {
-        Ok((mut owner, report)) => {
+        Ok((owner, report)) => {
             let placer = owner.placer(&budget);
             // The start waits for the report, so only a start that ended can refuse it.
             if ready.send(Ok((report, placer))).is_err() {

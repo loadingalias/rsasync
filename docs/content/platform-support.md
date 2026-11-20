@@ -107,13 +107,15 @@ passed with glibc on two AWS EC2 hosts:
 | Debian 12 | x86_64 | `6.1.0-56-cloud-amd64` | c8i.4xlarge, 8 cores with SMT |
 | Ubuntu 26.04 | aarch64 | `7.0.0-1018-aws` | c8g.4xlarge, 16 cores |
 
-Each run passed 463 tests and the doctests. The runtime tests check a start that fails at one
+Each run passed 467 tests and the doctests. The runtime tests check a start that fails at one
 worker of four at the descriptor limit, the factory spawn and its refusals, a cancel of a factory
 spawn before and after its worker places it, `Dedicated` placement on one CPU of each physical core,
 an `Exact` CPU outside the CPU set, the release of the operations of `block_on` before it returns,
-a root that starts no driver, a wake after the first operation, and the generator of each owner.
-They run on io_uring, and the factory spawn, the release, and the wake also run on epoll. The final
-form of two of these tests, the failed start and the release, ran only on the x86_64 host. No host
+a waker that the teardown calls, a kept waker that holds no descriptor, a kept cancel handle that
+keeps its charge, a root that starts no driver, a wake after the first operation, and the
+generators of each owner. They run on io_uring, and the factory spawn, the release, and the wake
+also run on epoll. `cargo xtask explore -p rsasync` passed its 53 exploration tests on the x86_64
+host, where the wakes of a task go through the cell of the ring of its home. No host
 with two NUMA nodes or two cache domains ran them, so the spread of `Domain` and `Dedicated` over
 nodes and domains has only the test of the plan on the facts of such a host.
 

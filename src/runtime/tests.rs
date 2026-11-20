@@ -1,11 +1,15 @@
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::assert_matches;
 use core::ffi::c_int;
 use core::future::pending;
 use core::num::NonZeroU64;
-use std::sync::mpsc;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll, Waker};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 
 use super::topology::{Host, Quota};
@@ -15,7 +19,7 @@ use crate::channel::oneshot;
 use crate::driver::tests::{Log, pipe, recorded, taken};
 use crate::driver::{Backend, Config};
 use crate::task::tests::yield_once;
-use crate::task::{Outcome as TaskOutcome, Reason, spawn_local, with_driver, with_generator};
+use crate::task::{DriverRefused, Outcome as TaskOutcome, Reason, generator, spawn_local, with_driver};
 
 fn budget() -> Budget {
     Budget::new(NonZeroU64::new(1 << 20).unwrap())
@@ -209,8 +213,8 @@ fn a_factory_makes_its_future_on_its_worker_and_a_spawn_beyond_the_free_slots_co
     a_factory_makes_its_future_on_its_worker_and_a_spawn_beyond_the_free_slots_comes_back(Backend::Epoll);
 }
 
-/// A cancel ends a factory spawn whether it comes before the worker calls the factory or after the
-/// task runs.
+/// A cancel ends a factory spawn whether it comes before the worker calls the factory, which then
+/// drops uncalled, or after the task runs.
 #[test]
 fn a_cancel_ends_a_factory_spawn_before_or_after_its_worker_places_it() {
     let runtime = Runtime::builder().local_workers(1).build().unwrap();
@@ -223,10 +227,23 @@ fn a_cancel_ends_a_factory_spawn_before_or_after_its_worker_places_it() {
             async {}
         })
         .unwrap();
-    let early = handle.spawn_on(WorkerId::new(0), pending::<()>).unwrap();
+    let called = Arc::new(AtomicBool::new(false));
+    let early = handle
+        .spawn_on(WorkerId::new(0), {
+            let called = Arc::clone(&called);
+            move || {
+                called.store(true, Ordering::Relaxed);
+                pending::<()>()
+            }
+        })
+        .unwrap();
     early.cancel_handle().cancel();
     unblock.send(()).unwrap();
     assert_matches!(early.join_blocking(), TaskOutcome::Cancelled);
+    assert!(
+        !called.load(Ordering::Relaxed),
+        "a cancel that came first drops the factory uncalled"
+    );
     completed(blocker.join_blocking());
     let (polled, mut started) = oneshot::channel::<()>(&budget()).unwrap();
     let late = handle
@@ -480,39 +497,115 @@ fn a_wake_from_another_thread_ends_the_wait_after_the_first_operation_made_the_d
     a_wake_from_another_thread_ends_the_wait_after_the_first_operation_made_the_driver(Backend::Epoll);
 }
 
-/// Draws one value on each of two workers, and one in `block_on`.
+/// One value of a new generator of the owner of this thread.
+fn draw() -> u64 {
+    generator(b"draw\0\0\0\0").unwrap().next_u64()
+}
+
+/// Draws one value on each of two workers, and two in `block_on`.
 fn draws(builder: Builder) -> Vec<u64> {
     let runtime = builder.local_workers(2).build().unwrap();
     let mut handle = runtime.handle().unwrap();
     let mut draws: Vec<u64> = (0..2)
         .map(|index| {
-            let task = handle
-                .spawn_on(WorkerId::new(index), || async {
-                    with_generator(|generator| generator.next_u64())
-                })
-                .unwrap();
-            completed(task.join_blocking()).unwrap()
+            let task = handle.spawn_on(WorkerId::new(index), || async { draw() }).unwrap();
+            completed(task.join_blocking())
         })
         .collect();
-    draws.push(
-        runtime
-            .block_on(async { with_generator(|generator| generator.next_u64()) })
-            .unwrap()
-            .unwrap(),
-    );
+    // Two calls on one owner give two children.
+    let (first, second) = runtime.block_on(async { (draw(), draw()) }).unwrap();
+    draws.extend([first, second]);
     draws
 }
 
-/// Two starts with one seed give each owner the same values, two owners of one start give
-/// different values, and two starts with a seed from the system differ.
+/// Two starts with one seed give each generator of each owner the same values, no two generators
+/// of one start share a stream, and two starts with a seed from the system differ.
 #[test]
-fn one_seed_gives_each_owner_the_same_values_and_no_two_owners_share_a_stream() {
+fn one_seed_gives_each_generator_the_same_values_and_no_two_generators_share_a_stream() {
     let seed = [7; ChaCha20Rng::SEED_SIZE];
     let first = draws(Runtime::builder().seed(seed));
     assert_eq!(first, draws(Runtime::builder().seed(seed)));
-    assert!(
-        first[0] != first[1] && first[0] != first[2] && first[1] != first[2],
-        "{first:?}"
-    );
+    let mut distinct = first.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), first.len(), "{first:?}");
     assert_ne!(draws(Runtime::builder()), draws(Runtime::builder()));
+}
+
+/// Asks for the driver when the teardown of `block_on` wakes it, and records whether the driver was
+/// in use.
+struct AsksForTheDriver(Mutex<Option<bool>>);
+
+impl alloc::task::Wake for AsksForTheDriver {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let in_use = matches!(with_driver(|_driver| ()), Err(DriverRefused::InUse));
+        *self.0.lock().unwrap() = Some(in_use);
+    }
+}
+
+/// The teardown of `block_on` ends a receive whose future the root forgot, and calls its waker. A
+/// waker that then asks for the driver gets `InUse`, and the owner makes no second driver.
+#[test]
+#[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
+fn a_waker_that_the_teardown_calls_makes_no_second_driver() {
+    let runtime = Runtime::builder().build().unwrap();
+    let asks = Arc::new(AsksForTheDriver(Mutex::new(None)));
+    let (read, _write) = pipe();
+    runtime
+        .block_on(async {
+            let reader = Box::leak(Box::new(
+                with_driver(|driver| driver.adopt_reader(read)).unwrap().unwrap(),
+            ));
+            let mut receive = Box::pin(
+                with_driver(|driver| driver.recv(reader, crate::buffer::Backing::from(Vec::with_capacity(64))))
+                    .unwrap()
+                    .unwrap(),
+            );
+            let waker = Waker::from(Arc::clone(&asks));
+            assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            core::mem::forget(receive);
+        })
+        .unwrap();
+    assert_eq!(*asks.0.lock().unwrap(), Some(true));
+}
+
+/// A waker of the root that the caller keeps after `block_on` returns holds no descriptor of the
+/// driver of the call, and a wake then does nothing.
+#[test]
+fn a_kept_waker_holds_no_descriptor_after_block_on_returns() {
+    let runtime = Runtime::builder().build().unwrap();
+    let before = descriptors().len();
+    let waker = runtime
+        .block_on(async {
+            with_driver(|_driver| ()).unwrap();
+            core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await
+        })
+        .unwrap();
+    assert_eq!(descriptors().len(), before, "the descriptors of the driver closed");
+    waker.wake();
+}
+
+/// A cancel handle of a factory spawn that the caller keeps after the task ended, and after the
+/// runtime dropped, keeps its charge until it drops.
+#[test]
+fn a_kept_cancel_handle_of_a_factory_spawn_keeps_its_charge_until_it_drops() {
+    let budget = Budget::new(NonZeroU64::new(DEFAULT_BUDGET).unwrap());
+    let start = budget.available();
+    let runtime = Runtime::builder()
+        .local_workers(1)
+        .budget(budget.clone())
+        .build()
+        .unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let task = handle.spawn_on(WorkerId::new(0), || async {}).unwrap();
+    let cancel = task.cancel_handle();
+    completed(task.join_blocking());
+    drop((handle, runtime));
+    assert!(budget.available() < start, "the kept cancel handle holds its charge");
+    drop(cancel);
+    assert_eq!(budget.available(), start);
 }
