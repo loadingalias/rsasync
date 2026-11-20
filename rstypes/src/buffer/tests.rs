@@ -354,3 +354,60 @@ fn the_owner_drops_once_at_the_last_lease_or_view_on_its_thread() {
     assert_eq!(releases.count.load(Ordering::Relaxed), 1);
     assert_eq!(*releases.thread.lock().unwrap(), Some(last));
 }
+
+#[test]
+fn a_frozen_prefix_keeps_its_address_and_bytes_while_the_rest_receives() {
+    let mut loan = WriteLoan::new(Backing::from(Vec::with_capacity(64)));
+    backend_fill(&mut loan, b"RECORD|NE");
+    let backing = loan.into_inner();
+    let (address, capacity) = (backing.as_ptr(), backing.capacity());
+    let (record, rest) = backing.freeze_prefix(7).unwrap();
+    assert_eq!((record.as_ptr(), record.bytes()), (address, &b"RECORD|"[..]));
+    assert_eq!(facts(&rest), (address.wrapping_add(7), 2, capacity - 7));
+    assert_eq!(rest.allocation_size(), record.allocation_size());
+
+    // The next receive fills the rest while the record is shared.
+    let mut loan = WriteLoan::new(rest);
+    backend_fill(&mut loan, b"XT");
+    let next = Lease::from(loan.into_inner());
+    assert_eq!((record.as_ptr(), record.bytes()), (address, &b"RECORD|"[..]));
+    assert_eq!((next.as_ptr(), next.bytes()), (address.wrapping_add(7), &b"NEXT"[..]));
+}
+
+#[test]
+fn a_split_backing_is_released_once_after_its_last_part_in_each_order() {
+    // The parts: the first lease, a view of it, the lease of a second split, and its rest.
+    for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2]] {
+        let releases = Arc::new(Releases::default());
+        let mut loan = WriteLoan::new(page(&releases));
+        backend_fill(&mut loan, b"HEADBODYTAIL");
+        let (head, rest) = loan.into_inner().freeze_prefix(4).unwrap();
+        let view = head.view(1..).unwrap();
+        let (body, tail) = rest.freeze_prefix(4).unwrap();
+        assert_eq!((view.bytes(), body.bytes()), (&b"EAD"[..], &b"BODY"[..]));
+        let mut parts: [Option<Box<dyn Send>>; 4] = [
+            Some(Box::new(head)),
+            Some(Box::new(view)),
+            Some(Box::new(body)),
+            Some(Box::new(tail)),
+        ];
+        for &part in &order[..3] {
+            drop(parts[part].take());
+            assert_eq!(releases.count.load(Ordering::Relaxed), 0, "{order:?}");
+        }
+        let last = parts[order[3]].take();
+        let thread = thread::spawn(move || drop(last));
+        let id = thread.thread().id();
+        thread.join().unwrap();
+        assert_eq!(releases.count.load(Ordering::Relaxed), 1, "{order:?}");
+        assert_eq!(*releases.thread.lock().unwrap(), Some(id));
+    }
+}
+
+#[test]
+fn a_prefix_longer_than_the_initialized_bytes_gives_the_backing_back_unchanged() {
+    let backing = Backing::from(b"ABC".to_vec());
+    let before = facts(&backing);
+    let back = backing.freeze_prefix(4).unwrap_err();
+    assert_eq!(facts(&back), before);
+}

@@ -142,6 +142,41 @@ assert!(owner.join().unwrap());
 drop(head);
 ```
 
+## Freeze a prefix and keep receiving
+
+`Backing::freeze_prefix(len)` freezes the first `len` initialized bytes of a backing into a
+`Lease`, and gives the rest of its region as a writable `Backing`. Use it when the protocol is done
+with the start of a region, but the next receive continues in the same region. For example, a
+stream gives one complete record to its parser while the rest of the next record arrives.
+
+- The lease and its views own the prefix. The rest owns the bytes after it: its initialized bytes
+  first, and then the capacity after them.
+- A receive fills the rest. A later `freeze_prefix` or `Lease::from` freezes the next part. Each
+  part keeps its address in the one allocation.
+- The allocation is released one time, when the last view and the last rest drop, on any thread.
+  Each part reports the allocation size of the whole.
+- A pool slot splits with no allocation. Another backing allocates one reference count at its
+  first split, and each later split of its rest shares it.
+- When `len` is more than the initialized bytes, `freeze_prefix` gives the backing back with no
+  change.
+
+```rust
+use rsasync::buffer::{Backing, Buffer, Lease, WriteLoan};
+
+// A receive filled one record and the start of the next one.
+let mut loan = WriteLoan::new(Backing::from(Vec::with_capacity(64)));
+loan.fill_from(b"RECORD|NE");
+let (record, rest) = loan.into_inner().freeze_prefix(7).unwrap();
+assert_eq!(record.bytes(), b"RECORD|");
+
+// The next receive fills the rest of the same allocation while the record is shared.
+let mut loan = WriteLoan::new(rest);
+loan.fill_from(b"XT");
+let next = Lease::from(loan.into_inner());
+assert_eq!(next.bytes(), b"NEXT");
+assert_eq!(next.as_ptr(), record.as_ptr().wrapping_add(7));
+```
+
 ## Receive into pool slots
 
 A `Pool` holds slots of one size and alignment, and gives each free slot as a `Backing`. Use it on
@@ -305,7 +340,7 @@ the bytes:
 
 ## Check the examples and the unsafe code
 
-The five examples on this page are doctests of `rsasync::buffer`. From the repository root,
+The six examples on this page are doctests of `rsasync::buffer`. From the repository root,
 `cargo xtask test` runs them with the other tests.
 
 Miri runs the tests of the buffer code and stops at undefined behavior, for example a read of

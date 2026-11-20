@@ -96,17 +96,16 @@ Each refusal is a `TimeError`:
 
 ## How a shared type changes
 
-The shared types of `rstypes` 0.1.0-alpha.2 are frozen: they change only through the path below.
-Three families use them: rsasync (the runtime), rsnetwork (networking), and rsauthnz (auth). The
-freeze keeps one set of types for all three, so a value goes between the families with no
-conversion.
+The shared types of `rstypes` change only through the path below. Three families use them:
+rsasync (the runtime), rsnetwork (networking), and rsauthnz (auth). One set of types for all three
+lets a value go between the families with no conversion.
 
 1. Make the change as a reviewed change. Name each family that uses the changed type: rsasync and
    rsnetwork for `buffer` and `capacity`, and also rsauthnz for `time`.
 2. Test the uses of the changed type in each named family again, on the changed revision.
 3. Merge the change only when each of these uses passes.
 
-A release that contains the change has a new version of `rstypes`. The freeze covers only
+A release that contains the change has a new version of `rstypes`. This path covers only
 `rstypes`. The other APIs of rsasync can change in each alpha.
 
 ## Build without `std`

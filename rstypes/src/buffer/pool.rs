@@ -9,7 +9,7 @@ use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
-use super::{Backing, Release};
+use super::{Backing, Kind, Release};
 use crate::capacity::{Budget, Exhausted, Permit};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
@@ -238,7 +238,7 @@ impl Pool {
         let release = Release {
             data: pool.cast(),
             release: release_slot,
-            pool_slot: true,
+            kind: Kind::Slot,
         };
         // SAFETY: the slot is `capacity` bytes in the arena, which its reference to the pool keeps
         // allocated. The pool gives a slot again only after its last count drops, so only this
@@ -338,20 +338,41 @@ impl SlotRef {
     /// Takes the count of `backing` if it is from `Pool::acquire`, or gives the backing back.
     #[expect(unsafe_code, reason = "only `Pool::acquire` marks a release as a pool slot")]
     pub(super) fn try_from(backing: Backing) -> Result<Self, Backing> {
-        if !backing.release.pool_slot {
+        if backing.release.kind != Kind::Slot {
             return Err(backing);
         }
         // The count of the backing moves to the new `SlotRef`, so the backing does not drop.
         let backing = ManuallyDrop::new(backing);
         let pool = backing.release.data.cast::<Shared>();
-        // SAFETY: only `Pool::acquire` sets `pool_slot`, with the pool as `data` and the slot at
-        // `ptr`. The count of the backing keeps the pool alive.
+        // SAFETY: only `Pool::acquire` and `into_backing` make a `Kind::Slot` release, with the pool
+        // as `data` and a region of the slot at `ptr`. The count of the backing keeps the pool
+        // alive. Each address in a slot gives the index of that slot.
         let index = unsafe { (*pool).index(backing.ptr) };
         Ok(Self {
             // SAFETY: `pool` is from `Arc::as_ptr`, which is not null.
             pool: unsafe { NonNull::new_unchecked(pool.cast_mut()) },
             index,
         })
+    }
+
+    /// Turns this count into a backing of the `capacity` bytes at `ptr`, with the first
+    /// `initialized` of them initialized. The backing gives the count back when it drops.
+    ///
+    /// # Safety
+    ///
+    /// The region is in this slot, and only the new backing uses it.
+    #[expect(unsafe_code, reason = "the new backing owns its region of the slot with this count")]
+    pub(super) unsafe fn into_backing(self, ptr: NonNull<u8>, capacity: usize, initialized: usize) -> Backing {
+        // The count moves to the new backing, so this `SlotRef` does not drop.
+        let this = ManuallyDrop::new(self);
+        let release = Release {
+            data: this.pool.as_ptr().cast_const().cast(),
+            release: release_slot,
+            kind: Kind::Slot,
+        };
+        // SAFETY: the caller gives a region of the slot that only the new backing uses. The count
+        // keeps the slot in use and its pool alive, and `release_slot` drops it on any thread.
+        unsafe { Backing::from_raw_parts(ptr, capacity, initialized, this.shared().stride, release) }
     }
 
     #[expect(unsafe_code, reason = "the count of a slot keeps its pool alive")]
@@ -408,7 +429,7 @@ unsafe impl Send for SlotRef {}
 unsafe impl Sync for SlotRef {}
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[cfg(all(test, loom))]
 mod explore;

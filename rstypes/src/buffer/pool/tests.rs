@@ -37,7 +37,7 @@ unsafe impl GlobalAlloc for Counting {
 static ALLOCATOR: Counting = Counting;
 
 /// Runs `f`, and gives its result and the number of allocations that it made on this thread.
-fn allocations<R>(f: impl FnOnce() -> R) -> (R, usize) {
+pub(in crate::buffer) fn allocations<R>(f: impl FnOnce() -> R) -> (R, usize) {
     let before = ALLOCATIONS.with(Cell::get);
     let result = f();
     (result, ALLOCATIONS.with(Cell::get) - before)
@@ -168,4 +168,38 @@ fn a_view_dropped_on_another_thread_returns_its_slot_with_no_allocation() {
     assert_eq!(made, 0);
     // The next acquire at the home gets the slot from the return list.
     assert_eq!(pool.acquire().unwrap().as_ptr().addr(), address);
+}
+
+#[test]
+fn a_split_slot_allocates_nothing_and_returns_after_its_last_part() {
+    let budget = budget();
+    let mut pool = pool(&budget, 1);
+    let mut loan = WriteLoan::new(pool.acquire().unwrap());
+    loan.fill_from(b"HEADBODY");
+    let backing = loan.into_inner();
+    let ((head, rest), split) = allocations(|| backing.freeze_prefix(4).unwrap());
+    let (body, frozen) = allocations(|| Lease::from(rest));
+    assert_eq!((split, frozen), (0, 0));
+    // The lease of the rest gives the bytes of the rest, at their place in the slot.
+    assert_eq!((head.bytes(), body.bytes()), (&b"HEAD"[..], &b"BODY"[..]));
+    assert_eq!(body.as_ptr(), head.as_ptr().wrapping_add(4));
+
+    drop(head);
+    assert_eq!(pool.acquire().unwrap_err(), PoolEmpty);
+    drop(body);
+    pool.acquire().unwrap();
+}
+
+#[test]
+fn a_later_split_of_a_heap_backing_allocates_nothing() {
+    let backing = Backing::from(b"ABCDEF".to_vec());
+    let ((first, rest), one) = allocations(|| backing.freeze_prefix(2).unwrap());
+    let ((second, rest), later) = allocations(|| rest.freeze_prefix(2).unwrap());
+    let (third, last) = allocations(|| Lease::from(rest));
+    // The first split allocates the shared count. Each later part shares it.
+    assert_eq!((one, later, last), (1, 0, 0));
+    assert_eq!(
+        (first.bytes(), second.bytes(), third.bytes()),
+        (&b"AB"[..], &b"CD"[..], &b"EF"[..])
+    );
 }

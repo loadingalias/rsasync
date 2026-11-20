@@ -13,7 +13,8 @@
 //!   the receive filled, and it makes only those bytes readable.
 //! - A [`Lease`] freezes the initialized bytes of a buffer, or lends the bytes of a different
 //!   owner, for example a `bytes::Bytes`. Its views share the backing with no copy, and the last
-//!   lease or view that drops releases the backing.
+//!   lease or view that drops releases the backing. [`Backing::freeze_prefix`] freezes only the
+//!   first bytes of a backing, and the rest of its region stays writable for the next receive.
 //! - A [`Pool`] gives slots of one size as backings, with no allocation, and charges all of them
 //!   to a budget. The last backing, lease, or view of a slot returns it to the pool, on any thread.
 //!
@@ -43,6 +44,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
+use core::mem::ManuallyDrop;
 use core::ptr::{self, NonNull};
 use core::slice::SliceIndex;
 
@@ -239,9 +241,21 @@ unsafe impl Buffer for &'static [u8] {
 pub struct Release {
     data: *const (),
     release: unsafe fn(*const (), NonNull<u8>, usize),
-    /// Set only by [`Pool::acquire`]: `data` is the pool of the slot, and the slot counts its owners,
-    /// so that a lease of the slot needs no allocation.
-    pool_slot: bool,
+    /// What `data` is.
+    kind: Kind,
+}
+
+/// What the data pointer of a [`Release`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// The data of a hook of the caller, from [`Release::new`].
+    Hook,
+    /// The pool of a slot, from [`Pool::acquire`]. The slot counts its owners, so that a lease or a
+    /// tail of the slot needs no allocation.
+    Slot,
+    /// The `Arc` of the lease of a split backing, from [`Backing::freeze_prefix`]. The tail holds
+    /// one strong count of it, so that a later split or lease of the tail needs no allocation.
+    Shared,
 }
 
 impl Release {
@@ -250,7 +264,7 @@ impl Release {
         Self {
             data,
             release,
-            pool_slot: false,
+            kind: Kind::Hook,
         }
     }
 }
@@ -344,6 +358,148 @@ impl Backing {
             release,
         }
     }
+
+    /// Freezes the first `len` initialized bytes into a [`Lease`], with no copy, and gives the rest
+    /// of the region as a writable backing of the same allocation: the initialized bytes after
+    /// `len`, and then the capacity after them. A receive can fill the rest while the views of the
+    /// lease go to their owners.
+    ///
+    /// The allocation is released once, after the last view of the lease and the last backing of
+    /// the rest drop, on any thread. Each part reports the allocation size of the whole. A backing
+    /// from a [`Pool`] splits with no allocation, because its slot counts each part. Another backing
+    /// allocates one reference count at its first split, and each later split of its rest shares it.
+    ///
+    /// Gives the backing back, unchanged, when `len` is more than its initialized bytes.
+    ///
+    /// ```
+    /// # extern crate rstypes as rsasync;
+    /// use rsasync::buffer::{Backing, Buffer, Lease, WriteLoan};
+    ///
+    /// // A receive filled one record and the start of the next one.
+    /// let mut loan = WriteLoan::new(Backing::from(Vec::with_capacity(64)));
+    /// loan.fill_from(b"RECORD|NE");
+    /// let (record, rest) = loan.into_inner().freeze_prefix(7).unwrap();
+    /// assert_eq!(record.bytes(), b"RECORD|");
+    ///
+    /// // The next receive fills the rest of the same allocation while the record is shared.
+    /// let mut loan = WriteLoan::new(rest);
+    /// loan.fill_from(b"XT");
+    /// let next = Lease::from(loan.into_inner());
+    /// assert_eq!(next.bytes(), b"NEXT");
+    /// assert_eq!(next.as_ptr(), record.as_ptr().wrapping_add(7));
+    /// ```
+    #[expect(
+        unsafe_code,
+        reason = "the rest of the region starts after the frozen prefix, and only the new backing uses it"
+    )]
+    pub fn freeze_prefix(mut self, len: usize) -> Result<(Lease, Self), Self> {
+        let Some(rest) = self.initialized.checked_sub(len) else {
+            return Err(self);
+        };
+        let (ptr, capacity) = (self.ptr, self.capacity);
+        // The lease covers exactly the prefix, so no shared reference covers the rest.
+        self.initialized = len;
+        let shared = Shared::from(self);
+        // SAFETY: `len` is at most the initialized bytes, which are at most the capacity, so the rest
+        // starts in the region or at its end.
+        let start = unsafe { ptr.add(len) };
+        // SAFETY: the rest is in the allocation of `shared`, after the prefix that the lease covers.
+        // The backing that owned it is now `shared`, which writes nothing, so only the new backing
+        // uses the rest.
+        let tail = unsafe { shared.tail(start, capacity - len, rest) };
+        Ok((Lease::of(shared, ptr.as_ptr(), len), tail))
+    }
+}
+
+/// The owner that the parts of a backing share after it becomes a lease or splits: the slot of a
+/// pool backing, or the reference count of another backing.
+enum Shared {
+    Slot(pool::SlotRef),
+    Heap(Arc<Backing>),
+}
+
+impl From<Backing> for Shared {
+    /// Takes the count of `backing`: of its slot, or of the `Arc` that the rest of a split backing
+    /// shares. Another backing moves into a new `Arc`, the one allocation.
+    fn from(backing: Backing) -> Self {
+        if backing.release.kind == Kind::Shared {
+            return Self::Heap(shared_count(backing));
+        }
+        match pool::SlotRef::try_from(backing) {
+            Ok(slot) => Self::Slot(slot),
+            Err(backing) => Self::Heap(Arc::new(backing)),
+        }
+    }
+}
+
+impl Shared {
+    /// The address of the first byte of the owner.
+    fn base(&self) -> *const u8 {
+        match self {
+            Self::Slot(slot) => slot.as_ptr(),
+            Self::Heap(backing) => backing.as_ptr(),
+        }
+    }
+
+    /// A backing of the `capacity` bytes at `ptr`, with the first `initialized` of them
+    /// initialized, which holds one more count of this owner. Its drop gives the count back.
+    ///
+    /// # Safety
+    ///
+    /// The region is in the allocation of the owner, after each byte that a lease of the owner
+    /// covers, and only the new backing uses it.
+    #[expect(
+        unsafe_code,
+        reason = "the new backing holds one more count of the owner of its region"
+    )]
+    unsafe fn tail(&self, ptr: NonNull<u8>, capacity: usize, initialized: usize) -> Backing {
+        match self {
+            // SAFETY: the caller gives a region of the slot that only the new backing uses.
+            Self::Slot(slot) => unsafe { slot.clone().into_backing(ptr, capacity, initialized) },
+            Self::Heap(backing) => {
+                let data = Arc::as_ptr(backing);
+                // SAFETY: `data` is from a live `Arc`. This is the count of the new backing, which
+                // `release_shared` drops.
+                unsafe { Arc::increment_strong_count(data) };
+                let release = Release {
+                    data: data.cast(),
+                    release: release_shared,
+                    kind: Kind::Shared,
+                };
+                // SAFETY: the count keeps the allocation alive, and the caller gives a region of it
+                // that only the new backing uses. `release_shared` drops the count on any thread.
+                unsafe { Backing::from_raw_parts(ptr, capacity, initialized, backing.allocation_size(), release) }
+            }
+        }
+    }
+}
+
+/// Takes the strong count that the rest of a split backing holds of the `Arc` that it shares.
+#[expect(
+    unsafe_code,
+    reason = "the rest of a split backing holds one strong count of the `Arc` that it shares"
+)]
+fn shared_count(backing: Backing) -> Arc<Backing> {
+    // The count moves to the new `Arc`, so the backing does not drop.
+    let backing = ManuallyDrop::new(backing);
+    // SAFETY: only `Shared::tail` makes a `Kind::Shared` release, with `Arc::as_ptr` of the `Arc` as
+    // `data`, and the backing holds one strong count of it.
+    unsafe { Arc::from_raw(backing.release.data.cast::<Backing>()) }
+}
+
+/// The release hook of the rest of a split backing: gives up its strong count of the `Arc` that it
+/// shares. The last count drops the first backing, whose own hook releases the whole allocation.
+///
+/// # Safety
+///
+/// `data` is from `Shared::tail`, and the backing gives up its count with this call.
+#[expect(
+    unsafe_code,
+    reason = "the rest of a split backing gives up its count of the `Arc` that it shares"
+)]
+unsafe fn release_shared(data: *const (), _: NonNull<u8>, _: usize) {
+    // SAFETY: `Shared::tail` took this strong count for the backing that drops now.
+    unsafe { Arc::decrement_strong_count(data.cast::<Backing>()) };
 }
 
 /// Frees the heap block of a `Vec<u8>` that became a [`Backing`].
@@ -647,14 +803,23 @@ impl From<Backing> for Lease {
     /// in the allocation until the release.
     ///
     /// This is the one allocation of a lease: its reference count. Views and clones add none. A
-    /// backing from a [`Pool`] needs no allocation, because its slot counts the leases.
+    /// backing from a [`Pool`] needs no allocation, because its slot counts the leases. The rest of
+    /// a split backing needs none either: it shares the count of its first split.
     fn from(backing: Backing) -> Self {
-        let len = backing.initialized();
-        let owner = match pool::SlotRef::try_from(backing) {
-            Ok(slot) => Owner::Slot(slot),
-            Err(backing) => Owner::Backing(Arc::new(backing)),
+        let (ptr, len) = (backing.as_ptr(), backing.initialized());
+        Self::of(Shared::from(backing), ptr, len)
+    }
+}
+
+impl Lease {
+    /// A lease of the `len` bytes at `ptr`, in the region of `shared`.
+    fn of(shared: Shared, ptr: *const u8, len: usize) -> Self {
+        let offset = ptr.addr() - shared.base().addr();
+        let owner = match shared {
+            Shared::Slot(slot) => Owner::Slot(slot),
+            Shared::Heap(backing) => Owner::Backing(backing),
         };
-        Self { owner, offset: 0, len }
+        Self { owner, offset, len }
     }
 }
 
@@ -683,15 +848,18 @@ impl From<&'static [u8]> for Lease {
 // SAFETY: the owner of a lease is a static region, a shared backing, a foreign owner, or a pool
 // slot, and the lease keeps it alive. A shared backing is never borrowed mutably: no code takes
 // `&mut` from its `Arc`, so its address, its initialized length, and its bytes stay the same until
-// the last lease drops it. A foreign owner gave its bytes through `as_ref` one time, at its final
+// the last lease drops it. The rest of a split backing writes only after the initialized bytes of
+// the shared backing, in the same allocation, and a lease covers bytes of that rest only after the
+// rest froze them. A foreign owner gave its bytes through `as_ref` one time, at its final
 // address in its `Arc`. After that, no code moves it, calls it, or borrows it mutably until its
 // last drop. Two shared borrows of a type can overlap, so a sound type cannot change bytes that it
 // gave through `&self` while it gives a shared borrow: only a `&mut` borrow or the drop can change
 // them. A pool slot stays in use while its count is above zero, so its pool does not give it again,
-// and its address in the arena of the pool is fixed. Its only writer was the backing that became
-// the lease, so nothing writes its bytes while a lease of it lives. Each lease covers `len` bytes
-// from `offset`, in the initialized bytes of its owner: `From` takes all of them, and `view` takes
-// a sub-slice of them. A move of a lease copies the `Arc` pointer or the shared reference, so the
+// and its address in the arena of the pool is fixed. Its writers are the backing that became the
+// lease and the rests of its splits, and each writes only bytes that no lease covers until it froze
+// them. So nothing writes the bytes of a lease while it lives. Each lease covers `len` bytes from
+// `offset`, in bytes of its owner that a backing froze: `From` and `Backing::freeze_prefix` take
+// them, and `view` takes a sub-slice of them. A move of a lease copies the `Arc` pointer or the shared reference, so the
 // region does not move.
 unsafe impl Buffer for Lease {
     fn as_ptr(&self) -> *const u8 {
@@ -803,3 +971,6 @@ pub use pool::{Pool, PoolEmpty, PoolRefused};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, loom))]
+mod explore;
