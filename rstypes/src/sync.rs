@@ -23,6 +23,29 @@ pub(crate) use loom::{
 #[cfg(not(all(test, loom)))]
 pub(crate) use {alloc::sync::Arc, core::sync::atomic, native::UnsafeCell};
 
+/// `Arc::try_new` in each form: a refusal of the allocator gives `AllocError`. The loom `Arc` has no
+/// fallible form, so its allocation never fails.
+#[cfg(not(all(test, loom)))]
+pub(crate) fn try_arc<T>(value: T) -> Result<Arc<T>, core::alloc::AllocError> {
+    Arc::try_new(value)
+}
+
+/// See the native form.
+#[cfg(all(test, loom))]
+pub(crate) fn try_arc<T>(value: T) -> Result<Arc<T>, core::alloc::AllocError> {
+    Ok(Arc::new(value))
+}
+
+/// The size of the allocation of a native `Arc<T>`: its two counts, and then `T` at its
+/// alignment. A charge of a shared state counts it. A layout too large for an allocation gives
+/// `usize::MAX`, so the charge is too large for each budget.
+pub(crate) const fn arc_size<T>() -> usize {
+    match core::alloc::Layout::new::<[usize; 2]>().extend(core::alloc::Layout::new::<T>()) {
+        Ok((inner, _)) => inner.pad_to_align().size(),
+        Err(_) => usize::MAX,
+    }
+}
+
 #[cfg(not(all(test, loom)))]
 mod native {
     #![expect(

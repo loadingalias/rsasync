@@ -657,3 +657,41 @@ fn a_kept_waker_and_cancel_handle_keep_their_charge_until_they_drop() {
     drop((waker, cancel));
     assert_eq!(budget.available(), start);
 }
+
+/// Each refusal of the allocator gives `Allocation`, and keeps no charge and no memory. A spawn
+/// gives its future back. An owner or a spawn whose allocation aborts the process fails.
+#[test]
+fn an_owner_or_a_spawn_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let budget = budget();
+    let refusals = each_refusal(|| LocalOwner::new(&budget, 2).map(drop));
+    assert!(!refusals.is_empty());
+    assert!(refusals.iter().all(|refusal| *refusal == (Refused::Allocation, 0)));
+    assert_eq!(budget.available(), 1 << 20);
+
+    let mut owner = LocalOwner::new(&budget, 2).unwrap();
+    owner.block_on(async {
+        let before = budget.available();
+        let refusals = each_refusal(|| spawn_local(async { 7 }).map_err(|refused| (refused, budget.available())));
+        assert!(!refusals.is_empty());
+        for ((refused, available), held) in refusals {
+            assert_eq!((refused.reason(), available, held), (Reason::Allocation, before, 0));
+            assert_eq!(refused.into_future().await, 7);
+        }
+    });
+}
+
+/// The charge of an owner equals the bytes that its construction allocates. A charge that omits
+/// the two counts of its `Rc` or of its `Arc` fails.
+#[test]
+fn an_owner_charges_each_byte_that_it_allocates() {
+    use crate::table::tests::allocations::bytes;
+
+    let budget = budget();
+    let before = bytes();
+    let owner = LocalOwner::new(&budget, 3).unwrap();
+    let allocated = bytes() - before;
+    assert_eq!((1 << 20) - budget.available(), allocated);
+    drop(owner);
+}

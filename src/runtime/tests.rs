@@ -609,3 +609,19 @@ fn a_kept_cancel_handle_of_a_factory_spawn_keeps_its_charge_until_it_drops() {
     drop(cancel);
     assert_eq!(budget.available(), start);
 }
+
+/// Each refusal of the allocator gives `Allocation` with the factory, and keeps no memory on the
+/// thread of the spawn. A factory spawn whose allocation aborts the process fails.
+#[test]
+fn a_factory_spawn_that_the_allocator_refuses_gives_its_factory_back() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let refusals = each_refusal(|| handle.spawn_on(WorkerId::new(0), || async { 7 }).map(drop));
+    assert!(!refusals.is_empty());
+    for (refused, held) in refusals {
+        assert_eq!((refused.reason(), held), (Reason::Allocation, 0));
+        let _factory = refused.into_future();
+    }
+}

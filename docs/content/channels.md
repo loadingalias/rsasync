@@ -19,14 +19,15 @@ receivers compete for the same values: with one receiver, SPSC and MPSC cost les
 
 The SPSC, MPSC, and MPMC constructors give a `Sender` and a `Receiver`, or a refusal:
 
-- The channel charges its slots and its shared state to the `Budget` (see [Capacity](capacity.md))
-  before it allocates. The charge ends when each endpoint has dropped.
+- The channel charges its slots and the whole allocation of its shared state to the `Budget` (see
+  [Capacity](capacity.md)) before it allocates. The charge ends when each endpoint has dropped.
 - The capacity is the number of slots, from 1 to 2^27. A capacity of zero is a refusal,
   `Refused::Zero`. It does not make a rendezvous channel or an unbounded channel.
 - For MPSC and MPMC, `senders` is the number of sender places. For MPMC, `receivers` is the
   number of receiver places. Each is from 1 to 2^16, and zero is also `Refused::Zero`.
 - Other refusals are `Refused::TooLarge`, `Refused::Budget` with the `Exhausted` value of the
-  budget, and `Refused::Allocation`. A refusal keeps no charge and no memory.
+  budget, and `Refused::Allocation` when the allocator gives no memory for one of the allocations
+  of the channel. A refusal keeps no charge and no memory.
 
 The channel does not examine its values. If a value holds memory, such as a `Vec`, put a `Permit`
 for that memory in the value, so that the charge moves with the value.

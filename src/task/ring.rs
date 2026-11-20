@@ -48,7 +48,9 @@ impl RingOwner {
         )?;
         local.driver.replace(Some(driver));
         local.sends.set(true);
-        Ok(Self { local: Rc::new(local) })
+        Ok(Self {
+            local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
+        })
     }
 
     /// Makes an owner with `slots` task slots, on this thread, that makes its driver with `config`
@@ -56,7 +58,9 @@ impl RingOwner {
     pub(crate) fn lazy(budget: &Budget, slots: u32, config: Config) -> Result<Self, Refused> {
         let local = Local::new(budget, slots, Home::new(thread::current(), None), driver::MESSAGES)?;
         local.lazy.set(Some(config));
-        Ok(Self { local: Rc::new(local) })
+        Ok(Self {
+            local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
+        })
     }
 
     /// Gives the owner a timer storage, which `clock` drives, as `LocalOwner::use_timers` does.

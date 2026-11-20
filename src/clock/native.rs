@@ -228,7 +228,7 @@ cfg_select! {
 
             /// No value of this type exists.
             #[derive(Debug, Clone, Copy)]
-            pub(super) enum Source {}
+            pub(super) struct Source(!);
 
             impl Source {
                 pub(super) fn new(_suspend: Suspend) -> Option<(Self, Duration)> {
@@ -236,7 +236,7 @@ cfg_select! {
                 }
 
                 pub(super) fn now(self) -> u64 {
-                    match self {}
+                    self.0
                 }
             }
         }

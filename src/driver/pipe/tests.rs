@@ -8,7 +8,7 @@ use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::super::suite::{self, Backend};
-use super::super::tests::{budget, drive, driver, numbered, posted};
+use super::super::tests::{drive, driver, numbered, pool_budget, posted};
 use super::super::{Config, Driver, Reason, SendCount};
 use super::{PipeReader, PipeWriter, sys};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool};
@@ -150,7 +150,7 @@ fn full_pipe(_read: &io::PipeReader) -> (usize, usize) {
 /// Idle read ends whose receives wait for a buffer that the kernel selects hold no buffer: eight
 /// receives wait while the pool has one slot. The data of the last pipe then arrives in that slot.
 pub(in crate::driver) fn idle_read_ends_with_a_waiting_selecting_receive_hold_no_buffer(backend: Backend) {
-    let budget = budget();
+    let budget = pool_budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut driver = suite::driver(Config::new(), backend);
     driver

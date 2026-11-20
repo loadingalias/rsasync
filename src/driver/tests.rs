@@ -153,8 +153,16 @@ unsafe fn release_recorded(data: *const (), ptr: NonNull<u8>, capacity: usize) {
     drop(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, capacity) });
 }
 
+/// The budget of the operation-charge tests, which run on Unix.
+#[cfg(unix)]
 pub(super) fn budget() -> Budget {
     Budget::new(NonZeroU64::MIN.saturating_add(99))
+}
+
+/// A budget for a test pool of a few small slots, with the entries and the shared state that the
+/// pool also charges.
+pub(super) fn pool_budget() -> Budget {
+    Budget::new(NonZeroU64::new(4096).unwrap())
 }
 
 pub(super) fn driver(config: Config) -> Driver {
@@ -574,7 +582,7 @@ pub(in crate::driver) fn a_request_into_an_owned_buffer_and_a_response_from_a_le
 pub(in crate::driver) fn a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere(
     backend: Backend,
 ) {
-    let budget = budget();
+    let budget = pool_budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut pool = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
     // Zero the slot, so that the check of the bytes in place reads initialized memory.
@@ -628,7 +636,7 @@ const ENOBUFS: i32 = 10055;
 /// driver does not retry it. The data stays in the socket, and a receive after the buffer comes
 /// back gets it.
 pub(in crate::driver) fn a_selecting_receive_with_no_free_buffer_gives_enobufs(backend: Backend) {
-    let budget = budget();
+    let budget = pool_budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut driver = suite::driver(Config::new(), backend);
     driver
@@ -683,7 +691,7 @@ fn drive_from_reactor<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> 
 #[test]
 #[cfg(unix)]
 fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
-    let budget = budget();
+    let budget = pool_budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut driver = driver(Config::new());
     driver
@@ -1365,7 +1373,7 @@ pub(in crate::driver) fn a_cancelled_receive_keeps_its_buffer_until_its_packet(b
 /// buffer: eight receives wait while the pool has one slot, and its charge does not change. The
 /// data of the last connection then arrives in that slot.
 pub(in crate::driver) fn idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer(backend: Backend) {
-    let budget = budget();
+    let budget = pool_budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
     let mut driver = suite::driver(Config::new(), backend);
     driver
@@ -2183,7 +2191,7 @@ fn wait_datagrams(driver: &mut Driver, socket: &mut UdpSocket, count: core::ffi:
 pub(in crate::driver) fn a_selected_datagram_arrives_in_the_slot_of_the_pool_which_returns_at_its_drop(
     backend: Backend,
 ) {
-    let budget = budget();
+    let budget = pool_budget();
     let mut pool = Pool::new(&budget, NonZeroU32::MIN, Layout::from_size_align(64, 64).unwrap()).unwrap();
     let slot = pool.acquire().unwrap().as_ptr();
     let mut driver = suite::driver(Config::new(), backend);

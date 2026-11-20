@@ -310,12 +310,21 @@ pub(crate) mod allocations {
     use super::{Log, Recorded, apply, budget, done, taken};
     use crate::table::{Request, Shape, Table, Taken};
 
-    /// The allocations of the current thread.
+    /// The allocations of the current thread, and their bytes. It refuses each allocation from
+    /// the count in `REFUSE_FROM` on.
     struct Counting;
 
     std::thread_local! {
         static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+        static BYTES: Cell<u64> = const { Cell::new(0) };
+        static REFUSE_FROM: Cell<u64> = const { Cell::new(u64::MAX) };
+        /// The bytes that this thread allocated, less the bytes that it freed.
+        static HELD: Cell<isize> = const { Cell::new(0) };
     }
+
+    /// The most runs of [`each_refusal`]: more than the allocations of each operation that a test
+    /// gives it.
+    const RUNS: u64 = 16;
 
     #[expect(
         unsafe_code,
@@ -324,12 +333,19 @@ pub(crate) mod allocations {
     // SAFETY: each method forwards its arguments to the system allocator, which meets the contract.
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            ALLOCATIONS.set(ALLOCATIONS.get() + 1);
+            let count = ALLOCATIONS.get();
+            ALLOCATIONS.set(count + 1);
+            if count >= REFUSE_FROM.get() {
+                return core::ptr::null_mut();
+            }
+            BYTES.set(BYTES.get() + layout.size() as u64);
+            HELD.set(HELD.get() + layout.size().cast_signed());
             // SAFETY: the caller meets the contract of `alloc`.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            HELD.set(HELD.get() - layout.size().cast_signed());
             // SAFETY: the caller meets the contract of `dealloc`.
             unsafe { System.dealloc(ptr, layout) }
         }
@@ -341,6 +357,29 @@ pub(crate) mod allocations {
     /// The allocations of the current thread so far.
     pub(crate) fn count() -> u64 {
         ALLOCATIONS.get()
+    }
+
+    /// The bytes that the current thread allocated so far.
+    pub(crate) fn bytes() -> u64 {
+        BYTES.get()
+    }
+
+    /// Runs `make` until a run fails no allocation. Run `n` refuses allocation `n` of this thread,
+    /// counted from 0, and each later one. Gives the error of each run that failed, and the bytes
+    /// that the run kept.
+    pub(crate) fn each_refusal<T, E>(mut make: impl FnMut() -> Result<T, E>) -> Vec<(E, isize)> {
+        let mut refusals = Vec::new();
+        for n in 0..RUNS {
+            let held = HELD.get();
+            REFUSE_FROM.set(ALLOCATIONS.get() + n);
+            let made = make();
+            REFUSE_FROM.set(u64::MAX);
+            match made {
+                Ok(_) => return refusals,
+                Err(error) => refusals.push((error, HELD.get() - held)),
+            }
+        }
+        panic!("each of {RUNS} runs failed");
     }
 
     /// A post from another thread allocates nothing, and the home gets both requests.

@@ -28,12 +28,16 @@ budget, or `Refused::Allocation`.
 ## A spawn that has no capacity
 
 A spawn claims a free slot and charges the memory of the task before it allocates. When it cannot,
-it allocates nothing, and `SpawnRefused` gives the future back with its reason:
+it allocates nothing, and `SpawnRefused` gives the future back with its reason. The spawn then
+allocates the memory of the task before the future moves. When the allocator refuses, the spawn
+frees what it allocated, gives the slot and the charge back, and gives the future back with
+`Allocation`:
 
 | `Reason` | Cause | What to do |
 | --- | --- | --- |
 | `NoSlot` | Each slot of the owner holds a live task | Join or cancel a task, or use `spawn_local_waiting` |
 | `Budget(Exhausted)` | The budget has fewer free units than the task | Free units, or spawn a smaller future |
+| `Allocation` | The allocator did not give the memory of the task | Spawn again when memory is free, or run the future in place |
 | `Closed` | `block_on` is at its end and cancels its tasks, or it failed and drops them | Do the work in the root future, or before the end |
 | `NoOwner` | No `block_on` runs on this thread | Spawn from the root future or from a task |
 | `NoWorker` | `Handle::spawn_on` names no worker of the runtime | Use an index below `handle.workers()` |

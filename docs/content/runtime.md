@@ -155,9 +155,10 @@ of the factory can thus hold `!Send` state. The factory itself and the output of
 `Send`, because they cross threads. The spawn gives the same `JoinHandle` and the same outcomes as
 `spawn_local` (see [Tasks](tasks.md)).
 
-The spawn reserves the charge of the task and a free slot of the worker on the calling thread,
-before it sends the factory. So the worker spawns the future with no wait, and an accepted spawn
-cannot fail later for lack of capacity. The charge also covers the factory while it waits in the
+The spawn reserves the charge of the task, allocates the memory of the task and of the factory,
+and reserves a free slot of the worker on the calling thread, before it sends the factory. So the
+worker spawns the future with no wait and no allocation, and an accepted spawn cannot fail later
+for lack of capacity or memory. The charge also covers the factory while it waits in the
 inbox. A refusal keeps no reservation, and `SpawnRefused::into_future` gives the factory back:
 
 | `Reason` | Cause | What to do |
@@ -165,6 +166,7 @@ inbox. A refusal keeps no reservation, and `SpawnRefused::into_future` gives the
 | `NoWorker` | The runtime has no worker with this index | Use an index below `handle.workers()` |
 | `NoSlot` | Each free slot of the worker is reserved | Join or cancel a task of the worker, or spawn on another worker |
 | `Budget(Exhausted)` | The budget has fewer free units than the task and its factory | Free units, or spawn a smaller future |
+| `Allocation` | The allocator did not give the memory of the task or of the factory | Spawn again when memory is free |
 | `Closed` | The worker stopped | Spawn before the drop of the runtime |
 
 A cancel works before the worker calls the factory and after, and the task ends with

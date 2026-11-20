@@ -238,34 +238,28 @@ unsafe impl Buffer for &'static [u8] {
 /// it to a pool, or give it back to the library that owns it. It runs on the thread that drops
 /// the backing, which can be any thread, so it must not block.
 #[derive(Debug)]
-pub struct Release {
-    data: *const (),
-    release: unsafe fn(*const (), NonNull<u8>, usize),
-    /// What `data` is.
-    kind: Kind,
-}
+pub struct Release(Hook);
 
-/// What the data pointer of a [`Release`] is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    /// The data of a hook of the caller, from [`Release::new`].
-    Hook,
-    /// The pool of a slot, from [`Pool::acquire`]. The slot counts its owners, so that a lease or a
-    /// tail of the slot needs no allocation.
-    Slot,
-    /// The `Arc` of the lease of a split backing, from [`Backing::freeze_prefix`]. The tail holds
-    /// one strong count of it, so that a later split or lease of the tail needs no allocation.
-    Shared,
+/// What the drop of a backing does.
+#[derive(Debug)]
+enum Hook {
+    /// Calls the hook of the caller, from [`Release::new`], with the region of the backing.
+    Caller {
+        data: *const (),
+        release: unsafe fn(*const (), NonNull<u8>, usize),
+    },
+    /// Gives back one count of the owner that the parts of the region share: a pool slot, from
+    /// [`Pool::acquire`], or the `Arc` of the lease of a split, from [`Backing::freeze_prefix`].
+    /// The count names its owner, not the address of the region, so an empty tail at the end of a
+    /// slot keeps that slot. A later lease or split of the backing moves or copies the count, with
+    /// no allocation.
+    Shared(Shared),
 }
 
 impl Release {
     /// Makes a hook that calls `release(data, ptr, capacity)` with the region of its backing.
     pub const fn new(data: *const (), release: unsafe fn(*const (), NonNull<u8>, usize)) -> Self {
-        Self {
-            data,
-            release,
-            kind: Kind::Hook,
-        }
+        Self(Hook::Caller { data, release })
     }
 }
 
@@ -412,22 +406,26 @@ impl Backing {
 }
 
 /// The owner that the parts of a backing share after it becomes a lease or splits: the slot of a
-/// pool backing, or the reference count of another backing.
+/// pool backing, or the reference count of another backing. Each part holds one count of it. The
+/// last count to drop returns the slot, or drops the backing, whose own hook releases the region.
+#[derive(Clone, Debug)]
 enum Shared {
     Slot(pool::SlotRef),
     Heap(Arc<Backing>),
 }
 
 impl From<Backing> for Shared {
-    /// Takes the count of `backing`: of its slot, or of the `Arc` that the rest of a split backing
-    /// shares. Another backing moves into a new `Arc`, the one allocation.
+    /// Takes the count that `backing` holds of a slot or of the `Arc` of a split. Another backing
+    /// moves into a new `Arc`, the one allocation.
+    #[expect(unsafe_code, reason = "the count moves out of a backing that does not drop")]
     fn from(backing: Backing) -> Self {
-        if backing.release.kind == Kind::Shared {
-            return Self::Heap(shared_count(backing));
-        }
-        match pool::SlotRef::try_from(backing) {
-            Ok(slot) => Self::Slot(slot),
-            Err(backing) => Self::Heap(Arc::new(backing)),
+        // The count moves to the result, so the backing does not drop.
+        let backing = ManuallyDrop::new(backing);
+        // SAFETY: the backing does not drop, so the read hook is the one owner of its count.
+        match unsafe { ptr::read(&raw const backing.release.0) } {
+            Hook::Shared(shared) => shared,
+            // The read hook of the caller is two plain values, so the backing keeps its hook.
+            Hook::Caller { .. } => Self::Heap(Arc::new(ManuallyDrop::into_inner(backing))),
         }
     }
 }
@@ -438,6 +436,14 @@ impl Shared {
         match self {
             Self::Slot(slot) => slot.as_ptr(),
             Self::Heap(backing) => backing.as_ptr(),
+        }
+    }
+
+    /// The size of the allocation that the owner keeps.
+    fn allocation_size(&self) -> usize {
+        match self {
+            Self::Slot(slot) => slot.allocation_size(),
+            Self::Heap(backing) => backing.allocation_size(),
         }
     }
 
@@ -453,53 +459,11 @@ impl Shared {
         reason = "the new backing holds one more count of the owner of its region"
     )]
     unsafe fn tail(&self, ptr: NonNull<u8>, capacity: usize, initialized: usize) -> Backing {
-        match self {
-            // SAFETY: the caller gives a region of the slot that only the new backing uses.
-            Self::Slot(slot) => unsafe { slot.clone().into_backing(ptr, capacity, initialized) },
-            Self::Heap(backing) => {
-                let data = Arc::as_ptr(backing);
-                // SAFETY: `data` is from a live `Arc`. This is the count of the new backing, which
-                // `release_shared` drops.
-                unsafe { Arc::increment_strong_count(data) };
-                let release = Release {
-                    data: data.cast(),
-                    release: release_shared,
-                    kind: Kind::Shared,
-                };
-                // SAFETY: the count keeps the allocation alive, and the caller gives a region of it
-                // that only the new backing uses. `release_shared` drops the count on any thread.
-                unsafe { Backing::from_raw_parts(ptr, capacity, initialized, backing.allocation_size(), release) }
-            }
-        }
+        let release = Release(Hook::Shared(self.clone()));
+        // SAFETY: the count keeps the allocation alive, and the caller gives a region of it that
+        // only the new backing uses. The count drops on any thread.
+        unsafe { Backing::from_raw_parts(ptr, capacity, initialized, self.allocation_size(), release) }
     }
-}
-
-/// Takes the strong count that the rest of a split backing holds of the `Arc` that it shares.
-#[expect(
-    unsafe_code,
-    reason = "the rest of a split backing holds one strong count of the `Arc` that it shares"
-)]
-fn shared_count(backing: Backing) -> Arc<Backing> {
-    // The count moves to the new `Arc`, so the backing does not drop.
-    let backing = ManuallyDrop::new(backing);
-    // SAFETY: only `Shared::tail` makes a `Kind::Shared` release, with `Arc::as_ptr` of the `Arc` as
-    // `data`, and the backing holds one strong count of it.
-    unsafe { Arc::from_raw(backing.release.data.cast::<Backing>()) }
-}
-
-/// The release hook of the rest of a split backing: gives up its strong count of the `Arc` that it
-/// shares. The last count drops the first backing, whose own hook releases the whole allocation.
-///
-/// # Safety
-///
-/// `data` is from `Shared::tail`, and the backing gives up its count with this call.
-#[expect(
-    unsafe_code,
-    reason = "the rest of a split backing gives up its count of the `Arc` that it shares"
-)]
-unsafe fn release_shared(data: *const (), _: NonNull<u8>, _: usize) {
-    // SAFETY: `Shared::tail` took this strong count for the backing that drops now.
-    unsafe { Arc::decrement_strong_count(data.cast::<Backing>()) };
 }
 
 /// Frees the heap block of a `Vec<u8>` that became a [`Backing`].
@@ -556,10 +520,13 @@ impl AsRef<[u8]> for Backing {
 impl Drop for Backing {
     #[expect(unsafe_code, reason = "the drop is the one call of the release hook")]
     fn drop(&mut self) {
-        // SAFETY: `from_raw_parts` requires that a call of the hook with `ptr` and `capacity`
-        // releases the region on any thread. This drop is the only call, and nothing uses the
-        // region after it.
-        unsafe { (self.release.release)(self.release.data, self.ptr, self.capacity) };
+        // A shared count drops with the field, after this call.
+        if let Hook::Caller { data, release } = self.release.0 {
+            // SAFETY: `from_raw_parts` requires that a call of the hook with `ptr` and `capacity`
+            // releases the region on any thread. This drop is the only call, and nothing uses the
+            // region after it.
+            unsafe { release(data, self.ptr, self.capacity) };
+        }
     }
 }
 
@@ -681,14 +648,12 @@ pub struct Lease {
 /// What keeps the bytes of a lease alive.
 #[derive(Clone, Debug)]
 enum Owner {
-    /// A backing, which the last lease or view releases.
-    Backing(Arc<Backing>),
+    /// A backing or a pool slot, which the last lease, view, or tail releases or returns.
+    Shared(Shared),
     /// An owner from [`Lease::from_owner`], which the last lease or view drops. Its count is a
     /// standard `Arc` in each form, because the loom `Arc` cannot hold a trait object. The count
     /// only drops the owner.
     Foreign(alloc::sync::Arc<dyn ForeignBytes>),
-    /// A pool slot, which the last lease or view returns to its pool. The count is in the slot.
-    Slot(pool::SlotRef),
     /// A static region, which nothing releases.
     Static(&'static [u8]),
 }
@@ -814,12 +779,11 @@ impl From<Backing> for Lease {
 impl Lease {
     /// A lease of the `len` bytes at `ptr`, in the region of `shared`.
     fn of(shared: Shared, ptr: *const u8, len: usize) -> Self {
-        let offset = ptr.addr() - shared.base().addr();
-        let owner = match shared {
-            Shared::Slot(slot) => Owner::Slot(slot),
-            Shared::Heap(backing) => Owner::Backing(backing),
-        };
-        Self { owner, offset, len }
+        Self {
+            offset: ptr.addr() - shared.base().addr(),
+            owner: Owner::Shared(shared),
+            len,
+        }
     }
 }
 
@@ -864,9 +828,8 @@ impl From<&'static [u8]> for Lease {
 unsafe impl Buffer for Lease {
     fn as_ptr(&self) -> *const u8 {
         let base = match &self.owner {
-            Owner::Backing(backing) => backing.as_ptr(),
+            Owner::Shared(shared) => shared.base(),
             Owner::Foreign(foreign) => foreign.as_ptr(),
-            Owner::Slot(slot) => slot.as_ptr(),
             Owner::Static(region) => region.as_ptr(),
         };
         base.wrapping_add(self.offset)
@@ -878,9 +841,8 @@ unsafe impl Buffer for Lease {
 
     fn allocation_size(&self) -> usize {
         match &self.owner {
-            Owner::Backing(backing) => backing.allocation_size(),
+            Owner::Shared(shared) => shared.allocation_size(),
             Owner::Foreign(foreign) => foreign.allocation_size(),
-            Owner::Slot(slot) => slot.allocation_size(),
             Owner::Static(_) => 0,
         }
     }

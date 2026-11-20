@@ -240,8 +240,9 @@ impl LocalOwner {
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             None,
         );
+        let local = Local::new(budget, slots, home, 0)?;
         Ok(Self {
-            local: Rc::new(Local::new(budget, slots, home, 0)?),
+            local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
         })
     }
 
@@ -468,6 +469,8 @@ pub enum Reason {
     NoSlot,
     /// The budget has fewer free units than the memory of the task.
     Budget(Exhausted),
+    /// The allocator did not give the memory of the task.
+    Allocation,
     /// The `block_on` of the owner is at its end, and it cancels its tasks, or it failed, and it
     /// drops them.
     Closed,
@@ -482,6 +485,7 @@ impl fmt::Display for Reason {
         match self {
             Self::NoSlot => f.write_str("each task slot of the owner is in use"),
             Self::Budget(refused) => write!(f, "the budget cannot charge the task: {refused}"),
+            Self::Allocation => f.write_str("the allocator did not give the memory of the task"),
             Self::Closed => f.write_str("the owner is at the end of its block_on, or it failed"),
             Self::NoOwner => f.write_str("this thread has no local owner"),
             Self::NoWorker => f.write_str("the runtime has no worker with this index"),
@@ -532,7 +536,7 @@ impl<F> core::error::Error for SpawnRefused<F> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match &self.reason {
             Reason::Budget(exhausted) => Some(exhausted),
-            Reason::NoSlot | Reason::Closed | Reason::NoOwner | Reason::NoWorker => None,
+            Reason::NoSlot | Reason::Allocation | Reason::Closed | Reason::NoOwner | Reason::NoWorker => None,
         }
     }
 }

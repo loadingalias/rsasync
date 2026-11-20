@@ -57,7 +57,7 @@ assert_eq!((report.running(), report.dropped()), (0, 0));
 | --- | --- |
 | `Error::Config` | A limit is 0 or too large |
 | `Error::Budget` | The budget has fewer free units than the service, its queue, and its stacks |
-| `Error::Allocation` | The allocator did not give the memory of the queue |
+| `Error::Allocation` | The allocator did not give the memory of the service or of its queue |
 | `Error::Thread` | The system did not start a thread. The service joins the threads that started before it returns |
 
 ## Submit a job from a library
@@ -108,6 +108,7 @@ charge:
 | --- | --- | --- |
 | `Reason::Full` | Each job slot is occupied | Try again after a job returns, or report the overload |
 | `Reason::Budget` | The budget has fewer free units than the job and its result | Free memory in the budget, or report the overload |
+| `Reason::Allocation` | The allocator did not give the memory of the job or of its result | Try again when memory is free, or report the overload |
 | `Reason::Ended` | The service stopped | Do not submit again. No later submission can succeed |
 
 ## Wait for the result

@@ -97,7 +97,7 @@ use core::task::{Context, Poll};
 
 use crate::capacity::{Budget, Exhausted, Permit, ReleaseListener};
 use crate::sync::{
-    Mutex,
+    Mutex, arc_size,
     atomic::{AtomicU32, Ordering},
 };
 use crate::wait::Waiter;
@@ -168,8 +168,7 @@ impl core::error::Error for AboveBound {}
 /// The bytes of `places` waiter places, which [`budget`] charges to its memory budget.
 #[must_use]
 pub fn memory(places: NonZeroU32) -> u64 {
-    // The queue, with the two counts of its `Arc`.
-    let fixed = size_of::<Queue>() + 2 * size_of::<usize>();
+    let fixed = arc_size::<Queue>();
     let each = size_of::<Waiter>() + 2 * size_of::<u32>();
     // No overflow: each part is at most a few hundred bytes, and a count has 32 bits.
     fixed as u64 + u64::from(places.get()) * each as u64

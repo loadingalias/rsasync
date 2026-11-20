@@ -53,6 +53,7 @@
 //!   and then wakes the waiter of the receiver. The wait handshake (`crate::wait`) registers the
 //!   waker before it rechecks the word, so the recheck sees the change, or the wake comes.
 
+use core::alloc::AllocError;
 use core::fmt;
 use core::future::Future;
 use core::mem::MaybeUninit;
@@ -62,8 +63,9 @@ use core::task::{Context, Poll};
 use super::{Closed, Refused, SendError, TryRecvError};
 use crate::capacity::{Budget, Permit};
 use crate::sync::{
-    Arc, UnsafeCell,
+    Arc, UnsafeCell, arc_size,
     atomic::{AtomicU32, Ordering},
+    try_arc,
 };
 use crate::wait::Waiter;
 
@@ -117,32 +119,33 @@ unsafe impl<T: Send> Sync for Shared<T> {}
 ///
 /// # Errors
 ///
-/// [`Refused::Budget`] when the budget has fewer free units than the size of the shared state.
+/// [`Refused::Budget`] when the budget has fewer free units than the size of the shared state, and
+/// [`Refused::Allocation`] when the allocator does not give it.
 pub fn channel<T>(budget: &Budget) -> Result<(Sender<T>, Receiver<T>), Refused> {
     let charge = u64::try_from(size::<T>()).map_err(|_| Refused::TooLarge)?;
     let charge = budget.reserve(charge).map_err(Refused::Budget)?;
-    Ok(with_charge(charge))
+    with_charge(charge).map_err(|_| Refused::Allocation)
 }
 
 /// The size of the shared state of a one-shot channel of `T`, which its charge pays for.
 pub(crate) fn size<T>() -> usize {
-    size_of::<Shared<T>>()
+    arc_size::<Shared<T>>()
 }
 
 /// Makes a one-shot channel whose shared state `charge` pays for. The caller reserved at least
-/// [`size`] units for it.
-pub(crate) fn with_charge<T>(charge: Permit) -> (Sender<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
+/// [`size`] units for it. A refusal of the allocator ends the charge.
+pub(crate) fn with_charge<T>(charge: Permit) -> Result<(Sender<T>, Receiver<T>), AllocError> {
+    let shared = try_arc(Shared {
         state: AtomicU32::new(0),
         waiter: Waiter::new(),
         slot: UnsafeCell::new(MaybeUninit::uninit()),
         _charge: charge,
-    });
+    })?;
     let sender = Sender {
         shared: Some(Arc::clone(&shared)),
     };
     let receiver = Receiver { shared, taken: false };
-    (sender, receiver)
+    Ok((sender, receiver))
 }
 
 /// The sending endpoint. Its drop with no send closes the channel: a receive then gives

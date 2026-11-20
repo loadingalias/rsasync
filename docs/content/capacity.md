@@ -58,7 +58,8 @@ connection.release();
 assert_eq!(budget.available(), 64 * 1024);
 ```
 
-A `buffer::Pool` charges its slots to a budget when it is made (see
+A `buffer::Pool` charges its slots, their entries, and its shared state to a budget when it is
+made (see
 [Receive into pool slots](buffer-ownership.md#receive-into-pool-slots)).
 
 `Budget::available` is the number of free units at the time of the call. Other owners can change

@@ -504,7 +504,11 @@ impl Sqe {
 #[derive(Debug)]
 struct Mapping {
     base: core::ptr::NonNull<u8>,
+    #[cfg(target_os = "linux")]
     len: usize,
+    /// The layout of the allocation, which its release needs.
+    #[cfg(not(target_os = "linux"))]
+    layout: core::alloc::Layout,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -513,18 +517,18 @@ impl Mapping {
     const PAGE: usize = 4096;
 
     /// New zero memory of `len` bytes that starts at a page boundary.
-    #[expect(unsafe_code, reason = "the allocator gives new memory")]
     fn anonymous(len: usize) -> io::Result<Self> {
+        use core::alloc::Allocator as _;
+
         let layout =
             core::alloc::Layout::from_size_align(len.max(1), Self::PAGE).map_err(|_| io::ErrorKind::InvalidInput)?;
-        // SAFETY: the layout has a size above 0.
-        let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
-        core::ptr::NonNull::new(base)
-            .map(|base| Self {
-                base,
-                len: layout.size(),
-            })
-            .ok_or_else(|| io::ErrorKind::OutOfMemory.into())
+        let base = alloc::alloc::Global
+            .allocate_zeroed(layout)
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        Ok(Self {
+            base: base.cast(),
+            layout,
+        })
     }
 }
 
@@ -532,14 +536,11 @@ impl Mapping {
 impl Drop for Mapping {
     #[expect(unsafe_code, reason = "the memory ends with its owner")]
     fn drop(&mut self) {
-        // SAFETY: `anonymous` allocated `base` with this layout, which is valid, and no reference
-        // into it outlives its owner.
-        unsafe {
-            alloc::alloc::dealloc(
-                self.base.as_ptr(),
-                core::alloc::Layout::from_size_align_unchecked(self.len, Self::PAGE),
-            );
-        }
+        use core::alloc::Allocator as _;
+
+        // SAFETY: `anonymous` allocated `base` from `Global` with `layout`, and no reference into
+        // it outlives its owner.
+        unsafe { alloc::alloc::Global.deallocate(self.base, self.layout) };
     }
 }
 

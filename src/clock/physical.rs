@@ -235,7 +235,7 @@ cfg_select! {
 
             /// No value of this type exists.
             #[derive(Debug, Clone, Copy)]
-            pub(super) enum Source {}
+            pub(super) struct Source(!);
 
             impl Source {
                 pub(super) fn new() -> Option<Self> {
@@ -243,7 +243,7 @@ cfg_select! {
                 }
 
                 pub(super) fn read(self) -> Sample {
-                    match self {}
+                    self.0
                 }
             }
         }

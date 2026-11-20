@@ -119,8 +119,9 @@ use crate::capacity::{Budget, Permit};
 #[cfg(feature = "std")]
 use crate::sync::thread;
 use crate::sync::{
-    Arc, UnsafeCell,
+    Arc, UnsafeCell, arc_size,
     atomic::{AtomicU64, Ordering},
+    try_arc,
 };
 use crate::wait::Waiter;
 
@@ -323,7 +324,7 @@ pub fn channel<T>(
         .ok()
         .and_then(|slots| slots.size().checked_add(Places::size(senders)?))
         .and_then(|size| size.checked_add(Places::size(receivers)?))
-        .and_then(|size| size.checked_add(size_of::<Shared<T>>()))
+        .and_then(|size| size.checked_add(arc_size::<Shared<T>>()))
         .and_then(|size| u64::try_from(size).ok())
         .ok_or(Refused::TooLarge)?;
     let charge = budget.reserve(size).map_err(Refused::Budget)?;
@@ -334,7 +335,7 @@ pub fn channel<T>(
         value: UnsafeCell::new(MaybeUninit::uninit()),
     })?;
     // The first sender and the first receiver have place 0.
-    let shared = Arc::new(Shared {
+    let shared = try_arc(Shared {
         tail: Line(AtomicU64::new(0)),
         head: Line(AtomicU64::new(0)),
         slots,
@@ -342,7 +343,8 @@ pub fn channel<T>(
         senders: Places::new(senders)?,
         receivers: Places::new(receivers)?,
         _charge: charge,
-    });
+    })
+    .map_err(|_| Refused::Allocation)?;
     let sender = Sender {
         shared: Arc::clone(&shared),
         place: 0,

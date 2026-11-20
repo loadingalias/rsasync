@@ -557,10 +557,7 @@ impl Handle {
         };
         assert!(closed, "the inbox has a place for each reserved slot");
         let job = message.into_job().expect("the handle sent a job");
-        Err(SpawnRefused::new(
-            job.into_factory::<Fa, F::Output>(),
-            task::Reason::Closed,
-        ))
+        Err(SpawnRefused::new(job.into_factory::<Fa, F>(), task::Reason::Closed))
     }
 
     /// Gives another handle of the same runtime.

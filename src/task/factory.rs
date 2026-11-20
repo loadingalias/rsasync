@@ -1,7 +1,8 @@
 //! The spawn of a factory on an owner from another thread.
 //!
-//! The caller reserves the charge of the task and a free slot of the owner (`Shared::reserve_slot`),
-//! makes the channel of the outcome, and gives a [`Job`] to the inbox of the owner. On the thread of
+//! The caller reserves the charge of the task, allocates the memory of the task and of the job,
+//! reserves a free slot of the owner (`Shared::reserve_slot`), and gives a [`Job`] to the inbox of
+//! the owner. On the thread of
 //! the owner, the job calls the factory and puts its future in the reserved slot. A refusal before
 //! the job exists keeps no reservation and gives the factory back. A job that drops before it runs,
 //! such as a job in the inbox of an owner that stops, gives its reservation back, and its task ends
@@ -19,27 +20,28 @@
 //! task ends.
 
 use alloc::boxed::Box;
+use core::alloc::AllocError;
 use core::any::Any;
 use core::future::Future;
 use core::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 
-use super::owner::{discard, task_size};
+use super::owner::{TaskMemory, discard, task_size};
 use super::slot::Shared;
 use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, SpawnRefused, Target};
 use crate::capacity::{Budget, Permit};
 use crate::channel::oneshot;
 use crate::sync::{
-    Arc,
+    Arc, arc_size,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 /// The slot of a task that its job did not place yet.
 const UNPLACED: u32 = u32::MAX;
 
-/// The charge of the cancel cell of a factory spawn, and its two counts. The cell holds it, since a
-/// cancel handle can keep the cell after the task ends.
-const REMOTE: usize = size_of::<Remote>() + 2 * size_of::<usize>();
+/// The charge of the cancel cell of a factory spawn, in its `Arc`. The cell holds it, since a cancel
+/// handle can keep the cell after the task ends.
+const REMOTE: usize = arc_size::<Remote>();
 
 /// The side of an owner that another thread uses to spawn on it.
 #[derive(Clone)]
@@ -56,13 +58,15 @@ impl Placer {
         }
     }
 
-    /// Reserves a free slot of the owner and the charge of the task of `factory`, and gives the
-    /// job that spawns it and the handle of the task. The charge also holds the job.
+    /// Reserves a free slot of the owner and the charge of the task of `factory`, allocates the
+    /// memory of the task, and gives the job that spawns it and the handle of the task. The charge
+    /// also holds the job.
     ///
     /// # Errors
     ///
-    /// [`Reason::NoSlot`] when each free slot is reserved, and [`Reason::Budget`] when the budget has
-    /// too few free units. The refusal keeps no reservation.
+    /// [`Reason::NoSlot`] when each free slot is reserved, [`Reason::Budget`] when the budget has
+    /// too few free units, and [`Reason::Allocation`] when the allocator does not give the memory.
+    /// The refusal keeps no reservation and no memory.
     pub(crate) fn prepare<Fa, F>(&self, factory: Fa) -> Result<(Job, JoinHandle<F::Output>), SpawnRefused<Fa>>
     where
         Fa: FnOnce() -> F + Send + 'static,
@@ -70,7 +74,7 @@ impl Placer {
         F::Output: Send + 'static,
     {
         let outcome = oneshot::size::<Outcome<F::Output>>() as u64;
-        let job = size_of::<Spawn<Fa, F::Output>>() + REMOTE;
+        let job = size_of::<Spawn<Fa, F>>() + REMOTE;
         let reserved = self
             .budget
             .reserve(task_size::<F>().saturating_add(job as u64))
@@ -87,33 +91,48 @@ impl Placer {
                 });
             }
         };
-        // The slot comes after the charge: no refusal after this point gives a reservation back,
-        // so no spawn of the owner waits for a slot that is free.
+        let mut charge = charge;
+        let remote_charge = charge
+            .split(REMOTE as u64)
+            .expect("the charge of a factory spawn holds its cancel cell");
+        // A refusal of the allocator frees each part that it allocated, and ends its charge.
+        let allocated = (|| -> Result<_, AllocError> {
+            let (sender, receiver) = oneshot::with_charge(outcome)?;
+            let remote = alloc::sync::Arc::try_new(Remote {
+                shared: Arc::clone(&self.shared),
+                requested: AtomicBool::new(false),
+                slot: AtomicU32::new(UNPLACED),
+                generation: AtomicU64::new(0),
+                _charge: remote_charge,
+            })?;
+            let memory = TaskMemory::<F>::try_new()?;
+            Ok((sender, receiver, remote, memory, Box::<Spawn<Fa, F>>::try_new_uninit()?))
+        })();
+        let Ok((sender, receiver, remote, memory, spawn)) = allocated else {
+            return Err(SpawnRefused {
+                future: factory,
+                reason: Reason::Allocation,
+            });
+        };
+        // The slot comes after the charge and the memory: no refusal after this point gives a
+        // reservation back, so no spawn of the owner waits for a slot that is free.
         if !self.shared.reserve_slot() {
             return Err(SpawnRefused {
                 future: factory,
                 reason: Reason::NoSlot,
             });
         }
-        let (sender, receiver) = oneshot::with_charge(outcome);
-        let mut charge = charge;
-        let remote_charge = charge
-            .split(REMOTE as u64)
-            .expect("the charge of a factory spawn holds its cancel cell");
-        let remote = alloc::sync::Arc::new(Remote {
-            shared: Arc::clone(&self.shared),
-            requested: AtomicBool::new(false),
-            slot: AtomicU32::new(UNPLACED),
-            generation: AtomicU64::new(0),
-            _charge: remote_charge,
-        });
-        let job = Job(Box::new(Spawn {
-            factory: Some(factory),
-            sender: Some(sender),
-            charge: Some(charge),
-            remote: alloc::sync::Arc::clone(&remote),
-            reserved: true,
-        }));
+        let job = Job(Box::write(
+            spawn,
+            Spawn {
+                factory: Some(factory),
+                sender: Some(sender),
+                charge: Some(charge),
+                memory: Some(memory),
+                remote: alloc::sync::Arc::clone(&remote),
+                reserved: true,
+            },
+        ));
         let handle = JoinHandle {
             receiver,
             cancel: CancelHandle(Target::Remote(remote)),
@@ -134,12 +153,12 @@ impl Job {
     }
 
     /// Gives back the factory of a job that did not reach its owner, and the reservation of the
-    /// job. `Fa` and `T` are the types of [`Placer::prepare`] that made the job.
-    pub(crate) fn into_factory<Fa: Send + 'static, T: Send + 'static>(self) -> Fa {
+    /// job. `Fa` and `F` are the types of [`Placer::prepare`] that made the job.
+    pub(crate) fn into_factory<Fa: Send + 'static, F: Future<Output: Send> + 'static>(self) -> Fa {
         let mut spawn = self
             .0
             .into_any()
-            .downcast::<Spawn<Fa, T>>()
+            .downcast::<Spawn<Fa, F>>()
             .expect("the job holds a factory of these types");
         // The caller gets no handle, so the task needs no outcome.
         spawn.sender = None;
@@ -159,20 +178,20 @@ trait Run: Send {
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
 }
 
-struct Spawn<Fa, T> {
+struct Spawn<Fa, F: Future> {
     factory: Option<Fa>,
-    sender: Option<oneshot::Sender<Outcome<T>>>,
+    sender: Option<oneshot::Sender<Outcome<F::Output>>>,
     charge: Option<Permit>,
+    memory: Option<TaskMemory<F>>,
     remote: alloc::sync::Arc<Remote>,
     /// The job holds the reservation of a slot, which its drop gives back.
     reserved: bool,
 }
 
-impl<Fa, F, T> Run for Spawn<Fa, T>
+impl<Fa, F> Run for Spawn<Fa, F>
 where
     Fa: FnOnce() -> F + Send + 'static,
-    F: Future<Output = T> + 'static,
-    T: Send + 'static,
+    F: Future<Output: Send> + 'static,
 {
     fn run(mut self: Box<Self>) {
         let Some(local) = super::current() else {
@@ -192,14 +211,18 @@ where
             local.release_slot();
             return;
         }
-        let (Some(factory), Some(sender), Some(charge)) = (self.factory.take(), self.sender.take(), self.charge.take())
-        else {
+        let (Some(factory), Some(sender), Some(charge), Some(memory)) = (
+            self.factory.take(),
+            self.sender.take(),
+            self.charge.take(),
+            self.memory.take(),
+        ) else {
             return;
         };
         match catch_unwind(AssertUnwindSafe(factory)) {
             Ok(future) => {
                 self.reserved = false;
-                let task = local.place(future, sender, charge);
+                let task = local.place(future, sender, charge, memory);
                 self.remote.placed(task.slot, task.generation);
             }
             Err(payload) => {
@@ -217,7 +240,7 @@ where
     }
 }
 
-impl<Fa, T> Drop for Spawn<Fa, T> {
+impl<Fa, F: Future> Drop for Spawn<Fa, F> {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.take()
             && let Err(unjoined) = sender.send(Outcome::Cancelled)

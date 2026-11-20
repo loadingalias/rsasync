@@ -106,8 +106,9 @@ use crate::capacity::{Budget, Permit};
 #[cfg(feature = "std")]
 use crate::sync::thread;
 use crate::sync::{
-    Arc, UnsafeCell,
+    Arc, UnsafeCell, arc_size,
     atomic::{AtomicU32, Ordering},
+    try_arc,
 };
 use crate::wait::Waiter;
 
@@ -278,7 +279,7 @@ pub fn channel<T>(budget: &Budget, capacity: u32) -> Result<(Sender<T>, Receiver
     let slots = Layout::array::<Slot<T>>(capacity as usize).map_err(|_| Refused::TooLarge)?;
     let charge = slots
         .size()
-        .checked_add(size_of::<Shared<T>>())
+        .checked_add(arc_size::<Shared<T>>())
         .and_then(|size| u64::try_from(size).ok())
         .ok_or(Refused::TooLarge)?;
     let charge = budget.reserve(charge).map_err(Refused::Budget)?;
@@ -288,13 +289,14 @@ pub fn channel<T>(budget: &Budget, capacity: u32) -> Result<(Sender<T>, Receiver
         .try_reserve_exact(capacity as usize)
         .map_err(|_| Refused::Allocation)?;
     slots.extend((0..capacity).map(|_| UnsafeCell::new(MaybeUninit::uninit())));
-    let shared = Arc::new(Shared {
+    let shared = try_arc(Shared {
         written: End::new(),
         read: End::new(),
         slots: slots.into_boxed_slice(),
         capacity,
         _charge: charge,
-    });
+    })
+    .map_err(|_| Refused::Allocation)?;
     let sender = Sender {
         shared: Arc::clone(&shared),
         written: 0,

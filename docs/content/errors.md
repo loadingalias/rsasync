@@ -17,6 +17,17 @@ its recovery. rsasync is in development, and these errors are not in a published
 - The `Debug` form of each error of `rsasync::task`, `rsasync::channel`, and `rsasync::blocking`,
   and of `driver::Refused`, shows no output, value, job, or panic message.
 
+## Buffers
+
+The errors of `rsasync::buffer` (see [Buffer ownership](buffer-ownership.md)).
+
+| Error | When | Recovery |
+| --- | --- | --- |
+| `PoolRefused::Layout` | The slot size is 0, or the memory of the pool is too large for its allocations | Give a slot size above 0, or fewer slots |
+| `PoolRefused::Budget(Exhausted)` | The budget cannot charge the slots, their entries, and the shared state of the pool | Give a larger budget, or fewer or smaller slots |
+| `PoolRefused::Allocation` | The allocator did not give the memory of the pool | Give fewer or smaller slots, or make the pool when memory is free |
+| `PoolEmpty` | No slot of the pool is free | Acquire again after the last backing, lease, or view of a slot drops |
+
 ## Tasks
 
 The errors of `rsasync::task` (see [Tasks](tasks.md)).
@@ -29,6 +40,7 @@ The errors of `rsasync::task` (see [Tasks](tasks.md)).
 | `Refused::Allocation` | The allocator did not give the memory of the owner | Give fewer slots, or make the owner when memory is free |
 | `SpawnRefused` with `Reason::NoSlot` | Each slot of the owner holds a live task | Join or cancel a task, or use `spawn_local_waiting` |
 | `SpawnRefused` with `Reason::Budget(Exhausted)` | The budget has fewer free units than the task | Free units, or spawn a smaller future |
+| `SpawnRefused` with `Reason::Allocation` | The allocator did not give the memory of the task | Spawn again when memory is free, or run the future in place |
 | `SpawnRefused` with `Reason::Closed` | `block_on` is at its end and cancels its tasks, or it failed and drops them | Do the work in the root future, or before the end |
 | `SpawnRefused` with `Reason::NoOwner` | No `block_on` runs on this thread | Spawn from the root future or from a task |
 | `SpawnRefused` with `Reason::NoWorker` | `Handle::spawn_on` names no worker of the runtime | Use an index below `handle.workers()` |
@@ -75,10 +87,11 @@ The errors of `rsasync::blocking` (see [Blocking service](blocking-service.md)).
 | --- | --- | --- |
 | `Error::Config` | A limit of `Config` is 0 or too large | Give each limit a value in its range |
 | `Error::Budget(Exhausted)` | The budget cannot charge the service, its queue, and its stacks | Give a larger budget, or fewer threads, jobs, or stack bytes |
-| `Error::Allocation` | The allocator did not give the memory of the queue | Give fewer jobs, or start the service when memory is free |
+| `Error::Allocation` | The allocator did not give the memory of the service or of its queue | Give fewer jobs, or start the service when memory is free |
 | `Error::Thread(io::Error)` | The system did not start a thread | Read the `io::Error`, and give fewer threads or a smaller stack |
 | `Refused` with `Reason::Full` | Each job slot is in use | Take the `job` back, and submit it after a job returns |
 | `Refused` with `Reason::Budget(Exhausted)` | The budget cannot charge the job and its result | Submit it after a charge returns |
+| `Refused` with `Reason::Allocation` | The allocator did not give the memory of the job or of its result | Take the `job` back, and submit it when memory is free |
 | `Refused` with `Reason::Ended` | The service stopped | Terminal: run the job in another place |
 | `Failed::Ended` | The service stopped before the job ran, and the job dropped | Run the work again in another place |
 | `Failed::Panicked` | The job panicked. The panic hook reported it | Correct the job. The service continues with the next job |

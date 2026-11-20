@@ -69,8 +69,8 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crate::capacity::{Budget, Exhausted, Permit};
-use crate::sync::Arc;
 use crate::sync::atomic::{AtomicU32, Ordering};
+use crate::sync::{Arc, arc_size};
 use crate::time::{ClockDomain, Deadline, Instant, TimeError};
 use crate::wait::Waiter;
 use wheel::{RANGE, Wheel};
@@ -244,8 +244,7 @@ impl Timers {
     /// The bytes that a storage of `capacity` timers allocates, and charges to its budget.
     #[must_use]
     pub fn memory(capacity: NonZeroU32) -> u64 {
-        // The shared part, with the two counts of its `Arc`.
-        let fixed = size_of::<Shared>() + 2 * size_of::<usize>();
+        let fixed = arc_size::<Shared>();
         let each = size_of::<Entry>() + Wheel::entry_size();
         // No overflow: each part is at most a few hundred bytes, and a capacity has 32 bits.
         fixed as u64 + u64::from(capacity.get()) * each as u64

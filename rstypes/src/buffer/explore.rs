@@ -68,7 +68,7 @@ fn the_last_part_of_a_split_backing_releases_it_once_on_either_thread() {
 #[test]
 fn the_last_part_of_a_split_slot_returns_it_once_on_either_thread() {
     model(|| {
-        let budget = Budget::new(NonZeroU64::new(64).unwrap());
+        let budget = Budget::new(NonZeroU64::new(4096).unwrap());
         let mut pool = Pool::new(
             &budget,
             NonZeroU32::new(1).unwrap(),

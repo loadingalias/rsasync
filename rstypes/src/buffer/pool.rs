@@ -5,24 +5,24 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::{Allocator, Layout};
 use core::fmt;
-use core::mem::ManuallyDrop;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
-use super::{Backing, Kind, Release};
+use super::{Backing, Hook, Release};
 use crate::capacity::{Budget, Exhausted, Permit};
-use crate::sync::Arc;
 use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use crate::sync::{Arc, arc_size, try_arc};
 
 /// The end of a list of slots. A pool has fewer slots, so no slot has this index.
 const NONE: u32 = u32::MAX;
 
 /// A bounded pool of slots of one size, which it charges to a budget for its whole life.
 ///
-/// The pool takes its memory and its charge when it is made: the slot count times the rounded slot
-/// size, which is the slot size rounded up to the slot alignment. The charge includes the idle
-/// slots. The budget gets it back when the memory of the pool is freed, after the pool and each
-/// slot drop.
+/// The pool takes its memory and its charge when it is made. The charge is each allocation of the
+/// pool: its slots, an entry of 16 bytes for each slot, and its shared state. The slots take the
+/// slot count times the rounded slot size, which is the slot size rounded up to the slot
+/// alignment. The charge includes the idle slots. The budget gets it back when the memory of the
+/// pool is freed, after the pool and each slot drop.
 ///
 /// [`acquire`](Self::acquire) gives a free slot as a [`Backing`], with no allocation. The slot is
 /// exclusive: only that backing writes it. The backing can become a [`Lease`](super::Lease) whose
@@ -43,10 +43,11 @@ const NONE: u32 = u32::MAX;
 /// use rsasync::capacity::Budget;
 ///
 /// let budget = Budget::new(NonZeroU64::new(1024 * 1024).unwrap());
-/// // 2 slots of 4000 bytes, aligned to 4096 bytes: the pool charges 2 rounded slots.
+/// // 2 slots of 4000 bytes, aligned to 4096 bytes: the pool charges 2 rounded slots, and its
+/// // entries and shared state.
 /// let slot = Layout::from_size_align(4000, 4096).unwrap();
 /// let mut pool = Pool::new(&budget, NonZeroU32::new(2).unwrap(), slot).unwrap();
-/// assert_eq!(budget.available(), 1024 * 1024 - 2 * 4096);
+/// assert!(budget.available() < 1024 * 1024 - 2 * 4096);
 ///
 /// // A receive fills a slot. Its lease and views need no allocation.
 /// let mut loan = WriteLoan::new(pool.acquire().unwrap());
@@ -132,7 +133,7 @@ impl ReturnList {
 /// A refusal to make a pool. A refusal keeps no charge and no memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolRefused {
-    /// The slot size is zero, or the size of all of the slots is too large for one allocation.
+    /// The slot size is zero, or the memory of the pool is too large for its allocations.
     Layout,
     /// The budget has fewer free units than the size of all of the slots.
     Budget(Exhausted),
@@ -166,7 +167,8 @@ impl core::error::Error for PoolEmpty {}
 
 impl Pool {
     /// Makes a pool of `slots` slots, each with the size and the alignment of `slot`. It charges
-    /// all of the slots to `budget`, at their rounded size, before it allocates.
+    /// each allocation of the pool to `budget` before it allocates: all of the slots at their
+    /// rounded size, their entries, and its shared state.
     pub fn new(budget: &Budget, slots: NonZeroU32, slot: Layout) -> Result<Self, PoolRefused> {
         let count = slots.get();
         if slot.size() == 0 || count == NONE {
@@ -178,7 +180,12 @@ impl Pool {
             .pad_to_align()
             .repeat(count as usize)
             .map_err(|_| PoolRefused::Layout)?;
-        let charge = u64::try_from(arena_layout.size()).map_err(|_| PoolRefused::Layout)?;
+        let charge = Layout::array::<Slot>(count as usize)
+            .ok()
+            .and_then(|entries| entries.size().checked_add(arena_layout.size()))
+            .and_then(|size| size.checked_add(arc_size::<Shared>()))
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or(PoolRefused::Layout)?;
         let charge = budget.reserve(charge).map_err(PoolRefused::Budget)?;
 
         let mut entries = Vec::new();
@@ -195,20 +202,20 @@ impl Pool {
             .map_err(|_| PoolRefused::Allocation)?
             .cast();
 
-        Ok(Self {
-            shared: Arc::new(Shared {
-                arena,
-                arena_layout,
-                stride,
-                capacity: slot.size(),
-                slots: entries.into_boxed_slice(),
-                returned: ReturnList {
-                    head: AtomicU32::new(NONE),
-                },
-                _charge: charge,
-            }),
-            free: 0,
+        // A refusal drops the shared state, which frees the arena and ends the charge.
+        let shared = try_arc(Shared {
+            arena,
+            arena_layout,
+            stride,
+            capacity: slot.size(),
+            slots: entries.into_boxed_slice(),
+            returned: ReturnList {
+                head: AtomicU32::new(NONE),
+            },
+            _charge: charge,
         })
+        .map_err(|_| PoolRefused::Allocation)?;
+        Ok(Self { shared, free: 0 })
     }
 
     /// Gives a free slot as an exclusive backing, with no allocation, or refuses if no slot is free.
@@ -229,21 +236,21 @@ impl Pool {
         // Ordering: the slot is free, so only the home uses its count until the backing exists.
         slot.count.store(1, Ordering::Relaxed);
 
-        let pool = Arc::as_ptr(&self.shared);
-        // SAFETY: `pool` is from a live `Arc`. This is the reference of the slot to its pool, which
-        // `release_count` drops when the last count of the slot drops.
-        unsafe { Arc::increment_strong_count(pool) };
+        // The reference of the slot to its pool, which the drop of the last count of the slot gives
+        // back.
+        let pool = Arc::into_raw(Arc::clone(&self.shared));
         // SAFETY: the slot is in the arena: its index is less than the slot count.
         let ptr = unsafe { self.shared.arena.add(index as usize * self.shared.stride) };
-        let release = Release {
-            data: pool.cast(),
-            release: release_slot,
-            kind: Kind::Slot,
+        let count = SlotRef {
+            // SAFETY: `Arc::into_raw` gives a pointer that is not null.
+            pool: unsafe { NonNull::new_unchecked(pool.cast_mut()) },
+            index,
         };
+        let release = Release(Hook::Shared(super::Shared::Slot(count)));
         // SAFETY: the slot is `capacity` bytes in the arena, which its reference to the pool keeps
         // allocated. The pool gives a slot again only after its last count drops, so only this
-        // backing uses it. `release_slot` drops the count of the backing on any thread: the count
-        // and the return list are atomic.
+        // backing uses it. The count of the backing drops on any thread: the count and the return
+        // list are atomic.
         Ok(unsafe { Backing::from_raw_parts(ptr, self.shared.capacity, 0, self.shared.stride, release) })
     }
 }
@@ -255,17 +262,6 @@ impl fmt::Debug for Pool {
             .field("capacity", &self.shared.capacity)
             .field("allocation_size", &self.shared.stride)
             .finish_non_exhaustive()
-    }
-}
-
-impl Shared {
-    /// The index of the slot at `ptr`.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the index is less than the slot count, which is a u32"
-    )]
-    fn index(&self, ptr: NonNull<u8>) -> u32 {
-        ((ptr.addr().get() - self.arena.addr().get()) / self.stride) as u32
     }
 }
 
@@ -288,93 +284,16 @@ unsafe impl Send for Shared {}
 // SAFETY: see `Send`. A shared `Shared` gives only atomic operations and immutable facts.
 unsafe impl Sync for Shared {}
 
-/// The release hook of a backing from `Pool::acquire`: drops the count of the backing.
-///
-/// # Safety
-///
-/// `data` and `ptr` are from `Pool::acquire`, and the backing gives up its count with this call.
-#[expect(unsafe_code, reason = "the hook drops the count that keeps the pool alive")]
-unsafe fn release_slot(data: *const (), ptr: NonNull<u8>, _: usize) {
-    let pool = data.cast::<Shared>();
-    // SAFETY: the count of the backing keeps the pool alive.
-    let index = unsafe { (*pool).index(ptr) };
-    // SAFETY: the backing gives up its count of slot `index`.
-    unsafe { release_count(pool, index) };
-}
-
-/// Drops one count of slot `index`. The last count returns the slot to its home, and then drops the
-/// reference of the slot to its pool.
-///
-/// # Safety
-///
-/// The caller gives up one count of the slot, which keeps `pool` alive until this call.
-#[expect(unsafe_code, reason = "the last count of a slot drops its reference to the pool")]
-unsafe fn release_count(pool: *const Shared, index: u32) {
-    {
-        // SAFETY: the count that the caller gives up keeps the pool alive in this block.
-        let shared = unsafe { &*pool };
-        // Ordering: as for an `Arc`. `Release` orders each use of the slot by this owner before the
-        // drop of its count, and the `Acquire` fence of the last owner orders all of them before
-        // the return.
-        if shared.slots[index as usize].count.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-        fence(Ordering::Acquire);
-        shared.returned.push(&shared.slots, index);
-    }
-    // SAFETY: the slot kept this reference since `Pool::acquire`, and its last count is gone.
-    // Nothing uses `pool` after this.
-    unsafe { Arc::decrement_strong_count(pool) };
-}
-
-/// One count of a slot in use, which a lease of the slot holds.
+/// One count of a slot in use, which each backing, lease, and view of the slot holds. The index,
+/// not the address of a region, names the slot, so each part of a split keeps the slot.
 #[derive(Debug)]
 pub(super) struct SlotRef {
+    /// The pool, from `Arc::into_raw`. The slot holds one strong count of it while it is in use.
     pool: NonNull<Shared>,
     index: u32,
 }
 
 impl SlotRef {
-    /// Takes the count of `backing` if it is from `Pool::acquire`, or gives the backing back.
-    #[expect(unsafe_code, reason = "only `Pool::acquire` marks a release as a pool slot")]
-    pub(super) fn try_from(backing: Backing) -> Result<Self, Backing> {
-        if backing.release.kind != Kind::Slot {
-            return Err(backing);
-        }
-        // The count of the backing moves to the new `SlotRef`, so the backing does not drop.
-        let backing = ManuallyDrop::new(backing);
-        let pool = backing.release.data.cast::<Shared>();
-        // SAFETY: only `Pool::acquire` and `into_backing` make a `Kind::Slot` release, with the pool
-        // as `data` and a region of the slot at `ptr`. The count of the backing keeps the pool
-        // alive. Each address in a slot gives the index of that slot.
-        let index = unsafe { (*pool).index(backing.ptr) };
-        Ok(Self {
-            // SAFETY: `pool` is from `Arc::as_ptr`, which is not null.
-            pool: unsafe { NonNull::new_unchecked(pool.cast_mut()) },
-            index,
-        })
-    }
-
-    /// Turns this count into a backing of the `capacity` bytes at `ptr`, with the first
-    /// `initialized` of them initialized. The backing gives the count back when it drops.
-    ///
-    /// # Safety
-    ///
-    /// The region is in this slot, and only the new backing uses it.
-    #[expect(unsafe_code, reason = "the new backing owns its region of the slot with this count")]
-    pub(super) unsafe fn into_backing(self, ptr: NonNull<u8>, capacity: usize, initialized: usize) -> Backing {
-        // The count moves to the new backing, so this `SlotRef` does not drop.
-        let this = ManuallyDrop::new(self);
-        let release = Release {
-            data: this.pool.as_ptr().cast_const().cast(),
-            release: release_slot,
-            kind: Kind::Slot,
-        };
-        // SAFETY: the caller gives a region of the slot that only the new backing uses. The count
-        // keeps the slot in use and its pool alive, and `release_slot` drops it on any thread.
-        unsafe { Backing::from_raw_parts(ptr, capacity, initialized, this.shared().stride, release) }
-    }
-
     #[expect(unsafe_code, reason = "the count of a slot keeps its pool alive")]
     fn shared(&self) -> &Shared {
         // SAFETY: this count keeps the slot in use, and the slot keeps its pool alive.
@@ -412,10 +331,24 @@ impl Clone for SlotRef {
 }
 
 impl Drop for SlotRef {
-    #[expect(unsafe_code, reason = "a lease gives up its count of the slot")]
+    /// Drops this count. The last count returns the slot to its home, and then drops the reference
+    /// of the slot to its pool.
+    #[expect(unsafe_code, reason = "the last count of a slot drops its reference to the pool")]
     fn drop(&mut self) {
-        // SAFETY: this is the one drop of this count.
-        unsafe { release_count(self.pool.as_ptr(), self.index) };
+        {
+            let shared = self.shared();
+            // Ordering: as for an `Arc`. `Release` orders each use of the slot by this owner before
+            // the drop of its count, and the `Acquire` fence of the last owner orders all of them
+            // before the return.
+            if shared.slots[self.index as usize].count.fetch_sub(1, Ordering::Release) != 1 {
+                return;
+            }
+            fence(Ordering::Acquire);
+            shared.returned.push(&shared.slots, self.index);
+        }
+        // SAFETY: `Pool::acquire` took this reference with `Arc::into_raw`, and the slot kept it
+        // until its last count, which is gone now. Nothing uses `pool` after this.
+        unsafe { Arc::decrement_strong_count(self.pool.as_ptr().cast_const()) };
     }
 }
 

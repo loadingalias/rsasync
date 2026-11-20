@@ -10,9 +10,11 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::alloc::AllocError;
 use core::any::Any;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::panic::AssertUnwindSafe;
 use core::pin::{Pin, pin};
 use core::task::{Context, Poll, Waker};
@@ -27,9 +29,9 @@ use crate::channel::oneshot;
 use crate::clock::NativeClock;
 use crate::coop;
 use crate::sync::{
-    Arc,
+    Arc, arc_size,
     atomic::{AtomicU32, AtomicU64},
-    thread,
+    thread, try_arc,
 };
 use crate::time::{Instant, TimeError};
 use crate::timer::Timers;
@@ -197,8 +199,8 @@ fn items<X>(count: u32, make: impl Fn(u32) -> X) -> Result<Box<[X]>, Refused> {
     Ok(items.into_boxed_slice())
 }
 
-/// The charge of the identity of a task: the reference of its waker, which holds two counts.
-const IDENTITY: usize = size_of::<TaskRef>() + 2 * size_of::<usize>();
+/// The charge of the identity of a task: the reference of its waker, in its `Arc`.
+const IDENTITY: usize = arc_size::<TaskRef>();
 
 /// The charge of a task of `F`: its cell, its outcome, and its identity. A size too large for a
 /// budget saturates, and the budget refuses it.
@@ -206,6 +208,43 @@ pub(super) fn task_size<F: Future>() -> u64 {
     (size_of::<TaskCell<F>>() as u64)
         .saturating_add(oneshot::size::<Outcome<F::Output>>() as u64)
         .saturating_add(IDENTITY as u64)
+}
+
+/// The memory of the cell and the identity of a task of `F`. A spawn allocates it before the
+/// future moves, so that a refusal of the allocator can give the future back. Neither holds a
+/// value until `Local::place` writes it.
+pub(super) struct TaskMemory<F: Future> {
+    cell: Box<MaybeUninit<TaskCell<F>>>,
+    identity: alloc::sync::Arc<MaybeUninit<TaskRef>>,
+}
+
+impl<F: Future> TaskMemory<F> {
+    pub(super) fn try_new() -> Result<Self, AllocError> {
+        Ok(Self {
+            cell: Box::try_new_uninit()?,
+            identity: alloc::sync::Arc::try_new_uninit()?,
+        })
+    }
+}
+
+#[expect(unsafe_code, reason = "the memory of a task holds no value until its home writes it")]
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the cell holds no value of `F` while it can move between threads"
+)]
+// SAFETY: the cell holds no value of `F` until `Local::place` writes it, on the thread of the
+// owner, and the identity is `Send`. A move or a drop on a different thread moves or frees only
+// the memory.
+unsafe impl<F: Future> Send for TaskMemory<F> {}
+
+/// Writes `value` into `memory`, a new `Arc` with one count.
+#[expect(unsafe_code, reason = "the write initializes the value of the new `Arc`")]
+fn init<T>(mut memory: alloc::sync::Arc<MaybeUninit<T>>, value: T) -> alloc::sync::Arc<T> {
+    alloc::sync::Arc::get_mut(&mut memory)
+        .expect("the memory of a task is a new `Arc`, with one count")
+        .write(value);
+    // SAFETY: the write above initialized the value.
+    unsafe { memory.assume_init() }
 }
 
 pub(super) struct Local {
@@ -263,16 +302,13 @@ impl Local {
             size_of::<AtomicU64>() + size_of::<AtomicU32>() + size_of::<Cell<Option<Entry>>>() + 2 * size_of::<u32>();
         let size = slot_size
             .checked_mul(slots as usize)
-            .and_then(|size| size.checked_add(size_of::<Shared>() + size_of::<Self>()))
+            .and_then(|size| size.checked_add(arc_size::<Shared>() + arc_size::<Self>()))
             .and_then(|size| size.checked_add(outbox * size_of::<usize>()))
             .and_then(|size| u64::try_from(size).ok())
             .ok_or(Refused::TooLarge)?;
         let mut charge = budget.reserve(size).map_err(Refused::Budget)?;
-        // The shared part, which a waker can keep after the owner drops, holds its own charge, and
-        // its reference holds two counts.
-        let shared = (size_of::<AtomicU64>() + size_of::<AtomicU32>()) * slots as usize
-            + size_of::<Shared>()
-            + 2 * size_of::<usize>();
+        // The shared part, which a waker can keep after the owner drops, holds its own charge.
+        let shared = (size_of::<AtomicU64>() + size_of::<AtomicU32>()) * slots as usize + arc_size::<Shared>();
         let shared_charge = charge
             .split(shared as u64)
             .expect("the charge of the owner holds its shared part");
@@ -293,8 +329,9 @@ impl Local {
             homes.try_reserve_exact(outbox).map_err(|_| Refused::Allocation)?;
             RefCell::new(homes)
         };
+        let shared = try_arc(Shared::new(words, next, home, shared_charge)).map_err(|_| Refused::Allocation)?;
         Ok(Self {
-            shared: Arc::new(Shared::new(words, next, home, shared_charge)),
+            shared,
             budget: budget.clone(),
             entries,
             free: RefCell::new(free),
@@ -320,7 +357,8 @@ impl Local {
         })
     }
 
-    /// Spawns `future` in a free slot. A refusal gives the future back, and allocates nothing.
+    /// Spawns `future` in a free slot. A refusal gives the future back. Only a refusal of the
+    /// allocator comes after an allocation, and it frees it.
     pub(super) fn spawn<F>(&self, future: F) -> Result<JoinHandle<F::Output>, SpawnRefused<F>>
     where
         F: Future + 'static,
@@ -351,22 +389,33 @@ impl Local {
                 reason: Reason::NoSlot,
             });
         }
-        let (sender, receiver) = oneshot::with_charge(outcome);
-        let identity = self.place(future, sender, charge);
+        // The memory comes after the slot, so a refusal for a slot or a charge allocates nothing.
+        // This thread is the home, so it can give the slot back to a waiting spawn.
+        let Ok(((sender, receiver), memory)) =
+            oneshot::with_charge(outcome).and_then(|ends| Ok((ends, TaskMemory::try_new()?)))
+        else {
+            self.release_slot();
+            return Err(SpawnRefused {
+                future,
+                reason: Reason::Allocation,
+            });
+        };
+        let identity = self.place(future, sender, charge, memory);
         Ok(JoinHandle {
             receiver,
             cancel: CancelHandle(Target::Local(identity)),
         })
     }
 
-    /// Puts `future` in a free slot, after a spawn reserved the slot (`Shared::reserve_slot`) and
-    /// `charge`, and schedules it. Gives the identity of the task, which holds its own part of the
-    /// charge: a waker or a cancel handle can keep it after the task ends.
+    /// Puts `future` in a free slot, after a spawn reserved the slot (`Shared::reserve_slot`),
+    /// `charge`, and `memory`, and schedules it. Gives the identity of the task, which holds its own
+    /// part of the charge: a waker or a cancel handle can keep it after the task ends.
     pub(super) fn place<F>(
         &self,
         future: F,
         sender: oneshot::Sender<Outcome<F::Output>>,
         mut charge: Permit,
+        memory: TaskMemory<F>,
     ) -> alloc::sync::Arc<TaskRef>
     where
         F: Future + 'static,
@@ -379,18 +428,25 @@ impl Local {
             .borrow_mut()
             .pop()
             .expect("the free list has a slot for each reservation");
-        let identity = alloc::sync::Arc::new(TaskRef {
-            shared: Arc::clone(&self.shared),
-            slot,
-            generation: self.shared.generation(slot),
-            _charge: identity_charge,
-        });
+        let TaskMemory { cell, identity } = memory;
+        let identity = init(
+            identity,
+            TaskRef {
+                shared: Arc::clone(&self.shared),
+                slot,
+                generation: self.shared.generation(slot),
+                _charge: identity_charge,
+            },
+        );
         let waker = Waker::from(alloc::sync::Arc::clone(&identity));
-        let task: Pin<Box<dyn Task>> = Box::pin(TaskCell {
-            future: Some(future),
-            sender: Some(sender),
-            _charge: charge,
-        });
+        let task: Pin<Box<dyn Task>> = Box::into_pin(Box::write(
+            cell,
+            TaskCell {
+                future: Some(future),
+                sender: Some(sender),
+                _charge: charge,
+            },
+        ));
         self.shared.start(slot);
         self.entries[slot as usize].set(Some(Entry { task, waker }));
         self.live.update(|live| live + 1);
@@ -404,9 +460,8 @@ impl Local {
         self.closed.get()
     }
 
-    /// Gives back the reservation of a slot that a factory spawn did not take, and wakes the first
-    /// waiting spawn.
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    /// Gives back the reservation of a slot that a spawn did not take, and wakes the first waiting
+    /// spawn.
     pub(super) fn release_slot(&self) {
         self.shared.release_slot();
         self.waiting.wake_first();
@@ -507,6 +562,17 @@ impl Local {
 
     /// The next turn of the timers that has work, or `None` with no waiting timer. It is at most
     /// the deadline of the next timer and the coarsening of the storage after it.
+    #[cfg_attr(
+        not(any(
+            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+            target_os = "macos",
+            all(windows, any(target_arch = "x86_64", target_arch = "aarch64"))
+        )),
+        expect(
+            clippy::uninhabited_references,
+            reason = "with no native clock, `NativeClock` has no value, so no owner holds timers and the read never runs"
+        )
+    )]
     fn until(&self) -> Option<Until> {
         let timers = self.timers.borrow();
         let (timers, clock) = timers.as_ref()?;

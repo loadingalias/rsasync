@@ -10,7 +10,7 @@ use crate::buffer::{Buffer, Lease};
 use crate::capacity::Budget;
 
 fn pool(slots: u32) -> Pool {
-    let budget = Budget::new(NonZeroU64::new(64).unwrap());
+    let budget = Budget::new(NonZeroU64::new(4096).unwrap());
     let slot = Layout::from_size_align(8, 8).unwrap();
     Pool::new(&budget, NonZeroU32::new(slots).unwrap(), slot).unwrap()
 }

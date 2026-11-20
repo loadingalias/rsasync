@@ -183,12 +183,14 @@ A `Pool` holds slots of one size and alignment, and gives each free slot as a `B
 a path that receives often: an acquire allocates nothing, and a slot comes back for the next
 receive.
 
-- `Pool::new(&budget, slots, layout)` charges all of the slots to the budget before it allocates:
-  the slot count times the rounded slot size, which is the slot size rounded up to its alignment.
-  Idle slots stay charged. The charge ends when the memory is freed, after the pool and each of its
-  slots drop. It refuses with a `PoolRefused` value: `Layout` for a slot size of zero or a size
-  that is too large, `Budget` when the budget has too few free units, and `Allocation` when the
-  allocator gives no memory. A refusal keeps no charge.
+- `Pool::new(&budget, slots, layout)` charges each allocation of the pool to the budget before it
+  allocates. The slots take the slot count times the rounded slot size, which is the slot size
+  rounded up to its alignment. Each slot also has an entry of 16 bytes, and the pool has one shared
+  state. Idle slots stay charged. The charge ends when the memory is freed, after the pool and each
+  of its slots drop. It refuses with a `PoolRefused` value: `Layout` for a slot size of zero or a
+  size that is too large, `Budget` when the budget has too few free units, and `Allocation` when
+  the allocator gives no memory for one of its allocations. A refusal keeps no charge and no
+  memory.
 - `Pool::acquire` gives a free slot, or refuses with `PoolEmpty`. It allocates nothing. The backing
   has the capacity of the slot size and the allocation size of the rounded slot size, and none of
   its bytes are initialized.
@@ -209,10 +211,11 @@ use rsasync::buffer::{Buffer, BufferMut, Lease, Pool, PoolEmpty, WriteLoan};
 use rsasync::capacity::Budget;
 
 let budget = Budget::new(NonZeroU64::new(1024 * 1024).unwrap());
-// 2 slots of 4000 bytes, aligned to 4096 bytes: the pool charges 2 rounded slots.
+// 2 slots of 4000 bytes, aligned to 4096 bytes: the pool charges 2 rounded slots, and its
+// entries and shared state.
 let slot = Layout::from_size_align(4000, 4096).unwrap();
 let mut pool = Pool::new(&budget, NonZeroU32::new(2).unwrap(), slot).unwrap();
-assert_eq!(budget.available(), 1024 * 1024 - 2 * 4096);
+assert!(budget.available() < 1024 * 1024 - 2 * 4096);
 
 // A receive fills a slot. Its lease and views need no allocation.
 let mut loan = WriteLoan::new(pool.acquire().unwrap());

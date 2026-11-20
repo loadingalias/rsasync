@@ -19,6 +19,9 @@
 //! and `alloc`. With `std` and not `local`, the driver builds with no scheduler.
 
 #![no_std]
+// `Arc::try_new` and `Box::try_new_uninit`: each allocation on a refusal path refuses, and does
+// not abort (docs/content/unstable-features.md).
+#![feature(allocator_ext)]
 
 extern crate alloc;
 #[cfg(feature = "std")]

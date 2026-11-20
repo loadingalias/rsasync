@@ -68,6 +68,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::num::NonZeroU64;
 use core::panic::AssertUnwindSafe;
 use core::pin::Pin;
@@ -79,8 +80,9 @@ use crate::capacity::{Budget, Exhausted, Permit};
 use crate::channel::{self, Closed, TooManyReceivers, mpmc, oneshot};
 use crate::sync::thread::{self, JoinHandle};
 use crate::sync::{
-    Arc,
+    Arc, arc_size,
     atomic::{AtomicBool, Ordering},
+    try_arc,
 };
 
 /// Blocking work that the service runs on one of its threads.
@@ -238,6 +240,8 @@ pub enum Reason {
     Budget(Exhausted),
     /// The service stopped. No later submission can succeed.
     Ended,
+    /// The allocator did not give the memory of the job. A later submission can succeed.
+    Allocation,
 }
 
 impl fmt::Display for Reason {
@@ -246,6 +250,7 @@ impl fmt::Display for Reason {
             Self::Full => f.write_str("each job slot of the blocking service is occupied"),
             Self::Budget(refused) => write!(f, "the budget cannot charge the job: {refused}"),
             Self::Ended => f.write_str("the blocking service stopped"),
+            Self::Allocation => f.write_str("the allocator did not give the memory of the job"),
         }
     }
 }
@@ -391,7 +396,7 @@ impl Service {
     /// # Errors
     ///
     /// [`Error::Config`] when a limit is 0 or too large, [`Error::Budget`] when the budget has too
-    /// few free units, [`Error::Allocation`] when the allocator did not give the queue, and
+    /// few free units, [`Error::Allocation`] when the allocator did not give the memory of the service, and
     /// [`Error::Thread`] when the system did not start a thread. The threads that started then
     /// end, and the service joins them before it returns.
     pub fn new(budget: &Budget, config: Config) -> Result<Self, Error> {
@@ -402,7 +407,7 @@ impl Service {
         let stack_units = u64::try_from(stack).map_err(|_| Error::Config)?;
         let fixed = size_of::<JoinHandle<Teardown>>()
             .checked_mul(threads as usize)
-            .and_then(|handles| handles.checked_add(size_of::<Shared>()))
+            .and_then(|handles| handles.checked_add(arc_size::<Shared>()))
             .and_then(|size| u64::try_from(size).ok())
             .ok_or(Error::Config)?;
         let charge = budget.reserve(fixed).map_err(Error::Budget)?;
@@ -413,16 +418,22 @@ impl Service {
                 channel::Refused::Budget(exhausted) => Error::Budget(exhausted),
                 channel::Refused::Allocation => Error::Allocation,
             })?;
+        let shared = try_arc(Shared {
+            queue: sender,
+            slots: Budget::new(slots),
+            memory: budget.clone(),
+            stopped: AtomicBool::new(false),
+            _charge: charge,
+        })
+        .map_err(|_| Error::Allocation)?;
+        let mut handles = Vec::new();
+        handles
+            .try_reserve_exact(threads as usize)
+            .map_err(|_| Error::Allocation)?;
         let mut service = Self {
-            shared: Arc::new(Shared {
-                queue: sender,
-                slots: Budget::new(slots),
-                memory: budget.clone(),
-                stopped: AtomicBool::new(false),
-                _charge: charge,
-            }),
+            shared,
             queue: receiver,
-            threads: Vec::with_capacity(threads as usize),
+            threads: handles,
             config,
         };
         for _ in 0..threads {
@@ -548,7 +559,8 @@ impl Submitter {
     /// # Errors
     ///
     /// [`Refused`] with the job and its [`Reason`]: [`Reason::Full`] when each job slot is
-    /// occupied, [`Reason::Budget`] when the budget cannot charge the job and its result, and
+    /// occupied, [`Reason::Budget`] when the budget cannot charge the job and its result,
+    /// [`Reason::Allocation`] when the allocator does not give their memory, and
     /// [`Reason::Ended`] when the service stopped.
     pub fn submit<J: Job>(&self, job: J) -> Result<Waiter<J::Output>, Refused<J>> {
         match self.reserve() {
@@ -557,8 +569,8 @@ impl Submitter {
         }
     }
 
-    /// Admits one job of type `J` that comes later: it takes the job slot, the charge, and the
-    /// one-shot of the job now, so the [`Reservation::send`] of the job cannot fail. A drop of the
+    /// Admits one job of type `J` that comes later: it takes the job slot, the charge, the
+    /// one-shot, and the memory of the job now, so the [`Reservation::send`] of the job cannot fail. A drop of the
     /// reservation gives them back. It never waits.
     pub(crate) fn reserve<J: Job>(&self) -> Result<Reservation<'_, J>, Reason> {
         let shared = &*self.0;
@@ -574,6 +586,7 @@ impl Submitter {
         let (reply, waiter) = match oneshot::channel(&shared.memory) {
             Ok(pair) => pair,
             Err(channel::Refused::Budget(exhausted)) => return Err(Reason::Budget(exhausted)),
+            Err(channel::Refused::Allocation) => return Err(Reason::Allocation),
             // A one-shot refuses its budget, or a size above `u64::MAX`, which no budget has.
             Err(_) => {
                 return Err(Reason::Budget(Exhausted {
@@ -582,35 +595,41 @@ impl Submitter {
                 }));
             }
         };
+        let task = Box::try_new_uninit().map_err(|_| Reason::Allocation)?;
         Ok(Reservation {
             shared,
             reply,
             waiter,
             slot,
             memory,
+            task,
         })
     }
 }
 
 /// The admission of one job of type `J` that [`Submitter::reserve`] gave: its slot, its charge,
-/// and its one-shot.
+/// its one-shot, and its memory.
 pub(crate) struct Reservation<'a, J: Job> {
     shared: &'a Shared,
     reply: oneshot::Sender<Result<J::Output, Failed>>,
     waiter: oneshot::Receiver<Result<J::Output, Failed>>,
     slot: Permit,
     memory: Permit,
+    task: Box<MaybeUninit<Task<J>>>,
 }
 
 impl<J: Job> Reservation<'_, J> {
     /// Sends `job` to the service, and gives the waiter of its result.
     pub(crate) fn send(self, job: J) -> Waiter<J::Output> {
-        let task = Box::new(Task {
-            job,
-            reply: self.reply,
-            slot: self.slot,
-            _memory: self.memory,
-        });
+        let task = Box::write(
+            self.task,
+            Task {
+                job,
+                reply: self.reply,
+                slot: self.slot,
+                _memory: self.memory,
+            },
+        );
         // The queue has a slot for each job slot, so only the stop refuses the task. The stop came
         // after the reservation: the task drops, and its waiter gives `Failed::Ended`.
         drop(self.shared.queue.try_send_shared(task));
@@ -692,3 +711,6 @@ impl<R> fmt::Debug for Wait<'_, R> {
 fn result<R>(received: Result<Result<R, Failed>, Closed>) -> Result<R, Failed> {
     received.unwrap_or(Err(Failed::Ended))
 }
+
+#[cfg(test)]
+mod tests;

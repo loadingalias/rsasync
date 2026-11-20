@@ -374,6 +374,8 @@ fn a_frozen_prefix_keeps_its_address_and_bytes_while_the_rest_receives() {
     assert_eq!((next.as_ptr(), next.bytes()), (address.wrapping_add(7), &b"NEXT"[..]));
 }
 
+// The WebAssembly targets of the tests have no threads.
+#[cfg(not(target_family = "wasm"))]
 #[test]
 fn a_split_backing_is_released_once_after_its_last_part_in_each_order() {
     // The parts: the first lease, a view of it, the lease of a second split, and its rest.

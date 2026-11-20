@@ -54,3 +54,54 @@ pub(super) fn in_producer_order(values: &[u32]) -> bool {
         last.insert(producer, number).is_none_or(|previous| previous < number)
     })
 }
+
+/// The charge of a channel equals the bytes that its construction allocates. A charge that omits
+/// the two counts of the `Arc` and their padding fails.
+#[cfg(feature = "std")]
+#[test]
+fn each_channel_charges_each_byte_that_it_allocates() {
+    use crate::channel::{mpmc, mpsc, oneshot, spsc};
+    use crate::table::tests::allocations::bytes;
+
+    /// Makes a channel with `make`, and gives its charge and the bytes that `make` allocated.
+    fn measure<R>(budget: &Budget, make: impl FnOnce(&Budget) -> R) -> (u64, u64) {
+        let before = bytes();
+        let endpoints = make(budget);
+        let allocated = bytes() - before;
+        let charge = BOUND - budget.available();
+        drop(endpoints);
+        (charge, allocated)
+    }
+
+    let budget = budget();
+    let (charge, allocated) = measure(&budget, |budget| spsc::channel::<u64>(budget, 8).unwrap());
+    assert_eq!(charge, allocated, "spsc");
+    let (charge, allocated) = measure(&budget, |budget| mpsc::channel::<u64>(budget, 8, 3).unwrap());
+    assert_eq!(charge, allocated, "mpsc");
+    let (charge, allocated) = measure(&budget, |budget| mpmc::channel::<u64>(budget, 8, 3, 2).unwrap());
+    assert_eq!(charge, allocated, "mpmc");
+    let (charge, allocated) = measure(&budget, |budget| oneshot::channel::<u64>(budget).unwrap());
+    assert_eq!(charge, allocated, "oneshot");
+}
+
+/// Each refusal of the allocator gives `Allocation`, and keeps no charge and no memory. A channel
+/// whose last allocation aborts the process fails.
+#[cfg(feature = "std")]
+#[test]
+fn a_channel_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
+    use crate::channel::{Refused, mpmc, mpsc, oneshot, spsc};
+    use crate::table::tests::allocations::each_refusal;
+
+    let budget = budget();
+    let refusals = [
+        each_refusal(|| spsc::channel::<u64>(&budget, 8).map(drop)),
+        each_refusal(|| mpsc::channel::<u64>(&budget, 8, 3).map(drop)),
+        each_refusal(|| mpmc::channel::<u64>(&budget, 8, 3, 2).map(drop)),
+        each_refusal(|| oneshot::channel::<u64>(&budget).map(drop)),
+    ];
+    for refusals in refusals {
+        assert!(!refusals.is_empty());
+        assert!(refusals.iter().all(|refusal| *refusal == (Refused::Allocation, 0)));
+    }
+    assert_eq!(budget.available(), BOUND);
+}
