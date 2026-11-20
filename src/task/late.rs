@@ -15,6 +15,7 @@
 //! descriptors of a ring, closes at the detach.
 
 use alloc::boxed::Box;
+use core::alloc::AllocError;
 use core::marker::PhantomData;
 use core::ptr;
 
@@ -45,19 +46,27 @@ pub(super) struct Late<T> {
 }
 
 impl<T> Late<T> {
-    pub(super) fn new(value: Option<T>) -> Self {
-        Self {
-            value: AtomicPtr::new(value.map_or(ptr::null_mut(), |value| Box::into_raw(Box::new(value)))),
+    /// A cell with `value`, or `AllocError` when the allocator refuses its box.
+    pub(super) fn new(value: Option<T>) -> Result<Self, AllocError> {
+        let value = match value {
+            Some(value) => Box::into_raw(Box::try_new(value)?),
+            None => ptr::null_mut(),
+        };
+        Ok(Self {
+            value: AtomicPtr::new(value),
             state: AtomicU32::new(0),
             _value: PhantomData,
-        }
+        })
     }
 
-    /// Sets the value. Only the owner sets it, one time, before the detach.
-    pub(super) fn set(&self, value: T) {
+    /// Sets the value. Only the owner sets it, one time, before the detach. A refusal of the
+    /// allocator leaves the cell with no value.
+    pub(super) fn set(&self, value: T) -> Result<(), AllocError> {
+        let value = Box::into_raw(Box::try_new(value)?);
         // Ordering: `Release` publishes the box and the value to each read that loads it.
-        let before = self.value.swap(Box::into_raw(Box::new(value)), Ordering::Release);
+        let before = self.value.swap(value, Ordering::Release);
         assert!(before.is_null(), "an owner sets its value one time");
+        Ok(())
     }
 
     /// Calls `f` with the value, if the owner set it and did not detach the cell.

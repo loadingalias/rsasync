@@ -110,7 +110,7 @@ fn taken(table: &mut Table<Recorded>) -> Vec<Taken<Recorded>> {
 #[test]
 fn interest_that_ends_first_releases_the_buffer_and_charge_at_the_terminal_completion() {
     let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(4);
+    let mut table = Table::new(4).unwrap();
     let id = table
         .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
         .unwrap();
@@ -128,7 +128,7 @@ fn interest_that_ends_first_releases_the_buffer_and_charge_at_the_terminal_compl
 #[test]
 fn a_stale_identity_after_slot_reuse_changes_nothing() {
     let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(1);
+    let mut table = Table::new(1).unwrap();
     let old = table
         .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
         .unwrap();
@@ -164,7 +164,7 @@ fn each_cancel_result_waits_for_the_completion_of_its_target() {
     for result in [0, -EALREADY, -ENOENT] {
         for result_first in [true, false] {
             let (log, budget) = (Log::default(), budget());
-            let mut table = Table::new(1);
+            let mut table = Table::new(1).unwrap();
             let id = table
                 .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
                 .unwrap();
@@ -198,7 +198,7 @@ fn each_cancel_result_waits_for_the_completion_of_its_target() {
 #[test]
 fn a_full_table_refuses_and_returns_the_resources() {
     let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(1);
+    let mut table = Table::new(1).unwrap();
     let first = table.begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single);
     let Err(Full(second)) = table.begin(Recorded::new(&log, &budget, b"second".to_vec()), Shape::Single) else {
         panic!("a full table accepts no operation");
@@ -207,7 +207,10 @@ fn a_full_table_refuses_and_returns_the_resources() {
     assert!(log.take().is_empty());
     drop((first, second));
 
-    let Err(Full(resources)) = Table::new(0).begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single) else {
+    let Err(Full(resources)) = Table::new(0)
+        .unwrap()
+        .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
+    else {
         panic!("a table with no slot accepts no operation");
     };
     drop(resources);
@@ -219,7 +222,7 @@ fn a_full_table_refuses_and_returns_the_resources() {
 #[test]
 fn each_shape_releases_its_resources_once_at_its_terminal_event() {
     let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(1);
+    let mut table = Table::new(1).unwrap();
     let begin =
         |table: &mut Table<Recorded>, shape| table.begin(Recorded::new(&log, &budget, Vec::new()), shape).unwrap();
 
@@ -284,7 +287,7 @@ fn each_shape_releases_its_resources_once_at_its_terminal_event() {
 #[test]
 fn a_dropped_table_leaks_the_resources_that_the_kernel_can_still_use() {
     let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(3);
+    let mut table = Table::new(3).unwrap();
     let mut begin = |shape| table.begin(Recorded::new(&log, &budget, Vec::new()), shape).unwrap();
     let _running = begin(Shape::Single);
     let sending = begin(Shape::ZeroCopy);
@@ -324,7 +327,7 @@ pub(crate) mod allocations {
 
     /// The most runs of [`each_refusal`]: more than the allocations of each operation that a test
     /// gives it.
-    const RUNS: u64 = 16;
+    const RUNS: u64 = 64;
 
     #[expect(
         unsafe_code,
@@ -366,7 +369,7 @@ pub(crate) mod allocations {
 
     /// Runs `make` until a run fails no allocation. Run `n` refuses allocation `n` of this thread,
     /// counted from 0, and each later one. Gives the error of each run that failed, and the bytes
-    /// that the run kept.
+    /// that the run kept. The value of the last run drops after the refusals end.
     pub(crate) fn each_refusal<T, E>(mut make: impl FnMut() -> Result<T, E>) -> Vec<(E, isize)> {
         let mut refusals = Vec::new();
         for n in 0..RUNS {
@@ -386,7 +389,7 @@ pub(crate) mod allocations {
     #[test]
     fn posting_a_request_never_allocates() {
         let (log, budget) = (Log::default(), budget());
-        let mut table = Table::new(2);
+        let mut table = Table::new(2).unwrap();
         let _other = table
             .begin(Recorded::new(&log, &budget, Vec::new()), Shape::Single)
             .unwrap();

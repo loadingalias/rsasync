@@ -556,7 +556,8 @@ fn the_owner_parks_at_most_until_the_deadline_and_the_coarsening_of_the_next_tim
         thread,
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
         None,
-    );
+    )
+    .unwrap();
     let local = Rc::new(super::owner::Local::new(&budget, 1, home, 0).unwrap());
     local.use_timers(timers, clock).unwrap();
     let waiting = Rc::new(Cell::new(None));

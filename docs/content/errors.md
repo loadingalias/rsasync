@@ -12,6 +12,14 @@ its recovery. rsasync is in development, and these errors are not in a published
   and the value in `TrySendError` and `SendError`.
 - `Error::source` gives the cause of an error that has one: `capacity::Exhausted` for a budget
   refusal, and the `io::Error` for a failure of the system.
+- No allocation of runtime state aborts the process. Each operation that allocates a table, queue,
+  slot, shared state, task, registration, or handle that rsasync keeps can refuse, and a refusal of
+  the allocator is one of its refusals: `Allocation`, or `io::ErrorKind::OutOfMemory` for a driver.
+  Your own values allocate as the standard library does, and abort there as in `std`: `Budget::new`,
+  `InjectedClock::new`, `Lease::from`, `Lease::from_owner`, the first split of a heap backing, the
+  batch containers, a path, and a report or list that an operation gives back. The standard library
+  can also abort in its own allocations: when it starts a thread of a runtime or of a blocking
+  service, and, on macOS, at the first lock of a `std::sync::Mutex`.
 - A refusal of `rsasync::task` and its text need no allocation, so a report completes when the
   allocator refuses each request.
 - The `Debug` form of each error of `rsasync::task`, `rsasync::channel`, and `rsasync::blocking`,
@@ -106,6 +114,7 @@ The errors of `rsasync::timer`, `rsasync::clock`, and `rsasync::time` (see [Time
 | `timer::Invalid::Resolution` | The resolution is 0, or longer than `u64::MAX` nanoseconds | Give a resolution in that range |
 | `timer::Invalid::Capacity` | The memory of the capacity is larger than the address space | Give a smaller capacity |
 | `timer::Invalid::Exhausted(Exhausted)` | The budget has less free capacity than `Timers::memory` | Give a larger budget or a smaller capacity |
+| `timer::Invalid::Allocation` | The allocator did not give the memory of the timers | Give a smaller capacity, or make the storage when memory is free |
 | `timer::Refused::Full` | Each place of the storage holds a timer | Insert after a timer expires or is cancelled |
 | `timer::Refused::Range` | The deadline is after `Timers::latest` | Give an earlier deadline, or a storage with a longer range |
 | `timer::Refused::Closed` | The storage is closed | Terminal: stop the inserts |
@@ -125,7 +134,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | --- | --- | --- |
 | `Error::Refused(io::Error)` | The kernel or its policy refuses io_uring (`EPERM` or `ENOSYS`), and `Config::backend` requires `Backend::IoUring`. On Windows, the IoRing probe refuses the ring, and `Config::backend` requires `Backend::IoRing`: the error is the `HRESULT` of the step that refused it ([IoRing files](iocp.md#ioring-files)). `Config::backend` requires a backend that the target does not have: on Linux one other than `Backend::IoUring` and `Backend::Epoll`, on macOS one other than `Backend::Kqueue`, and on Windows one other than `Backend::IoRing` and `Backend::Iocp`. The error then has the kind `Unsupported` | Allow io_uring for the process, for example in the seccomp profile of the container or in `kernel.io_uring_disabled`, or remove the requirement: the driver then runs [epoll](epoll.md). On Windows, remove the requirement of `Backend::IoRing`: the driver then runs its files on the port. Require a backend of the target, or no backend |
 | `Error::Config` | A limit of `Config` is 0 or above what the kernel takes | Give each limit a value in its range |
-| `Error::System(io::Error)` | Another failure of the system | Read the `io::Error` |
+| `Error::System(io::Error)` | Another failure of the system. The kind `OutOfMemory` means that the allocator did not give the tables of the driver | Read the `io::Error`. For `OutOfMemory`, give smaller limits, or start the driver when memory is free |
 | `Error::Unsupported(Features)` | The kernel has no feature of these, which `Config::require` required | Run on a kernel with each feature, or remove the requirement and use the route that `Driver::report` gives |
 | `Refused` with `Reason::Operations` | Each operation slot is in use | Turn the driver until an operation ends, then submit again |
 | `Refused` with `Reason::Queue` | The submission queue is full | Turn the driver, then submit again |
@@ -141,6 +150,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `SignalError::Fault`, `Uncatchable`, `Invalid` | No stream can take the signal | Use another signal |
 | `SignalError::Full` | Each of the 64 streams of the process is in use | Close a stream, then try again |
 | `SignalError::Escalation` | An `Escalation::At` on a signal whose default action does not end the process | Register the signal with `Escalation::Never` |
+| `SignalError::Allocation` | The allocator did not give the memory of the stream | Register the stream when memory is free |
 | `Incomplete` | An exact read ended before the end of its buffer | Continue at the offset of the read plus `Incomplete::read` |
 | `WriteFailed` | A send whose future dropped failed, so the framing of the stream is unknown | Close the stream. `WriteFailed::of` finds it in the `io::Error` of a send, and `WriteFailed::sent` gives the `SendCount` of the dropped sends (see [A failed write direction](tcp.md#a-failed-write-direction)) |
 
@@ -154,5 +164,6 @@ The errors of `rsasync::capacity` and `rsasync::acquire` (see [Capacity](capacit
 | `NotCharged` | A refund is larger than the units that the credit charged | Correct the refund: it is a defect of the caller |
 | `acquire::Refused::TooManyPlaces` | `acquire::budget` got more than `acquire::MAX_PLACES` waiter places | Give fewer places |
 | `acquire::Refused::Memory(Exhausted)` | The memory budget cannot charge the waiter places | Give a larger memory budget or fewer places |
+| `acquire::Refused::Allocation` | The allocator did not give the memory of the waiter places | Give fewer places, or make the budget when memory is free |
 | `TooManyWaiters` | Each waiter place of the budget is in use | Clone after an acquirer drops |
 | `AboveBound` | A wait asks for more units than the bound of the budget | Ask for at most the bound: no release can make such a wait end |

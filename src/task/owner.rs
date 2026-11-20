@@ -28,6 +28,7 @@ use crate::capacity::{Budget, Permit};
 use crate::channel::oneshot;
 use crate::clock::NativeClock;
 use crate::coop;
+use crate::memory::{items, room};
 use crate::sync::{
     Arc, arc_size,
     atomic::{AtomicU32, AtomicU64},
@@ -189,16 +190,6 @@ impl Park for Thread {
     }
 }
 
-/// Makes `count` items with `make`, or refuses if the allocator does not give the memory.
-fn items<X>(count: u32, make: impl Fn(u32) -> X) -> Result<Box<[X]>, Refused> {
-    let mut items = Vec::new();
-    items
-        .try_reserve_exact(count as usize)
-        .map_err(|_| Refused::Allocation)?;
-    items.extend((0..count).map(make));
-    Ok(items.into_boxed_slice())
-}
-
 /// The charge of the identity of a task: the reference of its waker, in its `Arc`.
 const IDENTITY: usize = arc_size::<TaskRef>();
 
@@ -278,6 +269,8 @@ pub(super) struct Local {
     live: Cell<u32>,
     /// The end of `block_on` refuses new spawns.
     closed: Cell<bool>,
+    /// The waker of the root future of each `block_on`, which `new` makes once.
+    root: Waker,
     /// The poll budget of each poll of a task or of the root (`crate::coop`).
     pub(super) poll_budget: Cell<u32>,
     /// The timer storage of the owner and the clock of its domain, from `use_timers`.
@@ -302,7 +295,7 @@ impl Local {
             size_of::<AtomicU64>() + size_of::<AtomicU32>() + size_of::<Cell<Option<Entry>>>() + 2 * size_of::<u32>();
         let size = slot_size
             .checked_mul(slots as usize)
-            .and_then(|size| size.checked_add(arc_size::<Shared>() + arc_size::<Self>()))
+            .and_then(|size| size.checked_add(arc_size::<Shared>() + arc_size::<Self>() + arc_size::<RootRef>()))
             .and_then(|size| size.checked_add(outbox * size_of::<usize>()))
             .and_then(|size| u64::try_from(size).ok())
             .ok_or(Refused::TooLarge)?;
@@ -312,24 +305,17 @@ impl Local {
         let shared_charge = charge
             .split(shared as u64)
             .expect("the charge of the owner holds its shared part");
-        let words = items(slots, |_| AtomicU64::new(0))?;
-        let next = items(slots, |_| AtomicU32::new(0))?;
-        let entries = items(slots, |_| Cell::new(None))?;
-        let mut free = Vec::new();
-        free.try_reserve_exact(slots as usize)
-            .map_err(|_| Refused::Allocation)?;
+        let refused = |_| Refused::Allocation;
+        let words = items(slots, |_| AtomicU64::new(0)).map_err(refused)?;
+        let next = items(slots, |_| AtomicU32::new(0)).map_err(refused)?;
+        let entries = items(slots, |_| Cell::new(None)).map_err(refused)?;
+        let mut free = room(slots as usize).map_err(refused)?;
         free.extend((0..slots).rev());
-        let mut queue = VecDeque::new();
-        queue
-            .try_reserve_exact(slots as usize)
-            .map_err(|_| Refused::Allocation)?;
+        let queue = VecDeque::from(room(slots as usize).map_err(refused)?);
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let outbox = {
-            let mut homes = Vec::new();
-            homes.try_reserve_exact(outbox).map_err(|_| Refused::Allocation)?;
-            RefCell::new(homes)
-        };
-        let shared = try_arc(Shared::new(words, next, home, shared_charge)).map_err(|_| Refused::Allocation)?;
+        let outbox = RefCell::new(room(outbox).map_err(refused)?);
+        let shared = try_arc(Shared::new(words, next, home, shared_charge)).map_err(refused)?;
+        let root = alloc::sync::Arc::try_new(RootRef(Arc::clone(&shared))).map_err(refused)?;
         Ok(Self {
             shared,
             budget: budget.clone(),
@@ -350,6 +336,7 @@ impl Local {
             generator: RefCell::new(None),
             live: Cell::new(0),
             closed: Cell::new(false),
+            root: Waker::from(root),
             poll_budget: Cell::new(super::DEFAULT_POLL_BUDGET.get()),
             timers: RefCell::new(None),
             waiting: List::new(),
@@ -619,8 +606,7 @@ impl Local {
     /// ends the loop.
     pub(super) fn block_on<F: Future, P: Park>(&self, root: F, home: &mut P) -> Result<F::Output, P::Error> {
         let mut root = pin!(root);
-        let waker = Waker::from(alloc::sync::Arc::new(RootRef(Arc::clone(&self.shared))));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(&self.root);
         let mut poll_root = true;
         let output = loop {
             if poll_root || self.shared.take_root() {

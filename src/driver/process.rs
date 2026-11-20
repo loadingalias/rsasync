@@ -40,6 +40,8 @@ use super::{
     Refused, Route, Signal, Tag,
 };
 use crate::blocking::{Failed, Job};
+use crate::driver::out_of_memory;
+use crate::memory::{items, room};
 use crate::sync::Arc;
 use crate::table::OpId;
 use crate::uring::Sqe;
@@ -419,12 +421,12 @@ impl Children {
     ///
     /// # Errors
     ///
-    /// The error of `timerfd_create` on Linux.
+    /// The error of `timerfd_create` on Linux, and `OutOfMemory` when the allocator refuses.
     pub(super) fn new(children: u32) -> io::Result<Self> {
         Ok(Self {
-            slots: (0..children).map(|_| Slot::default()).collect(),
+            slots: items(children, |_| Slot::default()).map_err(out_of_memory)?,
             descriptors: None,
-            again: Vec::with_capacity(children as usize),
+            again: room(children as usize).map_err(out_of_memory)?,
             kept: 0,
             ending: false,
             #[cfg(target_os = "linux")]

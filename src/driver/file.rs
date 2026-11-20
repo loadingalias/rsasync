@@ -13,6 +13,7 @@
 pub(super) mod windows;
 
 use alloc::vec::Vec;
+use core::alloc::AllocError;
 #[cfg(unix)]
 use core::ffi::{c_int, c_void};
 use core::fmt;
@@ -957,6 +958,13 @@ pub enum NvmePath {
 /// The waker of the jobs of the blocking service: it wakes the driver, also in a wait.
 struct JobWaker(super::WakeHandle);
 
+/// The waker of the jobs of the driver whose shared state is `shared`. The driver makes it with
+/// its other state, so [`Driver::use_blocking`] allocates nothing.
+pub(super) fn job_waker(shared: &Arc<super::Shared>) -> Result<core::task::Waker, AllocError> {
+    let waker = alloc::sync::Arc::try_new(JobWaker(super::WakeHandle(Arc::clone(shared))))?;
+    Ok(core::task::Waker::from(waker))
+}
+
 impl alloc::task::Wake for JobWaker {
     fn wake(self: alloc::sync::Arc<Self>) {
         self.0.wake();
@@ -972,8 +980,7 @@ impl Driver {
     /// has no ring operation for ([`Route::BlockingService`]). The driver keeps the submitter, and
     /// each such operation is one job of the service.
     pub fn use_blocking(&mut self, submitter: Submitter) {
-        let waker = core::task::Waker::from(alloc::sync::Arc::new(JobWaker(self.wake_handle())));
-        self.blocking = Some((submitter, waker));
+        self.blocking = Some((submitter, self.job_waker.clone()));
     }
 
     /// Opens the file at `path` with `options` (`IORING_OP_OPENAT`). The descriptor closes on

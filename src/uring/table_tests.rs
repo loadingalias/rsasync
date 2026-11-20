@@ -28,7 +28,7 @@ impl Driver {
     fn new(slots: u32) -> Self {
         Self {
             ring: Ring::new(8, 16).expect("the test host allows io_uring"),
-            table: Table::new(slots),
+            table: Table::new(slots).expect("the allocator gives the table"),
             log: Log::default(),
         }
     }

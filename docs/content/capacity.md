@@ -84,8 +84,9 @@ with `TooManyWaiters` when each place is in use. A drop of an acquirer frees its
 - Places: from 1 to `acquire::MAX_PLACES` (2^16). `acquire::budget` refuses more with
   `Refused::TooManyPlaces`.
 - Memory: `acquire::budget` charges `acquire::memory(places)` bytes to `memory` before it allocates,
-  or refuses with `Refused::Memory` and the `Exhausted` value. The charge ends when the budget and
-  each acquirer have dropped.
+  or refuses with `Refused::Memory` and the `Exhausted` value. When the allocator refuses, it
+  refuses with `Refused::Allocation` and keeps no charge. The charge ends when the budget and each
+  acquirer have dropped.
 - Order:
   1. The waiters get units first in, first out, in the order in which their waits started. Only
      the first waiter takes units. When units return, the budget wakes the first waiter. When the
@@ -145,7 +146,8 @@ module documentation of `rsasync::acquire` has an example that polls the future 
 ### Get a call when units return
 
 `Budget::with_listener(bound, listener)` makes a budget that calls `listener.released()` after units
-return to it. `acquire::budget` uses it. Use it directly only for a waiting mechanism of your own:
+return to it, or gives `AllocError` when the allocator refuses its memory. `acquire::budget` uses
+it. Use it directly only for a waiting mechanism of your own:
 
 - The budget calls it on the thread that gives the units back, in the drop of a permit or a credit,
   or in a refund of a credit. The units are free when it runs.

@@ -61,6 +61,7 @@
 //! So the free list of the owner always has a slot for each reservation.
 
 use alloc::boxed::Box;
+use core::alloc::AllocError;
 use core::cell::Cell;
 
 use crate::capacity::Permit;
@@ -101,18 +102,19 @@ pub(super) struct Home {
 }
 
 impl Home {
-    /// The home of an owner on `thread`, which waits in `ring` if it has one.
+    /// The home of an owner on `thread`, which waits in `ring` if it has one, or `AllocError` when
+    /// the allocator refuses its memory.
     pub(super) fn new(
         thread: thread::Thread,
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))] ring: Option<
             Arc<driver::Home>,
         >,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AllocError> {
+        Ok(Self {
             thread,
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            ring: Late::new(ring),
-        }
+            ring: Late::new(ring)?,
+        })
     }
 }
 
@@ -180,8 +182,8 @@ impl Shared {
         not(all(test, not(loom))),
         expect(dead_code, reason = "the local I/O types of R307 build on it")
     )]
-    pub(super) fn set_ring(&self, home: Arc<driver::Home>) {
-        self.home.ring.set(home);
+    pub(super) fn set_ring(&self, home: Arc<driver::Home>) -> Result<(), AllocError> {
+        self.home.ring.set(home)
     }
 
     /// Detaches the ring of the home when its owner ends: each later wake does nothing, and the

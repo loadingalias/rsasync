@@ -10,7 +10,7 @@ fn a_posted_request_reaches_its_operation_and_never_the_next_one_of_its_slot() {
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(3);
     model.check(|| {
-        let mut table = Table::new(1);
+        let mut table = Table::new(1).unwrap();
         let first = table.begin(1_u8, Shape::Single).expect("one free slot");
         let requests = table.requests();
         let early = loom::thread::spawn(move || requests.post(first, Request::Cancel));

@@ -292,3 +292,19 @@ fn fill_wake(driver: &Driver) {
     }
     panic!("the wake descriptor took each write");
 }
+
+/// A refusal of the allocator gives `Allocation`, keeps no memory, and changes no registration, so
+/// the next stream of the signal starts. A stream whose allocation aborts the process fails.
+#[test]
+fn a_stream_that_the_allocator_refuses_changes_no_registration() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let mut driver = Driver::new(Config::new()).unwrap();
+    // On macOS, the standard library allocates the lock of the registry at its first use, so a
+    // first stream takes it before the allocator refuses.
+    drop(stream(&mut driver, Signal::TERMINATE));
+    let refusals = each_refusal(|| driver.signal(Signal::TERMINATE, Escalation::Never).map(drop));
+    assert!(!refusals.is_empty());
+    assert!(refusals.iter().all(|refusal| *refusal == (SignalError::Allocation, 0)));
+    driver.teardown().unwrap();
+}

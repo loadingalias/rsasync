@@ -159,6 +159,7 @@ Each refusal changes nothing.
 | `Timers::new` | `Invalid::Resolution` | The resolution is zero, or longer than `u64::MAX` nanoseconds |
 | `Timers::new` | `Invalid::Capacity` | The memory of the capacity is larger than the address space of the target |
 | `Timers::new` | `Invalid::Exhausted` | The budget has less free capacity than `Timers::memory(capacity)` |
+| `Timers::new` | `Invalid::Allocation` | The allocator did not give the memory of the timers |
 | `Timers::insert` | `Refused::Full` | Each place of the storage holds a timer |
 | `Timers::insert` | `Refused::Range` | The deadline is after `Timers::latest()` |
 | `Timers::insert` | `Refused::Closed` | The storage is closed |

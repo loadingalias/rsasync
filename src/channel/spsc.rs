@@ -99,10 +99,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use super::{Aborted, Closed, Refused, ReserveError, SendError, TryRecvError, TrySendError};
 use crate::capacity::{Budget, Permit};
+use crate::memory::items;
 #[cfg(feature = "std")]
 use crate::sync::thread;
 use crate::sync::{
@@ -284,15 +284,11 @@ pub fn channel<T>(budget: &Budget, capacity: u32) -> Result<(Sender<T>, Receiver
         .ok_or(Refused::TooLarge)?;
     let charge = budget.reserve(charge).map_err(Refused::Budget)?;
 
-    let mut slots = Vec::new();
-    slots
-        .try_reserve_exact(capacity as usize)
-        .map_err(|_| Refused::Allocation)?;
-    slots.extend((0..capacity).map(|_| UnsafeCell::new(MaybeUninit::uninit())));
+    let slots = items(capacity, |_| UnsafeCell::new(MaybeUninit::uninit())).map_err(|_| Refused::Allocation)?;
     let shared = try_arc(Shared {
         written: End::new(),
         read: End::new(),
-        slots: slots.into_boxed_slice(),
+        slots,
         capacity,
         _charge: charge,
     })

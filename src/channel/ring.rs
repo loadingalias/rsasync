@@ -16,9 +16,9 @@
 //!   after that swap reads it, so the close happens before its recheck.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use super::Refused;
+use crate::memory::items;
 use crate::sync::atomic::{AtomicU32, Ordering};
 use crate::wait::Waiter;
 
@@ -98,16 +98,6 @@ impl Ring {
 #[repr(align(128))]
 pub(super) struct Line<T>(pub(super) T);
 
-/// Makes `count` items with `make`, or refuses if the allocator does not give the memory.
-pub(super) fn items<X>(count: u32, make: impl Fn(u32) -> X) -> Result<Box<[X]>, Refused> {
-    let mut items = Vec::new();
-    items
-        .try_reserve_exact(count as usize)
-        .map_err(|_| Refused::Allocation)?;
-    items.extend((0..count).map(make));
-    Ok(items.into_boxed_slice())
-}
-
 /// The word and the bit of a place in a bitset.
 fn place_bit(place: u32) -> (usize, u32) {
     ((place / BITS) as usize, 1 << (place % BITS))
@@ -158,11 +148,12 @@ impl Places {
                 0
             };
             AtomicU32::new(unused | u32::from(index == 0))
-        })?;
+        });
+        let refused = |_| Refused::Allocation;
         Ok(Self {
-            waiters: items(count, |_| Waiter::new())?,
-            used,
-            waiting: items(words, |_| AtomicU32::new(0))?,
+            waiters: items(count, |_| Waiter::new()).map_err(refused)?,
+            used: used.map_err(refused)?,
+            waiting: items(words, |_| AtomicU32::new(0)).map_err(refused)?,
             live: AtomicU32::new(1),
             waits: AtomicU32::new(0),
             next: AtomicU32::new(0),

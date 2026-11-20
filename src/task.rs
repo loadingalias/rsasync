@@ -239,7 +239,8 @@ impl LocalOwner {
             crate::sync::thread::current(),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             None,
-        );
+        )
+        .map_err(|_| Refused::Allocation)?;
         let local = Local::new(budget, slots, home, 0)?;
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,

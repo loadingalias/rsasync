@@ -58,6 +58,7 @@ pub mod channel;
 mod completion;
 // The poll budget of the runtime leaves.
 mod coop;
+mod memory;
 mod sync;
 #[cfg_attr(
     not(all(

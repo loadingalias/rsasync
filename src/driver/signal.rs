@@ -38,7 +38,7 @@ use core::task::{Context, Poll};
 use std::sync::{Mutex, PoisonError};
 
 use super::{Ended, Shared};
-use crate::sync::{Arc, atomic::AtomicBool, hint};
+use crate::sync::{Arc, atomic::AtomicBool, hint, try_arc};
 use crate::wait::Waiter;
 
 /// The signals 1 to 64 of Linux, or 1 to 31 of macOS, and an unused 0.
@@ -184,6 +184,8 @@ pub enum SignalError {
     /// not end the process: `SIGCHLD`, `SIGCONT`, `SIGURG`, `SIGWINCH`, the stop signals
     /// `SIGTSTP`, `SIGTTIN`, and `SIGTTOU`, and `SIGIO` and `SIGINFO` on macOS.
     Escalation,
+    /// The allocator did not give the memory of the stream.
+    Allocation,
 }
 
 impl fmt::Display for SignalError {
@@ -194,6 +196,7 @@ impl fmt::Display for SignalError {
             Self::Invalid => "the number is not a signal that a handler can take",
             Self::Full => "each signal stream of the process is in use",
             Self::Escalation => "the default action of this signal does not end the process",
+            Self::Allocation => "the allocator did not give the memory of the stream",
         })
     }
 }
@@ -249,6 +252,14 @@ pub(super) fn register(
     if !(1..SIGNALS).contains(&usize::try_from(number).unwrap_or(0)) {
         return Err(SignalError::Invalid);
     }
+    // The home comes first, so a refusal of the allocator changes no registration.
+    let home = try_arc(Home {
+        signal: number,
+        woken: AtomicU64::new(0),
+        waiter: Waiter::new(),
+        ended: AtomicBool::new(false),
+    })
+    .map_err(|_| SignalError::Allocation)?;
     let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
     let slot = SLOTS
         .iter()
@@ -270,12 +281,8 @@ pub(super) fn register(
     // Ordering: the handler reads the descriptors after it reads the signal.
     entry.signal.store(number, Ordering::SeqCst);
     registry.escalate(number);
-    let home = Arc::new(Home {
-        signal: number,
-        woken: AtomicU64::new(count),
-        waiter: Waiter::new(),
-        ended: AtomicBool::new(false),
-    });
+    // Ordering: `Relaxed`: only this thread has the home until the return.
+    home.woken.store(count, Ordering::Relaxed);
     let stream = SignalStream {
         home: Arc::clone(&home),
         slot,

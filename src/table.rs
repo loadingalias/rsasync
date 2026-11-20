@@ -34,10 +34,12 @@ mod explore;
 pub(crate) mod tests;
 
 use alloc::boxed::Box;
+use core::alloc::AllocError;
 use core::mem::{self, ManuallyDrop};
 
-use crate::sync::Arc;
+use crate::memory::items;
 use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::sync::{Arc, try_arc};
 
 /// The largest number of slots: a slot index has 30 bits of the user data.
 pub(crate) const MAX_SLOTS: u32 = 1 << 30;
@@ -215,32 +217,30 @@ pub(crate) struct Table<T> {
 }
 
 impl<T> Table<T> {
-    /// A table of `slots` operations. It allocates here, one time.
+    /// A table of `slots` operations. It allocates here, one time, or refuses when the allocator
+    /// refuses.
     ///
     /// # Panics
     ///
     /// If `slots` is above [`MAX_SLOTS`].
-    pub(crate) fn new(slots: u32) -> Self {
+    pub(crate) fn new(slots: u32) -> Result<Self, AllocError> {
         assert!(slots <= MAX_SLOTS, "an operation table has at most 2^30 slots");
-        Self {
-            slots: (0..slots)
-                .map(|index| Slot {
-                    generation: 0,
-                    next_free: if index + 1 < slots { index + 1 } else { NIL },
-                    state: State::Free,
-                })
-                .collect(),
+        let entries = items(slots, |_| Entry {
+            word: AtomicU64::new(0),
+            next: AtomicU32::new(NIL),
+        })?;
+        Ok(Self {
+            slots: items(slots, |index| Slot {
+                generation: 0,
+                next_free: if index + 1 < slots { index + 1 } else { NIL },
+                state: State::Free,
+            })?,
             free: if slots > 0 { 0 } else { NIL },
-            requests: Requests(Arc::new(Shared {
-                entries: (0..slots)
-                    .map(|_| Entry {
-                        word: AtomicU64::new(0),
-                        next: AtomicU32::new(NIL),
-                    })
-                    .collect(),
+            requests: Requests(try_arc(Shared {
+                entries,
                 head: AtomicU32::new(NIL),
-            })),
-        }
+            })?),
+        })
     }
 
     /// The handle that posts requests to this table from any thread.

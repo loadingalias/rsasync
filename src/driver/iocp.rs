@@ -95,6 +95,8 @@ use rsnetwork_udp::{AF_INET, AF_INET6, SaFamily, SockAddrStorage};
 use sys::{Overlapped, OverlappedEntry};
 
 use crate::blocking::Waiter;
+use crate::driver::{filled, out_of_memory};
+use crate::memory::{items, room};
 use crate::uring::sys as ring;
 use crate::uring::{Cqe, Group, Sqe};
 
@@ -405,32 +407,35 @@ impl Port {
         // SAFETY: the call gave a new handle that nothing else owns.
         let port = unsafe { OwnedHandle::from_raw_handle(port) };
         let completions = completions.max(entries);
+        let mut free = room(completions as usize).map_err(out_of_memory)?;
+        free.extend((0..completions).rev());
+        let shared = Arc::try_new(Shared {
+            port,
+            posted: AtomicBool::new(false),
+        })
+        .map_err(out_of_memory)?;
         Ok(Self {
-            shared: Arc::new(Shared {
-                port,
-                posted: AtomicBool::new(false),
-            }),
+            shared,
             ring: None,
             draining: false,
-            later: Vec::new(),
-            queue: VecDeque::with_capacity(entries as usize),
+            // Each slot waits at most once in a drain of the ring of the files.
+            later: room(completions as usize).map_err(out_of_memory)?,
+            queue: VecDeque::from(room(entries as usize).map_err(out_of_memory)?),
             entries,
-            overlapped: (0..completions).map(|_| UnsafeCell::new(idle())).collect(),
-            slots: (0..completions).map(|_| None).collect(),
-            free: (0..completions).rev().collect(),
-            completions: VecDeque::with_capacity((completions + jobs) as usize),
+            overlapped: items(completions, |_| UnsafeCell::new(idle())).map_err(out_of_memory)?,
+            slots: filled(completions as usize, || None).map_err(out_of_memory)?,
+            free,
+            completions: VecDeque::from(room((completions + jobs) as usize).map_err(out_of_memory)?),
             group: None,
-            events: alloc::vec![
-                OverlappedEntry {
-                    key: 0,
-                    overlapped: ptr::null_mut(),
-                    internal: 0,
-                    bytes: 0,
-                };
-                EVENTS
-            ],
+            events: filled(EVENTS, || OverlappedEntry {
+                key: 0,
+                overlapped: ptr::null_mut(),
+                internal: 0,
+                bytes: 0,
+            })
+            .map_err(out_of_memory)?,
             full: false,
-            jobs: Vec::with_capacity(jobs as usize),
+            jobs: room(jobs as usize).map_err(out_of_memory)?,
             waker: None,
             #[cfg(test)]
             held: false,
@@ -442,8 +447,6 @@ impl Port {
     pub(crate) fn start_ring(&mut self) -> Result<(), i32> {
         let slots = u32::try_from(self.slots.len()).unwrap_or(u32::MAX);
         self.ring = Some(io_ring::Ring::new(self.shared.handle(), slots, RING)?);
-        // Each slot waits at most once in a drain.
-        self.later = Vec::with_capacity(self.slots.len());
         Ok(())
     }
 

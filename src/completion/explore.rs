@@ -8,7 +8,7 @@ use crate::table::{OpId, Shape, Table};
 
 /// An operation of a table with one slot.
 fn operation() -> OpId {
-    Table::new(1).begin((), Shape::Single).expect("one free slot")
+    Table::new(1).unwrap().begin((), Shape::Single).expect("one free slot")
 }
 
 /// Unparks a loom thread.

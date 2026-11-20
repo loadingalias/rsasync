@@ -25,6 +25,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, 
 
 use super::sys::{F_SETFD, FD_CLOEXEC, fcntl};
 use super::{ELAPSED, EXITED, POLLIN, POLLOUT, WAKE};
+use crate::driver::out_of_memory;
 
 /// The kqueue of a poller. A clone refers to the same kqueue.
 #[derive(Debug, Clone)]
@@ -50,7 +51,7 @@ impl Selector {
         if unsafe { fcntl(fd.as_raw_fd(), F_SETFD, FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let selector = Self(Rc::new(fd));
+        let selector = Self(Rc::try_new(fd).map_err(out_of_memory)?);
         change(&selector.0, registration(wake.as_raw_fd(), EVFILT_READ, EV_ADD, WAKE))?;
         Ok(selector)
     }

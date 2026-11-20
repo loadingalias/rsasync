@@ -103,6 +103,7 @@ signal that comes during a turn gives its report at that turn or wakes the next 
 | `SignalError::Invalid` | The number is not a signal of 1 to 64 on Linux or of 1 to 31 on macOS, or the C library keeps the signal for itself, such as 32 on Linux |
 | `SignalError::Full` | The process has 64 signal streams, of all signals and drivers |
 | `SignalError::Escalation` | The registration states `Escalation::At`, and the default action of the signal does not end the process: `SIGCHLD`, `SIGCONT`, `SIGURG`, and `SIGWINCH`, the stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU`, and `SIGIO` and `SIGINFO` on macOS |
+| `SignalError::Allocation` | The allocator did not give the memory of the stream |
 
 `Signal` names the common signals, such as `Signal::TERMINATE` and `Signal::HANGUP`. Some numbers
 differ between the systems, so each constant gives the number of the target: `Signal::USER1` is 10

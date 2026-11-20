@@ -46,6 +46,8 @@ use rsnetwork_udp::sys::MmsgHdr;
 use rsnetwork_udp::sys::{IoVec, MSG_DONTWAIT, MsgHdr};
 
 use crate::blocking::Waiter;
+use crate::driver::{filled, out_of_memory};
+use crate::memory::room;
 use crate::uring::sys as ring;
 use crate::uring::{Cqe, Group, Sqe};
 
@@ -230,27 +232,27 @@ impl Poller {
             .ok_or(io::ErrorKind::InvalidInput)?;
         let selector = Selector::new(wake)?;
         let completions = completions.max(entries);
+        let mut free = room(completions as usize).map_err(out_of_memory)?;
+        free.extend((0..completions).rev());
         Ok(Self {
             selector,
-            queue: VecDeque::with_capacity(entries as usize),
+            queue: VecDeque::from(room(entries as usize).map_err(out_of_memory)?),
             entries,
-            slots: alloc::vec![None; completions as usize],
-            free: (0..completions).rev().collect(),
-            completions: VecDeque::with_capacity((completions + jobs) as usize),
+            slots: filled(completions as usize, || None).map_err(out_of_memory)?,
+            free,
+            completions: VecDeque::from(room((completions + jobs) as usize).map_err(out_of_memory)?),
             // No generation of a slot is `u32::MAX`, so the first use of each slot starts it ready.
-            readiness: alloc::vec![
-                Readiness {
-                    generation: u32::MAX,
-                    ..Readiness::default()
-                };
-                resources as usize
-            ],
+            readiness: filled(resources as usize, || Readiness {
+                generation: u32::MAX,
+                ..Readiness::default()
+            })
+            .map_err(out_of_memory)?,
             group: None,
-            batch: Vec::with_capacity(entries as usize),
-            chain: Vec::with_capacity(entries as usize),
-            jobs: Vec::with_capacity(jobs as usize),
+            batch: room(entries as usize).map_err(out_of_memory)?,
+            chain: room(entries as usize).map_err(out_of_memory)?,
+            jobs: room(jobs as usize).map_err(out_of_memory)?,
             waker: None,
-            events: alloc::vec![Event::default(); EVENTS],
+            events: filled(EVENTS, Event::default).map_err(out_of_memory)?,
             full: false,
         })
     }

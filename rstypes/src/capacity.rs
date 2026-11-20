@@ -50,11 +50,12 @@
 //! # Ok::<(), Exhausted>(())
 //! ```
 
+use core::alloc::AllocError;
 use core::fmt;
 use core::num::NonZeroU64;
 
-use crate::sync::Arc;
 use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Arc, try_arc};
 
 /// A caller-owned budget of capacity units. Each clone shares the same units.
 ///
@@ -72,6 +73,16 @@ struct Inner {
     /// The listener of the releases. Its count is a standard `Arc`, because the loom `Arc` cannot
     /// hold a trait object. That count only drops the listener.
     listener: Option<alloc::sync::Arc<dyn ReleaseListener>>,
+}
+
+impl Inner {
+    fn new(bound: NonZeroU64, listener: Option<alloc::sync::Arc<dyn ReleaseListener>>) -> Self {
+        Self {
+            bound: bound.get(),
+            available: AtomicU64::new(bound.get()),
+            listener,
+        }
+    }
 }
 
 /// Code that a budget calls after units return to it.
@@ -110,23 +121,21 @@ impl core::error::Error for Exhausted {}
 impl Budget {
     /// Makes a budget of `bound` units, all of them free.
     pub fn new(bound: NonZeroU64) -> Self {
-        Self::make(bound, None)
+        Self {
+            inner: Arc::new(Inner::new(bound, None)),
+        }
     }
 
     /// Makes a budget of `bound` units, all of them free, that calls `listener` after units return
-    /// to it.
-    pub fn with_listener(bound: NonZeroU64, listener: alloc::sync::Arc<dyn ReleaseListener>) -> Self {
-        Self::make(bound, Some(listener))
-    }
-
-    fn make(bound: NonZeroU64, listener: Option<alloc::sync::Arc<dyn ReleaseListener>>) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                bound: bound.get(),
-                available: AtomicU64::new(bound.get()),
-                listener,
-            }),
-        }
+    /// to it. A waiting mechanism makes it in a path that can refuse, so a refusal of the allocator
+    /// gives `AllocError`.
+    pub fn with_listener(
+        bound: NonZeroU64,
+        listener: alloc::sync::Arc<dyn ReleaseListener>,
+    ) -> Result<Self, AllocError> {
+        Ok(Self {
+            inner: try_arc(Inner::new(bound, Some(listener)))?,
+        })
     }
 
     /// The number of units in the budget.

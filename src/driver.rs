@@ -89,6 +89,7 @@ mod udp;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::alloc::AllocError;
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -116,7 +117,8 @@ use rsnetwork_udp::SockAddrStorage;
 
 use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
 use crate::capacity::Permit;
-use crate::sync::Arc;
+use crate::memory::{items, room};
+use crate::sync::{Arc, try_arc};
 #[cfg(target_os = "linux")]
 use crate::table::CONTROL;
 use crate::table::{Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
@@ -335,6 +337,18 @@ impl Teardown {
     pub const fn kept(self) -> u32 {
         self.kept
     }
+}
+
+/// A vector of `count` items from `make`, or `AllocError` when the allocator refuses it.
+pub(crate) fn filled<T>(count: usize, make: impl FnMut() -> T) -> Result<Vec<T>, AllocError> {
+    let mut items = room(count)?;
+    items.resize_with(count, make);
+    Ok(items)
+}
+
+/// The I/O error of a refusal of the allocator.
+pub(crate) fn out_of_memory(_: AllocError) -> io::Error {
+    io::ErrorKind::OutOfMemory.into()
 }
 
 /// Wakes the driver from any thread: its wake descriptor becomes readable.
@@ -998,7 +1012,7 @@ struct Selected {
     pool: Pool,
     ring: BufferRing,
     /// The buffer of each buffer identifier that the kernel ring holds.
-    buffers: Box<[Option<Backing>]>,
+    buffers: Vec<Option<Backing>>,
     /// The identifiers with no buffer, which a refill fills from the pool.
     free: Vec<u16>,
     /// The capacity of each slot.
@@ -1010,10 +1024,9 @@ impl Selected {
     fn new(queue: &mut Queue, mut pool: Pool) -> io::Result<Self> {
         let mut buffers = Vec::new();
         while buffers.len() < 1 << 15 {
-            match pool.acquire() {
-                Ok(backing) => buffers.push(Some(backing)),
-                Err(_) => break,
-            }
+            let Ok(backing) = pool.acquire() else { break };
+            buffers.try_reserve(1).map_err(|_| io::ErrorKind::OutOfMemory)?;
+            buffers.push(Some(backing));
         }
         let count = u16::try_from(buffers.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let len = buffers
@@ -1021,11 +1034,13 @@ impl Selected {
             .and_then(|buffer| buffer.as_ref())
             .and_then(|buffer| u32::try_from(buffer.capacity()).ok())
             .ok_or(io::ErrorKind::InvalidInput)?;
+        // The memory comes before the buffer ring, so a refusal of the allocator provides nothing.
+        let free = room(usize::from(count)).map_err(out_of_memory)?;
         let mut selected = Self {
             ring: queue.provide(count.next_power_of_two(), GROUP)?,
             pool,
-            buffers: buffers.into_boxed_slice(),
-            free: Vec::with_capacity(usize::from(count)),
+            buffers,
+            free,
             len,
         };
         for (bid, buffer) in (0..).zip(selected.buffers.iter_mut()) {
@@ -1184,6 +1199,8 @@ pub struct Driver {
     /// The blocking service of the operations that the kernel cannot run
     /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
     blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
+    /// The waker of the jobs of [`Driver::use_blocking`], which wakes this driver.
+    job_waker: core::task::Waker,
     /// The operations that run on the blocking service, which each turn polls.
     jobs: Vec<OpId>,
     /// The file operations that wait for an operation that runs alone on their file, or that such
@@ -1222,7 +1239,8 @@ impl Driver {
     /// [`Error::Refused`] when the kernel refuses io_uring and [`Config::backend`] requires it, or
     /// when [`Config::backend`] requires a backend that the target does not have, [`Error::Config`]
     /// for a limit that is 0 or too large, [`Error::Unsupported`] for a required feature that the
-    /// kernel or the backend does not have, and [`Error::System`] for another failure.
+    /// kernel or the backend does not have, and [`Error::System`] for another failure, of the kind
+    /// `OutOfMemory` when the allocator does not give the memory of the driver.
     pub fn new(config: Config) -> Result<Self, Error> {
         if config.operations == 0
             || config.operations > MAX_SLOTS
@@ -1239,6 +1257,7 @@ impl Driver {
     /// the ring of its files where the IoRing probe passes, or where the caller requires it.
     #[cfg(target_os = "windows")]
     fn start_backend(config: Config, completions: u32) -> Result<Self, Error> {
+        let refused = |error| Error::System(out_of_memory(error));
         // IOCP and IoRing are the backends of Windows, and a feature is a feature of io_uring.
         if config
             .backend
@@ -1272,30 +1291,33 @@ impl Driver {
             selection.fallback = Some(error);
         }
         let (wake, registrar) = (port.wake(), port.registrar());
-        let table = Table::new(config.operations);
-        let shared = Arc::new(Shared {
-            entries: (0..config.operations).map(|_| Entry::new()).collect(),
+        let table = Table::new(config.operations).map_err(refused)?;
+        let shared = try_arc(Shared {
+            entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
             wake,
-        });
+        })
+        .map_err(refused)?;
+        let job_waker = file::job_waker(&shared).map_err(refused)?;
         Ok(Self {
             queue: Queue::Port(port),
             table,
             shared,
             resources: Resources {
-                slots: (0..config.resources).map(|_| Owned::default()).collect(),
+                slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
             },
-            taken: Vec::with_capacity(config.operations as usize * 2),
-            pending: Vec::with_capacity(config.resources as usize),
+            taken: room(config.operations as usize * 2).map_err(refused)?,
+            pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
             blocking: None,
-            jobs: Vec::with_capacity(config.operations as usize),
-            waiting: Vec::with_capacity(config.operations as usize),
+            job_waker,
+            jobs: room(config.operations as usize).map_err(refused)?,
+            waiting: room(config.operations as usize).map_err(refused)?,
         })
     }
 
@@ -1303,6 +1325,7 @@ impl Driver {
     /// flight.
     #[cfg(target_os = "macos")]
     fn start_backend(config: Config, completions: u32) -> Result<Self, Error> {
+        let refused = |error| Error::System(out_of_memory(error));
         // kqueue is the one backend of macOS, and a feature is a feature of io_uring.
         if config.backend.is_some_and(|backend| backend != Backend::Kqueue) {
             return Err(Error::Refused(io::ErrorKind::Unsupported.into()));
@@ -1328,33 +1351,36 @@ impl Driver {
             _ => Error::System(error),
         })?;
         let registrar = poller.registrar();
-        let table = Table::new(config.operations);
-        let shared = Arc::new(Shared {
-            entries: (0..config.operations).map(|_| Entry::new()).collect(),
+        let table = Table::new(config.operations).map_err(refused)?;
+        let shared = try_arc(Shared {
+            entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
             wake,
             wake_read,
-        });
+        })
+        .map_err(refused)?;
+        let job_waker = file::job_waker(&shared).map_err(refused)?;
         Ok(Self {
             queue: Queue::Poller(poller),
             table,
             shared,
             resources: Resources {
-                slots: (0..config.resources).map(|_| Owned::default()).collect(),
+                slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar: Some(registrar),
             },
-            taken: Vec::with_capacity(config.operations as usize * 2),
-            pending: Vec::with_capacity(config.resources as usize),
+            taken: room(config.operations as usize * 2).map_err(refused)?,
+            pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
-            signals: Vec::new(),
+            signals: room(signal::STREAMS).map_err(refused)?,
             children: process::Children::new(config.children).map_err(Error::System)?,
             blocking: None,
-            jobs: Vec::with_capacity(config.operations as usize),
-            waiting: Vec::with_capacity(config.operations as usize),
+            job_waker,
+            jobs: room(config.operations as usize).map_err(refused)?,
+            waiting: room(config.operations as usize).map_err(refused)?,
         })
     }
 
@@ -1362,6 +1388,7 @@ impl Driver {
     /// or epoll where the kernel refuses io_uring.
     #[cfg(target_os = "linux")]
     fn start_backend(config: Config, completions: u32) -> Result<Self, Error> {
+        let refused = |error| Error::System(out_of_memory(error));
         // io_uring and epoll are the backends of Linux.
         if config
             .backend
@@ -1429,13 +1456,15 @@ impl Driver {
             Queue::Poller(poller) => Some(poller.registrar()),
             Queue::Ring(_) => None,
         };
-        let table = Table::new(config.operations);
-        let shared = Arc::new(Shared {
-            entries: (0..config.operations).map(|_| Entry::new()).collect(),
+        let table = Table::new(config.operations).map_err(refused)?;
+        let shared = try_arc(Shared {
+            entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
             wake,
             interrupt: fs::File::from(interrupt),
-        });
+        })
+        .map_err(refused)?;
+        let job_waker = file::job_waker(&shared).map_err(refused)?;
         #[cfg(all(feature = "local", target_os = "linux"))]
         let wakes = home::Wakes::new(&queue, &shared).map_err(Error::System)?;
         Ok(Self {
@@ -1443,22 +1472,23 @@ impl Driver {
             table,
             shared,
             resources: Resources {
-                slots: (0..config.resources).map(|_| Owned::default()).collect(),
+                slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
             },
             children: process::Children::new(config.children).map_err(Error::System)?,
-            taken: Vec::with_capacity(config.operations as usize * 2),
-            pending: Vec::with_capacity(config.resources as usize),
+            taken: room(config.operations as usize * 2).map_err(refused)?,
+            pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
             selected: None,
             report: Report::new(selection, config.required, probed, rearm_wake),
             completions_per_turn: config.completions_per_turn,
             waking: false,
             rearm_wake,
-            signals: Vec::new(),
+            signals: room(signal::STREAMS).map_err(refused)?,
             blocking: None,
-            jobs: Vec::with_capacity(config.operations as usize),
+            job_waker,
+            jobs: room(config.operations as usize).map_err(refused)?,
             #[cfg(all(feature = "local", target_os = "linux"))]
             wakes,
         })
@@ -1493,9 +1523,7 @@ impl Driver {
     #[cfg(unix)]
     pub fn signal(&mut self, signal: Signal, escalation: Escalation) -> Result<SignalStream, SignalError> {
         let (stream, home) = signal::register(&self.shared, signal, escalation)?;
-        if self.signals.capacity() == 0 {
-            self.signals.reserve_exact(signal::STREAMS);
-        }
+        // The process has at most `STREAMS` streams, so the push never grows the list.
         self.signals.push(home);
         Ok(stream)
     }
@@ -1548,7 +1576,8 @@ impl Driver {
     /// # Errors
     ///
     /// `AlreadyExists` when the driver has its buffers, `InvalidInput` for a pool with no free slot
-    /// or a slot above `u32::MAX` bytes, and an error of the registration.
+    /// or a slot above `u32::MAX` bytes, `OutOfMemory` when the allocator refuses, and an error of
+    /// the registration.
     pub fn provide(&mut self, pool: Pool) -> io::Result<()> {
         if self.selected.is_some() {
             return Err(io::ErrorKind::AlreadyExists.into());

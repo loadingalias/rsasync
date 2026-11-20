@@ -15,6 +15,7 @@ use std::io;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
 use super::{POLLIN, POLLOUT, POLLRDHUP, WAKE};
+use crate::driver::out_of_memory;
 
 /// The events of a resource: each edge of its reads and its writes, and the end of the read side
 /// of its peer.
@@ -39,7 +40,7 @@ impl Selector {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: the C library returned a new descriptor that nothing else owns.
-        let selector = Self(Rc::new(unsafe { OwnedFd::from_raw_fd(fd) }));
+        let selector = Self(Rc::try_new(unsafe { OwnedFd::from_raw_fd(fd) }).map_err(out_of_memory)?);
         selector.control(EPOLL_CTL_ADD, wake.as_raw_fd(), POLLIN, WAKE)?;
         Ok(selector)
     }

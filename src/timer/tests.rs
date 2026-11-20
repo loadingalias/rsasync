@@ -322,3 +322,38 @@ fn the_storage_charges_its_memory_until_its_last_timer_drops() {
         Err(Invalid::Exhausted(_))
     );
 }
+
+/// Each refusal of the allocator gives `Allocation`, and keeps no charge and no memory. A storage
+/// whose allocation aborts the process fails.
+#[cfg(feature = "std")]
+#[test]
+fn a_storage_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let budget = budget();
+    let before = budget.available();
+    let capacity = NonZeroU32::new(8).unwrap();
+    let refusals = each_refusal(|| Timers::new(capacity, Duration::from_millis(1), at(0), &budget).map(drop));
+    assert!(!refusals.is_empty());
+    assert!(refusals.iter().all(|refusal| *refusal == (Invalid::Allocation, 0)));
+    assert_eq!(budget.available(), before);
+}
+
+/// The charge of a storage, `Timers::memory`, equals the bytes that its construction allocates. A
+/// charge that omits the two counts of its `Arc` fails.
+#[cfg(feature = "std")]
+#[test]
+fn a_storage_charges_each_byte_that_it_allocates() {
+    use crate::table::tests::allocations::bytes;
+
+    let budget = budget();
+    let capacity = NonZeroU32::new(8).unwrap();
+    let before = (bytes(), budget.available());
+    let timers = Timers::new(capacity, Duration::from_millis(1), at(0), &budget).unwrap();
+    let (allocated, charged) = (bytes() - before.0, before.1 - budget.available());
+    assert_eq!(
+        (charged, allocated),
+        (Timers::memory(capacity), Timers::memory(capacity))
+    );
+    drop(timers);
+}

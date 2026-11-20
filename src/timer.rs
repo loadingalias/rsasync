@@ -69,8 +69,9 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 
 use crate::capacity::{Budget, Exhausted, Permit};
+use crate::memory::items;
 use crate::sync::atomic::{AtomicU32, Ordering};
-use crate::sync::{Arc, arc_size};
+use crate::sync::{Arc, arc_size, try_arc};
 use crate::time::{ClockDomain, Deadline, Instant, TimeError};
 use crate::wait::Waiter;
 use wheel::{RANGE, Wheel};
@@ -93,6 +94,8 @@ pub enum Invalid {
     Capacity,
     /// The budget has less free capacity than [`Timers::memory`].
     Exhausted(Exhausted),
+    /// The allocator did not give the memory of the timers.
+    Allocation,
 }
 
 impl fmt::Display for Invalid {
@@ -101,6 +104,7 @@ impl fmt::Display for Invalid {
             Self::Resolution => f.write_str("the timer resolution is zero or too long"),
             Self::Capacity => f.write_str("the memory of the timer capacity does not fit the target"),
             Self::Exhausted(exhausted) => write!(f, "the memory of the timers: {exhausted}"),
+            Self::Allocation => f.write_str("the allocator did not give the memory of the timers"),
         }
     }
 }
@@ -219,20 +223,21 @@ impl Timers {
             return Err(Invalid::Capacity);
         }
         let charge = budget.reserve(memory).map_err(Invalid::Exhausted)?;
-        let shared = Arc::new(Shared {
-            entries: (0..capacity.get())
-                .map(|_| Entry {
-                    state: AtomicU32::new(ARMED),
-                    waiter: Waiter::new(),
-                    next: AtomicU32::new(NIL),
-                })
-                .collect(),
+        let refused = |_| Invalid::Allocation;
+        let entries = items(capacity.get(), |_| Entry {
+            state: AtomicU32::new(ARMED),
+            waiter: Waiter::new(),
+            next: AtomicU32::new(NIL),
+        });
+        let shared = try_arc(Shared {
+            entries: entries.map_err(refused)?,
             released: AtomicU32::new(NIL),
             _charge: charge,
-        });
+        })
+        .map_err(refused)?;
         Ok(Self {
             shared,
-            wheel: Wheel::new(capacity.get(), now.as_nanos() / resolution),
+            wheel: Wheel::new(capacity.get(), now.as_nanos() / resolution).map_err(refused)?,
             capacity,
             domain: now.domain(),
             resolution,

@@ -187,7 +187,7 @@ fn the_listener_runs_after_each_release_and_sees_the_units_free() {
     }
 
     let record = Arc::new(Record::default());
-    let budget = Budget::with_listener(NonZeroU64::new(100).unwrap(), record.clone());
+    let budget = Budget::with_listener(NonZeroU64::new(100).unwrap(), record.clone()).unwrap();
     // The record and the budget hold each other. The last line of the test ends the cycle.
     *record.budget.lock().unwrap() = Some(budget.clone());
     let seen = || record.seen.lock().unwrap().clone();

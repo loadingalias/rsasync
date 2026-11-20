@@ -121,9 +121,10 @@ use core::task::{Context, Poll};
 
 use alloc::boxed::Box;
 
-use super::ring::{ABORTED, CLOSED, Line, MAX_CAPACITY, MAX_PLACES, POSITION, Places, Ring, items};
+use super::ring::{ABORTED, CLOSED, Line, MAX_CAPACITY, MAX_PLACES, POSITION, Places, Ring};
 use super::{Aborted, Closed, Refused, ReserveError, SendError, TooManySenders, TryRecvError, TrySendError};
 use crate::capacity::{Budget, Permit};
+use crate::memory::items;
 #[cfg(feature = "std")]
 use crate::sync::thread;
 use crate::sync::{
@@ -267,7 +268,8 @@ pub fn channel<T>(budget: &Budget, capacity: u32, senders: u32) -> Result<(Sende
     let slots = items(capacity, |_| Slot {
         state: AtomicU32::new(EMPTY),
         value: UnsafeCell::new(MaybeUninit::uninit()),
-    })?;
+    })
+    .map_err(|_| Refused::Allocation)?;
     // The first sender has place 0.
     let senders = Places::new(senders)?;
     let shared = try_arc(Shared {

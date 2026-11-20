@@ -138,3 +138,21 @@ fn the_places_are_bounded_charged_and_free_again_after_a_drop() {
     drop(budget);
     assert_eq!(heap.available(), 1 << 20);
 }
+
+/// Each refusal of the allocator gives `Allocation`, and keeps no charge and no memory. A budget
+/// whose allocation aborts the process fails.
+#[cfg(feature = "std")]
+#[test]
+fn a_budget_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
+    use super::Refused;
+    use crate::table::tests::allocations::each_refusal;
+
+    let heap = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let (bound, places) = (NonZeroU64::new(8).unwrap(), NonZeroU32::new(4).unwrap());
+    // The budget of the last run drops after the refusals: on macOS, its drop takes the lock of the
+    // places for the first time, and the standard library allocates that lock then.
+    let refusals = each_refusal(|| budget(&heap, bound, places));
+    assert!(!refusals.is_empty());
+    assert!(refusals.iter().all(|refusal| *refusal == (Refused::Allocation, 0)));
+    assert_eq!(heap.available(), 1 << 20);
+}

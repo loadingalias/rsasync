@@ -32,6 +32,9 @@
 //!   slot differ only in bits below `6l`. A timer moves down at most five times.
 
 use alloc::boxed::Box;
+use core::alloc::AllocError;
+
+use crate::memory::items;
 
 /// The bits of a tick for each level.
 const SLOT_BITS: u32 = 6;
@@ -71,16 +74,14 @@ pub(super) struct Wheel {
 
 impl Wheel {
     /// A wheel of `capacity` free entries at the tick `elapsed`.
-    pub(super) fn new(capacity: u32, elapsed: u64) -> Self {
+    pub(super) fn new(capacity: u32, elapsed: u64) -> Result<Self, AllocError> {
         let mut wheel = Self {
-            links: (0..capacity)
-                .map(|_| Link {
-                    tick: 0,
-                    list: NONE,
-                    prev: NIL,
-                    next: NIL,
-                })
-                .collect(),
+            links: items(capacity, |_| Link {
+                tick: 0,
+                list: NONE,
+                prev: NIL,
+                next: NIL,
+            })?,
             heads: [NIL; LISTS],
             occupied: [0; LEVELS as usize],
             elapsed,
@@ -88,7 +89,7 @@ impl Wheel {
         for index in (0..capacity).rev() {
             wheel.push(FREE, index);
         }
-        wheel
+        Ok(wheel)
     }
 
     /// The memory of the entries of a wheel, in bytes, for each timer.

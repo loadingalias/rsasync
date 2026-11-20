@@ -96,6 +96,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::capacity::{Budget, Exhausted, Permit, ReleaseListener};
+use crate::memory::items;
 use crate::sync::{
     Mutex, arc_size,
     atomic::{AtomicU32, Ordering},
@@ -118,6 +119,8 @@ pub enum Refused {
     TooManyPlaces,
     /// The memory budget has fewer free units than [`memory`].
     Memory(Exhausted),
+    /// The allocator did not give the memory of the waiter places.
+    Allocation,
 }
 
 impl fmt::Display for Refused {
@@ -125,6 +128,7 @@ impl fmt::Display for Refused {
         match self {
             Self::TooManyPlaces => write!(f, "a budget has at most {MAX_PLACES} waiter places"),
             Self::Memory(exhausted) => write!(f, "the memory of the waiter places: {exhausted}"),
+            Self::Allocation => f.write_str("the allocator did not give the memory of the waiter places"),
         }
     }
 }
@@ -187,28 +191,29 @@ pub fn budget(memory: &Budget, bound: NonZeroU64, places: NonZeroU32) -> Result<
     }
     let charge = memory.reserve(self::memory(places)).map_err(Refused::Memory)?;
     let count = places.get();
-    let queue = alloc::sync::Arc::new(Queue {
+    let refused = |_| Refused::Allocation;
+    let queue = alloc::sync::Arc::try_new(Queue {
         head: AtomicU32::new(NONE),
-        waiters: (0..count).map(|_| Waiter::new()).collect(),
+        waiters: items(count, |_| Waiter::new()).map_err(refused)?,
         order: Mutex::new(Order {
             // Place 0 is in use. The free list holds the others, in order.
-            next: (0..count)
-                .map(|place| {
-                    if place == 0 || place + 1 == count {
-                        NONE
-                    } else {
-                        place + 1
-                    }
-                })
-                .collect(),
-            prev: (0..count).map(|_| OUT).collect(),
+            next: items(count, |place| {
+                if place == 0 || place + 1 == count {
+                    NONE
+                } else {
+                    place + 1
+                }
+            })
+            .map_err(refused)?,
+            prev: items(count, |_| OUT).map_err(refused)?,
             first: NONE,
             last: NONE,
             free: if count > 1 { 1 } else { NONE },
         }),
         _charge: charge,
-    });
-    let budget = Budget::with_listener(bound, queue.clone());
+    })
+    .map_err(refused)?;
+    let budget = Budget::with_listener(bound, queue.clone()).map_err(refused)?;
     let acquirer = Acquirer {
         budget: budget.clone(),
         queue,

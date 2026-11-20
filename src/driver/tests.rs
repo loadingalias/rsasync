@@ -2301,3 +2301,35 @@ fn a_new_driver_registers_no_file_or_buffer_and_starts_no_poller() {
         "{info}"
     );
 }
+
+/// Each refusal of the allocator in the start of a driver and in `provide` gives `OutOfMemory`,
+/// and keeps no memory. A driver whose allocation aborts the process fails.
+#[test]
+fn a_driver_that_the_allocator_refuses_keeps_no_memory() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let refusals = each_refusal(|| Driver::new(Config::new()).map(drop));
+    assert!(!refusals.is_empty());
+    for (error, held) in refusals {
+        let super::Error::System(error) = error else {
+            panic!("a refusal of the allocator gives `Error::System`, not {error:?}");
+        };
+        assert_eq!((error.kind(), held), (ErrorKind::OutOfMemory, 0));
+    }
+
+    let mut driver = Driver::new(Config::new()).unwrap();
+    let budget = pool_budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    // A pool for each run, made before the allocator refuses.
+    let mut pools: Vec<_> = (0..16)
+        .map(|_| Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
+        .collect();
+    let refusals = each_refusal(|| driver.provide(pools.pop().unwrap()));
+    assert!(!refusals.is_empty());
+    // A refused `provide` drops the pool that it took, so it frees the memory of the pool.
+    for (error, held) in refusals {
+        assert_eq!(error.kind(), ErrorKind::OutOfMemory);
+        assert!(held <= 0, "a refused provide kept {held} bytes");
+    }
+    driver.teardown().unwrap();
+}

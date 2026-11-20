@@ -6,7 +6,8 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::queue::Queue;
 use super::{Driver, Shared};
-use crate::sync::Arc;
+use crate::driver::out_of_memory;
+use crate::sync::{Arc, try_arc};
 use crate::uring::Sqe;
 
 /// The user data of the completion that a wake message posts at its home. It only ends a wait.
@@ -64,10 +65,11 @@ pub(super) struct Wakes {
 impl Wakes {
     /// The home on `queue`, with a duplicate of its descriptor.
     pub(super) fn new(queue: &Queue, shared: &Arc<Shared>) -> io::Result<Self> {
-        let home = Arc::new(Home {
+        let home = try_arc(Home {
             ring: queue.duplicate()?,
             shared: Arc::clone(shared),
-        });
+        })
+        .map_err(out_of_memory)?;
         Ok(Self {
             home,
             sent: [const { None }; MESSAGES],

@@ -27,6 +27,7 @@ use super::owner::{Enter, Local, Park, Until};
 use super::slot::Home;
 use crate::capacity::Budget;
 use crate::clock::NativeClock;
+use crate::driver::out_of_memory;
 use crate::driver::{self, Config, Driver};
 use crate::sync::{Arc, thread};
 use crate::time::TimeError;
@@ -43,7 +44,7 @@ impl RingOwner {
         let local = Local::new(
             budget,
             slots,
-            Home::new(thread::current(), Some(driver.home())),
+            Home::new(thread::current(), Some(driver.home())).map_err(|_| Refused::Allocation)?,
             driver::MESSAGES,
         )?;
         local.driver.replace(Some(driver));
@@ -56,7 +57,8 @@ impl RingOwner {
     /// Makes an owner with `slots` task slots, on this thread, that makes its driver with `config`
     /// at the first operation that needs a home (`with_driver`).
     pub(crate) fn lazy(budget: &Budget, slots: u32, config: Config) -> Result<Self, Refused> {
-        let local = Local::new(budget, slots, Home::new(thread::current(), None), driver::MESSAGES)?;
+        let home = Home::new(thread::current(), None).map_err(|_| Refused::Allocation)?;
+        let local = Local::new(budget, slots, home, driver::MESSAGES)?;
         local.lazy.set(Some(config));
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
@@ -194,7 +196,9 @@ impl Local {
         if slot.is_none() {
             let config = self.lazy.get().ok_or(super::DriverRefused::NoDriver)?;
             let driver = Driver::new(config).map_err(super::DriverRefused::Start)?;
-            self.shared().set_ring(driver.home());
+            self.shared()
+                .set_ring(driver.home())
+                .map_err(|error| super::DriverRefused::Start(driver::Error::System(out_of_memory(error))))?;
             self.sends.set(true);
             self.switched.set(true);
             *slot = Some(driver);
