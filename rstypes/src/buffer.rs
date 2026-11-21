@@ -43,6 +43,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::fmt;
 use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::{self, NonNull};
@@ -350,6 +351,23 @@ impl Backing {
             initialized,
             allocation_size,
             release,
+        }
+    }
+
+    /// The layout of the one allocation that [`Lease::from`] or the first
+    /// [`freeze_prefix`](Self::freeze_prefix) of this backing makes: its reference count, with the
+    /// backing in it. `None` for a backing from a [`Pool`] and for a part of a split, which share a
+    /// count with no allocation.
+    ///
+    /// Charge a [`Permit`](crate::capacity::Permit) of its size before the call, and keep it in the
+    /// data of the release hook of the backing, which drops when the count frees the backing. A
+    /// `Vec<u8>` or a `Box<[u8]>` has no such place: lease it with [`Lease::from_owner`] and an
+    /// owner that holds the charge.
+    #[must_use]
+    pub const fn lease_layout(&self) -> Option<Layout> {
+        match self.release.0 {
+            Hook::Caller { .. } => Some(const { crate::sync::arc_layout::<Self>() }),
+            Hook::Shared(_) => None,
         }
     }
 
@@ -736,6 +754,7 @@ impl Lease {
     where
         T: AsRef<[u8]> + Send + Sync + 'static,
     {
+        // The one allocation, whose layout `owner_layout` gives.
         let foreign = alloc::sync::Arc::new(Foreign {
             ptr: AtomicPtr::new(ptr::null_mut()),
             allocation_size,
@@ -752,6 +771,46 @@ impl Lease {
             owner: Owner::Foreign(foreign),
             offset: 0,
         }
+    }
+
+    /// The layout of the one allocation of [`Lease::from_owner`] with an owner of type `T`: its
+    /// reference count, with the owner in it. A type too large for an allocation fails the build.
+    ///
+    /// Charge a [`Permit`](crate::capacity::Permit) of its size before the call, and keep it in the
+    /// owner, so that the charge ends when the last lease or view drops the owner:
+    ///
+    /// ```
+    /// # extern crate rstypes as rsasync;
+    /// use core::num::NonZeroU64;
+    ///
+    /// use rsasync::buffer::Lease;
+    /// use rsasync::capacity::{Budget, Permit};
+    ///
+    /// struct Charged {
+    ///     bytes: Vec<u8>,
+    ///     _charge: Permit,
+    /// }
+    ///
+    /// impl AsRef<[u8]> for Charged {
+    ///     fn as_ref(&self) -> &[u8] {
+    ///         &self.bytes
+    ///     }
+    /// }
+    ///
+    /// let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    /// let bytes = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+    /// let size = bytes.capacity();
+    /// let count = Lease::owner_layout::<Charged>().size() as u64;
+    /// let charge = budget.reserve(size as u64 + count)?;
+    /// let lease = Lease::from_owner(Charged { bytes, _charge: charge }, size);
+    /// assert_eq!(budget.available(), budget.bound() - size as u64 - count);
+    /// drop(lease);
+    /// assert_eq!(budget.available(), budget.bound());
+    /// # Ok::<(), rsasync::capacity::Exhausted>(())
+    /// ```
+    #[must_use]
+    pub const fn owner_layout<T>() -> Layout {
+        const { crate::sync::arc_layout::<Foreign<T>>() }
     }
 }
 

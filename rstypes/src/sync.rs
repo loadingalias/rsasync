@@ -36,6 +36,20 @@ pub(crate) fn try_arc<T>(value: T) -> Result<Arc<T>, core::alloc::AllocError> {
     Ok(Arc::new(value))
 }
 
+/// The layout of the allocation of a native `Arc<T>`: its two counts, and then `T` at its
+/// alignment. Evaluate it in a `const` block: a `T` too large for an allocation then fails the
+/// build.
+#[expect(
+    clippy::panic,
+    reason = "each caller evaluates it in a `const` block, so a panic is a build error, never a run-time one"
+)]
+pub(crate) const fn arc_layout<T>() -> core::alloc::Layout {
+    match core::alloc::Layout::new::<[usize; 2]>().extend(core::alloc::Layout::new::<T>()) {
+        Ok((inner, _)) => inner.pad_to_align(),
+        Err(_) => panic!("the type is too large for the allocation of an `Arc`"),
+    }
+}
+
 /// The size of the allocation of a native `Arc<T>`: its two counts, and then `T` at its
 /// alignment. A charge of a shared state counts it. A layout too large for an allocation gives
 /// `usize::MAX`, so the charge is too large for each budget.

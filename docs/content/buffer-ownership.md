@@ -139,6 +139,13 @@ no allocation. A lease of a pool slot costs no allocation, because the slot coun
 [Receive into pool slots](#receive-into-pool-slots)). A lease of a static region has no reference
 count.
 
+`Backing::lease_layout()` gives the layout of that one allocation before you make it, or `None`
+for a pool slot and for a part of a split, which make none. To charge it to a budget, reserve a
+`Permit` of its size first, and keep the permit where it drops with the backing: in the data of
+the release hook of your backing (see [Put your own memory in a backing](#put-your-own-memory-in-a-backing)).
+A `Vec<u8>` or a `Box<[u8]>` has no such place, so lease it with `Lease::from_owner` and an owner
+that holds the charge (see [Lease the bytes of a different owner](#lease-the-bytes-of-a-different-owner)).
+
 A small view keeps the whole allocation. Its `Buffer::allocation_size` is that of the backing, not
 its own length. Thus a view of 4 bytes can keep a receive buffer of 64 KiB. To free a large
 allocation early, copy the small part into a new buffer and drop the view.
@@ -338,6 +345,39 @@ The owner does not tell the size of the allocation that it keeps, so the caller 
 charge too little for the memory that the lease keeps. The length of the bytes is the minimum.
 
 The conversion costs one allocation: the reference count, with the owner in it.
+`Lease::owner_layout::<T>()` gives its layout for an owner of type `T`. To charge each byte that the
+lease keeps, reserve a `Permit` for the bytes of the owner and the size of that layout first, and
+keep the permit in the owner. The last lease or view then drops the owner, the permit, and the
+allocation at one time:
+
+```rust
+use core::num::NonZeroU64;
+
+use rsasync::buffer::Lease;
+use rsasync::capacity::{Budget, Permit};
+
+struct Charged {
+    bytes: Vec<u8>,
+    _charge: Permit,
+}
+
+impl AsRef<[u8]> for Charged {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+let bytes = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+let size = bytes.capacity();
+let count = Lease::owner_layout::<Charged>().size() as u64;
+let charge = budget.reserve(size as u64 + count)?;
+let lease = Lease::from_owner(Charged { bytes, _charge: charge }, size);
+assert_eq!(budget.available(), budget.bound() - size as u64 - count);
+drop(lease);
+assert_eq!(budget.available(), budget.bound());
+# Ok::<(), rsasync::capacity::Exhausted>(())
+```
 
 ```rust
 use rsasync::buffer::{Buffer, Lease};

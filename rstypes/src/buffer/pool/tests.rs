@@ -267,3 +267,53 @@ fn a_pool_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
     }
     assert!(refused > 0);
 }
+
+/// An owner aligned to 64 bytes, so the reference count of its lease has padding.
+#[repr(align(64))]
+struct Aligned([u8; 64]);
+
+impl AsRef<[u8]> for Aligned {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// `Lease::from_owner` allocates the size of `Lease::owner_layout` of its owner: the reference
+/// count with the owner in it, also with the padding of an owner aligned to 64 bytes.
+#[test]
+fn a_lease_of_an_owner_allocates_the_size_of_its_owner_layout() {
+    let owner = b"head".to_vec();
+    let (_lease, bytes) = allocated(move || Lease::from_owner(owner, 4));
+    assert_eq!(bytes, Lease::owner_layout::<Vec<u8>>().size() as u64);
+
+    let (_lease, bytes) = allocated(|| Lease::from_owner(Aligned([7; 64]), 64));
+    assert_eq!(bytes, Lease::owner_layout::<Aligned>().size() as u64);
+    assert_eq!(Lease::owner_layout::<Aligned>().align(), 64);
+}
+
+/// `Lease::from` and the first `freeze_prefix` of a heap backing allocate the size of its
+/// `lease_layout`. A pool slot and the rest of a split give `None`, and allocate nothing.
+#[test]
+fn a_backing_gives_the_layout_of_its_lease_and_none_where_it_allocates_nothing() {
+    let heap = Backing::from(b"head".to_vec());
+    let layout = heap.lease_layout().unwrap();
+    let (_lease, bytes) = allocated(|| Lease::from(heap));
+    assert_eq!(bytes, layout.size() as u64);
+
+    let mut loan = WriteLoan::new(Backing::from(Vec::with_capacity(64)));
+    loan.fill_from(b"HEADBODY");
+    let backing = loan.into_inner();
+    let layout = backing.lease_layout().unwrap();
+    let ((_head, rest), bytes) = allocated(|| backing.freeze_prefix(4).unwrap());
+    assert_eq!(bytes, layout.size() as u64);
+    assert_eq!(rest.lease_layout(), None);
+    let (_body, bytes) = allocated(|| Lease::from(rest));
+    assert_eq!(bytes, 0);
+
+    let budget = budget();
+    let mut pool = pool(&budget, 1);
+    let slot = pool.acquire().unwrap();
+    assert_eq!(slot.lease_layout(), None);
+    let (_lease, bytes) = allocated(|| Lease::from(slot));
+    assert_eq!(bytes, 0);
+}
