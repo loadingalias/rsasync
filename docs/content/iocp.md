@@ -221,7 +221,9 @@ when both checks pass:
 The rule needs one more fact: no other handle of the socket exists. The driver makes each socket
 itself with no inheritance, and no API of the driver duplicates a socket or adopts one, so this
 holds for each socket of the driver. A socket that fails a check gets a packet for each call, and the
-driver ends each call at its packet. Both forms pass the same suites.
+driver ends each call at its packet. Both forms pass the same suites. Under
+[controlled delivery](controlled-delivery.md), no socket skips, so each completion comes through the
+port.
 
 ## Drive it
 

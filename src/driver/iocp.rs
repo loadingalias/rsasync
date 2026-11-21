@@ -95,7 +95,7 @@ use rsnetwork_udp::{AF_INET, AF_INET6, SaFamily, SockAddrStorage};
 use sys::{Overlapped, OverlappedEntry};
 
 use crate::blocking::Waiter;
-use crate::driver::{filled, out_of_memory};
+use crate::driver::{Delivery, filled, out_of_memory};
 use crate::memory::{items, room};
 use crate::uring::sys as ring;
 use crate::uring::{Cqe, Group, Sqe};
@@ -178,17 +178,14 @@ pub(crate) struct Registrar {
     port: Arc<Shared>,
     /// The port has a ring, so no file is on the port.
     pub(crate) ring: bool,
-    /// The test seam of a failed association: the next association fails with this error.
-    #[cfg(test)]
-    pub(crate) fail: core::cell::Cell<Option<i32>>,
-    /// The test seam of the packets: no socket skips them.
-    #[cfg(test)]
-    pub(crate) packets: core::cell::Cell<bool>,
+    /// Under controlled delivery, no socket skips its packet, so each completion comes through the
+    /// port.
+    delivery: Delivery,
 }
 
 impl Registrar {
     /// Associates `socket` with the port for its life, and turns on skip-on-success where its
-    /// provider allows it. Gives whether the socket skips.
+    /// provider allows it and the delivery is native. Gives whether the socket skips.
     ///
     /// # Errors
     ///
@@ -200,17 +197,11 @@ impl Registrar {
         if self::socket(super::number(socket.as_socket())) != raw {
             return Err(io::ErrorKind::InvalidInput.into());
         }
-        // The test seam gives the error of the association in place of the call.
-        #[cfg(test)]
-        if let Some(error) = self.fail.take() {
-            return Err(io::Error::from_raw_os_error(error));
-        }
         // SAFETY: the socket and the port are open handles during the call.
         if unsafe { sys::CreateIoCompletionPort(handle(raw), self.port.handle(), SOCKET, 0) }.is_null() {
             return Err(io::Error::last_os_error());
         }
-        #[cfg(test)]
-        if self.packets.get() {
+        if self.delivery == Delivery::Controlled {
             return Ok(false);
         }
         let flags = sys::FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | sys::FILE_SKIP_SET_EVENT_ON_HANDLE;
@@ -371,10 +362,6 @@ pub(crate) struct Port {
     /// The jobs of the blocking service that run file entries, and the waker of the driver.
     jobs: Vec<(u64, Waiter<i32>)>,
     waker: Option<Waker>,
-    /// The test seam of the packets of the kernel: while it holds, the port takes no packet, and
-    /// the kernel keeps each one in the port.
-    #[cfg(test)]
-    pub(crate) held: bool,
 }
 
 impl Port {
@@ -437,8 +424,6 @@ impl Port {
             full: false,
             jobs: room(jobs as usize).map_err(out_of_memory)?,
             waker: None,
-            #[cfg(test)]
-            held: false,
         })
     }
 
@@ -455,15 +440,12 @@ impl Port {
         Wake(Arc::clone(&self.shared))
     }
 
-    /// The associations of the sockets with this port.
-    pub(crate) fn registrar(&self) -> Registrar {
+    /// The associations of the sockets with this port, for `delivery`.
+    pub(crate) fn registrar(&self, delivery: Delivery) -> Registrar {
         Registrar {
             port: Arc::clone(&self.shared),
             ring: self.ring.is_some(),
-            #[cfg(test)]
-            fail: core::cell::Cell::new(None),
-            #[cfg(test)]
-            packets: core::cell::Cell::new(false),
+            delivery,
         }
     }
 
@@ -500,13 +482,6 @@ impl Port {
     /// Whether packets can remain after the last wait, because it filled its array.
     pub(crate) const fn more(&self) -> bool {
         self.full
-    }
-
-    /// The ready completions, which stay for the driver. Only the driver tests read them, and the
-    /// loom build has none.
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn peek(&self) -> Vec<Cqe> {
-        self.completions.iter().copied().collect()
     }
 
     /// Takes the ready completions, in order.
@@ -744,10 +719,6 @@ impl Port {
     /// whether a wake came.
     #[expect(unsafe_code, reason = "the kernel writes the event array")]
     fn poll(&mut self, timeout: u32) -> io::Result<bool> {
-        #[cfg(test)]
-        if self.held {
-            return Ok(false);
-        }
         let capacity = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         let mut removed = 0;
         // SAFETY: the array has `capacity` entries, and the kernel writes at most that many.

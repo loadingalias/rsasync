@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 use super::super::suite::{self, Backend};
-use super::super::tests::{drive, numbered, posted};
-use super::super::{Config, Driver, Regions};
+use super::super::tests::{drive, hold, numbered, posted};
+use super::super::{Config, Delivery, Driver, Regions};
 use super::{LocalListener, LocalStream, Stale};
 use crate::buffer::{Backing, Buffer as _, Lease};
 
@@ -81,11 +81,12 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
 ) {
     let scratch = Scratch::new("stream");
     let path = scratch.join("socket");
-    let mut driver = suite::driver(Config::new(), backend);
+    let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let accept = driver.accept_local(&mut listener).unwrap();
+    let id = hold(&mut driver, &accept);
     let mut peer = UnixStream::connect(&path).unwrap();
-    posted(&mut driver, 1);
+    posted(&mut driver, id).unwrap();
     drop(accept);
     driver.turn().unwrap();
     let next = driver.accept_local(&mut listener).unwrap();
@@ -110,7 +111,8 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
     let dropped = driver
         .recv(&mut stream, Backing::from(Vec::with_capacity(600)))
         .unwrap();
-    posted(&mut driver, 1);
+    let id = hold(&mut driver, &dropped);
+    posted(&mut driver, id).unwrap();
     drop(dropped);
     let next = driver
         .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
@@ -119,7 +121,8 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
     let forgotten = driver
         .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
         .unwrap();
-    posted(&mut driver, 1);
+    let id = hold(&mut driver, &forgotten);
+    posted(&mut driver, id).unwrap();
     driver.turn().unwrap();
     mem::forget(forgotten);
     peer.write_all(&numbered(1000, 500)).unwrap();

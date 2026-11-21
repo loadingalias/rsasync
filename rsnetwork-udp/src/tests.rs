@@ -13,17 +13,41 @@ use tokio::net::UdpSocket;
 use crate::set_gro;
 #[cfg(windows)]
 use crate::set_uro;
+#[cfg(windows)]
+use crate::sys::IPPROTO_IP;
 #[cfg(any(target_os = "linux", windows))]
 use crate::sys::IPPROTO_IPV6;
 #[cfg(target_os = "linux")]
 use crate::sys::IPV6_MTU;
-#[cfg(windows)]
-use crate::sys::{IP_USER_MTU, IPPROTO_IP};
 #[cfg(unix)]
 use crate::unix::io::set;
 #[cfg(windows)]
 use crate::windows::io::set;
 use crate::{Ecn, Received, Refused, Transmit, configure, recv, recv_batch, send, send_batch, set_dont_fragment};
+
+/// The Winsock items that only these tests use, so the crate declares none of them. They agree with
+/// `winsock2.h` and `ws2ipdef.h` of the SDK that `windows/sys.rs` names.
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "ws2_32.dll gives the function")]
+mod winsock {
+    use core::ffi::c_int;
+
+    use crate::sys::Socket;
+
+    /// `INVALID_SOCKET`: the result of a `socket` call that failed.
+    pub(super) const INVALID_SOCKET: Socket = !0;
+    /// `IP_USER_MTU`: the upper bound of the IPv4 path MTU that the socket sets, with no privilege.
+    pub(super) const IP_USER_MTU: c_int = 76;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        /// `SOCKET socket(int af, int type, int protocol)`: a dual-stack socket, whose
+        /// `IPV6_V6ONLY` must be off before the bind.
+        pub(super) fn socket(af: c_int, kind: c_int, protocol: c_int) -> Socket;
+    }
+}
+#[cfg(windows)]
+use winsock::{INVALID_SOCKET, IP_USER_MTU, socket};
 
 /// The borrowed socket that the calls of this crate take on this target.
 #[cfg(unix)]
@@ -85,7 +109,7 @@ async fn dual_stack() -> UdpSocket {
 async fn dual_stack() -> UdpSocket {
     use std::os::windows::io::FromRawSocket as _;
 
-    use crate::sys::{INVALID_SOCKET, IPPROTO_UDP, IPV6_V6ONLY, SOCK_DGRAM, bind, socket};
+    use crate::sys::{IPPROTO_UDP, IPV6_V6ONLY, SOCK_DGRAM, bind};
     use crate::{AF_INET6, SockAddrStorage};
 
     // The standard library starts Winsock with its first socket.

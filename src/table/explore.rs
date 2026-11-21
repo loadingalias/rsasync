@@ -17,11 +17,7 @@ fn a_posted_request_reaches_its_operation_and_never_the_next_one_of_its_slot() {
 
         let mut taken_early = Vec::new();
         table.take_requests(|taken| taken_early.push(taken));
-        let ended = Event {
-            result: 0,
-            more: false,
-            notice: false,
-        };
+        let ended = Event { result: 0, more: false };
         assert_eq!(table.complete(first.user_data(), ended), super::Outcome::Ready);
         assert!(table.claim(first).is_some());
         let second = table.begin(2_u8, Shape::Single).expect("the slot is free again");

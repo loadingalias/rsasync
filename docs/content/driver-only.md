@@ -288,6 +288,7 @@ operations that run on the socket, and its future is ready after the kernel ends
 | `resources` | 256 | Descriptors that the driver can own at one time |
 | `children` | 64 | Child processes that the driver can own at one time. Each child also holds an operation slot until its status is taken or its handle drops. 0 refuses each spawn |
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
+| `delivery` | `Delivery::Native` | How the driver gives each completion to its operation. Under `Delivery::Controlled`, `Driver::control()` lets a test hold, fail, or repeat a completion: see [Test your code under controlled completions](controlled-delivery.md) |
 
 A limit of 0, other than `children`, gives `Error::Config`.
 

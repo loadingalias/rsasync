@@ -9,8 +9,8 @@ use std::process::{Command, Stdio};
 
 use super::super::super::iocp::sys;
 use super::super::super::suite::{self, Backend};
-use super::super::super::tests::{drive, numbered, posted};
-use super::super::super::{Config, Driver, Reason, Regions};
+use super::super::super::tests::{drive, hold, numbered, posted};
+use super::super::super::{Config, Delivery, Driver, Reason, Regions};
 use super::super::{LocalListener, LocalStream, Stale};
 use crate::buffer::{Backing, Buffer as _, Lease};
 
@@ -61,12 +61,13 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_named_pipe_with_no_gap_thro
     backend: Backend,
 ) {
     let path = pipe("stream");
-    let mut driver = suite::driver(Config::new(), backend);
+    let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let accept = driver.accept_local(&mut listener).unwrap();
+    let id = hold(&mut driver, &accept);
     driver.turn().unwrap();
     let mut peer = client(&path).unwrap();
-    posted(&mut driver, 1);
+    posted(&mut driver, id).unwrap();
     drop(accept);
     driver.turn().unwrap();
     let next = driver.accept_local(&mut listener).unwrap();
@@ -99,7 +100,8 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_named_pipe_with_no_gap_thro
     let dropped = driver
         .recv(&mut stream, Backing::from(Vec::with_capacity(600)))
         .unwrap();
-    posted(&mut driver, 1);
+    let id = hold(&mut driver, &dropped);
+    posted(&mut driver, id).unwrap();
     drop(dropped);
     let next = driver
         .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
@@ -109,7 +111,8 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_named_pipe_with_no_gap_thro
     let forgotten = driver
         .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
         .unwrap();
-    posted(&mut driver, 1);
+    let id = hold(&mut driver, &forgotten);
+    posted(&mut driver, id).unwrap();
     driver.turn().unwrap();
     mem::forget(forgotten);
     peer.write_all(&numbered(1000, 500)).unwrap();

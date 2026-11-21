@@ -154,6 +154,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`. `Driver::report` gives the route of each call |
 | `Refused` with `Reason::Allocation` | The allocator did not give the memory of the operation, such as its job on the blocking service | Try again when memory is free |
 | `Ended` | The driver ended before the operation gave its result | Keep the driver driven until each future takes its result |
+| `ControlError` | A call of the `Control` of a driver under controlled delivery changed nothing: `OtherDriver`, `NoCompletion`, `Full`, `NoCode`, or `NoRegistration` | See [Control calls](controlled-delivery.md#control-calls) |
 | `SignalError::Fault`, `Uncatchable`, `Invalid` | No stream can take the signal | Use another signal |
 | `SignalError::Full` | Each of the 64 streams of the process is in use | Close a stream, then try again |
 | `SignalError::Escalation` | An `Escalation::At` on a signal whose default action does not end the process | Register the signal with `Escalation::Never` |

@@ -7,29 +7,28 @@
 //! ring. [`Backend::Epoll`] gives it as the epoll poller posts it: the poller takes the same
 //! entries, and runs each one as a nonblocking call when epoll reports its descriptor ready, and
 //! each file entry as a job of a blocking service of the case.
-//! [`Backend::Injected`] uses the completion-injection seam of the ring (`Ring::inject`), at the
-//! boundary of the backend. The ring keeps each completion that the kernel posts and gives it at
-//! the next take, after the driver applied the requests of that turn. So a drop, a cancel, or a
-//! close always comes before the completion of its operation, with no dependence on the timing of
-//! the kernel. A case can also hold the completions of one operation, replace a result, or add a
-//! completion that the kernel did not post. The seam supplies inputs only: the table, the harvest,
-//! and the stream rules run as in production. The seam exists only in the tests, and no public
-//! injection API exists.
+//! [`Backend::Controlled`] runs the backend of the target under `Delivery::Controlled`, the public
+//! seam of the completions: io_uring on Linux, kqueue on macOS, and the port on Windows. The
+//! driver keeps each completion that the backend posts and gives it at the next turn, after it
+//! applied the requests of that turn. So a drop, a cancel, or a close always comes before the
+//! completion of its operation, with no dependence on the timing of the kernel. Through
+//! `Driver::control`, a case can also hold the completions of one operation, fail or repeat a
+//! completion, or fail a registration. The seam supplies inputs only: the table, the harvest, and
+//! the stream rules run as with native delivery. A case of another backend that holds an operation
+//! selects `Delivery::Controlled` itself.
 //!
 //! On macOS, `Backend::Kqueue` gives each completion as the kqueue poller posts it: the poller of
 //! epoll, with the kqueue selector, and each file entry as a job of a blocking service of the case.
 //! A case with a `cfg` of Linux runs only there: the two sends that wait in the driver (see
-//! below), the refused submission of a full driver, and the cases of the injection seam. A
-//! datagram with a segment size has its own case on macOS, because macOS has no segmentation
-//! offload.
+//! below). A datagram with a segment size has its own case on macOS, because macOS has no
+//! segmentation offload.
 //!
 //! On Windows, `Backend::Iocp` gives each completion as the completion port gives it, where each
-//! socket that passes the installed-provider check skips the packet of a call that ends at once,
-//! and `Backend::Packets` gives it with no skip, so each call that does not fail at once ends at
-//! its packet. A file never skips packets, so its cases run the same on both, and each file
-//! operation with no overlapped form runs on a blocking service of the case. Both pin
-//! `Config::backend(Backend::Iocp)`, so the file path of IOCP runs on a host that has an I/O ring
-//! too. `Backend::IoRing` pins the IoRing backend: the cases of the `files` block run there, with
+//! socket that passes the installed-provider check skips the packet of a call that ends at once.
+//! Under `Backend::Controlled`, no socket skips, so each call that does not fail at once ends at
+//! its packet. A file never skips packets, and each file operation with no overlapped form runs on
+//! a blocking service of the case. Both pin `Config::backend(Backend::Iocp)`, so the file path of
+//! IOCP runs on a host that has an I/O ring too. `Backend::IoRing` pins the IoRing backend: the cases of the `files` block run there, with
 //! each read, write, and sync of a file as an entry of the ring, and each other file operation,
 //! also a hole punch, on a blocking service of the case. Only the TCP, UDP, local stream, and file
 //! cases run on Windows: its pipes, processes, and signals have no IOCP form yet. The cases whose
@@ -46,17 +45,15 @@
 //! # Forms of a case
 //!
 //! The body of a case stays beside the code of its surface, and this index gives each body its
-//! tests: `<suite>::kernel::<case>`, `<suite>::injected::<case>`, and `<suite>::epoll::<case>` on
-//! Linux, `<suite>::kqueue::<case>` on macOS, and `<suite>::iocp::<case>`,
-//! `<suite>::packets::<case>`, and, for a file case, `<suite>::io_ring::<case>` on Windows. A case
-//! runs once, as
-//! `<suite>::once::<case>`, when the seam can change none of its inputs: a refusal makes no
-//! completion, and a signal reaches its stream through the wake descriptor of the driver, not
-//! through a completion. Two cases run only under injection, as `law::injected_only::<case>`,
-//! because a kernel cannot make them on demand: a completion with a stale generation, and a cancel
-//! result that says that its target already runs. They do not apply to epoll: the data of each
-//! registration holds the generation of its resource, and an operation that the poller runs ends
-//! at the return of its call, so no cancel finds it running.
+//! tests: `<suite>::kernel::<case>`, `<suite>::controlled::<case>`, and `<suite>::epoll::<case>`
+//! on Linux, `<suite>::kqueue::<case>` and `<suite>::controlled::<case>` on macOS, and
+//! `<suite>::iocp::<case>`, `<suite>::controlled::<case>`, and, for a file case,
+//! `<suite>::io_ring::<case>` on Windows. A case runs once, as `<suite>::once::<case>`, when the
+//! seam can change none of its inputs: a refusal makes no completion, and a signal reaches its
+//! stream through the wake descriptor of the driver, not through a completion. Two cases run only
+//! under controlled delivery on Linux and macOS, as `law::controlled_only::<case>`, because a
+//! kernel cannot make them on demand: a late completion with a stale generation, and a cancel
+//! result that says that its target already runs.
 //!
 //! # The ownership law
 //!
@@ -67,8 +64,8 @@
 //!
 //! | Terminal-event row | Case, or the reason that no case applies |
 //! | --- | --- |
-//! | io_uring, single-completion request | `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion` |
-//! | io_uring, multishot request | No driver operation is multishot. The table rule runs in `uring::table_tests::a_multishot_operation_releases_at_its_last_completion` on the kernel, and in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` under injection |
+//! | io_uring, single-completion request | `a_forgotten_future_releases_its_buffer_only_after_the_terminal_completion` |
+//! | io_uring, multishot request | No driver operation is multishot. The table rule runs in `uring::table_tests::a_multishot_operation_releases_at_its_last_completion` on the kernel, and in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` with the events of the test |
 //! | io_uring, zero-copy send | No driver operation is a zero-copy send before R611. The table rule runs in `table::tests::each_shape_releases_its_resources_once_at_its_terminal_event` |
 //! | epoll, `MSG_ZEROCOPY` send | No driver operation is a zero-copy send before R611, which adds it on epoll too |
 //! | IOCP, initiating call returns `STATUS_PENDING` | On Windows, `law::iocp` and `law::packets`, for example `a_dropped_accept_leaves_its_connection_to_the_next_accept`; after `CancelIoEx`, `a_cancelled_receive_keeps_its_buffer_until_its_packet`; for a file write, `a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet` |
@@ -76,11 +73,11 @@
 //! | IOCP, immediate return with any other status | On Windows, with skip-on-success in `law::iocp` and with a packet in `law::packets`: `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order`, whose receive ends at once with its bytes. The warning status of an oversized datagram comes in the packet of `an_oversized_datagram_gives_the_truncation_outcome`: on Windows Server 2025, the receive of a datagram that waits returns pending, so no case makes the warning at once |
 //! | Windows IoRing | On Windows, `law::io_ring`: `a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet`, whose write ends at its completion queue entry, which the packet of the ring brings, and `two_reads_started_in_one_turn_each_end_with_their_bytes`, whose two entries end in one drain of the completion queue |
 //! | Windows Registered I/O | No Registered I/O: R6 adds it |
-//! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion`. On kqueue, each case of `law::kqueue`, for example `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order` |
+//! | epoll and kqueue readiness operations | On epoll, each case of `law::epoll`, for example `a_forgotten_future_releases_its_buffer_only_after_the_terminal_completion`. On kqueue, each case of `law::kqueue`, for example `a_dropped_receive_leaves_its_bytes_to_the_next_receives_in_order` |
 //! | The blocking service | `a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy`. Before Linux 6.9, also the length change of the operation suite. On epoll and kqueue, each file case, for example `a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion`. On IOCP, each file case that opens, syncs, or changes the length or the space of a file, and on IoRing each one that opens, changes the length or the space, or punches a hole |
 //! | Child wait | `a_dropped_wait_and_child_leave_no_zombie_after_the_exit` |
 //!
-//! A cancel result is not a terminal event: `law::injected_only` and the table cases show it, with
+//! A cancel result is not a terminal event: `law::controlled_only` and the table cases show it, with
 //! each cancel result and a completion after "not found" (`table::tests` and
 //! `uring::table_tests`).
 //!
@@ -175,7 +172,7 @@
 
 use core::num::NonZeroU64;
 
-use super::{Config, Driver};
+use super::{Config, Delivery, Driver};
 use crate::blocking::{self, Service};
 use crate::capacity::Budget;
 
@@ -185,10 +182,10 @@ pub(super) enum Backend {
     /// The io_uring ring, as the kernel posts them.
     #[cfg(target_os = "linux")]
     Kernel,
-    /// The completion-injection seam of the io_uring ring: each completion comes at the take after
-    /// the one that found it, unless the case holds, replaces, or adds a completion.
-    #[cfg(target_os = "linux")]
-    Injected,
+    /// The backend of the target under `Delivery::Controlled`: each completion comes at the turn
+    /// after the one that took it, unless the case holds, fails, or repeats it. On Windows, no
+    /// socket skips its packet.
+    Controlled,
     /// The epoll poller, as its nonblocking calls end. Each file operation runs on a blocking
     /// service of the case.
     #[cfg(target_os = "linux")]
@@ -198,11 +195,6 @@ pub(super) enum Backend {
     /// operation with no overlapped form runs on a blocking service of the case.
     #[cfg(target_os = "windows")]
     Iocp,
-    /// The completion port with no skip-on-success: each call that does not fail at once ends at
-    /// its packet. Each file operation with no overlapped form runs on a blocking service of the
-    /// case.
-    #[cfg(target_os = "windows")]
-    Packets,
     /// The completion port with the I/O ring of the files: each read, write, and sync of a file is
     /// an entry of the ring, and each other file operation runs on a blocking service of the case.
     #[cfg(target_os = "windows")]
@@ -216,7 +208,10 @@ pub(super) enum Backend {
 /// A driver of `config` that takes its completions from `backend`.
 #[cfg(target_os = "macos")]
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
-    let Backend::Kqueue = backend;
+    let config = match backend {
+        Backend::Kqueue => config,
+        Backend::Controlled => config.delivery(Delivery::Controlled),
+    };
     let mut driver = super::tests::driver(config.backend(super::Backend::Kqueue));
     driver.use_blocking(service().submitter());
     driver
@@ -225,14 +220,12 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
 /// A driver of `config` that takes its completions from `backend`.
 #[cfg(target_os = "windows")]
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
-    let selected = match backend {
-        Backend::IoRing => super::Backend::IoRing,
-        Backend::Iocp | Backend::Packets => super::Backend::Iocp,
+    let (selected, config) = match backend {
+        Backend::IoRing => (super::Backend::IoRing, config),
+        Backend::Iocp => (super::Backend::Iocp, config),
+        Backend::Controlled => (super::Backend::Iocp, config.delivery(Delivery::Controlled)),
     };
     let mut driver = super::tests::driver(config.backend(selected));
-    if backend == Backend::Packets {
-        driver.resources.registrar.packets.set(true);
-    }
     driver.use_blocking(service().submitter());
     driver
 }
@@ -240,15 +233,14 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
 /// A driver of `config` that takes its completions from `backend`.
 #[cfg(target_os = "linux")]
 pub(super) fn driver(config: Config, backend: Backend) -> Driver {
-    let selected = match backend {
-        Backend::Kernel | Backend::Injected => super::Backend::IoUring,
-        Backend::Epoll => super::Backend::Epoll,
+    let (selected, config) = match backend {
+        Backend::Kernel => (super::Backend::IoUring, config),
+        Backend::Controlled => (super::Backend::IoUring, config.delivery(Delivery::Controlled)),
+        Backend::Epoll => (super::Backend::Epoll, config),
     };
     let mut driver = super::tests::driver(config.backend(selected));
-    match backend {
-        Backend::Kernel => {}
-        Backend::Injected => driver.queue.ring().unwrap().inject(),
-        Backend::Epoll => driver.use_blocking(service().submitter()),
+    if backend == Backend::Epoll {
+        driver.use_blocking(service().submitter());
     }
     driver
 }
@@ -261,9 +253,9 @@ fn service() -> &'static Service {
     alloc::boxed::Box::leak(alloc::boxed::Box::new(Service::new(&budget, config).unwrap()))
 }
 
-/// Gives each case a test on each backend of the target: on Linux, the kernel, the injection, and
-/// epoll; on macOS, kqueue; on Windows, the port with and with no skip-on-success. Each case of the
-/// `files` block also has a test on IoRing on Windows, which differs from IOCP only in its files. A
+/// Gives each case a test on each backend of the target, and under controlled delivery: on Linux,
+/// the kernel and epoll; on macOS, kqueue; on Windows, the port. Each case of the `files` block also
+/// has a test on IoRing on Windows, which differs from IOCP only in its files. A
 /// case with a `cfg` runs only where it holds, for example a case of pipes only on Linux.
 macro_rules! cases {
     (
@@ -278,10 +270,9 @@ macro_rules! cases {
     };
     (@all [$($files:tt)*] [$($others:tt)*]) => {
         cases!(@backend kernel, target_os = "linux", Kernel; $($files)* $($others)*);
-        cases!(@backend injected, target_os = "linux", Injected; $($files)* $($others)*);
+        cases!(@backend controlled, all(), Controlled; $($files)* $($others)*);
         cases!(@backend epoll, target_os = "linux", Epoll; $($files)* $($others)*);
         cases!(@backend iocp, target_os = "windows", Iocp; $($files)* $($others)*);
-        cases!(@backend packets, target_os = "windows", Packets; $($files)* $($others)*);
         cases!(@backend io_ring, target_os = "windows", IoRing; $($files)*);
         cases!(@backend kqueue, target_os = "macos", Kqueue; $($files)* $($others)*);
     };
@@ -340,7 +331,7 @@ mod law {
         tests => a_request_into_an_owned_buffer_and_a_response_from_a_lease_keep_their_addresses,
         // Forgotten futures.
         #[cfg(unix)]
-        tests => a_forgotten_future_releases_its_buffer_and_charge_only_after_the_terminal_completion,
+        tests => a_forgotten_future_releases_its_buffer_only_after_the_terminal_completion,
         tests => a_forgotten_receive_leaves_its_bytes_to_the_next_receive_which_gives_them_before_it_submits,
         // Abandoned operations: a stream receive and send, a datagram receive, a spawn, and a child
         // wait.
@@ -393,7 +384,7 @@ mod law {
 
     // The refused submissions, also of a resource or a child that another driver made.
     once! {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         tests => a_full_driver_refuses_a_submission_and_returns_its_resources,
         tests => a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back,
         tests => a_resource_of_another_driver_refuses_and_each_driver_keeps_its_own,
@@ -402,8 +393,8 @@ mod law {
     }
 
     /// The cases that a kernel cannot make on demand.
-    #[cfg(target_os = "linux")]
-    mod injected_only {
+    #[cfg(unix)]
+    mod controlled_only {
         use alloc::vec::Vec;
         use core::future::Future;
         use core::pin::Pin;
@@ -414,11 +405,7 @@ mod law {
         use crate::buffer::{Backing, Buffer as _};
         use crate::driver::Config;
         use crate::driver::suite::{Backend, driver};
-        use crate::driver::tests::{drive, posted};
-        use crate::table::OpId;
-
-        /// `EALREADY` (`include/uapi/asm-generic/errno.h`): the cancel found its target running.
-        const EALREADY: i32 = 114;
+        use crate::driver::tests::{drive, held, hold};
 
         /// Whether one poll of `future` leaves it pending.
         fn pending<F: Future + Unpin>(future: &mut F) -> bool {
@@ -427,29 +414,33 @@ mod law {
                 .is_pending()
         }
 
-        /// A completion whose user data names a slot that a later operation holds now changes
-        /// nothing, because its generation is stale. The later operation gives its own result.
+        /// A late completion with the identity of an ended receive, whose slot a later receive
+        /// holds now, changes nothing, because its generation is stale. The later receive gives its
+        /// own result.
         #[test]
         fn a_stale_completion_after_the_slot_is_used_again_changes_nothing() {
-            let mut driver = driver(Config::new().operations(1), Backend::Injected);
+            let mut driver = driver(Config::new().operations(1), Backend::Controlled);
             let (read, mut write) = std::io::pipe().expect("the test host makes a pipe");
             let mut reader = driver.adopt_reader(OwnedFd::from(read)).expect("the driver has room");
             let first = driver
                 .recv(&mut reader, Backing::from(Vec::with_capacity(8)))
                 .expect("the driver has room");
+            let old = first.id();
             write.write_all(b"a").expect("the pipe has room");
-            let stale = posted(&mut driver, 1)[0];
             assert_eq!(drive(&mut driver, first).expect("the driver runs").1.bytes(), b"a");
 
             // The one operation slot takes the next receive, with a new generation.
             let mut second = driver
                 .recv(&mut reader, Backing::from(Vec::with_capacity(8)))
                 .expect("the driver has room");
-            let running = driver.table.running().next().expect("the receive runs");
-            let old = OpId::from_user_data(stale.user_data).expect("the completion of an operation");
-            assert_eq!(running.index(), old.index());
-            assert_ne!(running.generation(), old.generation());
-            driver.queue.ring().unwrap().add(stale);
+            let new = second.id();
+            assert_eq!(new.op.index(), old.op.index());
+            assert_ne!(new.op.generation(), old.op.generation());
+            driver
+                .control()
+                .expect("the driver is controlled")
+                .repeat(old)
+                .expect("the first receive got its completion");
             while driver.turn().expect("a turn works").more() {}
             assert!(pending(&mut second), "the stale completion ended the receive");
 
@@ -462,25 +453,29 @@ mod law {
         /// with no copy.
         #[test]
         fn a_cancel_that_finds_its_receive_running_waits_for_the_completion_of_the_receive() {
-            let mut driver = driver(Config::new(), Backend::Injected);
+            let mut driver = driver(Config::new(), Backend::Controlled);
             let (read, mut write) = std::io::pipe().expect("the test host makes a pipe");
             let mut reader = driver.adopt_reader(OwnedFd::from(read)).expect("the driver has room");
             let buffer = Backing::from(Vec::with_capacity(64));
             let address = buffer.as_ptr();
             let mut receive = driver.recv(&mut reader, buffer).expect("the driver has room");
+            let id = hold(&mut driver, &receive);
             write.write_all(b"hello").expect("the pipe has room");
-            let completion = posted(&mut driver, 1)[0];
-            let id = OpId::from_user_data(completion.user_data).expect("the completion of an operation");
+            assert_eq!(held(&mut driver, id).expect("the receive works"), 5);
 
             // The completion waits, and the result of the cancel says that the receive already
             // runs.
-            driver.queue.ring().unwrap().hold(completion.user_data);
-            driver.queue.ring().unwrap().replace(id.cancel_user_data(), -EALREADY);
+            let mut control = driver.control().expect("the driver is controlled");
+            control.cancel_finds_running(id).expect("the receive is of the driver");
             receive.cancel();
             while driver.turn().expect("a turn works").more() {}
             assert!(pending(&mut receive), "the result of the cancel ended the receive");
 
-            driver.queue.ring().unwrap().release(completion.user_data);
+            driver
+                .control()
+                .expect("the driver is controlled")
+                .deliver(id)
+                .expect("the receive is of the driver");
             let (count, buffer) = drive(&mut driver, receive).expect("the driver runs");
             let count = count.expect("the receive works");
             assert_eq!((count, buffer.as_ptr(), buffer.bytes()), (5, address, &b"hello"[..]));

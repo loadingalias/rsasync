@@ -11,8 +11,7 @@
 //!   ignores it.
 //! - Debt and the terminal event: [`Table::begin`] records the resources and the [`Shape`] of an
 //!   operation before the backend submits it. The shape gives the event that releases the
-//!   resources, by the terminal-event table of the design; a zero-copy send selects between its two
-//!   rows at its first completion.
+//!   resources, by the terminal-event table of the design.
 //! - Interest apart from ownership: when the consumer ends its interest, the operation and its
 //!   resources stay. At the terminal event, the table gives them back to the driver, which applies
 //!   the abandoned rule.
@@ -94,6 +93,11 @@ impl OpId {
         CANCEL_RESULT | self.user_data()
     }
 
+    /// The target of the cancel result of `user_data`, or `None` for other user data.
+    pub(crate) fn from_cancel_user_data(user_data: u64) -> Option<Self> {
+        (user_data & CONTROL == CANCEL_RESULT).then(|| Self::from_bits(user_data))
+    }
+
     #[expect(
         clippy::cast_possible_truncation,
         reason = "the generation is the low 32 bits of the user data, and the index fits in 30 bits"
@@ -113,9 +117,6 @@ pub(crate) enum Shape {
     Single,
     /// Items while each completion has `more`; the completion without it is terminal.
     Multishot,
-    /// A zero-copy send. A result with `more` ends the operation, and the notice that follows
-    /// releases the resources. A result without `more` is terminal, because no notice follows.
-    ZeroCopy,
 }
 
 /// A completion, in the terms of every backend.
@@ -124,8 +125,6 @@ pub(crate) struct Event {
     pub(crate) result: i32,
     /// The operation posts more completions (`IORING_CQE_F_MORE`).
     pub(crate) more: bool,
-    /// The completion is the notice of a zero-copy send (`IORING_CQE_F_NOTIF`).
-    pub(crate) notice: bool,
 }
 
 /// What [`Table::complete`] did.
@@ -145,19 +144,16 @@ pub(crate) enum Outcome<T> {
     Ready,
     /// The operation ended with no consumer. The driver applies the abandoned rule.
     Abandoned(Ended<T>),
-    /// The notice of an ended zero-copy send released its resources.
-    Released(T),
     /// The terminal-event table has no row for this event in this state, so nothing changed. The
     /// driver reports it.
     Unclassified,
 }
 
-/// The result of an ended operation, and its resources if they are free.
+/// The result of an ended operation, and its resources.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Ended<T> {
     pub(crate) result: i32,
-    /// `None` for a zero-copy send whose notice has not released them.
-    pub(crate) resources: Option<T>,
+    pub(crate) resources: T,
 }
 
 /// The table has no free slot. The caller keeps its resources.
@@ -190,15 +186,9 @@ enum State<T> {
         resources: T,
         interest: bool,
     },
-    /// A zero-copy send ended, and its resources wait for the notice. `result` waits for the
-    /// consumer while it has interest.
-    Notice {
-        resources: T,
-        result: Option<i32>,
-    },
     /// The operation ended, and its result waits for the consumer.
     Done {
-        resources: Option<T>,
+        resources: T,
         result: i32,
     },
 }
@@ -301,11 +291,7 @@ impl<T> Table<T> {
                     resources,
                     interest,
                 },
-                Event {
-                    result,
-                    more: true,
-                    notice: false,
-                },
+                Event { result, more: true },
             ) => (
                 State::Live {
                     shape: Shape::Multishot,
@@ -316,87 +302,13 @@ impl<T> Table<T> {
             ),
             (
                 State::Live {
-                    shape: Shape::ZeroCopy,
-                    resources,
-                    interest,
-                },
-                Event {
-                    result,
-                    more: true,
-                    notice: false,
-                },
-            ) if interest => (
-                State::Notice {
-                    resources,
-                    result: Some(result),
-                },
-                Outcome::Ready,
-            ),
-            (
-                State::Live {
-                    shape: Shape::ZeroCopy,
-                    resources,
-                    ..
-                },
-                Event {
-                    result,
-                    more: true,
-                    notice: false,
-                },
-            ) => (
-                State::Notice {
-                    resources,
-                    result: None,
-                },
-                Outcome::Abandoned(Ended {
-                    result,
-                    resources: None,
-                }),
-            ),
-            (
-                State::Live {
                     resources, interest, ..
                 },
-                Event {
-                    result,
-                    more: false,
-                    notice: false,
-                },
-            ) if interest => (
-                State::Done {
-                    resources: Some(resources),
-                    result,
-                },
-                Outcome::Ready,
-            ),
-            (
-                State::Live { resources, .. },
-                Event {
-                    result,
-                    more: false,
-                    notice: false,
-                },
-            ) => (
-                State::Free,
-                Outcome::Abandoned(Ended {
-                    result,
-                    resources: Some(resources),
-                }),
-            ),
-            (
-                State::Notice { resources, result },
-                Event {
-                    more: false,
-                    notice: true,
-                    ..
-                },
-            ) => (
-                result.map_or(State::Free, |result| State::Done {
-                    resources: None,
-                    result,
-                }),
-                Outcome::Released(resources),
-            ),
+                Event { result, more: false },
+            ) if interest => (State::Done { resources, result }, Outcome::Ready),
+            (State::Live { resources, .. }, Event { result, more: false }) => {
+                (State::Free, Outcome::Abandoned(Ended { result, resources }))
+            }
             (state, _) => (state, Outcome::Unclassified),
         };
         let free = matches!(state, State::Free);
@@ -415,19 +327,6 @@ impl<T> Table<T> {
             State::Done { resources, result } => {
                 self.free_slot(id.index);
                 Some(Ended { result, resources })
-            }
-            State::Notice {
-                resources,
-                result: Some(result),
-            } => {
-                slot.state = State::Notice {
-                    resources,
-                    result: None,
-                };
-                Some(Ended {
-                    result,
-                    resources: None,
-                })
             }
             state => {
                 slot.state = state;
@@ -492,8 +391,7 @@ impl<T> Table<T> {
             .get(id.index as usize)
             .filter(|slot| slot.generation == id.generation)?;
         match &slot.state {
-            State::Live { resources, .. } | State::Notice { resources, .. } => Some(resources),
-            State::Done { resources, .. } => resources.as_ref(),
+            State::Live { resources, .. } | State::Done { resources, .. } => Some(resources),
             State::Free => None,
         }
     }
@@ -522,12 +420,9 @@ impl<T> Table<T> {
         })
     }
 
-    /// Whether an event can still come: an operation runs, or a zero-copy send waits for its
-    /// notice.
+    /// Whether an event can still come: an operation runs.
     pub(crate) fn busy(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|slot| matches!(slot.state, State::Live { .. } | State::Notice { .. }))
+        self.slots.iter().any(|slot| matches!(slot.state, State::Live { .. }))
     }
 
     /// The slot of a live operation, or `None` for a stale identity.
@@ -548,11 +443,11 @@ impl<T> Table<T> {
 }
 
 impl<T> Drop for Table<T> {
-    /// The kernel can still use the resources of a running operation and of a zero-copy send
-    /// that waits for its notice, so they leak. The other resources drop.
+    /// The kernel can still use the resources of a running operation, so they leak. The other
+    /// resources drop.
     fn drop(&mut self) {
         for slot in &mut self.slots {
-            if let State::Live { .. } | State::Notice { .. } = slot.state {
+            if let State::Live { .. } = slot.state {
                 let _leaked = ManuallyDrop::new(mem::replace(&mut slot.state, State::Free));
             }
         }

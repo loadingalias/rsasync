@@ -6,32 +6,26 @@ use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::super::tests::{drive, driver};
-use super::super::{Backend, Call, Config, Driver, Error, OpenOptions, Reason, Route, TcpOptions};
+use super::super::{Backend, Call, Config, Delivery, Driver, Error, OpenOptions, Reason, Route, TcpOptions};
 use crate::buffer::{Backing, Buffer as _, Lease};
-
-/// `ENOSPC` (`include/uapi/asm-generic/errno-base.h`): `epoll_ctl` at the limit of
-/// `fs.epoll.max_user_watches`.
-#[cfg(target_os = "linux")]
-const ENOSPC: i32 = 28;
 
 /// `EPERM` (`include/uapi/asm-generic/errno-base.h`).
 #[cfg(target_os = "linux")]
 const EPERM: i32 = 1;
 
 /// A refused registration gives the descriptor back, open, with [`Reason::Register`], and the
-/// driver takes the same descriptor later. The test seam of the registrar gives the error of
-/// `epoll_ctl`, because no unprivileged path makes `epoll_ctl` fail on a pipe or a socket: each
-/// adoption refuses a regular file, which epoll does not take, before the registration, and the
-/// limit `fs.epoll.max_user_watches` is a setting of root for each user of the host.
+/// driver takes the same descriptor later. The control fails the registration, because no
+/// unprivileged path makes `epoll_ctl` fail on a pipe or a socket: each adoption refuses a regular
+/// file, which epoll does not take, before the registration, and the limit
+/// `fs.epoll.max_user_watches` is a setting of root for each user of the host.
 #[test]
 #[cfg(target_os = "linux")]
 fn a_failed_registration_returns_the_descriptor_open_with_its_reason() {
-    let mut driver = driver(Config::new().backend(Backend::Epoll));
+    let mut driver = driver(Config::new().backend(Backend::Epoll).delivery(Delivery::Controlled));
     let (read, mut write) = io::pipe().unwrap();
     let read = OwnedFd::from(read);
     let raw = read.as_raw_fd();
-    let registrar = driver.resources.registrar.as_ref().unwrap();
-    registrar.fail.set(Some(ENOSPC));
+    driver.control().unwrap().fail_next_registration().unwrap();
 
     let refused = driver.adopt_reader(read).unwrap_err();
     assert_eq!(refused.reason(), Reason::Register);
@@ -115,25 +109,21 @@ fn a_disabled_io_uring_runs_epoll_in_the_permissive_selection_and_refuses_the_st
     assert_eq!(&ping, b"ping");
 }
 
-/// `ENOMEM` (`sys/errno.h` of macOS): `kevent` with no kernel memory for a registration.
-#[cfg(target_os = "macos")]
-const ENOMEM: i32 = 12;
-
 /// A refused registration of an accepted connection loses no connection: the accept gives
-/// `OutOfMemory`, the listener keeps the connection, and the next accept gives it. The test seam of
-/// the registrar gives the error of `kevent`, because no unprivileged path makes the registration
-/// of a socket fail.
+/// `OutOfMemory`, the listener keeps the connection, and the next accept gives it. The control fails
+/// the registration, because no unprivileged path makes the registration of a socket in a kqueue
+/// fail.
 #[test]
 #[cfg(target_os = "macos")]
 fn a_refused_registration_of_an_accepted_connection_keeps_it_for_the_next_accept() {
-    let mut driver = driver(Config::new());
+    let mut driver = driver(Config::new().delivery(Delivery::Controlled));
     let bind = driver
         .bind("127.0.0.1:0".parse().unwrap(), TcpOptions::default())
         .unwrap();
     let mut listener = drive(&mut driver, bind).unwrap().unwrap();
     let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
     peer.write_all(b"kept").unwrap();
-    driver.resources.registrar.as_ref().unwrap().fail.set(Some(ENOMEM));
+    driver.control().unwrap().fail_next_registration().unwrap();
     let accept = driver.accept(&mut listener).unwrap();
     let refused = drive(&mut driver, accept).unwrap().unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::OutOfMemory);

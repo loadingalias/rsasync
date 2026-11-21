@@ -58,6 +58,7 @@
 
 mod capability;
 mod completion;
+mod control;
 mod file;
 #[cfg(all(feature = "local", target_os = "linux"))]
 mod home;
@@ -118,7 +119,6 @@ use std::os::windows::io::{BorrowedSocket as Borrowed, OwnedSocket as Handle};
 use rsnetwork_udp::SockAddrStorage;
 
 use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
-use crate::capacity::Permit;
 use crate::memory::{items, room};
 use crate::sync::{Arc, try_arc};
 #[cfg(target_os = "linux")]
@@ -130,6 +130,7 @@ use crate::uring::{Ring, SetupError};
 use queue::Queue;
 
 pub use capability::{Backend, Call, Feature, Features, Report, Route};
+pub use control::{Control, ControlError, Delivery, OperationId};
 #[cfg(target_os = "windows")]
 pub use file::NvmePath;
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
@@ -169,11 +170,12 @@ pub struct Config {
     completions_per_turn: u32,
     required: Features,
     backend: Option<Backend>,
+    delivery: Delivery,
 }
 
 impl Config {
     /// 64 submission entries, 256 operations, 256 resources, 64 children, 64 completions per turn,
-    /// no required feature, and the permissive selection of the backend.
+    /// no required feature, the permissive selection of the backend, and native delivery.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -185,7 +187,30 @@ impl Config {
             completions_per_turn: 64,
             required: Features::NONE,
             backend: None,
+            delivery: Delivery::Native,
         }
+    }
+
+    /// Gives the completions of the backend by `delivery`. With [`Delivery::Controlled`],
+    /// [`Driver::control`] gives the [`Control`] that holds, fails, or repeats them, so a test of
+    /// the caller makes each order of completions and requests on demand.
+    ///
+    /// ```
+    /// # #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    /// # fn main() -> Result<(), rsasync::driver::Error> {
+    /// // The same text as `docs/content/controlled-delivery.md`. Edit both.
+    /// use rsasync::driver::{Config, Delivery, Driver};
+    ///
+    /// let mut driver = Driver::new(Config::new().delivery(Delivery::Controlled))?;
+    /// assert!(driver.control().is_some());
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    /// # fn main() {}
+    /// ```
+    #[must_use]
+    pub const fn delivery(self, delivery: Delivery) -> Self {
+        Self { delivery, ..self }
     }
 
     /// Requires `backend`: with [`Backend::IoUring`], a kernel that refuses io_uring makes
@@ -380,11 +405,6 @@ pub(crate) struct Held {
     pub(crate) payload: Payload,
     /// The loan of the buffer that a receive or a read fills.
     pub(crate) loan: Option<WriteLoan<Backing>>,
-    #[cfg_attr(
-        any(not(test), loom, not(target_os = "linux")),
-        expect(dead_code, reason = "no operation takes a charge yet; the tests of Linux do")
-    )]
-    pub(crate) charge: Option<Permit>,
     /// The socket that an accept, a connect, or a bind gave, or the file that an open gave.
     pub(crate) accepted: Option<Resource>,
     /// The next operation that waits in the same direction, in start order.
@@ -744,6 +764,12 @@ impl<'a, T> Operation<'a, T> {
         }
     }
 
+    /// The identity of the operation, which the [`Control`] of its driver takes.
+    #[must_use]
+    pub fn id(&self) -> OperationId {
+        self.completion.id()
+    }
+
     /// Asks the driver to cancel the operation. The future keeps its interest: it later gives
     /// the result, with the original buffer and its exact progress. A receive gives the bytes
     /// that it received before the cancel took effect, with no copy, and a send leaves its
@@ -895,9 +921,24 @@ struct Resources {
     /// The associations with the port.
     #[cfg(target_os = "windows")]
     registrar: iocp::Registrar,
+    /// The next registration fails ([`Control::fail_next_registration`]).
+    fail_registration: bool,
 }
 
 impl Resources {
+    /// Whether the backend registers each socket and pipe: the poller and the port do.
+    #[cfg(unix)]
+    const fn registers(&self) -> bool {
+        self.registrar.is_some()
+    }
+
+    /// Whether the backend registers each socket and pipe: the port does.
+    #[cfg(target_os = "windows")]
+    #[expect(clippy::unused_self, reason = "the same call as on Unix, where the backend decides")]
+    const fn registers(&self) -> bool {
+        true
+    }
+
     /// Takes `fd`, a descriptor of `medium`. Refuses with `fd` and [`Reason::Resources`] when each
     /// slot that no spawn keeps is in use, or with [`Reason::Register`] when the poller does not
     /// take it.
@@ -961,14 +1002,21 @@ impl Resources {
             if medium == Medium::Pipe && !pipe::set_nonblocking(fd.as_fd(), true) {
                 return Err((Reason::Register, fd));
             }
-            if registrar.add(fd.as_fd(), token).is_err() {
+            if mem::take(&mut self.fail_registration) || registrar.add(fd.as_fd(), token).is_err() {
                 return Err((Reason::Register, fd));
             }
         }
         #[cfg(target_os = "windows")]
-        match self.registrar.add(&fd) {
-            Ok(skips) => slot.skips = skips,
-            Err(_) => return Err((Reason::Register, fd)),
+        {
+            let added = if mem::take(&mut self.fail_registration) {
+                Err(())
+            } else {
+                self.registrar.add(&fd).map_err(drop)
+            };
+            match added {
+                Ok(skips) => slot.skips = skips,
+                Err(()) => return Err((Reason::Register, fd)),
+            }
         }
         slot.fd = Some(fd);
         slot.medium = medium;
@@ -1162,6 +1210,8 @@ impl Selected {
 
 /// The state that the futures and the wake handles share with the home.
 struct Shared {
+    /// The driver of the operations: their identity names it ([`Operation::id`]).
+    driver: DriverId,
     entries: Box<[Entry<Held>]>,
     requests: Requests,
     /// The closes that the drops of local resources record ([`home::Cleanup`]).
@@ -1294,6 +1344,8 @@ pub struct Driver {
     /// The home of a local owner on this driver, and the wake messages that it sent.
     #[cfg(all(feature = "local", target_os = "linux"))]
     wakes: home::Wakes,
+    /// The state of [`Delivery::Controlled`].
+    control: Option<control::Controlled>,
 }
 
 impl fmt::Debug for Driver {
@@ -1336,7 +1388,14 @@ impl Driver {
             return Err(Error::Config);
         }
         let completions = config.operations.max(config.submissions).saturating_mul(2).min(1 << 16);
-        Self::start_backend(config, completions)
+        let mut driver = Self::start_backend(config, completions)?;
+        if config.delivery == Delivery::Controlled {
+            driver.control = Some(
+                control::Controlled::new(config.operations, completions)
+                    .map_err(|error| Error::System(out_of_memory(error)))?,
+            );
+        }
+        Ok(driver)
     }
 
     /// Starts the port of a valid `config` with room for `completions` operations in flight, and
@@ -1376,9 +1435,11 @@ impl Driver {
             selection.backend = Backend::Iocp;
             selection.fallback = Some(error);
         }
-        let (wake, registrar) = (port.wake(), port.registrar());
+        let (wake, registrar) = (port.wake(), port.registrar(config.delivery));
         let table = Table::new(config.operations).map_err(refused)?;
+        let driver = DriverId::next()?;
         let shared = try_arc(Shared {
+            driver,
             entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
             wake,
@@ -1390,10 +1451,11 @@ impl Driver {
             table,
             shared,
             resources: Resources {
-                driver: DriverId::next()?,
+                driver,
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
+                fail_registration: false,
             },
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,
@@ -1405,6 +1467,7 @@ impl Driver {
             job_waker,
             jobs: room(config.operations as usize).map_err(refused)?,
             waiting: room(config.operations as usize).map_err(refused)?,
+            control: None,
         })
     }
 
@@ -1439,7 +1502,9 @@ impl Driver {
         })?;
         let registrar = poller.registrar();
         let table = Table::new(config.operations).map_err(refused)?;
+        let driver = DriverId::next()?;
         let shared = try_arc(Shared {
+            driver,
             entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
             wake,
@@ -1447,7 +1512,6 @@ impl Driver {
         })
         .map_err(refused)?;
         let job_waker = file::job_waker(&shared).map_err(refused)?;
-        let driver = DriverId::next()?;
         Ok(Self {
             queue: Queue::Poller(poller),
             table,
@@ -1457,6 +1521,7 @@ impl Driver {
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar: Some(registrar),
+                fail_registration: false,
             },
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,
@@ -1470,6 +1535,7 @@ impl Driver {
             job_waker,
             jobs: room(config.operations as usize).map_err(refused)?,
             waiting: room(config.operations as usize).map_err(refused)?,
+            control: None,
         })
     }
 
@@ -1546,7 +1612,9 @@ impl Driver {
             Queue::Ring(_) => None,
         };
         let table = Table::new(config.operations).map_err(refused)?;
+        let driver = DriverId::next()?;
         let shared = try_arc(Shared {
+            driver,
             entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
             #[cfg(all(feature = "local", target_os = "linux"))]
@@ -1558,7 +1626,6 @@ impl Driver {
         let job_waker = file::job_waker(&shared).map_err(refused)?;
         #[cfg(all(feature = "local", target_os = "linux"))]
         let wakes = home::Wakes::new(&queue, &shared).map_err(Error::System)?;
-        let driver = DriverId::next()?;
         Ok(Self {
             queue,
             table,
@@ -1568,6 +1635,7 @@ impl Driver {
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
+                fail_registration: false,
             },
             children: process::Children::new(config.children, driver).map_err(Error::System)?,
             taken: room(config.operations as usize * 2).map_err(refused)?,
@@ -1584,6 +1652,7 @@ impl Driver {
             jobs: room(config.operations as usize).map_err(refused)?,
             #[cfg(all(feature = "local", target_os = "linux"))]
             wakes,
+            control: None,
         })
     }
 
@@ -1598,6 +1667,16 @@ impl Driver {
     #[must_use]
     pub const fn copied(&self) -> u64 {
         self.copied
+    }
+
+    /// The [`Control`] of a driver under [`Delivery::Controlled`], or `None` under native
+    /// delivery.
+    pub fn control(&mut self) -> Option<Control<'_>> {
+        let state = self.control.as_mut()?;
+        Some(Control {
+            state,
+            resources: &mut self.resources,
+        })
     }
 
     /// A handle that wakes the driver from any thread.
@@ -1729,8 +1808,11 @@ impl Driver {
             self.poll_jobs();
             self.attend();
         }
-        more |=
-            self.queue.ready() || self.queue.more() || self.queue.unsubmitted() > 0 || !self.shared.requests.is_empty();
+        more |= self.queue.ready()
+            || self.queue.more()
+            || self.queue.unsubmitted() > 0
+            || !self.shared.requests.is_empty()
+            || self.control.as_ref().is_some_and(control::Controlled::due);
         // A drop that this turn ran, for example of a buffer, can record a close. The owner turns
         // again before it waits, so the close needs no wake.
         #[cfg(all(feature = "local", target_os = "linux"))]
@@ -1761,6 +1843,10 @@ impl Driver {
     /// The wait of [`wait`](Self::wait), with no limit or at most for `timeout`. On IOCP, a
     /// request or a wake of another thread posts a packet to the port, which ends the wait.
     fn wait_in(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        // A completion that the control keeps for the next turn is ready.
+        if self.control.as_ref().is_some_and(control::Controlled::due) {
+            return Ok(());
+        }
         // A wait in the kernel ends only at a completion, so a request or a wake from another
         // thread, which only writes a descriptor, would not end it. That thread also writes the
         // interrupt descriptor, and the poll of it in the ring then completes. The poll does not
@@ -1804,6 +1890,10 @@ impl Driver {
     ///
     /// A failure of the kernel entry other than an interrupt.
     pub fn teardown(mut self) -> io::Result<Teardown> {
+        // A hold would keep a terminal event that the teardown waits for.
+        if let Some(control) = &mut self.control {
+            control.deliver_all();
+        }
         // A spawn cannot be cancelled, and its child starts at the end of its job, so teardown
         // applies the end of each child after each spawn ended.
         #[cfg(unix)]
@@ -1895,51 +1985,6 @@ impl Driver {
     /// reason when each resource slot is in use or the poller does not take it.
     fn adopt(&mut self, fd: Handle, medium: Medium) -> Result<Resource, (Reason, Handle)> {
         self.resources.adopt(fd, medium)
-    }
-
-    /// The descriptor of `resource`, while the driver owns it.
-    #[cfg(all(test, not(loom), unix))]
-    pub(crate) fn fd(&mut self, resource: Resource) -> Option<std::os::fd::RawFd> {
-        Some(std::os::fd::AsRawFd::as_raw_fd(
-            self.resources.get(resource)?.fd.as_ref()?,
-        ))
-    }
-
-    /// Submits an operation of no direction on `resource` with the resources that `held` makes
-    /// from `value`, and gives its future. `entry` makes the submission from the resources in
-    /// their final place. A drop of the future asks for a cancel when `cancel_on_drop` holds. A
-    /// refusal gives back `value`.
-    ///
-    /// # Safety
-    ///
-    /// The memory that the entry names belongs to the resources, and each descriptor that it names
-    /// is `resource`. The memory keeps its address while the resources move.
-    #[cfg(all(test, not(loom), unix))]
-    #[expect(unsafe_code, reason = "the kernel uses the memory that the entry names")]
-    pub(crate) unsafe fn submit<P>(
-        &mut self,
-        value: P,
-        resource: Option<Resource>,
-        held: impl FnOnce(P) -> Held,
-        entry: impl FnOnce(&mut Held) -> Sqe,
-        cancel_on_drop: bool,
-    ) -> Result<Completion, Refused<P>> {
-        let refuse = |reason, value| Err(Refused { reason, value });
-        if let Some(resource) = resource
-            && self.resources.get(resource).is_none()
-        {
-            return refuse(Reason::Resource, value);
-        }
-        let tag = Tag {
-            resource,
-            kind: Kind::Other,
-        };
-        let id = self
-            .open(tag, 1, value, held)
-            .map_err(|(reason, value)| Refused { reason, value })?;
-        // SAFETY: the caller's contract, and the queue has room.
-        unsafe { self.push(id, entry) };
-        Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
     }
 
     /// Whether the submission queue has room for `entries` entries, after one submit if it does
@@ -2063,11 +2108,7 @@ impl Driver {
     /// Ends the operation `id` at the home with `result`, with no kernel event, as its terminal
     /// event.
     pub(crate) fn complete_now(&mut self, id: OpId, result: i32) {
-        let event = Event {
-            result,
-            more: false,
-            notice: false,
-        };
+        let event = Event { result, more: false };
         let outcome = self.table.complete(id.user_data(), event);
         self.ended(id, result, outcome);
     }
@@ -2080,16 +2121,14 @@ impl Driver {
         };
         if let Some(tag) = match &outcome {
             Outcome::Ready => self.table.resources(id).copied(),
-            Outcome::Abandoned(Done { resources, .. }) => *resources,
+            Outcome::Abandoned(Done { resources, .. }) => Some(*resources),
             _ => None,
         } {
             file::ended(&mut self.resources, &mut self.pending, tag);
         }
         match outcome {
             Outcome::Ready => slot.publish(id, result),
-            Outcome::Abandoned(Done {
-                resources: Some(tag), ..
-            }) => {
+            Outcome::Abandoned(Done { resources: tag, .. }) => {
                 if let Some(held) = slot.reclaim(id) {
                     tcp::abandon(&mut self.resources, tag, result, held);
                 }
@@ -2124,13 +2163,12 @@ impl Driver {
             .entries
             .get(id.index() as usize)
             .and_then(|slot| slot.reclaim(id));
-        if let Some(tag) = ended.resources {
-            match held {
-                Some(held) => tcp::abandon(&mut self.resources, tag, ended.result, held),
-                None => tcp::taken(&mut self.resources, tag),
-            }
-            tcp::after(&mut self.resources, &mut self.pending, tag);
+        let tag = ended.resources;
+        match held {
+            Some(held) => tcp::abandon(&mut self.resources, tag, ended.result, held),
+            None => tcp::taken(&mut self.resources, tag),
         }
+        tcp::after(&mut self.resources, &mut self.pending, tag);
     }
 
     /// Asks the kernel to cancel the running operation `id`, once. An operation that waits for
@@ -2179,9 +2217,16 @@ impl Driver {
         }
     }
 
-    /// Gives up to `limit` ready completions to their operations. Gives their number.
+    /// Gives up to `limit` ready completions to their operations. Gives their number. Under
+    /// [`Delivery::Controlled`], they are the completions of earlier turns that no hold keeps, and
+    /// the completions that the backend posted wait for the next turn.
     fn harvest(&mut self, limit: u32) -> u32 {
         let mut completed = 0;
+        let (mut native, mut kept) = (None, None);
+        match &mut self.control {
+            None => native = Some(self.queue.completions().take(limit as usize)),
+            Some(control) => kept = Some(core::iter::from_fn(|| control.give()).take(limit as usize)),
+        }
         let (shared, table, pending) = (&self.shared, &mut self.table, &mut self.pending);
         let (resources, selected) = (&mut self.resources, &mut self.selected);
         #[cfg(target_os = "linux")]
@@ -2190,7 +2235,7 @@ impl Driver {
         let wakes = &mut self.wakes;
         #[cfg(unix)]
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
-        for cqe in self.queue.completions().take(limit as usize) {
+        for cqe in native.iter_mut().flatten().chain(kept.iter_mut().flatten()) {
             completed += 1;
             let mut event = cqe.event();
             // The completion of an exit operation ends it when the home has the status of its child.
@@ -2260,14 +2305,9 @@ impl Driver {
                     Some(&tag) => (id, false, tag),
                     None => continue,
                 },
-                (
-                    Outcome::Abandoned(Done {
-                        resources: Some(tag), ..
-                    }),
-                    Some(id),
-                ) => (id, true, tag),
-                // No driver operation is multishot or a zero-copy send yet. The other outcomes,
-                // such as a wake message that `ARRIVED`, change nothing.
+                (Outcome::Abandoned(Done { resources: tag, .. }), Some(id)) => (id, true, tag),
+                // No driver operation is multishot yet. The other outcomes, such as a wake message
+                // that `ARRIVED`, change nothing.
                 _ => continue,
             };
             let Some(slot) = shared.entries.get(id.index() as usize) else {
@@ -2287,6 +2327,9 @@ impl Driver {
             } else {
                 slot.publish(id, event.result);
             }
+        }
+        if let Some(control) = &mut self.control {
+            control.take(self.queue.completions());
         }
         #[cfg(unix)]
         self.poll_again();

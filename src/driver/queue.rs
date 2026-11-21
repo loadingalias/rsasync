@@ -204,17 +204,6 @@ impl Queue {
         }
     }
 
-    /// The descriptor number of the backend, for the driver tests, which the loom build does not
-    /// have.
-    #[cfg(all(test, not(loom), target_os = "linux"))]
-    pub(crate) fn fd(&self) -> std::os::fd::RawFd {
-        use std::os::fd::AsRawFd as _;
-        match self {
-            Self::Ring(ring) => ring.fd(),
-            Self::Poller(poller) => poller.fd().as_raw_fd(),
-        }
-    }
-
     /// Registers a buffer ring of `entries` entries as the buffer group `group`.
     pub(crate) fn provide(&mut self, entries: u16, group: u16) -> io::Result<BufferRing> {
         match self {
@@ -253,20 +242,6 @@ impl Queue {
                 buffers.free();
                 Ok(())
             }
-        }
-    }
-
-    /// The ready completions, which stay for the driver, for the driver tests, which the loom build
-    /// does not have.
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn peek(&self) -> alloc::vec::Vec<Cqe> {
-        match self {
-            #[cfg(target_os = "linux")]
-            Self::Ring(ring) => ring.peek(),
-            #[cfg(unix)]
-            Self::Poller(poller) => poller.peek(),
-            #[cfg(target_os = "windows")]
-            Self::Port(port) => port.peek(),
         }
     }
 

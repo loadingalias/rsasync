@@ -5,7 +5,7 @@
 //! `IORING_SETUP_DEFER_TASKRUN`, Linux 6.1). Thus only the thread that creates a ring can submit to
 //! it or wait on it, and [`Ring`] is not `Send`. The kernel runs the deferred work only when that
 //! thread enters with `IORING_ENTER_GETEVENTS`. `IORING_SETUP_TASKRUN_FLAG` makes the kernel show
-//! such work in the ring flags: see [`Ring::task_run_pending`].
+//! such work in the ring flags: see [`Ring::needs_enter`].
 //!
 //! The kernel reads and writes the head, tail, and flag words of the mapping while the ring exists.
 //! These words are hardware atomics in every build, because the other party is the kernel.
@@ -616,10 +616,6 @@ pub(crate) struct Ring {
     cq_head: usize,
     cq_tail: usize,
     cqes: usize,
-    /// The completion-injection seam of the tests: with it, each take gives the completions
-    /// that the test lets through, not the ones that the kernel posted since the last take.
-    #[cfg(test)]
-    injection: core::cell::RefCell<Option<Injection>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -675,8 +671,6 @@ impl Ring {
             cq_head: offset(cq.head),
             cq_tail: offset(cq.tail),
             cqes: offset(cq.cqes),
-            #[cfg(test)]
-            injection: core::cell::RefCell::new(None),
         };
         // Queue position `i` names entry `i` for the life of the ring, so a push only moves the
         // tail. The kernel reads the array only at a submit.
@@ -726,9 +720,6 @@ impl Ring {
     /// completions are ready. Gives the number of entries that the kernel took.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
         self.word(self.sq_tail).store(self.sq_pushed, Ordering::Release);
-        // A completion that the injection keeps for the next take is ready, so no wait is needed.
-        #[cfg(test)]
-        let wait = if self.injected_ready() { 0 } else { wait };
         enter(self.fd(), self.unsubmitted(), wait, sys::IORING_ENTER_GETEVENTS)
     }
 
@@ -737,8 +728,6 @@ impl Ring {
     #[cfg(feature = "local")]
     pub(crate) fn submit_timeout(&mut self, wait: u32, timeout: Duration) -> io::Result<u32> {
         self.word(self.sq_tail).store(self.sq_pushed, Ordering::Release);
-        #[cfg(test)]
-        let wait = if self.injected_ready() { 0 } else { wait };
         let ts = sys::KernelTimespec {
             tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(timeout.subsec_nanos()),
@@ -747,12 +736,6 @@ impl Ring {
             Err(error) if error.raw_os_error() == Some(sys::ETIME) => Ok(0),
             entered => entered,
         }
-    }
-
-    /// Whether the kernel holds deferred task work for the ring (`IORING_SQ_TASKRUN`). Only a
-    /// [`submit`](Self::submit) runs it, also when no entry waits.
-    pub(crate) fn task_run_pending(&self) -> bool {
-        self.word(self.sq_flags).load(Ordering::Relaxed) & sys::IORING_SQ_TASKRUN != 0
     }
 
     /// Whether a [`submit`](Self::submit) has work with no entry to submit: deferred task work,
@@ -783,10 +766,6 @@ impl Ring {
 
     /// Whether a completion is ready.
     pub(crate) fn ready(&self) -> bool {
-        #[cfg(test)]
-        if self.injected_ready() {
-            return true;
-        }
         self.word(self.cq_tail).load(Ordering::Acquire) != self.word(self.cq_head).load(Ordering::Relaxed)
     }
 
@@ -813,31 +792,7 @@ impl Ring {
         // Only this thread writes the head.
         let head = self.word(self.cq_head).load(Ordering::Relaxed);
         let tail = self.word(self.cq_tail).load(Ordering::Acquire);
-        #[cfg(test)]
-        if self.injection.get_mut().is_some() {
-            let posted = self.peek();
-            let given = self
-                .injection
-                .get_mut()
-                .as_mut()
-                .map(|injection| injection.take(posted))
-                .unwrap_or_default();
-            // The release keeps the reads of the entries before the kernel can reuse them.
-            self.word(self.cq_head).store(tail, Ordering::Release);
-            return Completions {
-                ring: self,
-                head: tail,
-                tail,
-                given,
-            };
-        }
-        Completions {
-            ring: self,
-            head,
-            tail,
-            #[cfg(test)]
-            given: alloc::collections::VecDeque::new(),
-        }
+        Completions { ring: self, head, tail }
     }
 
     /// Probes each later feature. Call it once, on a new ring with no entry, completion, or buffer
@@ -920,18 +875,6 @@ impl Ring {
         Ok(self.completions().filter(|cqe| cqe.user_data == PROBE_MESSAGE).count() == 1)
     }
 
-    /// The ready completions, which stay in the ring for the next take: a test reads them before
-    /// the driver takes them.
-    #[cfg(test)]
-    pub(crate) fn peek(&self) -> alloc::vec::Vec<Cqe> {
-        // Only this thread writes the head.
-        let head = self.word(self.cq_head).load(Ordering::Relaxed);
-        let tail = self.word(self.cq_tail).load(Ordering::Acquire);
-        (0..tail.wrapping_sub(head))
-            .map(|index| self.cqe((head.wrapping_add(index) & self.cq_mask) as usize))
-            .collect()
-    }
-
     /// The shared word at byte `offset` of the ring mapping.
     #[expect(unsafe_code, reason = "the kernel shares the words of the ring mapping")]
     fn word(&self, offset: usize) -> &AtomicU32 {
@@ -960,9 +903,6 @@ pub(crate) struct Completions<'ring> {
     ring: &'ring Ring,
     head: u32,
     tail: u32,
-    /// The completions that the injection gives in this take.
-    #[cfg(test)]
-    given: alloc::collections::VecDeque<Cqe>,
 }
 
 #[cfg(target_os = "linux")]
@@ -970,10 +910,6 @@ impl Iterator for Completions<'_> {
     type Item = Cqe;
 
     fn next(&mut self) -> Option<Cqe> {
-        #[cfg(test)]
-        if let Some(cqe) = self.given.pop_front() {
-            return Some(cqe);
-        }
         if self.head == self.tail {
             return None;
         }
@@ -982,108 +918,6 @@ impl Iterator for Completions<'_> {
         // The release keeps the read of the entry before the kernel can reuse it.
         self.ring.word(self.ring.cq_head).store(self.head, Ordering::Release);
         Some(cqe)
-    }
-}
-
-/// A completion that the take did not give stays for the next take, first.
-#[cfg(all(test, target_os = "linux"))]
-impl Drop for Completions<'_> {
-    fn drop(&mut self) {
-        if let Some(injection) = self.ring.injection.borrow_mut().as_mut() {
-            while let Some(cqe) = self.given.pop_back() {
-                injection.due.push_front(cqe);
-            }
-        }
-    }
-}
-
-/// The completion-injection seam of the driver tests, at the boundary of the backend. With it, a
-/// completion that the kernel posts reaches the driver at the take after the one that found it, so
-/// the driver applies each request of that turn first. A test can also hold the completions of one
-/// operation until it releases them, replace a result, and add a completion that the kernel never
-/// posted. It changes no transition of the table or the driver: it only chooses their inputs. It
-/// exists only in the tests, and no public injection exists.
-#[cfg(all(test, target_os = "linux"))]
-#[derive(Debug, Default)]
-pub(crate) struct Injection {
-    /// The completions that the next take gives, in order.
-    due: alloc::collections::VecDeque<Cqe>,
-    /// The completions of held user data, which wait for their release.
-    held: alloc::vec::Vec<Cqe>,
-    /// The user data whose completions the injection holds.
-    holds: alloc::vec::Vec<u64>,
-    /// The results that replace the result of the next completion of their user data.
-    results: alloc::vec::Vec<(u64, i32)>,
-}
-
-#[cfg(all(test, target_os = "linux"))]
-impl Injection {
-    /// Gives the completions due now, and keeps the `posted` ones for the next take.
-    fn take(&mut self, posted: alloc::vec::Vec<Cqe>) -> alloc::collections::VecDeque<Cqe> {
-        let given = core::mem::take(&mut self.due);
-        for mut cqe in posted {
-            if let Some(index) = self.results.iter().position(|&(data, _)| data == cqe.user_data) {
-                cqe.res = self.results.swap_remove(index).1;
-            }
-            if self.holds.contains(&cqe.user_data) {
-                self.held.push(cqe);
-            } else {
-                self.due.push_back(cqe);
-            }
-        }
-        given
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-impl Ring {
-    /// Starts the injection: from now on, each take gives the completions that the injection lets
-    /// through.
-    pub(crate) fn inject(&mut self) {
-        *self.injection.get_mut() = Some(Injection::default());
-    }
-
-    /// Whether the injection keeps a completion for the next take.
-    fn injected_ready(&self) -> bool {
-        self.injection
-            .borrow()
-            .as_ref()
-            .is_some_and(|injection| !injection.due.is_empty())
-    }
-
-    /// The injection, which [`Ring::inject`] started.
-    fn injection(&mut self) -> &mut Injection {
-        self.injection
-            .get_mut()
-            .as_mut()
-            .expect("the test started the injection")
-    }
-
-    /// Holds each later completion of `user_data` until [`Ring::release`].
-    pub(crate) fn hold(&mut self, user_data: u64) {
-        self.injection().holds.push(user_data);
-    }
-
-    /// Ends the hold of `user_data`: its held completions are due at the next take, in order.
-    pub(crate) fn release(&mut self, user_data: u64) {
-        let injection = self.injection();
-        injection.holds.retain(|&data| data != user_data);
-        let (released, held) = injection
-            .held
-            .drain(..)
-            .partition::<alloc::vec::Vec<_>, _>(|cqe| cqe.user_data == user_data);
-        injection.held = held;
-        injection.due.extend(released);
-    }
-
-    /// Replaces the result of the next completion of `user_data` with `res`.
-    pub(crate) fn replace(&mut self, user_data: u64, res: i32) {
-        self.injection().results.push((user_data, res));
-    }
-
-    /// Makes `cqe`, which the kernel did not post, due at the next take.
-    pub(crate) fn add(&mut self, cqe: Cqe) {
-        self.injection().due.push_back(cqe);
     }
 }
 
@@ -1099,7 +933,6 @@ impl Cqe {
         Event {
             result: self.res,
             more: self.flags & sys::IORING_CQE_F_MORE != 0,
-            notice: self.flags & sys::IORING_CQE_F_NOTIF != 0,
         }
     }
 }

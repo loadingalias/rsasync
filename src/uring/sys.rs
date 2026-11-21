@@ -122,7 +122,6 @@ pub(crate) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
 pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 pub(super) const IORING_CQE_F_MORE: u32 = 1 << 1;
-pub(super) const IORING_CQE_F_NOTIF: u32 = 1 << 3;
 
 /// `POLLIN` (`include/uapi/asm-generic/poll.h`): the descriptor is readable.
 pub(super) const POLLIN: u32 = 0x1;

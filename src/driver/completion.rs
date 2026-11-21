@@ -32,6 +32,14 @@ impl Completion {
         }
     }
 
+    /// The identity of the operation and its driver.
+    pub(super) fn id(&self) -> super::OperationId {
+        super::OperationId {
+            driver: self.shared.driver,
+            op: self.id,
+        }
+    }
+
     /// Asks the home to cancel the operation. The consumer keeps its interest, and later takes
     /// the result.
     pub(super) fn cancel(&self) {

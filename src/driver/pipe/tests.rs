@@ -8,8 +8,8 @@ use std::io::{self, Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::super::suite::{self, Backend};
-use super::super::tests::{drive, driver, numbered, pool_budget, posted};
-use super::super::{Config, Driver, Reason, SendCount};
+use super::super::tests::{drive, driver, hold, numbered, pool_budget, posted};
+use super::super::{Config, Delivery, Driver, Reason, SendCount};
 use super::{PipeReader, PipeWriter, sys};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool};
 
@@ -46,7 +46,7 @@ fn receive_all(driver: &mut Driver, reader: &mut PipeReader, capacity: usize) ->
 pub(in crate::driver) fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer(
     backend: Backend,
 ) {
-    let mut driver = suite::driver(Config::new(), backend);
+    let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let (mut reader, mut writer) = adopted(&mut driver);
     drop(driver.send(&mut writer, Lease::from(numbered(0, 1000))).unwrap());
     let next = driver.send(&mut writer, Lease::from(numbered(1000, 1000))).unwrap();
@@ -55,7 +55,8 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_a
     let receive = driver
         .recv(&mut reader, Backing::from(Vec::with_capacity(4096)))
         .unwrap();
-    let kept = usize::try_from(posted(&mut driver, 1)[0].res).unwrap();
+    let id = hold(&mut driver, &receive);
+    let kept = usize::try_from(posted(&mut driver, id).unwrap()).unwrap();
     drop(receive);
     let close = driver.close_writer(writer).unwrap();
     assert_eq!(drive(&mut driver, close).unwrap().sent(), SendCount::Settled);

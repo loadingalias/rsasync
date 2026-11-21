@@ -15,8 +15,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use super::super::suite::{self, Backend};
 #[cfg(target_os = "linux")]
 use super::super::tests::driver;
-use super::super::tests::{Log, drive, note, numbered, posted, recorded, taken};
-use super::super::{Call, Config, Driver, Reason, Route};
+#[cfg(target_os = "windows")]
+use super::super::tests::held;
+use super::super::tests::{Log, drive, hold, note, numbered, posted, recorded, taken};
+use super::super::{Call, Config, Delivery, Driver, Reason, Route};
 use super::{Buffers, Cache, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 use crate::blocking::{self, Service};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool, WriteLoan};
@@ -530,16 +532,16 @@ fn a_file_system_without_hole_punching_refuses_with_unsupported() {
 pub(in crate::driver) fn a_dropped_write_changes_the_file_and_keeps_its_lease_until_its_completion(backend: Backend) {
     let scratch = Scratch::new("dropped");
     let log = Log::default();
-    let mut driver = suite::driver(Config::new(), backend);
+    let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let file = open(&mut driver, &scratch.join("data"), writable());
     let mut loan = WriteLoan::new(recorded(&log, 4096));
     loan.fill_from(&numbered(0, 4096));
-    drop(
-        driver
-            .write_at(&file, Lease::from(loan.into_inner()), 0, WriteMode::DataSync)
-            .unwrap(),
-    );
-    posted(&mut driver, 1);
+    let write = driver
+        .write_at(&file, Lease::from(loan.into_inner()), 0, WriteMode::DataSync)
+        .unwrap();
+    let id = hold(&mut driver, &write);
+    drop(write);
+    posted(&mut driver, id).unwrap();
     note(&log, "completed");
     while driver.turn().unwrap().more() {}
     assert_eq!(taken(&log), ["completed", "released"]);
@@ -616,8 +618,8 @@ unsafe fn release_aligned(data: *const (), ptr: core::ptr::NonNull<u8>, capacity
 
 /// On Windows, a dropped write that returns pending keeps its lease until its packet. A write
 /// with no cache inside the length of the file goes to the device, so its call returns pending.
-/// While the port takes no packet, turns of the driver release nothing. The release comes after
-/// the packet in the release record (R203).
+/// While the control holds its packet, turns of the driver release nothing. The release comes
+/// after the packet in the release record (R203).
 #[cfg(target_os = "windows")]
 pub(in crate::driver) fn a_dropped_write_that_returns_pending_keeps_its_lease_until_its_packet(backend: Backend) {
     const LEN: usize = 1 << 16;
@@ -628,7 +630,7 @@ pub(in crate::driver) fn a_dropped_write_that_returns_pending_keeps_its_lease_un
     data.set_len(16 * LEN as u64).unwrap();
     data.sync_all().unwrap();
     drop(data);
-    let mut driver = suite::driver(Config::new(), backend);
+    let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let file = open(
         &mut driver,
         &scratch.join("data"),
@@ -636,21 +638,18 @@ pub(in crate::driver) fn a_dropped_write_that_returns_pending_keeps_its_lease_un
     );
     let mut loan = WriteLoan::new(recorded_aligned(&log, LEN));
     loan.fill_from(&numbered(0, LEN));
-    let super::super::queue::Queue::Port(port) = &mut driver.queue;
-    port.held = true;
-    drop(
-        driver
-            .write_at(&file, Lease::from(loan.into_inner()), 4 * LEN as u64, WriteMode::Plain)
-            .unwrap(),
-    );
+    let write = driver
+        .write_at(&file, Lease::from(loan.into_inner()), 4 * LEN as u64, WriteMode::Plain)
+        .unwrap();
+    let id = hold(&mut driver, &write);
+    drop(write);
+    held(&mut driver, id).unwrap();
     for _ in 0..4 {
         driver.turn().unwrap();
     }
     assert!(taken(&log).is_empty(), "the lease returned before its packet");
 
-    let super::super::queue::Queue::Port(port) = &mut driver.queue;
-    port.held = false;
-    posted(&mut driver, 1);
+    driver.control().unwrap().deliver(id).unwrap();
     note(&log, "completed");
     while driver.turn().unwrap().more() {}
     assert_eq!(taken(&log), ["completed", "released"]);

@@ -62,15 +62,14 @@ mod memory;
 mod sync;
 #[cfg_attr(
     not(all(
-        test,
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(
+            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "windows", target_arch = "x86_64")
+        ),
         feature = "std"
     )),
-    expect(
-        dead_code,
-        reason = "the driver uses only single operations so far, and only the driver uses some items"
-    )
+    expect(dead_code, reason = "only the driver uses the table, and this target has no driver")
 )]
 mod table;
 mod wait;
@@ -120,11 +119,8 @@ pub mod driver;
     feature = "std"
 ))]
 #[cfg_attr(
-    any(not(all(test, not(loom))), not(target_os = "linux")),
-    expect(
-        dead_code,
-        reason = "the driver uses only some items. The tests of the ring and the driver use the others, and the loom build leaves those tests out. On macOS and Windows, the driver uses only the entries"
-    )
+    not(target_os = "linux"),
+    expect(dead_code, reason = "on macOS and Windows, the driver uses only the entries")
 )]
 mod uring;
 

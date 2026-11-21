@@ -100,18 +100,6 @@ impl Home {
         // A full counter is a pending wake already, and nothing else can fail here.
         drop((&self.shared.interrupt).write(&1_u64.to_ne_bytes()));
     }
-
-    /// Takes the writes of the interrupt descriptor since the last take, or since the last turn of
-    /// the driver.
-    #[cfg(test)]
-    pub(crate) fn take_interrupts(&self) -> u64 {
-        use std::io::Read as _;
-
-        let mut count = [0; 8];
-        (&self.shared.interrupt)
-            .read(&mut count)
-            .map_or(0, |_| u64::from_ne_bytes(count))
-    }
 }
 
 /// The home of a local owner on a driver, and the wake messages that the driver sent and that

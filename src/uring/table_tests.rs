@@ -2,7 +2,6 @@
 //! completions in `table::tests`, with the same release record.
 
 use std::io::{Write as _, pipe};
-use std::net::UdpSocket;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::vec::Vec;
 
@@ -13,7 +12,6 @@ use crate::table::{CONTROL, OpId, Request, Shape, Table, Taken};
 /// The opcodes and flags of the test operations (`include/uapi/linux/io_uring.h` of Linux 6.1),
 /// and `POLLIN` (`include/uapi/asm-generic/poll.h`).
 const IORING_OP_POLL_ADD: u8 = 6;
-const IORING_OP_SEND_ZC: u8 = 47;
 const IORING_POLL_ADD_MULTI: u32 = 1 << 0;
 const POLLIN: u32 = 0x1;
 
@@ -208,29 +206,4 @@ fn a_multishot_operation_releases_at_its_last_completion() {
             || log == ["item", "item", "abandoned", "released", "cancel result"],
         "{log:?}"
     );
-}
-
-/// A zero-copy send ends at its send result, and its notice releases its buffer.
-#[test]
-fn a_zero_copy_send_releases_its_buffer_at_the_notice() {
-    let (mut driver, budget) = (Driver::new(1), budget());
-    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-    sender.connect(receiver.local_addr().unwrap()).unwrap();
-    let mut resources = Recorded::new(&driver.log, &budget, b"datagram".to_vec());
-    let entry = Sqe {
-        opcode: IORING_OP_SEND_ZC,
-        fd: sender.as_raw_fd(),
-        addr: resources.buffer.as_mut_ptr().addr() as u64,
-        len: 8,
-        ..Sqe::default()
-    };
-    let id = driver.start(resources, Shape::ZeroCopy, entry);
-    assert_eq!(driver.turn(2), [0, 8]);
-    assert_eq!(driver.log.take(), ["ready", "notice", "released"]);
-    let claim = driver.table.claim(id).unwrap();
-    assert_eq!((claim.result, claim.resources.is_none()), (8, true));
-    let mut received = [0; 16];
-    assert_eq!(receiver.recv(&mut received).unwrap(), 8);
-    assert_eq!(&received[..8], b"datagram");
 }

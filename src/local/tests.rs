@@ -492,10 +492,14 @@ fn a_group_start_that_the_budget_or_the_allocator_refuses_gives_a_typed_refusal(
 }
 
 /// A group that worker 1 refuses, because two tasks hold its two slots, fails with that worker and
-/// reason. Each driver has one resource slot, and the listener that worker 0 bound closed before
-/// the error, so a bind on worker 0 gets that slot at once.
+/// reason, and only after the listener that worker 0 bound closed. A task on worker 0 blocks its
+/// thread from the bind of the member until a release `HOLD` later, so the close of that listener
+/// comes after the release. Each driver has one resource slot, so a bind on worker 0 after the
+/// error gets that slot at once.
 #[test]
-fn a_group_that_worker_1_refuses_closes_the_listener_of_worker_0() {
+fn a_group_that_worker_1_refuses_fails_only_after_the_listener_of_worker_0_closed() {
+    const HOLD: Duration = Duration::from_millis(300);
+    let address = std::net::TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
     let runtime = Runtime::builder()
         .local_workers(2)
         .task_slots(2)
@@ -504,10 +508,31 @@ fn a_group_that_worker_1_refuses_closes_the_listener_of_worker_0() {
         .unwrap();
     let mut handle = runtime.handle().unwrap();
     let _busy = [0, 1].map(|_| handle.spawn_on(WorkerId::new(1), pending::<()>).unwrap());
-    let failed = runtime
-        .block_on(handle.tcp_group(loopback(), TcpOptions::default(), |_worker, _listener| pending::<()>()))
+    let (release, held) = mpsc::channel::<()>();
+    let blocker = handle
+        .spawn_on(WorkerId::new(0), move || async move {
+            // The member binds in its first poll, which comes after a yield of this task.
+            while std::net::TcpStream::connect(address).is_err() {
+                yield_once().await;
+            }
+            held.recv().unwrap();
+        })
         .unwrap();
+    let start = Instant::now();
+    let releaser = thread::spawn(move || {
+        thread::sleep(HOLD);
+        release.send(()).unwrap();
+    });
+    let failed = runtime
+        .block_on(handle.tcp_group(address, TcpOptions::default(), |_worker, _listener| pending::<()>()))
+        .unwrap();
+    assert!(
+        start.elapsed() >= HOLD,
+        "the group failed before worker 0 closed its listener"
+    );
+    releaser.join().unwrap();
     assert_matches!(failed, Err(GroupError::Spawn(worker, task::Reason::NoSlot)) if worker == WorkerId::new(1));
+    assert_matches!(blocker.join_blocking(), task::Outcome::Completed(()));
     let rebind = handle
         .spawn_on(WorkerId::new(0), || async {
             TcpListener::bind(loopback(), TcpOptions::default())

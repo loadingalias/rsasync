@@ -4,7 +4,7 @@ use core::assert_matches;
 use core::cell::RefCell;
 use core::num::NonZeroU64;
 
-use super::{Ended, Event, Full, Outcome, Request, Shape, Table, Taken};
+use super::{Event, Full, Outcome, Request, Shape, Table, Taken};
 use crate::capacity::{Budget, Permit};
 
 /// `ENOENT`, `EALREADY`, and `ECANCELED` (`include/uapi/asm-generic/errno-base.h` and `errno.h`).
@@ -69,35 +69,17 @@ pub(crate) fn apply(outcome: Outcome<Recorded>, log: &Log) {
             log.note("abandoned");
             drop(ended);
         }
-        Outcome::Released(resources) => {
-            log.note("notice");
-            drop(resources);
-        }
         Outcome::Unclassified => log.note("unclassified"),
     }
 }
 
 const fn done(result: i32) -> Event {
-    Event {
-        result,
-        more: false,
-        notice: false,
-    }
+    Event { result, more: false }
 }
 
 const fn more(result: i32) -> Event {
-    Event {
-        result,
-        more: true,
-        notice: false,
-    }
+    Event { result, more: true }
 }
-
-const NOTICE: Event = Event {
-    result: 0,
-    more: false,
-    notice: true,
-};
 
 fn taken(table: &mut Table<Recorded>) -> Vec<Taken<Recorded>> {
     let mut taken = Vec::new();
@@ -172,11 +154,7 @@ fn each_cancel_result_waits_for_the_completion_of_its_target() {
             table.requests().post(id, Request::EndInterest);
             table.requests().post(id, Request::Cancel);
             assert_matches!(taken(&mut table)[..], [Taken::Cancel(cancel)] if cancel == id);
-            let cancel_result = Event {
-                result,
-                more: false,
-                notice: false,
-            };
+            let cancel_result = done(result);
             if result_first {
                 apply(table.complete(id.cancel_user_data(), cancel_result), &log);
             }
@@ -234,69 +212,27 @@ fn each_shape_releases_its_resources_once_at_its_terminal_event() {
     apply(table.complete(id.user_data(), done(-ECANCELED)), &log);
     assert_eq!(log.take(), ["item", "item", "abandoned", "released"]);
 
-    // Zero-copy send with a notice: the result ends the send, and the notice releases.
-    let id = begin(&mut table, Shape::ZeroCopy);
-    apply(table.complete(id.user_data(), NOTICE), &log);
-    apply(table.complete(id.user_data(), more(64)), &log);
-    let claim = table.claim(id).unwrap();
-    assert_eq!((claim.result, claim.resources.is_none()), (64, true));
-    apply(table.complete(id.user_data(), NOTICE), &log);
-    assert_eq!(log.take(), ["unclassified", "ready", "notice", "released"]);
-
-    // The notice before the claim, and a send with no consumer.
-    let id = begin(&mut table, Shape::ZeroCopy);
-    apply(table.complete(id.user_data(), more(64)), &log);
-    apply(table.complete(id.user_data(), NOTICE), &log);
-    assert_matches!(
-        table.claim(id),
-        Some(Ended {
-            result: 64,
-            resources: None
-        })
-    );
-    let id = begin(&mut table, Shape::ZeroCopy);
-    assert!(table.end_interest(id).is_none());
-    apply(table.complete(id.user_data(), more(-1)), &log);
-    apply(table.complete(id.user_data(), NOTICE), &log);
-    assert_eq!(
-        log.take(),
-        ["ready", "notice", "released", "abandoned", "notice", "released"]
-    );
-
-    // A zero-copy result without `more` is terminal: no notice follows.
-    let id = begin(&mut table, Shape::ZeroCopy);
-    apply(table.complete(id.user_data(), done(-22)), &log);
-    assert_matches!(
-        table.claim(id),
-        Some(Ended {
-            result: -22,
-            resources: Some(_)
-        })
-    );
-
     // A single completion with `more` has no row; the real completion still ends it.
     let id = begin(&mut table, Shape::Single);
     apply(table.complete(id.user_data(), more(1)), &log);
     apply(table.complete(id.user_data(), done(1)), &log);
     drop(table.claim(id));
-    assert_eq!(log.take(), ["ready", "released", "unclassified", "ready", "released"]);
+    assert_eq!(log.take(), ["unclassified", "ready", "released"]);
 }
 
 /// A table that drops keeps each resource that the kernel can still use: those of a running
-/// operation and of a send that waits for its notice leak, and the others drop.
+/// operation leak, and the others drop.
 #[test]
 fn a_dropped_table_leaks_the_resources_that_the_kernel_can_still_use() {
     let (log, budget) = (Log::default(), budget());
-    let mut table = Table::new(3).unwrap();
+    let mut table = Table::new(2).unwrap();
     let mut begin = |shape| table.begin(Recorded::new(&log, &budget, Vec::new()), shape).unwrap();
     let _running = begin(Shape::Single);
-    let sending = begin(Shape::ZeroCopy);
     let ended = begin(Shape::Single);
-    apply(table.complete(sending.user_data(), more(1)), &log);
     apply(table.complete(ended.user_data(), done(1)), &log);
     drop(table);
-    assert_eq!(log.take(), ["ready", "ready", "released"]);
-    assert_eq!(budget.available(), 100 - 2 * CHARGE);
+    assert_eq!(log.take(), ["ready", "released"]);
+    assert_eq!(budget.available(), 100 - CHARGE);
 }
 
 /// The allocation test needs threads and the system allocator. The allocator counts for each

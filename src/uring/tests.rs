@@ -66,10 +66,10 @@ fn a_message_from_another_ring_reaches_a_deferred_ring() {
     let mut received: Vec<Cqe> = target.completions().collect();
     let posted_at_once = !received.is_empty();
     if !posted_at_once {
-        assert!(target.task_run_pending(), "the kernel shows the deferred message");
+        assert!(target.needs_enter(), "the kernel shows the deferred message");
         target.submit(1).unwrap();
         received = target.completions().collect();
-        assert!(!target.task_run_pending());
+        assert!(!target.needs_enter());
     }
     std::println!("cross-ring message posted at once: {posted_at_once}");
     assert_eq!(

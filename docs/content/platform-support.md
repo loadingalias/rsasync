@@ -43,7 +43,8 @@ Six tests need root or `CAP_SYS_TIME`, so they did not run. The last command run
 [Drive the I/O driver yourself](driver-only.md#run-the-example), and it printed the documented
 output on each host. The tests cover file, TCP, UDP, local stream, and pipe operations on owned
 buffers, child processes, signal streams, cancellation, close, teardown, and the capability report.
-The negative-path cases also run under injected completions. Debian 12 and Ubuntu 26.04 take
+The negative-path cases also ran with injected completions, from the test seam that
+[controlled delivery](controlled-delivery.md) replaced. Debian 12 and Ubuntu 26.04 take
 different routes for some calls: see the [capability report](capability-report.md).
 
 ## Evidence today

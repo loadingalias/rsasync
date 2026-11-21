@@ -118,9 +118,6 @@ impl Token {
 #[derive(Debug)]
 pub(crate) struct Registrar {
     selector: Selector,
-    /// The test seam of a failed registration: the next registration fails with this error.
-    #[cfg(test)]
-    pub(crate) fail: core::cell::Cell<Option<i32>>,
 }
 
 impl Registrar {
@@ -130,11 +127,6 @@ impl Registrar {
     ///
     /// The error of the registration. Nothing changed then.
     pub(crate) fn add(&self, fd: BorrowedFd<'_>, token: Token) -> io::Result<()> {
-        // The test seam gives the error of the registration in place of the call.
-        #[cfg(test)]
-        if let Some(errno) = self.fail.take() {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
         self.selector.add(fd.as_raw_fd(), token.data())
     }
 
@@ -261,8 +253,6 @@ impl Poller {
     pub(crate) fn registrar(&self) -> Registrar {
         Registrar {
             selector: self.selector.clone(),
-            #[cfg(test)]
-            fail: core::cell::Cell::new(None),
         }
     }
 
@@ -304,13 +294,6 @@ impl Poller {
     /// Whether events can remain after the last wait, because it filled its array.
     pub(crate) const fn more(&self) -> bool {
         self.full
-    }
-
-    /// The ready completions, which stay for the driver. Only the driver tests read them, and the
-    /// loom build has none.
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn peek(&self) -> Vec<Cqe> {
-        self.completions.iter().copied().collect()
     }
 
     /// Takes the ready completions, in order.

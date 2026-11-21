@@ -9,7 +9,8 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Poll, Waker};
 use core::time::Duration;
-use std::io::{self, Write as _};
+use std::fs::File;
+use std::io::{self, Read as _, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::thread::{JoinHandleExt as _, RawPthread};
 use std::sync::mpsc;
@@ -19,6 +20,7 @@ use super::RingOwner;
 use crate::blocking::{self, Service};
 use crate::buffer::{Backing, Buffer as _};
 use crate::capacity::Budget;
+use crate::driver::tests::interrupts;
 use crate::driver::{Backend, Config, Driver};
 use crate::table::tests::allocations;
 use crate::task::tests::yield_once;
@@ -36,6 +38,13 @@ fn driver(owner: &RingOwner) -> core::cell::RefMut<'_, Driver> {
     core::cell::RefMut::map(owner.local.driver.borrow_mut(), |driver| {
         driver.as_mut().expect("a worker has its driver")
     })
+}
+
+/// Takes the writes of the interrupt descriptor since the last take, from a descriptor that shares
+/// its count ([`interrupts`]). A descriptor with no write gives `WouldBlock`.
+fn take(interrupts: &File) -> u64 {
+    let mut count = [0; 8];
+    (&*interrupts).read(&mut count).map_or(0, |_| u64::from_ne_bytes(count))
 }
 
 /// Gives its waker to `wakers` at its first poll, and ends at its next poll.
@@ -59,7 +68,7 @@ fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
     const TASKS: usize = 16;
     const THREADS: usize = 4;
     let owner = owner(TASKS);
-    let home = driver(&owner).home();
+    let interrupts = interrupts(&driver(&owner));
     owner
         .block_on(async move {
             for _batch in 0..2 {
@@ -86,7 +95,7 @@ fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
                     threads.into_iter().map(|thread| thread.join().unwrap()).sum::<u64>()
                 });
                 assert_eq!(allocations, 0);
-                assert_eq!(home.take_interrupts(), 1);
+                assert_eq!(take(&interrupts), 1);
                 for task in tasks {
                     assert_matches!(task.join().await, Outcome::Completed(()));
                 }
@@ -104,7 +113,7 @@ fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {
     let (wakers, received) = mpsc::channel::<Vec<Waker>>();
     let target = thread::spawn(move || {
         let owner = owner(TASKS);
-        let home = driver(&owner).home();
+        let interrupts = interrupts(&driver(&owner));
         owner
             .block_on(async move {
                 let (sender, receiver) = mpsc::channel();
@@ -117,7 +126,7 @@ fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {
                 for task in tasks {
                     assert_matches!(task.join().await, Outcome::Completed(()));
                 }
-                home.take_interrupts()
+                take(&interrupts)
             })
             .unwrap()
     });

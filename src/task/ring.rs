@@ -229,5 +229,8 @@ impl Local {
     }
 }
 
+// Two attributes, so that Clippy sees the test module. The loom build runs only the exploration
+// tests, and the driver tests that these use are not in it.
 #[cfg(test)]
+#[cfg(not(loom))]
 mod tests;
