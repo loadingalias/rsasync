@@ -61,7 +61,6 @@
 //! So the free list of the owner always has a slot for each reservation.
 
 use alloc::boxed::Box;
-use core::alloc::AllocError;
 use core::cell::Cell;
 
 use crate::capacity::Permit;
@@ -98,23 +97,22 @@ pub(super) struct Home {
     /// The ring of the driver of the owner, which the owner sets one time and detaches when it
     /// ends, so a kept waker holds no descriptor of it.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    ring: Late<Arc<driver::Home>>,
+    ring: Late<driver::Home>,
 }
 
 impl Home {
-    /// The home of an owner on `thread`, which waits in `ring` if it has one, or `AllocError` when
-    /// the allocator refuses its memory.
+    /// The home of an owner on `thread`, which waits in `ring` if it has one.
     pub(super) fn new(
         thread: thread::Thread,
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))] ring: Option<
             Arc<driver::Home>,
         >,
-    ) -> Result<Self, AllocError> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             thread,
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            ring: Late::new(ring)?,
-        })
+            ring: Late::new(ring),
+        }
     }
 }
 
@@ -182,8 +180,8 @@ impl Shared {
         not(all(test, not(loom))),
         expect(dead_code, reason = "the local I/O types of R307 build on it")
     )]
-    pub(super) fn set_ring(&self, home: Arc<driver::Home>) -> Result<(), AllocError> {
-        self.home.ring.set(home)
+    pub(super) fn set_ring(&self, home: Arc<driver::Home>) {
+        self.home.ring.set(home);
     }
 
     /// Detaches the ring of the home when its owner ends: each later wake does nothing, and the
@@ -395,7 +393,11 @@ impl alloc::task::Wake for TaskRef {
 }
 
 /// The waker of the root future of `block_on`.
-pub(super) struct RootRef(pub(super) Arc<Shared>);
+pub(super) struct RootRef {
+    pub(super) shared: Arc<Shared>,
+    /// The charge of this waker, which the caller can keep after the owner.
+    pub(super) _charge: Permit,
+}
 
 impl alloc::task::Wake for RootRef {
     fn wake(self: alloc::sync::Arc<Self>) {
@@ -403,6 +405,6 @@ impl alloc::task::Wake for RootRef {
     }
 
     fn wake_by_ref(self: &alloc::sync::Arc<Self>) {
-        self.0.wake_root();
+        self.shared.wake_root();
     }
 }

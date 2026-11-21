@@ -119,11 +119,22 @@ impl fmt::Display for Exhausted {
 impl core::error::Error for Exhausted {}
 
 impl Budget {
+    /// The bytes of the one allocation of a budget, which a charge of a budget counts.
+    pub const ALLOCATION_BYTES: u64 = crate::sync::arc_size::<Inner>() as u64;
+
     /// Makes a budget of `bound` units, all of them free.
     pub fn new(bound: NonZeroU64) -> Self {
         Self {
             inner: Arc::new(Inner::new(bound, None)),
         }
+    }
+
+    /// Makes a budget as [`Budget::new`] does, for a path that can refuse: a refusal of the
+    /// allocator gives `AllocError`.
+    pub fn try_new(bound: NonZeroU64) -> Result<Self, AllocError> {
+        Ok(Self {
+            inner: try_arc(Inner::new(bound, None))?,
+        })
     }
 
     /// Makes a budget of `bound` units, all of them free, that calls `listener` after units return

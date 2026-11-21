@@ -51,12 +51,12 @@ fn model(bound: usize, f: impl Fn() + Sync + Send + 'static) {
 #[test]
 fn a_read_that_finds_the_value_sees_each_write_that_made_it() {
     model(3, || {
-        let late = Arc::new(Late::<Value>::new(None).unwrap());
+        let late = Arc::new(Late::<Value>::new(None));
         let reader = loom::thread::spawn({
             let late = Arc::clone(&late);
-            move || late.with(Value::read)
+            move || late.with(|value| value.read())
         });
-        late.set(Value::new()).unwrap();
+        late.set(Arc::new(Value::new()));
         let read = reader.join().unwrap();
         assert!(matches!(read, Read::Empty | Read::Value(7)), "{read:?}");
     });
@@ -65,14 +65,14 @@ fn a_read_that_finds_the_value_sees_each_write_that_made_it() {
 #[test]
 fn the_detach_frees_the_value_only_after_each_read_ends() {
     model(3, || {
-        let late = Arc::new(Late::new(Some(Value::new())).unwrap());
+        let late = Arc::new(Late::new(Some(Arc::new(Value::new()))));
         let reader = loom::thread::spawn({
             let late = Arc::clone(&late);
-            move || late.with(Value::read)
+            move || late.with(|value| value.read())
         });
         late.detach();
         let read = reader.join().unwrap();
         assert!(matches!(read, Read::Value(7) | Read::Detached), "{read:?}");
-        assert_eq!(late.with(Value::read), Read::Detached);
+        assert_eq!(late.with(|value| value.read()), Read::Detached);
     });
 }

@@ -487,6 +487,8 @@ pub(crate) const ERROR_INVALID_FUNCTION: c_int = 1;
 pub(crate) const ERROR_INVALID_PARAMETER: c_int = 87;
 /// `ERROR_NOT_SUPPORTED`.
 pub(crate) const ERROR_NOT_SUPPORTED: c_int = 50;
+/// `ERROR_NOT_ENOUGH_MEMORY`, which reads as `OutOfMemory`.
+pub(crate) const ERROR_NOT_ENOUGH_MEMORY: c_int = 8;
 /// `ERROR_CALL_NOT_IMPLEMENTED`: the error that `std::io` reads as `Unsupported`, which a file
 /// operation gives for a file system without it.
 pub(crate) const ERROR_CALL_NOT_IMPLEMENTED: c_int = 120;

@@ -103,7 +103,9 @@ and `Arrivals::drain` gives each one with its facts.
 Make `Datagrams` and `Arrivals` one time and use them again, so that each batch allocates nothing.
 
 A batch needs one entry of the submission queue for each datagram, at one time. A batch that does
-not fit in the free entries refuses with `Reason::Queue` and gives its value back. A batch of more
+not fit in the free entries refuses with `Reason::Queue` and gives its value back, with each
+datagram that it held from an earlier batch. An accepted batch drops those datagrams before it
+receives. A batch of more
 datagrams than the queue has entries (`Config::submissions`, which the kernel rounds up to a power
 of two) never fits, so it always refuses: use smaller batches.
 

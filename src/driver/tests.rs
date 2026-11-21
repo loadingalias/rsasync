@@ -2142,8 +2142,21 @@ pub(in crate::driver) fn a_batch_receive_returns_several_datagrams_each_with_its
     #[cfg(target_os = "macos")]
     wait_datagrams(&mut driver, &mut receiver, 3);
     let receive = driver.recv_batch(&mut receiver, Arrivals::with_capacity(4)).unwrap();
-    let (count, mut arrivals) = drive(&mut driver, receive).unwrap();
+    let (count, arrivals) = drive(&mut driver, receive).unwrap();
     assert_eq!(count.unwrap(), 3);
+    // A refusal gives the datagrams of the batch back: here a queue with fewer entries than the
+    // batch refuses it.
+    let mut small = suite::driver(Config::new().submissions(2), backend);
+    small
+        .provide(Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
+        .unwrap();
+    let mut other = udp(&mut small, "127.0.0.1:0", UdpOptions::default());
+    let Err(refused) = small.recv_batch(&mut other, arrivals) else {
+        panic!("a batch above the entries of the queue refuses");
+    };
+    assert_eq!(refused.reason(), Reason::Queue);
+    let mut arrivals = refused.into_inner();
+    assert_eq!(arrivals.len(), 3, "the refusal gives each datagram of the batch back");
     for (index, (buffer, received)) in arrivals.drain().enumerate() {
         assert!(
             buffer.bytes() == numbered(index, 10),
@@ -2306,7 +2319,7 @@ fn a_new_driver_registers_no_file_or_buffer_and_starts_no_poller() {
 /// and keeps no memory. A driver whose allocation aborts the process fails.
 #[test]
 fn a_driver_that_the_allocator_refuses_keeps_no_memory() {
-    use crate::table::tests::allocations::each_refusal;
+    use crate::table::tests::allocations::{each_refusal, held};
 
     let refusals = each_refusal(|| Driver::new(Config::new()).map(drop));
     assert!(!refusals.is_empty());
@@ -2320,16 +2333,27 @@ fn a_driver_that_the_allocator_refuses_keeps_no_memory() {
     let mut driver = Driver::new(Config::new()).unwrap();
     let budget = pool_budget();
     let slot = Layout::from_size_align(64, 64).unwrap();
+    // The bytes and the units of one pool.
+    let (bytes, units) = (held(), budget.available());
+    let probe = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
+    let (bytes, units) = (held() - bytes, units - budget.available());
+    drop(probe);
     // A pool for each run, made before the allocator refuses.
     let mut pools: Vec<_> = (0..16)
         .map(|_| Pool::new(&budget, NonZeroU32::MIN, slot).unwrap())
         .collect();
-    let refusals = each_refusal(|| driver.provide(pools.pop().unwrap()));
+    let refusals = each_refusal(|| {
+        let available = budget.available();
+        driver
+            .provide(pools.pop().unwrap())
+            .map_err(|error| (error, budget.available() - available))
+    });
     assert!(!refusals.is_empty());
-    // A refused `provide` drops the pool that it took, so it frees the memory of the pool.
-    for (error, held) in refusals {
+    // A refused `provide` drops the pool that it took: it frees each byte and each unit of the
+    // pool, and keeps nothing else.
+    for ((error, refunded), held) in refusals {
         assert_eq!(error.kind(), ErrorKind::OutOfMemory);
-        assert!(held <= 0, "a refused provide kept {held} bytes");
+        assert_eq!((held, refunded), (-bytes, units));
     }
     driver.teardown().unwrap();
 }

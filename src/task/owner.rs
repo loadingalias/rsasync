@@ -305,6 +305,10 @@ impl Local {
         let shared_charge = charge
             .split(shared as u64)
             .expect("the charge of the owner holds its shared part");
+        // A root waker, too, can outlive the owner.
+        let root_charge = charge
+            .split(arc_size::<RootRef>() as u64)
+            .expect("the charge of the owner holds its root waker");
         let refused = |_| Refused::Allocation;
         let words = items(slots, |_| AtomicU64::new(0)).map_err(refused)?;
         let next = items(slots, |_| AtomicU32::new(0)).map_err(refused)?;
@@ -315,7 +319,11 @@ impl Local {
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
         let outbox = RefCell::new(room(outbox).map_err(refused)?);
         let shared = try_arc(Shared::new(words, next, home, shared_charge)).map_err(refused)?;
-        let root = alloc::sync::Arc::try_new(RootRef(Arc::clone(&shared))).map_err(refused)?;
+        let root = alloc::sync::Arc::try_new(RootRef {
+            shared: Arc::clone(&shared),
+            _charge: root_charge,
+        })
+        .map_err(refused)?;
         Ok(Self {
             shared,
             budget: budget.clone(),

@@ -830,6 +830,7 @@ impl Driver {
     ///
     /// A refusal, with `command`, that gives [`Reason::Children`] when each child slot is in use,
     /// [`Reason::Blocking`] when the driver has no service or the service refused the job,
+    /// [`Reason::Allocation`] when the allocator refused the job,
     /// [`Reason::Resources`] for fewer than three free resource slots, [`Reason::Unsupported`] on
     /// a kernel with no process descriptor, or [`Reason::Operations`] or [`Reason::Queue`] when
     /// the driver has no room for the operations.
@@ -850,7 +851,7 @@ impl Driver {
         if !self.children.descriptors() {
             return refuse(Reason::Unsupported, command);
         }
-        let Some(submitter) = self.blocking.as_ref().map(|(submitter, _)| submitter.clone()) else {
+        let Some(submitter) = self.blocking.clone() else {
             return refuse(Reason::Blocking, command);
         };
         if !self.resources.reserve(STREAMS) {
@@ -878,7 +879,7 @@ impl Driver {
                 payload: Payload::Spawn { waiter, child: None },
                 ..Held::default()
             }),
-            Err(refused) => Err((Reason::Blocking, refused.job)),
+            Err(refused) => Err((super::file::blocking_reason(refused.reason), refused.job)),
         };
         match self.open_with(tag, 0, job, held) {
             Ok(id) => {

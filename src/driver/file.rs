@@ -50,6 +50,8 @@ use super::{
     Call, Completion, Driver, ECANCELED, Held, Kind, Medium, Operation, Payload, Reason, Refused, Resource, Resources,
     Route, Tag,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::blocking::Reservation;
 use crate::blocking::{Job, Submitter};
 use crate::buffer::{Backing, Buffer as _, Lease, WriteLoan};
 use crate::sync::Arc;
@@ -214,7 +216,8 @@ pub(super) struct Waiting {
 /// overlapped entry of the port.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 enum Start {
-    Job(FileJob),
+    /// The job, with its admission, which it keeps while it waits.
+    Job(Reservation<FileJob>, FileJob),
     #[cfg(target_os = "windows")]
     Port(Sqe),
 }
@@ -980,7 +983,7 @@ impl Driver {
     /// has no ring operation for ([`Route::BlockingService`]). The driver keeps the submitter, and
     /// each such operation is one job of the service.
     pub fn use_blocking(&mut self, submitter: Submitter) {
-        self.blocking = Some((submitter, self.job_waker.clone()));
+        self.blocking = Some(submitter);
     }
 
     /// Opens the file at `path` with `options` (`IORING_OP_OPENAT`). The descriptor closes on
@@ -1249,7 +1252,8 @@ impl Driver {
     ///
     /// A refusal when the driver has no room for the operation, and [`Reason::Blocking`] when the
     /// change runs on the blocking service and the driver has none, or the service refused the
-    /// job. The future gives an error of the system.
+    /// job, or [`Reason::Allocation`] when the allocator refused it. The future gives an error of
+    /// the system.
     pub fn set_file_len<'a>(&mut self, file: &'a File, len: u64) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         // The ring has the call from Linux 6.9, and on epoll and kqueue it is a file job.
         let entry = self.report.route(Call::SetFileLen) == Route::Ring
@@ -1470,8 +1474,9 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation, and [`Reason::Blocking`] when the
-    /// driver has no blocking service, or the service refused the job. The future gives an error of
-    /// the system.
+    /// driver has no blocking service, or the service refused the job, or [`Reason::Allocation`]
+    /// when the allocator refused it. The future gives an error of the system, `OutOfMemory` when
+    /// the allocator refuses the list of the devices.
     #[cfg(target_os = "windows")]
     pub fn nvme_path<'a>(&mut self, file: &'a File) -> Result<Operation<'a, io::Result<NvmePath>>, Refused<()>> {
         let job = |file: Duplicate| match windows::nvme_path(file.as_raw_handle()) {
@@ -1495,9 +1500,7 @@ impl Driver {
         if self.jobs.is_empty() {
             return;
         }
-        let Some(waker) = self.blocking.as_ref().map(|(_, waker)| waker.clone()) else {
-            return;
-        };
+        let waker = self.job_waker.clone();
         let cx = Context::from_waker(&waker);
         let mut index = 0;
         while let Some(&id) = self.jobs.get(index) {
@@ -1755,22 +1758,22 @@ impl Driver {
         entry: impl FnOnce(i32, &mut Held) -> Sqe,
         cancel_on_drop: bool,
     ) -> Result<Completion, Refused<P>> {
-        let Some((submitter, waker)) = self
-            .blocking
-            .as_ref()
-            .map(|(submitter, waker)| (submitter.clone(), waker.clone()))
-        else {
+        let Some(submitter) = self.blocking.clone() else {
             return Err(Refused {
                 reason: Reason::Blocking,
                 value,
             });
         };
-        // The reservation comes first, so a full service refuses before the operation exists.
-        let Ok(reservation) = submitter.reserve::<FileJob>() else {
-            return Err(Refused {
-                reason: Reason::Blocking,
-                value,
-            });
+        // The reservation comes first, so a full service refuses before the operation exists. A
+        // waiting operation keeps it, so an accepted operation never refuses later.
+        let reservation = match submitter.reserve::<FileJob>() {
+            Ok(reservation) => reservation,
+            Err(reason) => {
+                return Err(Refused {
+                    reason: blocking_reason(reason),
+                    value,
+                });
+            }
         };
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let waits = resource.is_some_and(|resource| self.waits(resource, op));
@@ -1804,7 +1807,7 @@ impl Driver {
                 id,
                 resource,
                 op,
-                start: Start::Job(FileJob { sqe, _fd: fd }),
+                start: Start::Job(reservation, FileJob { sqe, _fd: fd }),
             });
             return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
         }
@@ -1815,7 +1818,11 @@ impl Driver {
         #[cfg(target_os = "windows")]
         let jobs = Some(self.queue.port());
         match (sqe, jobs) {
-            (Some(sqe), Some(jobs)) => jobs.add_job(id.user_data(), reservation.send(FileJob { sqe, _fd: fd }), &waker),
+            (Some(sqe), Some(jobs)) => jobs.add_job(
+                id.user_data(),
+                reservation.send(FileJob { sqe, _fd: fd }),
+                &self.job_waker,
+            ),
             _ => self.complete_now(id, -EINVAL),
         }
         Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
@@ -1850,9 +1857,9 @@ impl Driver {
     }
 
     /// Starts each waiting file operation that can run now, in the order of their starts on each
-    /// file, on macOS and Windows. A full service starts no job, and a full submission queue no
-    /// entry: a job that ends wakes the driver, a later turn submits the queue, and a later turn
-    /// tries again. A stopped service ends each job, as it ends a job that runs.
+    /// file, on macOS and Windows. A job has its admission from its start, so it never refuses
+    /// here. A full submission queue starts no entry: a later turn submits the queue, and a later
+    /// turn tries again. A stopped service ends each job, as it ends a job that runs.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub(super) fn start_waiting(&mut self) {
         let mut index = 0;
@@ -1860,7 +1867,7 @@ impl Driver {
         // operation, so the loop ends after at most `Config::operations` steps.
         while let Some(waiting) = self.waiting.get(index) {
             let (resource, op) = (waiting.resource, waiting.op);
-            let job = matches!(waiting.start, Start::Job(_));
+            let job = matches!(waiting.start, Start::Job(..));
             // An earlier operation of the same file waits, and it starts first.
             let first = !self.waiting[..index].iter().any(|earlier| earlier.resource == resource);
             let count = self.waiting.iter().filter(|other| other.resource == resource).count();
@@ -1874,30 +1881,14 @@ impl Driver {
                 continue;
             }
             if job {
-                let Some((submitter, waker)) = self
-                    .blocking
-                    .as_ref()
-                    .map(|(submitter, waker)| (submitter.clone(), waker.clone()))
-                else {
-                    return;
-                };
-                let reservation = match submitter.reserve::<FileJob>() {
-                    Ok(reservation) => reservation,
-                    Err(crate::blocking::Reason::Ended) => {
-                        let waiting = self.waiting.remove(index);
-                        self.complete_now(waiting.id, -ECANCELED);
-                        continue;
-                    }
-                    Err(_) => return,
-                };
                 let waiting = self.waiting.remove(index);
                 self.started(Some(resource), op, waiting.id);
                 #[cfg(unix)]
                 let jobs = self.queue.poller();
                 #[cfg(target_os = "windows")]
                 let jobs = Some(self.queue.port());
-                if let (Start::Job(file_job), Some(jobs)) = (waiting.start, jobs) {
-                    jobs.add_job(waiting.id.user_data(), reservation.send(file_job), &waker);
+                if let (Start::Job(reservation, file_job), Some(jobs)) = (waiting.start, jobs) {
+                    jobs.add_job(waiting.id.user_data(), reservation.send(file_job), &self.job_waker);
                 }
                 continue;
             }
@@ -1950,7 +1941,7 @@ impl Driver {
         job: impl FnOnce(Duplicate) -> i32 + Send + 'static,
     ) -> Result<Completion, Refused<()>> {
         let refuse = |reason| Err(Refused { reason, value: () });
-        let Some(submitter) = self.blocking.as_ref().map(|(submitter, _)| submitter.clone()) else {
+        let Some(submitter) = self.blocking.clone() else {
             return refuse(Reason::Blocking);
         };
         let fd = match self.duplicate(resource) {
@@ -1968,7 +1959,7 @@ impl Driver {
                 ..Held::default()
             }),
             // The job drops, and its descriptor closes.
-            Err(_refused) => Err((Reason::Blocking, ())),
+            Err(refused) => Err((blocking_reason(refused.reason), ())),
         };
         let id = self
             .open_with(tag, 0, (), held)
@@ -1984,6 +1975,15 @@ impl Driver {
         if let Some(owned) = resource.and_then(|resource| self.resources.get(resource)) {
             owned.running += 1;
         }
+    }
+}
+
+/// The reason of a driver refusal for a refusal of the blocking service: `Allocation` when the
+/// allocator refused, else `Blocking`.
+pub(super) fn blocking_reason(reason: crate::blocking::Reason) -> Reason {
+    match reason {
+        crate::blocking::Reason::Allocation => Reason::Allocation,
+        _ => Reason::Blocking,
     }
 }
 

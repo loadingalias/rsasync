@@ -308,3 +308,20 @@ fn a_stream_that_the_allocator_refuses_changes_no_registration() {
     assert!(refusals.iter().all(|refusal| *refusal == (SignalError::Allocation, 0)));
     driver.teardown().unwrap();
 }
+
+/// A driver keeps the home of each stream at the slot of the stream, so streams that close with
+/// no turn of the driver leave room for each later stream. A list that grows at the stream after
+/// the 64th allocates in a path that cannot refuse, and that refusal aborts the process.
+#[test]
+fn streams_that_close_with_no_turn_leave_room_for_the_next_stream() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let mut driver = Driver::new(Config::new()).unwrap();
+    for _ in 0..super::STREAMS {
+        drop(stream(&mut driver, Signal::TERMINATE));
+    }
+    let refusals = each_refusal(|| driver.signal(Signal::TERMINATE, Escalation::Never).map(drop));
+    assert!(!refusals.is_empty());
+    assert!(refusals.iter().all(|refusal| *refusal == (SignalError::Allocation, 0)));
+    driver.teardown().unwrap();
+}

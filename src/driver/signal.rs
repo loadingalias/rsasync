@@ -213,32 +213,40 @@ pub(super) struct Home {
     ended: AtomicBool,
 }
 
+/// The homes of the streams of one driver, each at the slot of its stream. A new stream takes the
+/// place of the closed stream that had its slot, so the table never grows.
+pub(super) type Homes = alloc::boxed::Box<[Option<Arc<Home>>]>;
+
 /// Wakes each stream of `homes` whose signal arrived since the last turn, and forgets each stream
 /// that closed.
-pub(super) fn wake(homes: &mut alloc::vec::Vec<Arc<Home>>) {
-    homes.retain(|home| Arc::strong_count(home) > 1);
-    for home in homes.iter() {
-        let count = DELIVERIES[index(home.signal)].load(Ordering::SeqCst);
-        if home.woken.swap(count, Ordering::Relaxed) != count {
-            home.waiter.wake();
+pub(super) fn wake(homes: &mut [Option<Arc<Home>>]) {
+    for place in homes.iter_mut() {
+        drop(place.take_if(|home| Arc::strong_count(home) == 1));
+        if let Some(home) = place {
+            let count = DELIVERIES[index(home.signal)].load(Ordering::SeqCst);
+            if home.woken.swap(count, Ordering::Relaxed) != count {
+                home.waiter.wake();
+            }
         }
     }
 }
 
 /// Ends each stream of `homes`: it gives [`Ended`].
-pub(super) fn end(homes: &[Arc<Home>]) {
-    for home in homes {
+pub(super) fn end(homes: &[Option<Arc<Home>>]) {
+    for home in homes.iter().flatten() {
         home.ended.store(true, Ordering::Release);
         home.waiter.wake();
     }
 }
 
-/// Registers a stream of `signal` at the home of `shared`, and gives the stream and its home.
+/// Registers a stream of `signal` at the home of `shared`, whose driver keeps the home in `homes`,
+/// and gives the stream.
 pub(super) fn register(
     shared: &Arc<Shared>,
+    homes: &mut [Option<Arc<Home>>],
     signal: Signal,
     escalation: Escalation,
-) -> Result<(SignalStream, Arc<Home>), SignalError> {
+) -> Result<SignalStream, SignalError> {
     let number = signal.0;
     if sys::FAULTS.contains(&number) {
         return Err(SignalError::Fault);
@@ -289,7 +297,9 @@ pub(super) fn register(
         reported: count,
         _shared: Arc::clone(shared),
     };
-    Ok((stream, home))
+    // The stream that had this slot closed, so its home leaves the table.
+    homes[slot] = Some(home);
+    Ok(stream)
 }
 
 /// A stream of one signal. It reports that the signal arrived since its last report, not how many

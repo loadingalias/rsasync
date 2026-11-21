@@ -98,9 +98,10 @@ impl BufferRing {
         let base = self.memory.base.as_ptr();
         // SAFETY: the entry is in the mapping. The kernel reads no entry at or after the published
         // tail, so these writes race with no read. They do not touch the `resv` field, which is
-        // the tail in the first entry.
+        // the tail in the first entry. The address exposes its provenance, because the poller and
+        // IOCP backends make the pointer again from it.
         unsafe {
-            base.add(entry).cast::<u64>().write(address.addr() as u64);
+            base.add(entry).cast::<u64>().write(address.expose_provenance() as u64);
             base.add(entry + sys::BUF_LEN).cast::<u32>().write(len);
             base.add(entry + sys::BUF_BID).cast::<u16>().write(bid);
         }

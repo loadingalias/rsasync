@@ -19,3 +19,21 @@ pub(crate) fn items<T>(count: u32, make: impl FnMut(u32) -> T) -> Result<Box<[T]
     items.extend((0..count).map(make));
     Ok(items.into_boxed_slice())
 }
+
+/// Adds `item` to the end of `items`, which grows if it has no room.
+#[cfg_attr(
+    not(all(
+        feature = "local",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )),
+    expect(
+        dead_code,
+        reason = "the start of the runtime uses it, and the runtime is on Linux only"
+    )
+)]
+pub(crate) fn push<T>(items: &mut Vec<T>, item: T) -> Result<(), AllocError> {
+    items.try_reserve(1).map_err(|_| AllocError)?;
+    items.push(item);
+    Ok(())
+}

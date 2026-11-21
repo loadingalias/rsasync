@@ -106,7 +106,7 @@ match Runtime::builder().local_workers(4).build() {
 | --- | --- | --- |
 | `Plan(PlanError)` | A setting is invalid, or a strict placement falls back. No worker started | Correct the setting. See [Placement](#placement) |
 | `Seed(io::Error)` | The kernel gave no seed. No worker started | Give a seed with `seed`, or start again |
-| `Allocation` | The allocator did not give the tables of the start. No worker started | Start fewer workers, or start again when memory is free |
+| `Allocation` | The allocator did not give the memory of the start: the default budget, the facts of the host, the plans, or the tables of the workers. No worker started | Start fewer workers, or start again when memory is free |
 | `Worker { index, error }` | Worker `index` did not start | See `WorkerError` below |
 
 | `WorkerError` | When | Recovery |
@@ -145,8 +145,14 @@ can replace the driver that the owner waits in. rsasync has no such public type 
 has, a task of the runtime does no I/O, and [driver-only use](driver-only.md) is the path for I/O.
 
 `block_on` gives a `BlockOnError` when the owner gets no task tables (`Owner`) or no timers
-(`Timers`, `Time`), or when its driver fails (`Driver`). A driver failure during the call ends each
-live task with `Outcome::OwnerFailed`. A failure of the final teardown drops the output of `root`.
+(`Timers`, `Time`), or when its driver fails (`Driver`). The first three come before the first
+poll of `root`, and `into_root` gives `root` back, unpolled, so you can run it later. A driver
+failure during the call ends each live task with `Outcome::OwnerFailed`. A failure of the final
+teardown drops the output of `root`.
+
+The error holds the root, so `?` into `Box<dyn Error>` needs a root that is `'static`, such as an
+`async move` block that owns what it uses. For a root that borrows, match the error, or map it
+with `into_root` first.
 
 ## Spawn on a worker
 
@@ -178,7 +184,8 @@ first poll. A factory that panics before the worker sees a cancel ends the task 
 
 A `Handle` can move to another thread, also to a task of a worker. Each handle holds a place in the
 inbox of each worker, so `handles` bounds them: `runtime.handle()` and `handle.try_clone()` refuse
-with `TooManyHandles` at the limit.
+with `HandleRefused::TooMany` at the limit, and with `HandleRefused::Allocation` when the allocator
+does not give the memory of the handle.
 
 ## Placement
 

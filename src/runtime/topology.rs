@@ -5,12 +5,16 @@
 //! not the same as no limit. Each read is one small file, and the discovery reads the file of a
 //! core, a cache domain, or a node one time, not one time for each of its CPUs.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::io::Read as _;
+use core::alloc::AllocError;
+use core::fmt;
+use std::io::{self, Read as _, Write as _};
 
 use super::placement::{CpuSet, MAX_CPUS};
 use super::sys;
+use crate::memory::{items, push};
 
 /// The most bytes of one file of `/sys` or `/proc` that the discovery reads. A list of 4096 CPUs
 /// in its longest form is about 20 KiB.
@@ -21,6 +25,10 @@ const CACHE_INDEXES: u32 = 16;
 
 /// The most levels of the cgroup tree that the discovery reads for the CPU limit.
 const CGROUP_DEPTH: usize = 64;
+
+/// The most bytes of a path of `/sys` that the discovery makes. The longest, the shared CPU list
+/// of a cache index, has about 64.
+const PATH_BYTES: usize = 96;
 
 /// The CPU limit of the cgroup of the process (`cpu.max` of cgroup v2), the smallest on its path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,11 +49,11 @@ pub struct Host {
     pub(super) allowed: Option<CpuSet>,
     pub(super) isolated: Option<CpuSet>,
     /// For each CPU index: the first CPU of its physical core.
-    pub(super) core: Vec<Option<u32>>,
+    pub(super) core: Box<[Option<u32>]>,
     /// For each CPU index: the first CPU of the CPUs that share its last-level cache.
-    pub(super) domain: Vec<Option<u32>>,
+    pub(super) domain: Box<[Option<u32>]>,
     /// For each CPU index: its NUMA node.
-    pub(super) node: Vec<Option<u32>>,
+    pub(super) node: Box<[Option<u32>]>,
     pub(super) quota: Quota,
 }
 
@@ -118,15 +126,16 @@ impl Host {
         Some(labelled(&self.core, label))
     }
 
-    /// The cache domains of the CPUs of `allowed`, each with its CPUs of `allowed`. With no cache
-    /// fact for a CPU, the NUMA nodes are the domains. With no node fact either, it is empty.
-    pub(super) fn domains_of(&self, allowed: &CpuSet) -> Vec<CpuSet> {
+    /// The cache domains of the CPUs of `allowed`, each with its label and its CPUs of `allowed`.
+    /// With no cache fact for a CPU, the NUMA nodes are the domains. With no node fact either, it
+    /// is empty.
+    pub(super) fn domains_of(&self, allowed: &CpuSet) -> Result<Vec<(u32, CpuSet)>, AllocError> {
         let labels = if covers(allowed, &self.domain) {
             &self.domain
         } else if covers(allowed, &self.node) {
             &self.node
         } else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut domains: Vec<(u32, CpuSet)> = Vec::new();
         for cpu in allowed.iter() {
@@ -140,11 +149,11 @@ impl Host {
                 None => {
                     let mut set = CpuSet::new();
                     set.insert(cpu);
-                    domains.push((label, set));
+                    push(&mut domains, (label, set))?;
                 }
             }
         }
-        domains.into_iter().map(|(_, set)| set).collect()
+        Ok(domains)
     }
 
     /// The physical cores of the CPUs of `set`. A CPU with no core fact counts as one core.
@@ -192,33 +201,33 @@ fn labelled(labels: &[Option<u32>], label: u32) -> CpuSet {
     set
 }
 
-/// Reads the facts of this host.
-pub(super) fn discover() -> Host {
+/// Reads the facts of this host, or `AllocError` when the allocator refuses their memory.
+pub(super) fn discover() -> Result<Host, AllocError> {
     let mut buffer = Vec::new();
     let allowed = sys::affinity().ok();
-    let online = read(&mut buffer, "/sys/devices/system/cpu/online").and_then(cpu_list);
-    let isolated = read(&mut buffer, "/sys/devices/system/cpu/isolated").and_then(cpu_list);
+    let online = read(&mut buffer, "/sys/devices/system/cpu/online")?.and_then(cpu_list);
+    let isolated = read(&mut buffer, "/sys/devices/system/cpu/isolated")?.and_then(cpu_list);
     let size = allowed
         .as_ref()
         .and_then(|allowed| allowed.iter().last())
-        .map_or(0, |last| last as usize + 1);
-    let mut core = alloc::vec![None; size];
-    let mut domain = alloc::vec![None; size];
-    let mut node = alloc::vec![None; size];
+        .map_or(0, |last| last + 1);
+    let mut core = items(size, |_| None)?;
+    let mut domain = items(size, |_| None)?;
+    let mut node = items(size, |_| None)?;
     if let Some(allowed) = &allowed {
         for cpu in allowed.iter() {
             if core[cpu as usize].is_none() {
-                let path = alloc::format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
-                label(&mut core, read(&mut buffer, &path).and_then(cpu_list));
+                let path = format_args!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+                label(&mut core, read_at(&mut buffer, path)?.and_then(cpu_list));
             }
             if domain[cpu as usize].is_none() {
-                label(&mut domain, last_level_cache(&mut buffer, cpu));
+                label(&mut domain, last_level_cache(&mut buffer, cpu)?);
             }
         }
-        if let Some(nodes) = read(&mut buffer, "/sys/devices/system/node/online").and_then(cpu_list) {
+        if let Some(nodes) = read(&mut buffer, "/sys/devices/system/node/online")?.and_then(cpu_list) {
             for id in nodes.iter() {
-                let path = alloc::format!("/sys/devices/system/node/node{id}/cpulist");
-                if let Some(cpus) = read(&mut buffer, &path).and_then(cpu_list) {
+                let path = format_args!("/sys/devices/system/node/node{id}/cpulist");
+                if let Some(cpus) = read_at(&mut buffer, path)?.and_then(cpu_list) {
                     for cpu in cpus.iter() {
                         if let Some(entry) = node.get_mut(cpu as usize) {
                             *entry = Some(id);
@@ -228,15 +237,15 @@ pub(super) fn discover() -> Host {
             }
         }
     }
-    Host {
+    Ok(Host {
         online,
         allowed,
         isolated,
         core,
         domain,
         node,
-        quota: quota(&mut buffer),
-    }
+        quota: quota(&mut buffer)?,
+    })
 }
 
 /// Gives each CPU of `set` the first CPU of `set` as its label.
@@ -255,39 +264,53 @@ fn label(labels: &mut [Option<u32>], set: Option<CpuSet>) {
 }
 
 /// The CPUs that share the cache of the highest level of `cpu`, other than an instruction cache.
-fn last_level_cache(buffer: &mut Vec<u8>, cpu: u32) -> Option<CpuSet> {
+fn last_level_cache(buffer: &mut Vec<u8>, cpu: u32) -> Result<Option<CpuSet>, AllocError> {
     let mut highest: Option<(u32, u32)> = None;
     for index in 0..CACHE_INDEXES {
-        let base = alloc::format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}");
-        let Some(level) = read(buffer, &alloc::format!("{base}/level")).and_then(|text| text.parse::<u32>().ok())
-        else {
+        let path = format_args!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}/level");
+        let Some(level) = read_at(buffer, path)?.and_then(|text| text.parse::<u32>().ok()) else {
             break;
         };
-        if read(buffer, &alloc::format!("{base}/type")).is_some_and(|kind| kind == "Instruction") {
+        let path = format_args!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}/type");
+        if read_at(buffer, path)?.is_some_and(|kind| kind == "Instruction") {
             continue;
         }
         if highest.is_none_or(|(top, _)| level > top) {
             highest = Some((level, index));
         }
     }
-    let (_, index) = highest?;
-    let path = alloc::format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}/shared_cpu_list");
-    read(buffer, &path).and_then(cpu_list)
+    let Some((_, index)) = highest else {
+        return Ok(None);
+    };
+    let path = format_args!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}/shared_cpu_list");
+    Ok(read_at(buffer, path)?.and_then(cpu_list))
 }
 
 /// The smallest CPU limit on the cgroup v2 path of the process.
-fn quota(buffer: &mut Vec<u8>) -> Quota {
-    let Some(path) = read(buffer, "/proc/self/cgroup")
-        .and_then(|groups| groups.lines().find_map(|line| line.strip_prefix("0::")))
-        .map(String::from)
+fn quota(buffer: &mut Vec<u8>) -> Result<Quota, AllocError> {
+    const ROOT: &str = "/sys/fs/cgroup";
+    const LIMIT: &str = "/cpu.max";
+    let Some(group) =
+        read(buffer, "/proc/self/cgroup")?.and_then(|groups| groups.lines().find_map(|line| line.strip_prefix("0::")))
     else {
-        return Quota::Unknown;
+        return Ok(Quota::Unknown);
     };
-    let mut directory = alloc::format!("/sys/fs/cgroup{}", path.trim_end_matches('/'));
+    let group = group.trim_end_matches('/');
+    // The directory only gets shorter, so the room for its longest path holds each path.
+    let mut directory = String::new();
+    directory
+        .try_reserve_exact(ROOT.len() + group.len() + LIMIT.len())
+        .map_err(|_| AllocError)?;
+    directory.push_str(ROOT);
+    directory.push_str(group);
     let mut smallest = None;
     let mut read_any = false;
     for _ in 0..CGROUP_DEPTH {
-        if let Some(limit) = read(buffer, &alloc::format!("{directory}/cpu.max")) {
+        let len = directory.len();
+        directory.push_str(LIMIT);
+        let limit = read(buffer, &directory)?;
+        directory.truncate(len);
+        if let Some(limit) = limit {
             read_any = true;
             let mut fields = limit.split_whitespace();
             if let (Some(max), Some(period)) = (fields.next(), fields.next())
@@ -297,7 +320,7 @@ fn quota(buffer: &mut Vec<u8>) -> Quota {
                 smallest = Some(smallest.map_or(millis, |smallest: u64| smallest.min(millis)));
             }
         }
-        if directory == "/sys/fs/cgroup" {
+        if directory == ROOT {
             break;
         }
         match directory.rsplit_once('/') {
@@ -305,23 +328,58 @@ fn quota(buffer: &mut Vec<u8>) -> Quota {
             None => break,
         }
     }
-    match (smallest, read_any) {
+    Ok(match (smallest, read_any) {
         (Some(millis), _) => Quota::Millis(millis),
         (None, true) => Quota::None,
         (None, false) => Quota::Unknown,
-    }
+    })
 }
 
 /// The trimmed text of the file at `path`, or `None` if it is missing, larger than `READ_LIMIT`,
-/// or not text.
-fn read<'a>(buffer: &'a mut Vec<u8>, path: &str) -> Option<&'a str> {
+/// or not text. The buffer grows with `try_reserve`, and a refusal gives `AllocError`. The
+/// discovery does not use `read_to_end`: its probe of a short file grows the buffer with an
+/// allocation that aborts when the allocator refuses.
+fn read<'a>(buffer: &'a mut Vec<u8>, path: &str) -> Result<Option<&'a str>, AllocError> {
     buffer.clear();
-    let file = std::fs::File::open(path).ok()?;
-    file.take(READ_LIMIT + 1).read_to_end(buffer).ok()?;
-    if buffer.len() as u64 > READ_LIMIT {
-        return None;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    let mut len = 0;
+    // Each pass reads at least one byte or ends, and `READ_LIMIT` bounds the bytes.
+    loop {
+        if len == buffer.len() {
+            if len as u64 > READ_LIMIT {
+                return Ok(None);
+            }
+            buffer.try_reserve(len.max(256)).map_err(|_| AllocError)?;
+            buffer.resize(buffer.capacity(), 0);
+        }
+        match file.read(&mut buffer[len..]) {
+            Ok(0) => break,
+            Ok(read) => len += read,
+            Err(_) => return Ok(None),
+        }
     }
-    core::str::from_utf8(buffer).ok().map(str::trim)
+    buffer.truncate(len);
+    if len as u64 > READ_LIMIT {
+        return Ok(None);
+    }
+    Ok(core::str::from_utf8(buffer).ok().map(str::trim))
+}
+
+/// [`read`] of the path that `path` writes, which the discovery writes on the stack. A path longer
+/// than `PATH_BYTES` gives `None`.
+fn read_at<'a>(buffer: &'a mut Vec<u8>, path: fmt::Arguments<'_>) -> Result<Option<&'a str>, AllocError> {
+    let mut bytes = [0; PATH_BYTES];
+    let mut cursor = io::Cursor::new(&mut bytes[..]);
+    if cursor.write_fmt(path).is_err() {
+        return Ok(None);
+    }
+    let len = usize::try_from(cursor.position()).unwrap_or(PATH_BYTES);
+    match core::str::from_utf8(&bytes[..len]) {
+        Ok(path) => read(buffer, path),
+        Err(_) => Ok(None),
+    }
 }
 
 /// A CPU list of Linux, such as `0-3,8`, or `None` if it is malformed or names a CPU that is not

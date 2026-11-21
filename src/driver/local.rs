@@ -479,11 +479,16 @@ impl Driver {
 
     /// Ends the operation `id` with the pipe instance or client of `made`, and the next instances
     /// of a listener, which the driver then owns, or with the negative error of `made`, or with
-    /// `ERROR_NOT_ENOUGH_MEMORY` when each resource slot is in use or the port does not take the
-    /// handle. The handle closes when the operation has no consumer.
+    /// `ERROR_NOT_ENOUGH_MEMORY` when each resource slot is in use, the port does not take the
+    /// handle, or the allocator refuses the state of the listener. The handle closes when the operation has no consumer.
     #[cfg(target_os = "windows")]
     fn end_pipe(&mut self, id: OpId, made: Result<(std::os::windows::io::OwnedHandle, Option<Listening>), i32>) {
         let result = made.and_then(|(file, listening)| {
+            // The box comes before the adoption, so a refusal of the allocator adopts nothing.
+            let listening = listening
+                .map(alloc::boxed::Box::try_new)
+                .transpose()
+                .map_err(|_| NOT_ENOUGH_MEMORY.saturating_neg())?;
             // The instances that wait after the first share its association.
             let associated = listening.as_ref().is_none_or(|listening| {
                 listening
@@ -500,7 +505,7 @@ impl Driver {
                 .adopt_handles(handles, super::Medium::Pipe, true)
                 .map_err(|_| NOT_ENOUGH_MEMORY.saturating_neg())?;
             if let Some(owned) = self.resources.get(resource) {
-                owned.listening = listening.map(alloc::boxed::Box::new);
+                owned.listening = listening;
             }
             self.hold(id, |held| held.accepted = Some(resource));
             Ok(())
@@ -509,9 +514,8 @@ impl Driver {
     }
 }
 
-/// `ERROR_NOT_ENOUGH_MEMORY` (`winerror.h`), which reads as `OutOfMemory`.
 #[cfg(target_os = "windows")]
-const NOT_ENOUGH_MEMORY: i32 = 8;
+use super::iocp::sys::ERROR_NOT_ENOUGH_MEMORY as NOT_ENOUGH_MEMORY;
 
 /// The accept `tag` of a pipe listener ended with `result` at its terminal event, on Windows. The
 /// first instance of the listener has its client: the stream takes the instance, the next waiting

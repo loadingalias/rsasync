@@ -317,3 +317,16 @@ fn signals_do_not_delay_the_timer_of_a_parked_owner_on_io_uring() {
 fn signals_do_not_delay_the_timer_of_a_parked_owner_on_epoll() {
     signals_do_not_delay_the_timer_of_a_parked_owner(Backend::Epoll);
 }
+
+/// The charge of an owner with a ring equals the bytes that its construction allocates. A home
+/// that boxes its ring in an allocation that no charge counts fails.
+#[test]
+fn a_ring_owner_charges_each_byte_that_it_allocates() {
+    let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let driver = Driver::new(Config::new()).expect("the test host allows io_uring");
+    let before = allocations::bytes();
+    let owner = RingOwner::new(&budget, 3, driver).unwrap();
+    let allocated = allocations::bytes() - before;
+    assert_eq!((1 << 20) - budget.available(), allocated);
+    drop(owner);
+}

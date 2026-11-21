@@ -239,8 +239,7 @@ impl LocalOwner {
             crate::sync::thread::current(),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             None,
-        )
-        .map_err(|_| Refused::Allocation)?;
+        );
         let local = Local::new(budget, slots, home, 0)?;
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
@@ -569,7 +568,7 @@ impl<F: Future + 'static> Future for WaitSpawn<F> {
                 reason: Reason::NoOwner,
             }));
         };
-        local.waiting.remove(&this.node);
+        let woken = local.waiting.remove(&this.node);
         match local.spawn(future) {
             Err(refused) if refused.reason == Reason::NoSlot => {
                 this.future = Some(refused.future);
@@ -577,7 +576,14 @@ impl<F: Future + 'static> Future for WaitSpawn<F> {
                 unsafe { local.waiting.wait(&this.node, cx.waker()) };
                 Poll::Pending
             }
-            result => Poll::Ready(result),
+            result => {
+                // A freed slot woke this spawn, and another refusal left the slot free: the next
+                // waiting spawn gets it.
+                if woken && result.is_err() {
+                    local.waiting.wake_first();
+                }
+                Poll::Ready(result)
+            }
         }
     }
 }

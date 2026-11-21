@@ -41,7 +41,7 @@ fails at once. The future of `bind_local` and `connect_local` gives these errors
 | `NotFound` | A connect to a path with no file |
 | `ConnectionRefused` | A connect to a socket file with no listener, for example the file of a closed listener |
 | `ResourceBusy` | A connect to a live listener whose queue of connections that wait for an accept is full. Connect again later. See [A busy listener](#a-busy-listener) |
-| `OutOfMemory` | Each resource slot of the driver is in use (`Config::resources`) |
+| `OutOfMemory` | Each resource slot of the driver is in use (`Config::resources`). On Windows, also when the allocator refuses the state of a listener |
 
 Windows gives other causes for some of these kinds: see [Windows](#windows).
 

@@ -367,6 +367,20 @@ pub(crate) mod allocations {
         BYTES.get()
     }
 
+    /// The bytes that the current thread allocated and did not free so far.
+    pub(crate) fn held() -> isize {
+        HELD.get()
+    }
+
+    /// Runs `f`, which this thread runs with each allocation refused.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn refused<T>(f: impl FnOnce() -> T) -> T {
+        REFUSE_FROM.set(ALLOCATIONS.get());
+        let output = f();
+        REFUSE_FROM.set(u64::MAX);
+        output
+    }
+
     /// Runs `make` until a run fails no allocation. Run `n` refuses allocation `n` of this thread,
     /// counted from 0, and each later one. Gives the error of each run that failed, and the bytes
     /// that the run kept. The value of the last run drops after the refusals end.

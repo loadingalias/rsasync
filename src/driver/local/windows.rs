@@ -11,7 +11,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::fmt;
+use core::fmt::{self, Write as _};
 use core::ptr::{self, NonNull};
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
@@ -20,6 +20,7 @@ use std::path::Path;
 
 use super::super::file::windows::number;
 use super::super::iocp::sys;
+use crate::memory::room;
 
 /// The prefix of the name of a local pipe.
 const PREFIX: &str = r"\\.\pipe\";
@@ -193,10 +194,11 @@ fn last_error() -> i32 {
 /// Makes the first instance of the pipe `name`, which takes the name. Gives the instance and what
 /// the listener keeps, or the negative error: `WSAEADDRINUSE` when an instance of the name exists.
 pub(crate) fn listen(name: Vec<u16>) -> Result<(OwnedHandle, Listening), i32> {
+    let waiting = room(BACKLOG - 1).map_err(|_| sys::ERROR_NOT_ENOUGH_MEMORY.saturating_neg())?;
     let mut listening = Listening {
         name,
         descriptor: owner_only()?,
-        waiting: VecDeque::with_capacity(BACKLOG - 1),
+        waiting: VecDeque::from(waiting),
     };
     let first = match instance(&listening, sys::FILE_FLAG_FIRST_PIPE_INSTANCE) {
         Ok(instance) => instance,
@@ -420,16 +422,14 @@ fn owner_only() -> Result<Descriptor, i32> {
     // SAFETY: the call gave a new handle that nothing else owns.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
     let user = Sid::of_token(&token)?;
-    let sddl: Vec<u16> = alloc::format!("O:{user}D:P(A;;GA;;;{user})")
-        .encode_utf16()
-        .chain([0])
-        .collect();
+    let mut sddl = Wide::new();
+    write!(sddl, "O:{user}D:P(A;;GA;;;{user})").map_err(|_| sys::ERROR_INVALID_PARAMETER.saturating_neg())?;
     let mut descriptor = ptr::null_mut();
     // SAFETY: the string is NUL-terminated, and the call writes one pointer to a descriptor that it
     // allocates.
     let converted = unsafe {
         sys::ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
+            sddl.units.as_ptr(),
             sys::SDDL_REVISION_1,
             &raw mut descriptor,
             ptr::null_mut(),
@@ -441,6 +441,40 @@ fn owner_only() -> Result<Descriptor, i32> {
     NonNull::new(descriptor)
         .map(Descriptor)
         .ok_or(sys::ERROR_INVALID_PARAMETER.saturating_neg())
+}
+
+/// The most UTF-16 units of the descriptor string of [`owner_only`]: two SIDs of at most 185
+/// characters each, 15 more characters, and the NUL.
+const SDDL_UNITS: usize = 400;
+
+/// A NUL-terminated UTF-16 string in fixed storage, which `write!` fills.
+struct Wide {
+    units: [u16; SDDL_UNITS],
+    len: usize,
+}
+
+impl Wide {
+    const fn new() -> Self {
+        Self {
+            units: [0; SDDL_UNITS],
+            len: 0,
+        }
+    }
+}
+
+impl fmt::Write for Wide {
+    /// Adds `text`, or gives an error if the storage has no room for it and the NUL.
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for unit in text.encode_utf16() {
+            // The last unit stays for the NUL.
+            if self.len + 1 >= SDDL_UNITS {
+                return Err(fmt::Error);
+            }
+            self.units[self.len] = unit;
+            self.len += 1;
+        }
+        Ok(())
+    }
 }
 
 // Two attributes, so that Clippy sees the test module (`allow-unwrap-in-tests`).

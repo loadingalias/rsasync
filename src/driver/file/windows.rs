@@ -16,6 +16,7 @@ use std::path::Path;
 
 use super::super::iocp::sys;
 use super::{Alignment, Cache, NvmePath, OpenOptions};
+use crate::driver::filled;
 use crate::uring::Sqe;
 use crate::uring::sys as ring;
 
@@ -471,25 +472,41 @@ fn zero_control(file: sys::Handle, code: u32, range: Option<&sys::FileZeroDataIn
 /// Whether the native NVMe path of Windows Server 2025 serves each disk of the volume of the open
 /// file `file`: the driver service of the device node of each disk is `nvmedisk`. A disk under
 /// the disk class driver, `disk`, goes through the SCSI translation of its port driver. The report
-/// reads the devices, not the version of the system. Gives the path, or the negative error.
+/// reads the devices, not the version of the system. Gives the path, or the negative error:
+/// `ERROR_NOT_ENOUGH_MEMORY` when the allocator refuses the list of the devices.
 pub(crate) fn nvme_path(file: sys::Handle) -> Result<NvmePath, i32> {
-    let disks = disks(file)?;
+    let mut disks = [0; EXTENTS];
+    let count = volume_disks(file, &mut disks)?;
+    let disks = &disks[..count];
     if disks.is_empty() {
         return Ok(NvmePath::Other);
     }
-    let services = services()?;
-    let native = disks.iter().all(|disk| {
-        services
-            .iter()
-            .any(|(number, service)| number == disk && service.eq_ignore_ascii_case("nvmedisk"))
-    });
-    Ok(if native { NvmePath::Native } else { NvmePath::Other })
+    let mut native = [false; EXTENTS];
+    services(|number, service| {
+        for (disk, native) in disks.iter().zip(&mut native) {
+            *native |= *disk == number && is_nvme(service);
+        }
+    })?;
+    Ok(if native[..disks.len()].iter().all(|native| *native) {
+        NvmePath::Native
+    } else {
+        NvmePath::Other
+    })
 }
 
-/// The numbers of the disks of the volume of the open file `file`. A volume with no disk, such as
-/// a network share, has none.
+/// Whether the driver service `service` is `nvmedisk`, in any case.
+fn is_nvme(service: &[u16]) -> bool {
+    service.len() == "nvmedisk".len()
+        && service
+            .iter()
+            .zip("nvmedisk".bytes())
+            .all(|(&unit, byte)| u8::try_from(unit).is_ok_and(|unit| unit.eq_ignore_ascii_case(&byte)))
+}
+
+/// Writes the numbers of the disks of the volume of the open file `file` into `disks`, and gives
+/// their count. A volume with no disk, such as a network share, has none.
 #[expect(unsafe_code, reason = "the calls write into storage that lives during the calls")]
-fn disks(file: sys::Handle) -> Result<Vec<u32>, i32> {
+fn volume_disks(file: sys::Handle, disks: &mut [u32; EXTENTS]) -> Result<usize, i32> {
     let mut path = [0_u16; NAME];
     // SAFETY: `path` holds `NAME` units, and the call writes at most that many.
     let len = unsafe {
@@ -500,39 +517,38 @@ fn disks(file: sys::Handle) -> Result<Vec<u32>, i32> {
             sys::VOLUME_NAME_GUID,
         )
     };
-    let path = path.get(..len as usize).ok_or(-sys::ERROR_INVALID_PARAMETER)?;
+    if len as usize >= NAME {
+        return Err(-sys::ERROR_INVALID_PARAMETER);
+    }
     if len == 0 {
         return Err(last_error());
     }
     // `\\?\Volume{GUID}\…`: the volume is the path up to its fourth separator, opened as `\\.\`.
-    let Some(end) = path
+    let Some(end) = path[..len as usize]
         .iter()
         .enumerate()
         .filter(|&(_, &unit)| unit == u16::from(b'\\'))
         .nth(3)
         .map(|(index, _)| index)
     else {
-        return Ok(Vec::new());
+        return Ok(0);
     };
-    let mut volume: Vec<u16> = path[..end].to_vec();
-    if let Some(unit) = volume.get_mut(2) {
-        *unit = u16::from(b'.');
-    }
-    volume.push(0);
-    let volume = open_device(&volume)?;
+    path[2] = u16::from(b'.');
+    path[end] = 0;
+    let volume = open_device(&path[..=end])?;
     let mut extents = sys::VolumeDiskExtents::<EXTENTS> {
         count: 0,
         extents: [sys::DiskExtent::default(); EXTENTS],
     };
     // A volume with no disk, such as a network share, has no extents.
     if control(&volume, sys::IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, &mut extents).is_err() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
     let count = (extents.count as usize).min(EXTENTS);
-    let mut disks: Vec<u32> = extents.extents[..count].iter().map(|extent| extent.disk).collect();
-    disks.sort_unstable();
-    disks.dedup();
-    Ok(disks)
+    for (disk, extent) in disks.iter_mut().zip(&extents.extents[..count]) {
+        *disk = extent.disk;
+    }
+    Ok(count)
 }
 
 /// Opens the device at the NUL-terminated path `path` with no access, which device queries need.
@@ -578,9 +594,9 @@ fn control<T>(device: &OwnedHandle, code: u32, output: &mut T) -> Result<(), i32
     if done == 0 { Err(last_error()) } else { Ok(()) }
 }
 
-/// The number and the driver service of each present disk.
+/// Calls `found` with the number and the driver service of each present disk.
 #[expect(unsafe_code, reason = "the calls write into storage that lives during the calls")]
-fn services() -> Result<Vec<(u32, alloc::string::String)>, i32> {
+fn services(mut each: impl FnMut(u32, &[u16])) -> Result<(), i32> {
     let mut len = 0;
     // SAFETY: the call writes one count.
     let result = unsafe {
@@ -594,7 +610,7 @@ fn services() -> Result<Vec<(u32, alloc::string::String)>, i32> {
     if result != sys::CR_SUCCESS {
         return Err(-sys::ERROR_NOT_SUPPORTED);
     }
-    let mut list = alloc::vec![0_u16; len as usize];
+    let mut list = filled(len as usize, || 0_u16).map_err(|_| sys::ERROR_NOT_ENOUGH_MEMORY.saturating_neg())?;
     // SAFETY: `list` holds `len` units, and the call writes at most that many.
     let result = unsafe {
         sys::CM_Get_Device_Interface_ListW(
@@ -608,7 +624,6 @@ fn services() -> Result<Vec<(u32, alloc::string::String)>, i32> {
     if result != sys::CR_SUCCESS {
         return Err(-sys::ERROR_NOT_SUPPORTED);
     }
-    let mut services = Vec::new();
     // The list holds NUL-terminated paths, and an empty path ends it.
     for interface in list
         .split_inclusive(|&unit| unit == 0)
@@ -662,7 +677,7 @@ fn services() -> Result<Vec<(u32, alloc::string::String)>, i32> {
             continue;
         }
         let end = service.iter().position(|&unit| unit == 0).unwrap_or(NAME);
-        services.push((number.number, alloc::string::String::from_utf16_lossy(&service[..end])));
+        each(number.number, &service[..end]);
     }
-    Ok(services)
+    Ok(())
 }

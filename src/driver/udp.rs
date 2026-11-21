@@ -857,7 +857,7 @@ impl Driver {
     pub fn recv_batch<'a, R: AsMut<ReadHalf>>(
         &mut self,
         reader: &'a mut R,
-        mut arrivals: Arrivals,
+        arrivals: Arrivals,
     ) -> Result<Operation<'a, (io::Result<usize>, Arrivals)>, Refused<Arrivals>> {
         if self.selected.is_none() {
             return Err(Refused {
@@ -865,17 +865,20 @@ impl Driver {
                 value: arrivals,
             });
         }
-        arrivals.datagrams.clear();
         let entries = u32::try_from(arrivals.capacity()).unwrap_or(u32::MAX);
-        let held = |arrivals| Held {
-            payload: Payload::Batch {
-                batch: Batch::Receive(arrivals),
-                progress: Progress {
-                    remaining: entries,
-                    ..Progress::default()
+        // The admission runs this last, so a refusal gives back the datagrams of the earlier batch.
+        let held = |mut arrivals: Arrivals| {
+            arrivals.datagrams.clear();
+            Held {
+                payload: Payload::Batch {
+                    batch: Batch::Receive(arrivals),
+                    progress: Progress {
+                        remaining: entries,
+                        ..Progress::default()
+                    },
                 },
-            },
-            ..Held::default()
+                ..Held::default()
+            }
         };
         let completion = self.begin_entries(reader.as_mut().resource, Kind::RecvBatch, entries, arrivals, held)?;
         Ok(Operation::new(completion, |result, held| {

@@ -699,3 +699,73 @@ pub(in crate::driver) fn a_file_at_a_path_longer_than_max_path_opens_writes_and_
     drive(&mut driver, unlink).unwrap().unwrap();
     assert!(!path.exists());
 }
+
+/// Each refusal of the allocator at the admission of a file job is `Allocation`, gives the lease
+/// back, and keeps no memory. A refusal that reads `Blocking` fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_job_that_the_allocator_refuses_gives_allocation_and_its_lease() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let scratch = Scratch::new("refused");
+    let mut driver = suite::driver(Config::new(), Backend::Kqueue);
+    let file = open(&mut driver, &scratch.join("data"), writable());
+    // A lease for each run, made before the allocator refuses.
+    let mut leases: Vec<_> = (0..16).map(|_| Lease::from(numbered(0, 64))).collect();
+    let refusals = each_refusal(|| {
+        driver
+            .write_at(&file, leases.pop().unwrap(), 0, WriteMode::Plain)
+            .map(drop)
+    });
+    assert!(!refusals.is_empty());
+    for (refused, held) in refusals {
+        assert_eq!((refused.reason(), held), (Reason::Allocation, 0));
+        assert_eq!(refused.into_inner().bytes(), numbered(0, 64));
+    }
+}
+
+/// A file operation that waits behind an operation that runs alone on its file keeps its
+/// admission, so it starts when that operation ends with no allocation. A start that reserves
+/// again then fails, and nothing wakes the driver after it: the drive never ends.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_waiting_file_operation_starts_with_the_admission_that_it_kept() {
+    use crate::table::tests::allocations::refused;
+
+    let scratch = Scratch::new("waiting");
+    let mut driver = suite::driver(Config::new(), Backend::Kqueue);
+    let file = open(&mut driver, &scratch.join("data"), writable());
+    let allocate = driver.allocate(&file, 0, 1 << 20, Length::Extend).unwrap();
+    // The allocation runs alone on the file, so the write waits for it.
+    let write = driver
+        .write_at(&file, Lease::from(numbered(0, 4096)), 0, WriteMode::Plain)
+        .unwrap();
+    // Each turn of the driver refuses each allocation of this thread.
+    let (written, _lease) = refused(|| drive(&mut driver, write)).unwrap();
+    assert_eq!(written.unwrap(), 4096);
+    drive(&mut driver, allocate).unwrap().unwrap();
+}
+
+/// Each refusal of the allocator in the NVMe report gives `ERROR_NOT_ENOUGH_MEMORY`, which reads as
+/// `OutOfMemory`, and keeps no memory. A report whose allocation aborts the process fails.
+#[cfg(target_os = "windows")]
+#[test]
+fn an_nvme_report_that_the_allocator_refuses_keeps_no_memory() {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use crate::driver::iocp::sys;
+    use crate::table::tests::allocations::each_refusal;
+
+    let scratch = Scratch::new("nvme-refused");
+    let file = fs::File::create(scratch.join("data")).unwrap();
+    let refusals = each_refusal(|| super::windows::nvme_path(file.as_raw_handle()));
+    assert!(
+        !refusals.is_empty(),
+        "the volume of the test has a disk, so the report lists the devices"
+    );
+    assert!(
+        refusals
+            .iter()
+            .all(|refusal| *refusal == (-sys::ERROR_NOT_ENOUGH_MEMORY, 0))
+    );
+}

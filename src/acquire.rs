@@ -169,13 +169,14 @@ impl fmt::Display for AboveBound {
 
 impl core::error::Error for AboveBound {}
 
-/// The bytes of `places` waiter places, which [`budget`] charges to its memory budget.
+/// The bytes of the budget of [`budget`] and of its `places` waiter places, which it charges to its
+/// memory budget.
 #[must_use]
 pub fn memory(places: NonZeroU32) -> u64 {
-    let fixed = arc_size::<Queue>();
+    let fixed = arc_size::<Queue>() as u64 + Budget::ALLOCATION_BYTES;
     let each = size_of::<Waiter>() + 2 * size_of::<u32>();
     // No overflow: each part is at most a few hundred bytes, and a count has 32 bits.
-    fixed as u64 + u64::from(places.get()) * each as u64
+    fixed + u64::from(places.get()) * each as u64
 }
 
 /// Makes a budget of `bound` units whose waits use `places` waiter places, and the acquirer of the

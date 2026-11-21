@@ -194,7 +194,8 @@ operation and waits for each completion queue entry first.
 2025 serves each disk of the volume of the file, and `NvmePath::Other` when another driver serves a
 disk, or when the volume has no local disk. A job reads the driver service of the device node of
 each disk (`nvmedisk` for the native path, `disk` for the disk class driver over the SCSI
-translation of the port driver). It never infers the path from the version of the system.
+translation of the port driver). It never infers the path from the version of the system. When
+the allocator refuses the list of the devices, the report gives `OutOfMemory`.
 
 ## Local streams
 

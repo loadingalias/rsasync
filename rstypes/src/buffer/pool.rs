@@ -319,10 +319,14 @@ impl SlotRef {
 impl Clone for SlotRef {
     fn clone(&self) -> Self {
         // Ordering: as for an `Arc`. The count of `self` keeps the slot in use, so a new count
-        // needs no order. A 64-bit count cannot overflow.
-        self.shared().slots[self.index as usize]
+        // needs no order.
+        let before = self.shared().slots[self.index as usize]
             .count
             .fetch_add(1, Ordering::Relaxed);
+        // Forgotten clones can raise the count without a drop. As `Arc` does, stop far below the
+        // wrap, which would return the slot while a lease uses it. Other threads can each add one
+        // more before they stop, which half of the range holds.
+        assert!(before < u64::MAX / 2, "a slot has fewer than 2^63 counts");
         Self {
             pool: self.pool,
             index: self.index,

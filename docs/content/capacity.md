@@ -83,8 +83,9 @@ with `TooManyWaiters` when each place is in use. A drop of an acquirer frees its
 
 - Places: from 1 to `acquire::MAX_PLACES` (2^16). `acquire::budget` refuses more with
   `Refused::TooManyPlaces`.
-- Memory: `acquire::budget` charges `acquire::memory(places)` bytes to `memory` before it allocates,
-  or refuses with `Refused::Memory` and the `Exhausted` value. When the allocator refuses, it
+- Memory: `acquire::budget` charges `acquire::memory(places)` bytes to `memory` before it allocates:
+  the waiter places and the allocation of the budget that it makes. It refuses with
+  `Refused::Memory` and the `Exhausted` value when they do not fit. When the allocator refuses, it
   refuses with `Refused::Allocation` and keeps no charge. The charge ends when the budget and each
   acquirer have dropped.
 - Order:
@@ -154,6 +155,10 @@ it. Use it directly only for a waiting mechanism of your own:
 - A refusal, a reservation, and a release of zero units do not call it.
 - Keep it short, and do not wait in it, because it runs in the drop of a permit.
 - A budget from `Budget::new` has no listener. Its release then costs one branch for the check.
+
+A budget is one allocation of `Budget::ALLOCATION_BYTES` bytes. `Budget::new` aborts as `std` does
+when the allocator refuses it. In a path that must refuse, call `Budget::try_new`, which gives
+`AllocError`, and charge `Budget::ALLOCATION_BYTES` to the budget that contains it.
 
 ## Split a permit
 

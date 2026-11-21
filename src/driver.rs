@@ -577,6 +577,9 @@ pub enum Reason {
     /// ([`Route::BlockingService`]), and the driver has no service ([`Driver::use_blocking`]), or
     /// the service refused the job.
     Blocking,
+    /// The allocator did not give the memory of the operation, such as the job of an operation on
+    /// the blocking service. A later operation can succeed.
+    Allocation,
     /// Each child slot of the driver is in use ([`Config::children`]).
     #[cfg(unix)]
     Children,
@@ -1192,13 +1195,13 @@ pub struct Driver {
     rearm_wake: bool,
     /// The signal streams whose home is this driver.
     #[cfg(unix)]
-    signals: Vec<Arc<signal::Home>>,
+    signals: signal::Homes,
     /// The child processes that this driver owns.
     #[cfg(unix)]
     children: process::Children,
     /// The blocking service of the operations that the kernel cannot run
     /// ([`Driver::use_blocking`]), and the waker that its jobs wake.
-    blocking: Option<(crate::blocking::Submitter, core::task::Waker)>,
+    blocking: Option<crate::blocking::Submitter>,
     /// The waker of the jobs of [`Driver::use_blocking`], which wakes this driver.
     job_waker: core::task::Waker,
     /// The operations that run on the blocking service, which each turn polls.
@@ -1375,7 +1378,7 @@ impl Driver {
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
-            signals: room(signal::STREAMS).map_err(refused)?,
+            signals: filled(signal::STREAMS, || None).map_err(refused)?.into_boxed_slice(),
             children: process::Children::new(config.children).map_err(Error::System)?,
             blocking: None,
             job_waker,
@@ -1485,7 +1488,7 @@ impl Driver {
             completions_per_turn: config.completions_per_turn,
             waking: false,
             rearm_wake,
-            signals: room(signal::STREAMS).map_err(refused)?,
+            signals: filled(signal::STREAMS, || None).map_err(refused)?.into_boxed_slice(),
             blocking: None,
             job_waker,
             jobs: room(config.operations as usize).map_err(refused)?,
@@ -1522,10 +1525,7 @@ impl Driver {
     /// [`SignalError`] gives the reason, and nothing changes.
     #[cfg(unix)]
     pub fn signal(&mut self, signal: Signal, escalation: Escalation) -> Result<SignalStream, SignalError> {
-        let (stream, home) = signal::register(&self.shared, signal, escalation)?;
-        // The process has at most `STREAMS` streams, so the push never grows the list.
-        self.signals.push(home);
-        Ok(stream)
+        signal::register(&self.shared, &mut self.signals, signal, escalation)
     }
 
     /// Gives the slots of `pool` to the kernel as the buffers of [`Driver::recv_selected`]: a

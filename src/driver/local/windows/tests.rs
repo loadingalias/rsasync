@@ -465,3 +465,23 @@ pub(in crate::driver) fn a_client_reads_the_process_and_user_of_a_server_of_a_se
     assert_eq!(alloc::format!("{}", peer.user()), sid_of(&user));
     drop(server);
 }
+
+/// Each refusal of the allocator in the make of a listener gives `ERROR_NOT_ENOUGH_MEMORY` and
+/// keeps no memory: only the name that the call took is free. A listener whose allocation aborts
+/// the process fails.
+#[test]
+fn a_listener_that_the_allocator_refuses_keeps_no_memory() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let path = pipe("refused");
+    // A name for each run, made before the allocator refuses.
+    let mut names: Vec<Vec<u16>> = (0..16).map(|_| super::name(&path).unwrap()).collect();
+    let name = isize::try_from(names[0].capacity() * size_of::<u16>()).unwrap();
+    let refusals = each_refusal(|| super::listen(names.pop().unwrap()).map(drop));
+    assert!(!refusals.is_empty());
+    assert!(
+        refusals
+            .iter()
+            .all(|refusal| *refusal == (-sys::ERROR_NOT_ENOUGH_MEMORY, -name))
+    );
+}

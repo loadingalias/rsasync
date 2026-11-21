@@ -383,7 +383,10 @@ fn the_plans_spread_over_nodes_and_domains_and_take_smt_siblings_last() {
         ]
     );
     let too_many = placement::resolve(&Placement::Dedicated, Selection::Permissive, 17, &host);
-    assert_eq!(too_many, Err(PlanError::TooFewCpus { workers: 17, cpus: 16 }));
+    assert_matches!(
+        too_many,
+        Err(Cause::Plan(PlanError::TooFewCpus { workers: 17, cpus: 16 }))
+    );
     let mut one_domain = host;
     one_domain.domain.fill(Some(0));
     let plans = placement::resolve(&Placement::Domain, Selection::Permissive, 2, &one_domain).unwrap();
@@ -616,12 +619,128 @@ fn a_kept_cancel_handle_of_a_factory_spawn_keeps_its_charge_until_it_drops() {
 fn a_factory_spawn_that_the_allocator_refuses_gives_its_factory_back() {
     use crate::table::tests::allocations::each_refusal;
 
-    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let budget = Budget::new(NonZeroU64::new(DEFAULT_BUDGET).unwrap());
+    let runtime = Runtime::builder()
+        .local_workers(1)
+        .budget(budget.clone())
+        .build()
+        .unwrap();
     let mut handle = runtime.handle().unwrap();
-    let refusals = each_refusal(|| handle.spawn_on(WorkerId::new(0), || async { 7 }).map(drop));
+    let before = budget.available();
+    let refusals = each_refusal(|| {
+        handle
+            .spawn_on(WorkerId::new(0), || async { 7 })
+            .map(drop)
+            .map_err(|refused| (refused, budget.available()))
+    });
     assert!(!refusals.is_empty());
-    for (refused, held) in refusals {
-        assert_eq!((refused.reason(), held), (Reason::Allocation, 0));
+    for ((refused, available), held) in refusals {
+        assert_eq!((refused.reason(), available, held), (Reason::Allocation, before, 0));
         let _factory = refused.into_future();
     }
+}
+
+/// The job of a factory spawn holds the charge of its box until the box drops, when the worker
+/// places the task. A task that keeps that charge holds the units of a large factory after its
+/// memory is free.
+#[test]
+fn a_placed_factory_spawn_keeps_no_charge_of_its_factory() {
+    const CAPTURE: usize = 16 << 10;
+    let budget = Budget::new(NonZeroU64::new(DEFAULT_BUDGET).unwrap());
+    let runtime = Runtime::builder()
+        .local_workers(1)
+        .budget(budget.clone())
+        .build()
+        .unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let before = budget.available();
+    let (polled, first_poll) = mpsc::channel();
+    let capture = [0_u8; CAPTURE];
+    let _task = handle
+        .spawn_on(WorkerId::new(0), move || {
+            let len = capture.len();
+            async move {
+                polled.send(len).unwrap();
+                pending::<()>().await;
+            }
+        })
+        .unwrap();
+    assert_eq!(first_poll.recv().unwrap(), CAPTURE);
+    let held = before - budget.available();
+    assert!(
+        held < CAPTURE as u64,
+        "the task holds {held} units, also those of its factory"
+    );
+}
+
+/// Each refusal of the allocator in a start with no worker gives `Cause::Allocation`, also the
+/// refusal of the default budget and of the facts of the host, and keeps no memory. A start
+/// whose allocation aborts the process fails.
+#[test]
+fn a_start_that_the_allocator_refuses_gives_allocation() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let refusals = each_refusal(|| Runtime::builder().local_workers(0).build().map(drop));
+    assert!(!refusals.is_empty());
+    for (failure, held) in refusals {
+        assert_matches!(failure.cause(), Cause::Allocation);
+        assert_eq!(held, 0);
+    }
+}
+
+/// Each refusal of the allocator in the plans of `Dedicated` and of `Domain` gives
+/// `Cause::Allocation`, and keeps no memory.
+#[test]
+fn a_plan_that_the_allocator_refuses_gives_allocation() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let host = two_node_host();
+    for (placement, workers) in [(Placement::Dedicated, 16), (Placement::Domain, 6)] {
+        let refusals = each_refusal(|| placement::resolve(&placement, Selection::Strict, workers, &host));
+        assert!(!refusals.is_empty());
+        for (cause, held) in refusals {
+            assert_matches!(cause, Cause::Allocation);
+            assert_eq!(held, 0);
+        }
+    }
+}
+
+/// Each refusal of the allocator before the first poll of the root of `block_on` gives the root
+/// back, unpolled, and keeps no memory and no charge. A refusal that drops the root fails.
+#[test]
+fn a_block_on_that_the_allocator_refuses_gives_its_root_back() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let budget = Budget::new(NonZeroU64::new(DEFAULT_BUDGET).unwrap());
+    let runtime = Runtime::builder()
+        .local_workers(0)
+        .budget(budget.clone())
+        .build()
+        .unwrap();
+    let refusals = each_refusal(|| runtime.block_on(async { 7 }));
+    assert!(!refusals.is_empty());
+    for (error, held) in refusals {
+        assert_matches!(error, BlockOnError::Owner(..) | BlockOnError::Timers(..));
+        assert_eq!((held, budget.available()), (0, DEFAULT_BUDGET));
+        let mut root = core::pin::pin!(error.into_root().expect("a setup refusal gives the root back"));
+        let polled = root.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(polled, Poll::Ready(7));
+    }
+}
+
+/// A refusal of the allocator in a clone of a handle gives `Allocation`, not `TooMany`, and keeps
+/// no memory.
+#[test]
+fn a_handle_that_the_allocator_refuses_gives_allocation() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let handle = runtime.handle().unwrap();
+    let refusals = each_refusal(|| handle.try_clone());
+    assert!(!refusals.is_empty());
+    assert!(
+        refusals
+            .iter()
+            .all(|refusal| *refusal == (HandleRefused::Allocation, 0))
+    );
 }

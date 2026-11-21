@@ -180,7 +180,11 @@ for it:
   kernel refuse the driver.
 - `Driver::use_blocking(submitter)` gives the driver a `Submitter` of your service. Until then, the
   change refuses with `Reason::Blocking`. A full or stopped service also refuses with
-  `Reason::Blocking`.
+  `Reason::Blocking`, and a refusal of the allocator refuses with `Reason::Allocation`. Each
+  refusal gives the value back.
+- The admission of the job comes before the operation exists: its job slot, its charge, and its
+  memory. An operation that waits for an operation that runs alone on its file keeps that
+  admission, so an accepted operation never refuses later.
 - The job owns a duplicate of the descriptor. The operation ends when the job returns, as an
   operation of the ring ends at its completion, so a close and a teardown wait for it.
 

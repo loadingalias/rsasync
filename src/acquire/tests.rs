@@ -156,3 +156,18 @@ fn a_budget_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
     assert!(refusals.iter().all(|refusal| *refusal == (Refused::Allocation, 0)));
     assert_eq!(heap.available(), 1 << 20);
 }
+
+/// The charge of a budget equals the bytes that its construction allocates: its waiter places
+/// and its own budget. A charge that omits the allocation of that budget fails.
+#[cfg(feature = "std")]
+#[test]
+fn a_budget_charges_each_byte_that_it_allocates() {
+    use crate::table::tests::allocations::bytes;
+
+    let heap = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let before = bytes();
+    let made = budget(&heap, NonZeroU64::new(8).unwrap(), NonZeroU32::new(4).unwrap()).unwrap();
+    let allocated = bytes() - before;
+    assert_eq!((1 << 20) - heap.available(), allocated);
+    drop(made);
+}

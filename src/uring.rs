@@ -106,6 +106,8 @@ pub(crate) struct Features {
     pub(crate) zero_copy_receive: bool,
 }
 
+// Each address of an entry exposes its provenance: the poller and IOCP backends make the pointer
+// again with `with_exposed_provenance_mut`.
 impl Sqe {
     /// A no-op (`IORING_OP_NOP`): it completes with 0 and names no memory.
     pub(crate) fn nop() -> Self {
@@ -122,7 +124,7 @@ impl Sqe {
             opcode: sys::IORING_OP_READ,
             fd,
             off: u64::MAX,
-            addr: buffer.addr() as u64,
+            addr: buffer.expose_provenance() as u64,
             len,
             ..Self::default()
         }
@@ -148,7 +150,7 @@ impl Sqe {
             opcode: sys::IORING_OP_WRITE,
             fd,
             off: u64::MAX,
-            addr: buffer.addr() as u64,
+            addr: buffer.expose_provenance() as u64,
             len,
             ..Self::default()
         }
@@ -161,7 +163,7 @@ impl Sqe {
             opcode: sys::IORING_OP_WRITEV,
             fd,
             off: u64::MAX,
-            addr: vectors.addr() as u64,
+            addr: vectors.expose_provenance() as u64,
             len: count,
             ..Self::default()
         }
@@ -174,7 +176,7 @@ impl Sqe {
             opcode: sys::IORING_OP_READV,
             fd,
             off: u64::MAX,
-            addr: vectors.addr() as u64,
+            addr: vectors.expose_provenance() as u64,
             len: count,
             ..Self::default()
         }
@@ -222,7 +224,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_OPENAT,
             fd: directory,
-            addr: path.addr() as u64,
+            addr: path.expose_provenance() as u64,
             len: mode,
             rw_flags: flags,
             ..Self::default()
@@ -236,9 +238,9 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_STATX,
             fd: directory,
-            addr: path.addr() as u64,
+            addr: path.expose_provenance() as u64,
             len: mask,
-            off: buffer.addr() as u64,
+            off: buffer.expose_provenance() as u64,
             rw_flags: flags,
             ..Self::default()
         }
@@ -257,9 +259,9 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_RENAMEAT,
             fd: from_directory,
-            addr: from.addr() as u64,
+            addr: from.expose_provenance() as u64,
             len: to_directory.cast_unsigned(),
-            off: to.addr() as u64,
+            off: to.expose_provenance() as u64,
             rw_flags: flags,
             ..Self::default()
         }
@@ -271,7 +273,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_UNLINKAT,
             fd: directory,
-            addr: path.addr() as u64,
+            addr: path.expose_provenance() as u64,
             rw_flags: flags,
             ..Self::default()
         }
@@ -300,8 +302,8 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_ACCEPT,
             fd,
-            addr: address.addr() as u64,
-            off: len.addr() as u64,
+            addr: address.expose_provenance() as u64,
+            off: len.expose_provenance() as u64,
             #[cfg(target_os = "linux")]
             rw_flags: sys::SOCK_NONBLOCK | sys::SOCK_CLOEXEC,
             ..Self::default()
@@ -313,7 +315,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_RECV,
             fd,
-            addr: buffer.addr() as u64,
+            addr: buffer.expose_provenance() as u64,
             len,
             ..Self::default()
         }
@@ -337,7 +339,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_SEND,
             fd,
-            addr: buffer.addr() as u64,
+            addr: buffer.expose_provenance() as u64,
             len,
             rw_flags: sys::MSG_NOSIGNAL,
             ..Self::default()
@@ -350,7 +352,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_SENDMSG,
             fd,
-            addr: message.addr() as u64,
+            addr: message.expose_provenance() as u64,
             len: 1,
             rw_flags: sys::MSG_NOSIGNAL,
             ..Self::default()
@@ -364,7 +366,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_RECVMSG,
             fd,
-            addr: message.addr() as u64,
+            addr: message.expose_provenance() as u64,
             len: 1,
             rw_flags: flags.cast_unsigned(),
             ..Self::default()
@@ -397,7 +399,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_CONNECT,
             fd,
-            addr: address.addr() as u64,
+            addr: address.expose_provenance() as u64,
             off: u64::from(len),
             ..Self::default()
         }
@@ -420,7 +422,7 @@ impl Sqe {
         Self {
             opcode: sys::IORING_OP_BIND,
             fd,
-            addr: address.addr() as u64,
+            addr: address.expose_provenance() as u64,
             off: u64::from(len),
             ..Self::default()
         }
@@ -466,7 +468,7 @@ impl Sqe {
             fd: id,
             len: idtype,
             splice_fd_in: options.cast_signed(),
-            off: info.addr() as u64,
+            off: info.expose_provenance() as u64,
             ..Self::default()
         }
     }
@@ -1171,7 +1173,7 @@ fn enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> io::Result
 )]
 fn enter_timeout(fd: RawFd, to_submit: u32, min_complete: u32, ts: &sys::KernelTimespec) -> io::Result<u32> {
     let arg = sys::GeteventsArg {
-        ts: ptr::from_ref(ts).addr() as u64,
+        ts: ptr::from_ref(ts).expose_provenance() as u64,
         ..sys::GeteventsArg::default()
     };
     // SAFETY: `arg` and the timespec that it names are valid for reads during the call, and the

@@ -15,11 +15,14 @@ its recovery. rsasync is in development, and these errors are not in a published
 - No allocation of runtime state aborts the process. Each operation that allocates a table, queue,
   slot, shared state, task, registration, or handle that rsasync keeps can refuse, and a refusal of
   the allocator is one of its refusals: `Allocation`, or `io::ErrorKind::OutOfMemory` for a driver.
-  Your own values allocate as the standard library does, and abort there as in `std`: `Budget::new`,
-  `InjectedClock::new`, `Lease::from`, `Lease::from_owner`, the first split of a heap backing, the
-  batch containers, a path, and a report or list that an operation gives back. The standard library
-  can also abort in its own allocations: when it starts a thread of a runtime or of a blocking
-  service, and, on macOS, at the first lock of a `std::sync::Mutex`.
+  The start of a runtime refuses each of its allocations with `Cause::Allocation`, also those of
+  its report. `Runtime::block_on` gives its root back when it refuses before the first poll.
+  Your own values allocate as the standard library does, and abort there as in `std`: `Budget::new`
+  (`Budget::try_new` refuses with `AllocError`), `InjectedClock::new`, `Lease::from`,
+  `Lease::from_owner`, the first split of a heap backing, the batch containers, a path, and a
+  report or list that an operation gives back. The standard library can also abort in its own
+  allocations: when it starts a thread of a runtime or of a blocking service, with the name of
+  the thread, and, on macOS, at the first lock of a `std::sync::Mutex`.
 - A refusal of `rsasync::task` and its text need no allocation, so a report completes when the
   allocator refuses each request.
 - The `Debug` form of each error of `rsasync::task`, `rsasync::channel`, and `rsasync::blocking`,
@@ -64,8 +67,9 @@ The errors of `rsasync::runtime`, on Linux (see [Runtime](runtime.md)).
 | --- | --- | --- |
 | `StartFailure` | `Builder::build` failed. `cause()` gives a `Cause`, and `cleanup()` the `Outcome` of each worker that started | See [A failed start](runtime.md#a-failed-start) |
 | `PlanError` | A setting is invalid, or a strict placement falls back | See [Placement](runtime.md#placement) |
-| `BlockOnError` | `Runtime::block_on` got no task tables or timers, or its driver failed | See [Run the calling thread with block_on](runtime.md#run-the-calling-thread-with-block_on) |
-| `TooManyHandles` | `Builder::handles` handles exist | Drop a handle, or give a larger limit |
+| `BlockOnError<F>` | `Runtime::block_on` got no task tables or timers, and `into_root` gives the root back, or its driver failed | See [Run the calling thread with block_on](runtime.md#run-the-calling-thread-with-block_on) |
+| `HandleRefused::TooMany` | `Builder::handles` handles exist | Drop a handle, or give a larger limit |
+| `HandleRefused::Allocation` | The allocator did not give the memory of the handle | Try again when memory is free |
 
 ## Channels
 
@@ -146,6 +150,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::Alignment` | A direct-I/O buffer, length, or offset is not aligned | Align each one to the `Alignment` of the file |
 | `Refused` with `Reason::Register` | epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. On macOS, [kqueue](kqueue.md) refused the registration. On Windows, the association of a socket with the [port](iocp.md) failed | The refusal gives the descriptor back, open. Close other resources, or raise the limit |
 | `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`. `Driver::report` gives the route of each call |
+| `Refused` with `Reason::Allocation` | The allocator did not give the memory of the operation, such as its job on the blocking service | Try again when memory is free |
 | `Ended` | The driver ended before the operation gave its result | Keep the driver driven until each future takes its result |
 | `SignalError::Fault`, `Uncatchable`, `Invalid` | No stream can take the signal | Use another signal |
 | `SignalError::Full` | Each of the 64 streams of the process is in use | Close a stream, then try again |

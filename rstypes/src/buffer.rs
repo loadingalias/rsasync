@@ -821,10 +821,12 @@ impl From<&'static [u8]> for Lease {
 // them. A pool slot stays in use while its count is above zero, so its pool does not give it again,
 // and its address in the arena of the pool is fixed. Its writers are the backing that became the
 // lease and the rests of its splits, and each writes only bytes that no lease covers until it froze
-// them. So nothing writes the bytes of a lease while it lives. Each lease covers `len` bytes from
-// `offset`, in bytes of its owner that a backing froze: `From` and `Backing::freeze_prefix` take
-// them, and `view` takes a sub-slice of them. A move of a lease copies the `Arc` pointer or the shared reference, so the
-// region does not move.
+// them. A writable rest can hold the last count of the slot, and then the slot returns only after
+// the rest drops. So nothing writes the bytes that a lease covers while it lives, and a rest
+// writes only its own bytes. Each lease covers `len` bytes from `offset`, in bytes of its owner
+// that a backing froze: `From` and `Backing::freeze_prefix` take them, and `view` takes a
+// sub-slice of them. A move of a lease copies the `Arc` pointer, the raw pointer of the pool and
+// the index of the slot, or the shared reference, so the region does not move.
 unsafe impl Buffer for Lease {
     fn as_ptr(&self) -> *const u8 {
         let base = match &self.owner {

@@ -84,6 +84,7 @@ use crate::capacity::Budget;
 use crate::channel::{self, TrySendError, mpsc};
 use crate::clock;
 use crate::driver::{self, Config};
+use crate::memory::room;
 use crate::task::{self, JoinHandle, Placer, RingOwner, SpawnRefused};
 use crate::timer;
 use worker::Message;
@@ -226,7 +227,7 @@ impl Builder {
     pub fn build(self) -> Result<Runtime, StartFailure> {
         let fail = |cause| StartFailure {
             cause,
-            cleanup: Box::default(),
+            cleanup: Vec::new(),
         };
         if self.task_slots == 0 || self.task_slots > task::MAX_SLOTS {
             return Err(fail(Cause::Plan(PlanError::TaskSlots)));
@@ -234,12 +235,13 @@ impl Builder {
         if self.local_workers > MAX_WORKERS {
             return Err(fail(Cause::Plan(PlanError::TooManyWorkers)));
         }
-        let budget = self
-            .budget
-            .unwrap_or_else(|| Budget::new(NonZeroU64::new(DEFAULT_BUDGET).expect("the default is not zero")));
-        let host = topology::discover();
-        let plans = placement::resolve(&self.placement, self.selection, self.local_workers, &host)
-            .map_err(|error| fail(Cause::Plan(error)))?;
+        let budget = match self.budget {
+            Some(budget) => budget,
+            None => Budget::try_new(NonZeroU64::new(DEFAULT_BUDGET).expect("the default is not zero"))
+                .map_err(|_| fail(Cause::Allocation))?,
+        };
+        let host = topology::discover().map_err(|_| fail(Cause::Allocation))?;
+        let plans = placement::resolve(&self.placement, self.selection, self.local_workers, &host).map_err(fail)?;
         let generator = match self.generator {
             Some(generator) => generator,
             None => entropy::generator().map_err(|error| fail(Cause::Seed(error)))?,
@@ -259,23 +261,19 @@ impl Builder {
             if let Err((cause, failed)) = started.start(start, self.handles) {
                 let mut cleanup = started.stop();
                 cleanup.extend(failed);
-                return Err(StartFailure {
-                    cause,
-                    cleanup: cleanup.into_boxed_slice(),
-                });
+                return Err(StartFailure { cause, cleanup });
             }
         }
         let Started {
             workers,
-            senders,
-            placers,
+            routes,
             reports,
+            ..
         } = started;
         Ok(Runtime {
             workers: workers.into_boxed_slice(),
             handle: Handle {
-                senders: senders.into_boxed_slice(),
-                placers: placers.into(),
+                routes: routes.into_boxed_slice(),
             },
             budget,
             slots: self.task_slots,
@@ -307,12 +305,13 @@ impl fmt::Debug for Builder {
     }
 }
 
-/// The workers that started, during [`Builder::build`].
+/// The workers that started, during [`Builder::build`], and the room of the cleanup outcomes of a
+/// failed start. Each table has room for each worker, so no push of the start allocates.
 struct Started {
     workers: Vec<Thread<io::Result<()>>>,
-    senders: Vec<mpsc::Sender<Message>>,
-    placers: Vec<Placer>,
+    routes: Vec<Route>,
     reports: Vec<WorkerReport>,
+    cleanup: Vec<Cleanup>,
 }
 
 impl Started {
@@ -325,9 +324,9 @@ impl Started {
         }
         Some(Self {
             workers: table(workers)?,
-            senders: table(workers)?,
-            placers: table(workers)?,
+            routes: table(workers)?,
             reports: table(workers)?,
+            cleanup: table(workers)?,
         })
     }
 
@@ -349,8 +348,7 @@ impl Started {
         match ready_wait.recv_blocking() {
             Ok(Ok((report, placer))) => {
                 self.workers.push(thread);
-                self.senders.push(sender);
-                self.placers.push(placer);
+                self.routes.push(Route { sender, placer });
                 self.reports.push(report);
                 Ok(())
             }
@@ -366,10 +364,11 @@ impl Started {
         }
     }
 
-    /// Stops each worker that started, and joins it. Gives the outcome of each.
+    /// Stops each worker that started, and joins it. Gives the outcome of each, with room for the
+    /// outcome of the worker that failed.
     fn stop(&mut self) -> Vec<Cleanup> {
-        stop(&mut self.senders);
-        let mut cleanup = Vec::with_capacity(self.workers.len().saturating_add(1));
+        stop(&mut self.routes);
+        let mut cleanup = core::mem::take(&mut self.cleanup);
         for (index, thread) in (0..).zip(self.workers.drain(..)) {
             cleanup.push(join(index, thread));
         }
@@ -378,10 +377,10 @@ impl Started {
 }
 
 /// Sends the stop to each worker. Its inbox has a place for it.
-fn stop(senders: &mut [mpsc::Sender<Message>]) {
-    for sender in senders {
+fn stop(routes: &mut [Route]) {
+    for route in routes {
         // A worker whose driver failed ended, and its inbox is closed.
-        let sent = sender.try_send(Message::Stop);
+        let sent = route.sender.try_send(Message::Stop);
         assert!(
             !matches!(sent, Err(TrySendError::Full(_))),
             "the inbox of a worker has a place for the stop"
@@ -439,8 +438,9 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// [`TooManyHandles`] when [`Builder::handles`] handles exist.
-    pub fn handle(&self) -> Result<Handle, TooManyHandles> {
+    /// [`HandleRefused`] when [`Builder::handles`] handles exist, or when the allocator refuses
+    /// the memory of the handle.
+    pub fn handle(&self) -> Result<Handle, HandleRefused> {
         self.handle.try_clone()
     }
 
@@ -458,16 +458,24 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// [`BlockOnError`] when the owner gets no tables or timers, or when its driver fails. A driver
-    /// failure during the loop ends each live task with
-    /// [`OwnerFailed`](crate::task::Outcome::OwnerFailed). A failure of the final teardown drops
-    /// the output of `root`.
-    pub fn block_on<F: Future>(&self, root: F) -> Result<F::Output, BlockOnError> {
+    /// [`BlockOnError`] when the owner gets no tables or timers, which gives `root` back, unpolled
+    /// ([`BlockOnError::into_root`]), or when its driver fails. A driver failure during the loop
+    /// ends each live task with [`OwnerFailed`](crate::task::Outcome::OwnerFailed). A failure of
+    /// the final teardown drops the output of `root`.
+    pub fn block_on<F: Future>(&self, root: F) -> Result<F::Output, BlockOnError<F>> {
         let call = self.calls.get();
         self.calls.set(call.wrapping_add(1));
-        let mut owner = RingOwner::lazy(&self.budget, self.slots, self.driver).map_err(BlockOnError::Owner)?;
-        let (timers, clock) = worker::timers(&self.budget, self.timers).map_err(BlockOnError::Timers)?;
-        owner.use_timers(timers, clock).map_err(BlockOnError::Time)?;
+        let mut owner = match RingOwner::lazy(&self.budget, self.slots, self.driver) {
+            Ok(owner) => owner,
+            Err(refused) => return Err(BlockOnError::Owner(refused, root)),
+        };
+        let (timers, clock) = match worker::timers(&self.budget, self.timers) {
+            Ok(timers) => timers,
+            Err(error) => return Err(BlockOnError::Timers(error, root)),
+        };
+        if let Err(error) = owner.use_timers(timers, clock) {
+            return Err(BlockOnError::Time(error, root));
+        }
         owner.use_generator(self.generator.child(b"block_on", call));
         owner.block_on(root).map_err(BlockOnError::Driver)
     }
@@ -475,7 +483,7 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        stop(&mut self.handle.senders);
+        stop(&mut self.handle.routes);
         for (index, thread) in (0..).zip(core::mem::take(&mut self.workers)) {
             // The drop is a backstop: the shutdown of R305 reports these outcomes.
             let _outcome = join(index, thread);
@@ -513,15 +521,21 @@ impl WorkerId {
 /// Spawns on the workers of a runtime, from any thread. Each handle holds a sender of the inbox of
 /// each worker: [`Builder::handles`] bounds them.
 pub struct Handle {
-    senders: Box<[mpsc::Sender<Message>]>,
-    placers: alloc::sync::Arc<[Placer]>,
+    routes: Box<[Route]>,
+}
+
+/// The way of a handle to one worker: a sender of its inbox, and the side of its owner that
+/// reserves a slot and a charge.
+struct Route {
+    sender: mpsc::Sender<Message>,
+    placer: Placer,
 }
 
 impl Handle {
     /// The local workers of the runtime.
     #[must_use]
     pub fn workers(&self) -> u32 {
-        u32::try_from(self.placers.len()).expect("a runtime has at most MAX_WORKERS workers")
+        u32::try_from(self.routes.len()).expect("a runtime has at most MAX_WORKERS workers")
     }
 
     /// Spawns the future that `factory` makes on `worker`. The factory moves to the worker, which
@@ -546,7 +560,7 @@ impl Handle {
         F::Output: Send + 'static,
     {
         let index = worker.0 as usize;
-        let (Some(placer), Some(sender)) = (self.placers.get(index), self.senders.get_mut(index)) else {
+        let Some(Route { sender, placer }) = self.routes.get_mut(index) else {
             return Err(SpawnRefused::new(factory, task::Reason::NoWorker));
         };
         let (job, handle) = placer.prepare(factory)?;
@@ -564,39 +578,48 @@ impl Handle {
     ///
     /// # Errors
     ///
-    /// [`TooManyHandles`] when [`Builder::handles`] handles exist.
-    pub fn try_clone(&self) -> Result<Self, TooManyHandles> {
-        let mut senders = Vec::new();
-        senders
-            .try_reserve_exact(self.senders.len())
-            .map_err(|_| TooManyHandles)?;
-        for sender in &self.senders {
-            senders.push(sender.try_clone().map_err(|_| TooManyHandles)?);
+    /// [`HandleRefused`] when [`Builder::handles`] handles exist, or when the allocator refuses
+    /// the memory of the handle.
+    pub fn try_clone(&self) -> Result<Self, HandleRefused> {
+        let mut routes = room(self.routes.len()).map_err(|_| HandleRefused::Allocation)?;
+        for route in &self.routes {
+            routes.push(Route {
+                sender: route.sender.try_clone().map_err(|_| HandleRefused::TooMany)?,
+                placer: route.placer.clone(),
+            });
         }
         Ok(Self {
-            senders: senders.into_boxed_slice(),
-            placers: alloc::sync::Arc::clone(&self.placers),
+            routes: routes.into_boxed_slice(),
         })
     }
 }
 
 impl fmt::Debug for Handle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Handle").field("workers", &self.placers.len()).finish()
+        f.debug_struct("Handle").field("workers", &self.routes.len()).finish()
     }
 }
 
-/// [`Builder::handles`] handles exist, so no other one can.
+/// Why the runtime gave no handle. Nothing changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooManyHandles;
+#[non_exhaustive]
+pub enum HandleRefused {
+    /// [`Builder::handles`] handles exist, so no other one can.
+    TooMany,
+    /// The allocator did not give the memory of the handle.
+    Allocation,
+}
 
-impl fmt::Display for TooManyHandles {
+impl fmt::Display for HandleRefused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("the runtime has its most handles")
+        f.write_str(match self {
+            Self::TooMany => "the runtime has its most handles",
+            Self::Allocation => "the allocator did not give the memory of the handle",
+        })
     }
 }
 
-impl core::error::Error for TooManyHandles {}
+impl core::error::Error for HandleRefused {}
 
 /// What a start found and applied.
 #[derive(Debug)]
@@ -644,7 +667,7 @@ impl WorkerReport {
 #[derive(Debug)]
 pub struct StartFailure {
     cause: Cause,
-    cleanup: Box<[Cleanup]>,
+    cleanup: Vec<Cleanup>,
 }
 
 impl StartFailure {
@@ -657,7 +680,7 @@ impl StartFailure {
     /// The cleanup outcome of each worker whose thread started, the failed one too.
     #[must_use]
     pub const fn cleanup(&self) -> &[Cleanup] {
-        &self.cleanup
+        self.cleanup.as_slice()
     }
 }
 
@@ -840,37 +863,59 @@ impl PartialEq for Outcome {
     }
 }
 
-/// Why [`Runtime::block_on`] failed.
-#[derive(Debug)]
+/// Why [`Runtime::block_on`] failed. A refusal before the first poll holds the root, which
+/// [`BlockOnError::into_root`] gives back. The messages show no part of the root.
 #[non_exhaustive]
-pub enum BlockOnError {
+pub enum BlockOnError<F> {
     /// The task tables of the owner did not fit.
-    Owner(task::Refused),
+    Owner(task::Refused, F),
     /// The timers of the owner did not start.
-    Timers(TimersError),
+    Timers(TimersError, F),
     /// The timers of the owner are on another clock domain than its clock.
-    Time(crate::time::TimeError),
+    Time(crate::time::TimeError, F),
     /// The driver of the owner failed.
     Driver(io::Error),
 }
 
-impl fmt::Display for BlockOnError {
+impl<F> BlockOnError<F> {
+    /// The root of a refusal before its first poll, or `None` after a driver failure.
+    pub fn into_root(self) -> Option<F> {
+        match self {
+            Self::Owner(_, root) | Self::Timers(_, root) | Self::Time(_, root) => Some(root),
+            Self::Driver(_) => None,
+        }
+    }
+}
+
+// Not derived: the root need not be `Debug`, and the message does not show it.
+impl<F> fmt::Debug for BlockOnError<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Owner(refused) => write!(f, "the task tables of the owner did not fit: {refused}"),
-            Self::Timers(error) => write!(f, "the timers of the owner did not start: {error}"),
-            Self::Time(error) => write!(f, "the timers of the owner did not start: {error}"),
+            Self::Owner(refused, _) => f.debug_tuple("Owner").field(refused).finish_non_exhaustive(),
+            Self::Timers(error, _) => f.debug_tuple("Timers").field(error).finish_non_exhaustive(),
+            Self::Time(error, _) => f.debug_tuple("Time").field(error).finish_non_exhaustive(),
+            Self::Driver(error) => f.debug_tuple("Driver").field(error).finish(),
+        }
+    }
+}
+
+impl<F> fmt::Display for BlockOnError<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Owner(refused, _) => write!(f, "the task tables of the owner did not fit: {refused}"),
+            Self::Timers(error, _) => write!(f, "the timers of the owner did not start: {error}"),
+            Self::Time(error, _) => write!(f, "the timers of the owner did not start: {error}"),
             Self::Driver(error) => write!(f, "the driver of the owner failed: {error}"),
         }
     }
 }
 
-impl core::error::Error for BlockOnError {
+impl<F> core::error::Error for BlockOnError<F> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
-            Self::Owner(refused) => Some(refused),
-            Self::Timers(error) => Some(error),
-            Self::Time(error) => Some(error),
+            Self::Owner(refused, _) => Some(refused),
+            Self::Timers(error, _) => Some(error),
+            Self::Time(error, _) => Some(error),
             Self::Driver(error) => Some(error),
         }
     }

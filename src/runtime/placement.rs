@@ -7,9 +7,13 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::alloc::AllocError;
 use core::fmt;
 
+use super::Cause;
 use super::topology::Host;
+use crate::driver::filled;
+use crate::memory::{push, room};
 
 /// The most CPUs, and the largest CPU index plus 1, that a placement handles.
 pub const MAX_CPUS: u32 = 4096;
@@ -264,29 +268,31 @@ impl fmt::Display for PlanError {
 
 impl core::error::Error for PlanError {}
 
-/// Resolves `placement` for `workers` workers on `host`.
+/// Resolves `placement` for `workers` workers on `host`: the plans, or [`Cause::Plan`], or
+/// [`Cause::Allocation`] when the allocator refuses the tables of the plans. Each plan pushes into
+/// the room of `workers` plans.
 pub(super) fn resolve(
     placement: &Placement,
     selection: Selection,
     workers: u32,
     host: &Host,
-) -> Result<Vec<Placed>, PlanError> {
+) -> Result<Vec<Placed>, Cause> {
+    let refused = |_| Cause::Allocation;
     let count = workers as usize;
-    let mut plans = Vec::new();
-    plans.reserve_exact(count);
+    let mut plans = room(count).map_err(refused)?;
     match placement {
         Placement::Unpinned => plans.extend((0..count).map(|_| unpinned(Request::Unpinned, None))),
-        Placement::Domain => domain(host, count, &mut plans),
+        Placement::Domain => domain(host, count, &mut plans).map_err(refused)?,
         Placement::Dedicated if host.allowed.is_none() => {
             plans.extend((0..count).map(|_| unpinned(Request::Dedicated, Some(Fallback::NoTopology))));
         }
         Placement::Dedicated => {
-            let order = dedicated(host);
+            let order = dedicated(host).map_err(refused)?;
             if order.len() < count {
-                return Err(PlanError::TooFewCpus {
+                return Err(Cause::Plan(PlanError::TooFewCpus {
                     workers,
                     cpus: u32::try_from(order.len()).unwrap_or(u32::MAX),
-                });
+                }));
             }
             plans.extend(
                 order
@@ -297,17 +303,17 @@ pub(super) fn resolve(
         }
         Placement::Exact(cpus) => {
             if cpus.len() < count {
-                return Err(PlanError::TooFewCpus {
+                return Err(Cause::Plan(PlanError::TooFewCpus {
                     workers,
                     cpus: u32::try_from(cpus.len()).unwrap_or(u32::MAX),
-                });
+                }));
             }
             for (index, cpu) in cpus.iter().copied().enumerate().take(count) {
                 if cpu >= MAX_CPUS {
-                    return Err(PlanError::NoSuchCpu(cpu));
+                    return Err(Cause::Plan(PlanError::NoSuchCpu(cpu)));
                 }
                 if cpus[..index].contains(&cpu) {
-                    return Err(PlanError::DuplicateCpu(cpu));
+                    return Err(Cause::Plan(PlanError::DuplicateCpu(cpu)));
                 }
                 plans.push(match &host.allowed {
                     Some(allowed) if !allowed.contains(cpu) => {
@@ -323,7 +329,7 @@ pub(super) fn resolve(
             .zip(&plans)
             .find_map(|(worker, plan)| Some((worker, plan.fallback?)))
     {
-        return Err(PlanError::Refused { worker, fallback });
+        return Err(Cause::Plan(PlanError::Refused { worker, fallback }));
     }
     Ok(plans)
 }
@@ -352,12 +358,12 @@ fn pinned(request: Request, cpu: u32, host: &Host) -> Placed {
 
 /// Binds each worker to one domain, which the domain with the fewest workers for each of its
 /// physical cores gets, the first of them on a tie.
-fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) {
+fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) -> Result<(), AllocError> {
     let Some(allowed) = &host.allowed else {
         plans.extend((0..count).map(|_| unpinned(Request::Domain, Some(Fallback::NoTopology))));
-        return;
+        return Ok(());
     };
-    let domains = host.domains_of(allowed);
+    let domains = host.domains_of(allowed)?;
     if domains.len() < 2 {
         let fallback = if domains.is_empty() {
             Fallback::NoTopology
@@ -365,13 +371,15 @@ fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) {
             Fallback::OneDomain
         };
         plans.extend((0..count).map(|_| unpinned(Request::Domain, Some(fallback))));
-        return;
+        return Ok(());
     }
-    let cores: Vec<u64> = domains
-        .iter()
-        .map(|domain| u64::from(host.cores_in(domain).max(1)))
-        .collect();
-    let mut assigned = alloc::vec![0_u64; domains.len()];
+    let mut cores = room(domains.len())?;
+    cores.extend(
+        domains
+            .iter()
+            .map(|(_, domain)| u64::from(host.cores_in(domain).max(1))),
+    );
+    let mut assigned = filled(domains.len(), || 0_u64)?;
     for _ in 0..count {
         let mut best = 0;
         for candidate in 1..domains.len() {
@@ -381,7 +389,7 @@ fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) {
             }
         }
         assigned[best] += 1;
-        let target = domains[best].clone();
+        let target = domains[best].1.clone();
         plans.push(Placed {
             request: Request::Domain,
             node: host.node_of(&target),
@@ -390,14 +398,15 @@ fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) {
             fallback: None,
         });
     }
+    Ok(())
 }
 
 /// The CPUs of `Dedicated` in the order of the workers: one CPU of each physical core, spread over
 /// the nodes and then over the domains of each node, and then the next sibling of each core in the
 /// same order.
-fn dedicated(host: &Host) -> Vec<u32> {
+fn dedicated(host: &Host) -> Result<Vec<u32>, AllocError> {
     let Some(allowed) = &host.allowed else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut nodes: Vec<Node> = Vec::new();
     let mut seen = CpuSet::new();
@@ -405,9 +414,16 @@ fn dedicated(host: &Host) -> Vec<u32> {
         if seen.contains(cpu) {
             continue;
         }
-        let siblings: Vec<u32> = host
-            .core_of(cpu)
-            .map_or_else(|| alloc::vec![cpu], |core| core.and(allowed).iter().collect());
+        let core = host.core_of(cpu).map_or_else(
+            || {
+                let mut core = CpuSet::new();
+                core.insert(cpu);
+                core
+            },
+            |core| core.and(allowed),
+        );
+        let mut siblings = room(core.len() as usize)?;
+        siblings.extend(core.iter());
         for sibling in &siblings {
             seen.insert(*sibling);
         }
@@ -416,26 +432,31 @@ fn dedicated(host: &Host) -> Vec<u32> {
         let at = match nodes.iter().position(|(id, _)| *id == node) {
             Some(at) => at,
             None => {
-                nodes.push((node, Vec::new()));
+                push(&mut nodes, (node, Vec::new()))?;
                 nodes.len() - 1
             }
         };
         let domains = &mut nodes[at].1;
         match domains.iter_mut().find(|(id, _)| *id == domain) {
-            Some((_, cores)) => cores.push(siblings),
-            None => domains.push((domain, alloc::vec![siblings])),
+            Some((_, cores)) => push(cores, siblings)?,
+            None => {
+                let mut cores = room(1)?;
+                cores.push(siblings);
+                push(domains, (domain, cores))?;
+            }
         }
     }
-    let cores = interleave(
-        nodes
-            .into_iter()
-            .map(|(_, domains)| interleave(domains.into_iter().map(|(_, cores)| cores).collect()))
-            .collect(),
-    );
+    let mut spread = room(nodes.len())?;
+    for (_, domains) in nodes {
+        let mut cores = room(domains.len())?;
+        cores.extend(domains.into_iter().map(|(_, cores)| cores));
+        spread.push(interleave(cores)?);
+    }
+    let cores = interleave(spread)?;
     let rounds = cores.iter().map(Vec::len).max().unwrap_or(0);
-    (0..rounds)
-        .flat_map(|round| cores.iter().filter_map(move |core| core.get(round).copied()))
-        .collect()
+    let mut order = room(cores.iter().map(Vec::len).sum())?;
+    order.extend((0..rounds).flat_map(|round| cores.iter().filter_map(move |core| core.get(round).copied())));
+    Ok(order)
 }
 
 /// The CPUs of one physical core, in ascending order.
@@ -446,14 +467,14 @@ type Domain = (Option<u32>, Vec<Core>);
 type Node = (Option<u32>, Vec<Domain>);
 
 /// The items of `groups` in turn: the first of each group, then the second of each, and so on.
-fn interleave<T>(groups: Vec<Vec<T>>) -> Vec<T> {
-    let mut groups: Vec<_> = groups.into_iter().map(Vec::into_iter).collect();
-    let mut items = Vec::new();
-    loop {
-        let before = items.len();
-        items.extend(groups.iter_mut().filter_map(Iterator::next));
-        if items.len() == before {
-            return items;
-        }
+fn interleave<T>(mut groups: Vec<Vec<T>>) -> Result<Vec<T>, AllocError> {
+    let total = groups.iter().map(Vec::len).sum();
+    let mut items = room(total)?;
+    // Each group gives its items from its end, so it turns around first.
+    groups.iter_mut().for_each(|group| group.reverse());
+    // Each pass takes at least one item, so the loop ends after at most `total` passes.
+    while items.len() < total {
+        items.extend(groups.iter_mut().filter_map(Vec::pop));
     }
+    Ok(items)
 }

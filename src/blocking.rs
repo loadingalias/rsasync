@@ -405,10 +405,12 @@ impl Service {
             return Err(Error::Config);
         };
         let stack_units = u64::try_from(stack).map_err(|_| Error::Config)?;
+        // The handles, the shared state, and the budget of the job slots.
         let fixed = size_of::<JoinHandle<Teardown>>()
             .checked_mul(threads as usize)
             .and_then(|handles| handles.checked_add(arc_size::<Shared>()))
             .and_then(|size| u64::try_from(size).ok())
+            .and_then(|size| size.checked_add(Budget::ALLOCATION_BYTES))
             .ok_or(Error::Config)?;
         let charge = budget.reserve(fixed).map_err(Error::Budget)?;
         // A receiver place for each thread, and one for the service.
@@ -420,7 +422,7 @@ impl Service {
             })?;
         let shared = try_arc(Shared {
             queue: sender,
-            slots: Budget::new(slots),
+            slots: Budget::try_new(slots).map_err(|_| Error::Allocation)?,
             memory: budget.clone(),
             stopped: AtomicBool::new(false),
             _charge: charge,
@@ -572,8 +574,8 @@ impl Submitter {
     /// Admits one job of type `J` that comes later: it takes the job slot, the charge, the
     /// one-shot, and the memory of the job now, so the [`Reservation::send`] of the job cannot fail. A drop of the
     /// reservation gives them back. It never waits.
-    pub(crate) fn reserve<J: Job>(&self) -> Result<Reservation<'_, J>, Reason> {
-        let shared = &*self.0;
+    pub(crate) fn reserve<J: Job>(&self) -> Result<Reservation<J>, Reason> {
+        let shared = &self.0;
         // Ordering: `Acquire` reads the release of the stop.
         if shared.stopped.load(Ordering::Acquire) {
             return Err(Reason::Ended);
@@ -597,7 +599,7 @@ impl Submitter {
         };
         let task = Box::try_new_uninit().map_err(|_| Reason::Allocation)?;
         Ok(Reservation {
-            shared,
+            shared: Arc::clone(shared),
             reply,
             waiter,
             slot,
@@ -608,9 +610,10 @@ impl Submitter {
 }
 
 /// The admission of one job of type `J` that [`Submitter::reserve`] gave: its slot, its charge,
-/// its one-shot, and its memory.
-pub(crate) struct Reservation<'a, J: Job> {
-    shared: &'a Shared,
+/// its one-shot, and its memory. It holds a count of the service, so the driver can keep it while
+/// the job waits.
+pub(crate) struct Reservation<J: Job> {
+    shared: Arc<Shared>,
     reply: oneshot::Sender<Result<J::Output, Failed>>,
     waiter: oneshot::Receiver<Result<J::Output, Failed>>,
     slot: Permit,
@@ -618,7 +621,7 @@ pub(crate) struct Reservation<'a, J: Job> {
     task: Box<MaybeUninit<Task<J>>>,
 }
 
-impl<J: Job> Reservation<'_, J> {
+impl<J: Job> Reservation<J> {
     /// Sends `job` to the service, and gives the waiter of its result.
     pub(crate) fn send(self, job: J) -> Waiter<J::Output> {
         let task = Box::write(
@@ -637,7 +640,7 @@ impl<J: Job> Reservation<'_, J> {
     }
 }
 
-impl<J: Job> fmt::Debug for Reservation<'_, J> {
+impl<J: Job> fmt::Debug for Reservation<J> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Reservation").finish_non_exhaustive()
     }

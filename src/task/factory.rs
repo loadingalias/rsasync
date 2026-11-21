@@ -59,8 +59,8 @@ impl Placer {
     }
 
     /// Reserves a free slot of the owner and the charge of the task of `factory`, allocates the
-    /// memory of the task, and gives the job that spawns it and the handle of the task. The charge
-    /// also holds the job.
+    /// memory of the task, and gives the job that spawns it and the handle of the task. The job
+    /// holds the charge of its box until the box drops.
     ///
     /// # Errors
     ///
@@ -95,6 +95,10 @@ impl Placer {
         let remote_charge = charge
             .split(REMOTE as u64)
             .expect("the charge of a factory spawn holds its cancel cell");
+        // The job holds the charge of its box, which ends when the box drops.
+        let job_charge = charge
+            .split(size_of::<Spawn<Fa, F>>() as u64)
+            .expect("the charge of a factory spawn holds its job");
         // A refusal of the allocator frees each part that it allocated, and ends its charge.
         let allocated = (|| -> Result<_, AllocError> {
             let (sender, receiver) = oneshot::with_charge(outcome)?;
@@ -131,6 +135,7 @@ impl Placer {
                 memory: Some(memory),
                 remote: alloc::sync::Arc::clone(&remote),
                 reserved: true,
+                _charge: job_charge,
             },
         ));
         let handle = JoinHandle {
@@ -186,6 +191,8 @@ struct Spawn<Fa, F: Future> {
     remote: alloc::sync::Arc<Remote>,
     /// The job holds the reservation of a slot, which its drop gives back.
     reserved: bool,
+    /// The charge of the box of this job.
+    _charge: Permit,
 }
 
 impl<Fa, F> Run for Spawn<Fa, F>

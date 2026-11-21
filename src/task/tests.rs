@@ -89,6 +89,45 @@ fn the_waiting_form_spawns_after_a_slot_frees() {
     });
 }
 
+/// A freed slot wakes the first waiting spawn. When the budget then refuses that spawn, the slot
+/// stays free, and the next waiting spawn wakes. A refused spawn that keeps the wake leaves the
+/// next one asleep while the slot is free.
+#[test]
+fn a_waiting_spawn_that_the_budget_refuses_passes_its_wake_on() {
+    use crate::wait::tests::counter;
+
+    let budget = budget();
+    let mut owner = LocalOwner::new(&budget, 1).unwrap();
+    owner.block_on(async {
+        let (sender, mut receiver) = oneshot::channel::<()>(&budget).unwrap();
+        let first = spawn_local(async move { receiver.recv().await.unwrap() }).unwrap();
+        let large = [0_u8; 16 << 10];
+        let mut refused = pin!(spawn_local_waiting(async move { large.len() }));
+        let mut next = pin!(spawn_local_waiting(async { 2 }));
+        let (refused_wakes, refused_waker) = counter();
+        let (next_wakes, next_waker) = counter();
+        assert!(
+            refused
+                .as_mut()
+                .poll(&mut Context::from_waker(&refused_waker))
+                .is_pending()
+        );
+        assert!(next.as_mut().poll(&mut Context::from_waker(&next_waker)).is_pending());
+        // The large task does not fit in the budget, and the small one does.
+        let _rest = budget.reserve(budget.available() - (4 << 10)).unwrap();
+        sender.send(()).unwrap();
+        // The owner polls the first task, which ends, and its slot wakes the large spawn.
+        yield_once().await;
+        assert_eq!(refused_wakes.get(), 1);
+        let polled = refused.as_mut().poll(&mut Context::from_waker(&refused_waker));
+        assert_matches!(polled, Poll::Ready(Err(refused)) if matches!(refused.reason(), Reason::Budget(_)));
+        assert_eq!(next_wakes.get(), 1, "the refused spawn passes its wake to the next one");
+        let second = next.await.unwrap();
+        assert_matches!(first.join().await, Outcome::Completed(()));
+        assert_matches!(second.join().await, Outcome::Completed(2));
+    });
+}
+
 #[test]
 fn a_dropped_join_handle_does_not_cancel_the_task() {
     let budget = budget();
@@ -556,8 +595,7 @@ fn the_owner_parks_at_most_until_the_deadline_and_the_coarsening_of_the_next_tim
         thread,
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
         None,
-    )
-    .unwrap();
+    );
     let local = Rc::new(super::owner::Local::new(&budget, 1, home, 0).unwrap());
     local.use_timers(timers, clock).unwrap();
     let waiting = Rc::new(Cell::new(None));
@@ -695,4 +733,23 @@ fn an_owner_charges_each_byte_that_it_allocates() {
     let allocated = bytes() - before;
     assert_eq!((1 << 20) - budget.available(), allocated);
     drop(owner);
+}
+
+/// A root waker that the caller keeps after its owner drops keeps the charge of the bytes that
+/// stay allocated, and the charge ends with the waker. A waker whose charge ends with the owner
+/// fails.
+#[test]
+fn a_kept_root_waker_keeps_the_charge_of_its_memory() {
+    use crate::table::tests::allocations::held;
+
+    let budget = budget();
+    let root = || poll_fn(|cx| Poll::Ready(cx.waker().clone()));
+    // A first call makes the state of the thread that the standard library keeps.
+    drop(LocalOwner::new(&budget, 2).unwrap().block_on(root()));
+    let before = held();
+    let waker = LocalOwner::new(&budget, 2).unwrap().block_on(root());
+    let kept = u64::try_from(held() - before).unwrap();
+    assert_eq!((1 << 20) - budget.available(), kept);
+    drop(waker);
+    assert_eq!(budget.available(), 1 << 20);
 }
