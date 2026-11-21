@@ -227,13 +227,21 @@ println!("listening on {}", group.local_addr());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The future gives `GroupError` with its cause when a member does not start: no room in the budget
-for the list of the members (`Budget`), no memory for the lists of the group (`Allocation`), no
-channel in the budget (`Channel`), or, with the worker, no slot on the worker (`Spawn`), a refused
-bind (`Refused`), a failed bind (`Bind`), or a stopped worker (`Ended`). When the future gives the error, each member
-that bound has closed its socket, so the address is free again. A drop of the future before its end
-cancels each member, and each one closes its socket on its worker soon after. `Group::into_tasks` gives the task of
-each member, in the order of its worker.
+The future gives `GroupError` with its cause when a member does not start. The state of the start
+can refuse: no room in the budget for the start signals (`Budget`), no memory for the lists of the
+group (`Allocation`), or no channel in the budget (`Channel`). A worker can refuse, and the error
+then names it: no slot on the worker (`Spawn`), a refused bind (`Refused`), a failed bind (`Bind`),
+or a stopped worker (`Ended`).
+
+When the future gives the error, each member that bound has closed its socket, so the address is
+free again. A drop of the future before its end cancels each member, and each one closes its socket
+on its worker soon after. `Group::into_tasks` gives the task of each member, in the order of its
+worker.
+
+On Linux, another process of the same effective user ID, in the same network namespace, can bind a
+socket into the reuse-port group of a member and receive part of its connections or datagrams (see
+[socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)). Run a group under a user that no
+untrusted process shares.
 
 ## Placement
 

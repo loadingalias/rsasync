@@ -565,9 +565,10 @@ pub enum Reason {
     /// The descriptor or the child is not one that this driver owns: another driver made it, or it
     /// closed.
     Resource,
-    /// No driver runs on this thread for a call of `rsasync::local`: the thread runs no owner of a
-    /// `Runtime`, its owner is a `task::LocalOwner`, which has no driver, or the driver of
-    /// `Runtime::block_on` did not start, and `block_on` then gives its error.
+    /// A call of `rsasync::local` has no driver on this thread that it can use: the thread runs no
+    /// owner of a `Runtime`, its owner is a `task::LocalOwner`, which has no driver, or the driver of
+    /// `Runtime::block_on` did not start, and `block_on` then gives its error. A turn of the driver
+    /// also uses it, so a call in a destructor that the turn runs gets this refusal.
     #[cfg(all(feature = "local", target_os = "linux"))]
     NoDriver,
     /// The driver has no provided buffers ([`Driver::provide`]).

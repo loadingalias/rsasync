@@ -7,6 +7,7 @@ use core::assert_matches;
 use core::cell::RefCell;
 use core::ffi::c_int;
 use core::future::Future;
+use core::mem::DropGuard;
 use core::num::NonZeroU64;
 use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -427,10 +428,17 @@ pub(in crate::driver) fn a_child_of_another_driver_refuses_and_no_child_gets_the
         target_os = "linux" => Backend::Kernel,
         _ => Backend::Kqueue,
     };
-    let (mut first, _first_service) = with_service(Config::new(), 4, backend);
-    let (mut second, _second_service) = with_service(Config::new(), 4, backend);
-    let theirs = spawn(&mut first, sleeper(), ChildOptions::new().end(End::Kill));
-    let mut ours = spawn(&mut second, sleeper(), ChildOptions::new());
+    let (first, _first_service) = with_service(Config::new(), 4, backend);
+    let (second, _second_service) = with_service(Config::new(), 4, backend);
+    // The teardown kills and reaps each child of `End::Kill`, also after an assertion that fails.
+    let mut drivers = DropGuard::new([first, second], |drivers| {
+        for driver in drivers {
+            drop(driver.teardown());
+        }
+    });
+    let [first, second] = &mut *drivers;
+    let theirs = spawn(first, sleeper(), ChildOptions::new().end(End::Kill));
+    let mut ours = spawn(second, sleeper(), ChildOptions::new().end(End::Kill));
 
     assert_matches!(second.kill_child(&theirs), Err(SignalChildError::OtherDriver));
     let refused = second.close_child(theirs).unwrap_err();
@@ -440,7 +448,7 @@ pub(in crate::driver) fn a_child_of_another_driver_refuses_and_no_child_gets_the
     let _turn = first.turn().expect("a turn works");
     assert_eq!([theirs.id(), ours.id()].map(state), [State::Running; 2]);
 
-    for (driver, child) in [(&mut first, &mut theirs), (&mut second, &mut ours)] {
+    for (driver, child) in [(&mut *first, &mut theirs), (&mut *second, &mut ours)] {
         driver.kill_child(child).expect("the child runs");
         let status = drive(driver, child.wait()).expect("the driver runs");
         assert_eq!(status.expect("the wait works").signal(), Some(9));

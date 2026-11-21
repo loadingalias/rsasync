@@ -368,15 +368,19 @@ impl AsRef<[u8]> for Charged {
 }
 
 let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
-let bytes = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+let response = b"HTTP/1.1 200 OK\r\n\r\n";
+// The charge comes before each allocation: the bytes, and then the reference count.
+let charged = response.len() as u64 + Lease::owner_layout::<Charged>().size() as u64;
+let charge = budget.reserve(charged)?;
+let mut bytes = Vec::new();
+bytes.try_reserve_exact(response.len())?;
+bytes.extend_from_slice(response);
 let size = bytes.capacity();
-let count = Lease::owner_layout::<Charged>().size() as u64;
-let charge = budget.reserve(size as u64 + count)?;
 let lease = Lease::from_owner(Charged { bytes, _charge: charge }, size);
-assert_eq!(budget.available(), budget.bound() - size as u64 - count);
+assert_eq!(budget.available(), budget.bound() - charged);
 drop(lease);
 assert_eq!(budget.available(), budget.bound());
-# Ok::<(), rsasync::capacity::Exhausted>(())
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ```rust

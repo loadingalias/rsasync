@@ -449,8 +449,8 @@ impl Runtime {
     /// Makes the calling thread a local owner for the call, and polls `root` there until it gives
     /// its output. `root` and the tasks that it spawns with
     /// [`spawn_local`](crate::task::spawn_local) can hold `!Send` state. The first operation that
-    /// needs a home makes the driver of the owner, so a root that only waits starts none. No public
-    /// type runs an operation on the driver of an owner yet.
+    /// needs a home makes the driver of the owner, so a root that only waits starts none. The types
+    /// of [`rsasync::local`](crate::local) run their operations on that driver.
     ///
     /// After `root` gives its output, `block_on` cancels each task that is still on the owner and
     /// waits until each one ended. It then cancels each operation that the driver homes, drives the

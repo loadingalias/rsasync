@@ -68,7 +68,7 @@ The errors of `rsasync::runtime`, on Linux (see [Runtime](runtime.md)).
 | `StartFailure` | `Builder::build` failed. `cause()` gives a `Cause`, and `cleanup()` the `Outcome` of each worker that started | See [A failed start](runtime.md#a-failed-start) |
 | `PlanError` | A setting is invalid, or a strict placement falls back | See [Placement](runtime.md#placement) |
 | `BlockOnError<F>` | `Runtime::block_on` got no task tables or timers, and `into_root` gives the root back, or its driver did not start (`Start`, with the `driver::Error`), or its driver failed (`Driver`) | See [Run the calling thread with block_on](runtime.md#run-the-calling-thread-with-block_on) |
-| `GroupError` | `Handle::tcp_group` or `Handle::udp_group` started no group: `Budget` or `Allocation` for the lists of the group, `Channel`, or `Spawn`, `Refused`, `Bind`, or `Ended`, each with its worker | See [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker). Each member that bound closed |
+| `GroupError` | `Handle::tcp_group` or `Handle::udp_group` started no group: `Budget`, `Allocation`, or `Channel` for the state of the start, or `Spawn`, `Refused`, `Bind`, or `Ended` with the worker | See [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker). Each member that bound closed |
 | `HandleRefused::TooMany` | `Builder::handles` handles exist | Drop a handle, or give a larger limit |
 | `HandleRefused::Allocation` | The allocator did not give the memory of the handle | Try again when memory is free |
 
@@ -145,7 +145,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::Queue` | The submission queue is full | Turn the driver, then submit again |
 | `Refused` with `Reason::Resources` | Each resource slot is in use | Close a resource, then try again |
 | `Refused` with `Reason::Resource` | The descriptor or the child is not one that this driver owns | Do not use it with this driver: it closed, or another driver owns it. `Driver::close_child` gives the `Child` back |
-| `Refused` with `Reason::NoDriver` | A call of `rsasync::local` on a thread with no driver: no runtime owner, a `task::LocalOwner`, or a driver of `block_on` that did not start | Make the call in a task or the root of a `Runtime`. For a failed start, read the `BlockOnError` |
+| `Refused` with `Reason::NoDriver` | A call of `rsasync::local` with no driver that it can use: no runtime owner, a `task::LocalOwner`, a driver of `block_on` that did not start, or a call in a destructor that a turn of the driver runs | Make the call in a task or the root of a `Runtime`. A drop needs no call: it closes the resource. For a failed start, read the `BlockOnError` |
 | `Refused` with `Reason::Buffers` | The driver has no provided buffers | Call `Driver::provide` |
 | `Refused` with `Reason::NotPipe`, `Reason::Direction` | The descriptor is not a pipe, or its direction is wrong | Give a pipe end with the direction of the adoption |
 | `Refused` with `Reason::Unsupported` | The operation does not apply to the resource | Use an operation of that resource |

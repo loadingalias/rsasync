@@ -2,13 +2,17 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::assert_matches;
 use core::cell::RefCell;
-use core::future::pending;
+use core::future::{Future as _, pending, poll_fn};
 use core::net::SocketAddr;
 use core::num::NonZeroU64;
+use core::pin::Pin;
+use core::task::Poll;
 use core::time::Duration;
 use std::io::Read as _;
+use std::sync::mpsc;
+use std::thread::{self, ThreadId};
+use std::thread_local;
 use std::time::Instant;
-use std::{thread, thread_local};
 
 use super::{TcpListener, TcpStream, UdpSocket};
 use crate::buffer::{Backing, Buffer as _, Lease};
@@ -118,12 +122,34 @@ fn datagrams_cross_local_udp_sockets_and_their_halves() {
         .unwrap();
 }
 
+/// The bytes of one send that fills the socket buffers.
+const FILL: usize = 64 << 20;
+
+/// Waits until the bytes that wait at `peer` stay the same for 100 ms, while the owner turns: the
+/// receive window of the peer is closed, so no acknowledgment frees room in the send buffer.
+async fn until_window_closes(peer: &std::net::TcpStream) {
+    let mut probe = vec![0; FILL];
+    let mut before = None;
+    loop {
+        // A turn of the owner submits a new send, and its bytes then reach the peer.
+        yield_once().await;
+        thread::sleep(Duration::from_millis(100));
+        let waiting = peer.peek(&mut probe).unwrap();
+        if before == Some(waiting) {
+            return;
+        }
+        before = Some(waiting);
+    }
+}
+
 /// A close of a stream whose peer neither reads nor sends cancels a dropped receive and a dropped
-/// send that waits in the kernel, because the send before it filled the socket buffers. Its future
-/// ends after their terminal events, and its report gives the count of the dropped send: 0.
+/// send that waits in the kernel. A send waits there when the send buffer is full and the receive
+/// window of the peer is closed, so each send before it took only what fit. The future of the close
+/// ends after the terminal events, and its report gives the count of the dropped send: 0.
 #[test]
 fn a_close_cancels_a_dropped_send_to_a_peer_that_never_reads_and_ends() {
-    const FILL: usize = 64 << 20;
+    /// The sends that can end before one waits: each one fills the room that the last one left.
+    const FILLS: usize = 16;
     let runtime = Runtime::builder().build().unwrap();
     let sent = runtime
         .block_on(async {
@@ -133,13 +159,24 @@ fn a_close_cancels_a_dropped_send_to_a_peer_that_never_reads_and_ends() {
                 .unwrap()
                 .unwrap();
             let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let (mut stream, _peer) = listener.accept().unwrap().await.unwrap().unwrap();
-            let (filled, _lease) = stream.send(Lease::from(vec![7; FILL])).unwrap().await.unwrap();
-            assert!(filled.unwrap() < FILL, "the socket buffers held the whole send");
             let (mut read, mut write) = stream.split();
+            let mut waits = None;
+            for _ in 0..FILLS {
+                let mut send = write.send(Lease::from(vec![7; FILL])).unwrap();
+                until_window_closes(&peer).await;
+                if poll_fn(|cx| Poll::Ready(Pin::new(&mut send).poll(cx)))
+                    .await
+                    .is_pending()
+                {
+                    waits = Some(send);
+                    break;
+                }
+            }
+            let send = waits.expect("a send waits in the kernel");
             let receive = read.recv(buffer()).unwrap();
-            let send = write.send(Lease::from(vec![8; 4096])).unwrap();
-            // A turn of the owner submits both, and the kernel holds them.
+            // A turn of the owner submits the receive, and the kernel holds both.
             yield_once().await;
             drop((receive, send));
             let closed = stream.close().unwrap().await.unwrap();
@@ -321,81 +358,86 @@ fn a_socket_that_a_thread_local_value_keeps_drops_at_the_exit_of_the_thread() {
     .unwrap();
 }
 
-/// Each member of a TCP group accepts, and sends the index of its worker.
-async fn serve_tcp(worker: WorkerId, mut listener: TcpListener) {
-    let index = u8::try_from(worker.index()).unwrap();
-    while let Ok(accept) = listener.accept() {
-        let Ok(Ok((mut stream, _peer))) = accept.await else {
-            return;
-        };
-        let Ok(send) = stream.send(Lease::from(vec![index])) else {
-            return;
-        };
-        drop(send.await);
+/// Takes the report of each member of a group of four, in the order of the probes that `probe`
+/// sends: one probe, then its report. Each member closes its socket before its report, so the next
+/// probe reaches another member. Gives the threads of the four members.
+fn four_threads(reports: &mpsc::Receiver<ThreadId>, mut probe: impl FnMut()) -> Vec<ThreadId> {
+    (0..4)
+        .map(|_| {
+            probe();
+            reports.recv_timeout(Duration::from_secs(10)).unwrap()
+        })
+        .collect()
+}
+
+/// Asserts that `threads` are distinct, and that none of them is this thread.
+fn assert_distinct(threads: &[ThreadId]) {
+    for (index, thread) in threads.iter().enumerate() {
+        assert_ne!(
+            *thread,
+            thread::current().id(),
+            "a member runs on the thread of the test"
+        );
+        assert!(
+            !threads[index + 1..].contains(thread),
+            "two members run on one thread: {threads:?}"
+        );
     }
 }
 
-/// A group of four workers binds one listener on each worker at one port, and the kernel gives
-/// connections to each of them.
+/// A group of four workers binds one listener on each worker at one port, and each listener
+/// accepts a connection on its own worker thread. Each member accepts one connection, closes its
+/// listener, and then reports its thread, so the kernel gives the next connection to another
+/// member.
 #[test]
 fn a_tcp_group_of_four_workers_accepts_connections_on_each_worker() {
     let runtime = Runtime::builder().local_workers(4).build().unwrap();
     let mut handle = runtime.handle().unwrap();
+    let (report, reports) = mpsc::channel();
+    let serve = move |_worker, mut listener: TcpListener| {
+        let report = report.clone();
+        async move {
+            let (_stream, _peer) = listener.accept().unwrap().await.unwrap().unwrap();
+            listener.close().unwrap().await.unwrap();
+            report.send(thread::current().id()).unwrap();
+        }
+    };
     let group = runtime
-        .block_on(handle.tcp_group(loopback(), TcpOptions::default(), serve_tcp))
+        .block_on(handle.tcp_group(loopback(), TcpOptions::default(), serve))
         .unwrap()
         .unwrap();
-    let mut seen = [false; 4];
-    for _ in 0..400 {
-        if seen == [true; 4] {
-            break;
-        }
-        let mut stream = std::net::TcpStream::connect(group.local_addr()).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        let mut index = [0];
-        stream.read_exact(&mut index).unwrap();
-        seen[usize::from(index[0])] = true;
-    }
-    assert_eq!(seen, [true; 4], "each worker accepts");
+    let threads = four_threads(&reports, || {
+        std::net::TcpStream::connect(group.local_addr()).unwrap();
+    });
+    assert_distinct(&threads);
 }
 
-/// Each member of a UDP group answers each datagram with the index of its worker.
-async fn serve_udp(worker: WorkerId, mut socket: UdpSocket) {
-    let index = u8::try_from(worker.index()).unwrap();
-    while let Ok(receive) = socket.recv_from(buffer()) {
-        let Ok((Ok(received), _buffer)) = receive.await else {
-            return;
-        };
-        let Ok(send) = socket.send_to(Datagram::new(Lease::from(vec![index]), received.source)) else {
-            return;
-        };
-        drop(send.await);
-    }
-}
-
-/// A group of four workers binds one UDP socket on each worker at one port, and the kernel gives
-/// datagrams to each of them.
+/// A group of four workers binds one UDP socket on each worker at one port, and each socket
+/// receives a datagram on its own worker thread. Each member receives one datagram, closes its
+/// socket, and then reports its thread, so the kernel gives the next datagram to another member.
 #[test]
 fn a_udp_group_of_four_workers_receives_datagrams_on_each_worker() {
     let runtime = Runtime::builder().local_workers(4).build().unwrap();
     let mut handle = runtime.handle().unwrap();
+    let (report, reports) = mpsc::channel();
+    let serve = move |_worker, mut socket: UdpSocket| {
+        let report = report.clone();
+        async move {
+            let (received, _buffer) = socket.recv_from(buffer()).unwrap().await.unwrap();
+            received.unwrap();
+            socket.close().unwrap().await.unwrap();
+            report.send(thread::current().id()).unwrap();
+        }
+    };
     let group = runtime
-        .block_on(handle.udp_group(loopback(), UdpOptions::default(), serve_udp))
+        .block_on(handle.udp_group(loopback(), UdpOptions::default(), serve))
         .unwrap()
         .unwrap();
-    let mut seen = [false; 4];
-    for _ in 0..400 {
-        if seen == [true; 4] {
-            break;
-        }
-        let client = std::net::UdpSocket::bind(loopback()).unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let client = std::net::UdpSocket::bind(loopback()).unwrap();
+    let threads = four_threads(&reports, || {
         client.send_to(b"which", group.local_addr()).unwrap();
-        let mut index = [0];
-        assert_eq!(client.recv(&mut index).unwrap(), 1);
-        seen[usize::from(index[0])] = true;
-    }
-    assert_eq!(seen, [true; 4], "each worker receives");
+    });
+    assert_distinct(&threads);
 }
 
 /// A group start that the budget or the allocator refuses gives a typed refusal: the budget pays
@@ -449,21 +491,33 @@ fn a_group_start_that_the_budget_or_the_allocator_refuses_gives_a_typed_refusal(
     }
 }
 
-/// A group that worker 1 refuses, because a task holds its one slot, fails with that worker and
-/// reason. The listener that worker 0 bound closed before the error, so a plain listener binds its
-/// address at once.
+/// A group that worker 1 refuses, because two tasks hold its two slots, fails with that worker and
+/// reason. Each driver has one resource slot, and the listener that worker 0 bound closed before
+/// the error, so a bind on worker 0 gets that slot at once.
 #[test]
 fn a_group_that_worker_1_refuses_closes_the_listener_of_worker_0() {
-    let runtime = Runtime::builder().local_workers(2).task_slots(1).build().unwrap();
+    let runtime = Runtime::builder()
+        .local_workers(2)
+        .task_slots(2)
+        .driver(Config::new().resources(1))
+        .build()
+        .unwrap();
     let mut handle = runtime.handle().unwrap();
-    let _busy = handle.spawn_on(WorkerId::new(1), pending::<()>).unwrap();
-    let address = std::net::TcpListener::bind(loopback()).unwrap().local_addr().unwrap();
+    let _busy = [0, 1].map(|_| handle.spawn_on(WorkerId::new(1), pending::<()>).unwrap());
     let failed = runtime
-        .block_on(handle.tcp_group(address, TcpOptions::default(), |_worker, _listener| pending::<()>()))
+        .block_on(handle.tcp_group(loopback(), TcpOptions::default(), |_worker, _listener| pending::<()>()))
         .unwrap();
     assert_matches!(failed, Err(GroupError::Spawn(worker, task::Reason::NoSlot)) if worker == WorkerId::new(1));
-    assert!(
-        std::net::TcpListener::bind(address).is_ok(),
-        "the listener of worker 0 is open after the error"
+    let rebind = handle
+        .spawn_on(WorkerId::new(0), || async {
+            TcpListener::bind(loopback(), TcpOptions::default())
+                .err()
+                .map(|refused| refused.reason())
+        })
+        .unwrap();
+    assert_matches!(
+        rebind.join_blocking(),
+        task::Outcome::Completed(None),
+        "the listener of worker 0 holds its slot after the error"
     );
 }
