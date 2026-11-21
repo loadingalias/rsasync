@@ -1,6 +1,6 @@
 # The kqueue backend
 
-On macOS, the driver runs on kqueue. TCP, UDP, local streams, pipes, child processes, signal
+On macOS, the driver runs on kqueue. TCP, UDP, IPC streams, pipes, child processes, signal
 streams, and files have the same API and the same ownership rules as on io_uring and epoll: the terminal event of an operation releases its buffer and
 its charge, and a dropped or forgotten future ends only the interest. This page tells how each
 operation runs on kqueue, what you give the driver, and what differs from Linux. rsasync is in development, and the
@@ -29,10 +29,10 @@ kqueue reports its socket ready.
 
 | Operations | On kqueue |
 | --- | --- |
-| TCP, [local streams](local-streams.md), and [pipes](pipes.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket or the pipe end is ready. A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
+| TCP, [IPC streams](ipc-streams.md), and [pipes](pipes.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket or the pipe end is ready. A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
 | UDP: one datagram, with its metadata and truncation | One nonblocking `sendmsg` or `recvmsg`, with the control messages of [datagram I/O](datagram-io.md) |
 | UDP batches: `send_batch` and `recv_batch` | One `sendmsg` or `recvmsg` for each datagram, in order. A batch stops at the first datagram that the kernel does not take, and its report counts the datagrams before it |
-| Bind and listen (`Call::Bind`, `Call::BindUdp`, and `Driver::bind_local`) | System calls on the thread of the driver (`Route::SystemCall`) |
+| Bind and listen (`Call::Bind`, `Call::BindUdp`, and `Driver::bind_ipc`) | System calls on the thread of the driver (`Route::SystemCall`) |
 | Files and directories (`Call::File`, `Call::SetFileLen`) | A job of your [blocking service](blocking-service.md), with positional calls, because kqueue cannot wait on a regular file (`Route::BlockingService`). See [Files](#files) |
 | Spawn of a [child](processes.md) | A job of your blocking service, as on Linux |
 | The exit of a child (`Call::WaitChild`) | kqueue waits for the exit event of the process (`EVFILT_PROC` with `NOTE_EXIT`), then one nonblocking `waitid` (`Route::Poll`). A registration that finds no process is the exit event. When the status is not ready yet, a one-shot kqueue timer waits from 100 µs, doubling up to 10 ms, and the wait repeats each 10 ms until the status comes ([Wait for the exit](processes.md#wait-for-the-exit)) |

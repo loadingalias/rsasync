@@ -186,3 +186,25 @@ teardown, nothing reaps a kept child: it stays a zombie after its end until this
   starts, because `Command` does not tell which streams it pipes, and a child that the driver cannot
   give to its caller must not run. The resource slots that the child does not use come back when the
   job ends.
+
+## Use child processes from a task
+
+A task of a [runtime](runtime.md) owner uses `rsasync::local::Child` (Linux). Each call takes no
+driver argument, and it has the meaning of its driver call. A spawn runs on the [blocking service of
+the runtime](runtime.md#the-blocking-service), so a runtime with `blocking(None)` refuses it with
+`Reason::Blocking` and gives the command back.
+
+| Local call | Driver call |
+| --- | --- |
+| `Child::spawn(command, options)` | `Driver::spawn` |
+| `Child::adopt(child, end)` | `Driver::adopt_child` |
+| `child.wait()` | `Child::wait` |
+| `child.signal(signal)`, `kill()` | `Driver::signal_child`, `kill_child` |
+| `child.signal_tree(signal)`, `kill_tree()` | `Driver::signal_tree`, `kill_tree` |
+| `child.close()` | `Driver::close_child` |
+
+The fields `stdin`, `stdout`, and `stderr` are the local [pipe ends](pipes.md#use-pipes-from-a-task)
+of the piped standard streams. A `Child` is not `Send`. A signal or a kill on a thread with no
+driver, or on another owner, gives `SignalChildError::OtherDriver`. The end policy applies at
+`close`, at the drop of the `Child`, and at the end of its home: a child with `End::Kill` dies, and
+the driver reaps it. A `wait` can run on any thread.

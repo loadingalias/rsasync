@@ -15,7 +15,7 @@ use std::process::{Child, Command};
 use super::super::suite::{self, Backend};
 use super::super::tests::{drive, hold, numbered, posted};
 use super::super::{Config, Delivery, Driver, Regions};
-use super::{LocalListener, LocalStream, Stale};
+use super::{IpcListener, IpcStream, Stale};
 use crate::buffer::{Backing, Buffer as _, Lease};
 
 /// The user and the group `nobody`, the second OS user of the tests that run as root: 65534 on
@@ -49,14 +49,14 @@ impl Drop for Scratch {
     }
 }
 
-/// Binds a local listener at `path` with `stale`, and gives the result of the bind.
-fn bind(driver: &mut Driver, path: &Path, stale: Stale) -> io::Result<LocalListener> {
-    let bind = driver.bind_local(path, stale).expect("the test driver has room");
+/// Binds an IPC listener at `path` with `stale`, and gives the result of the bind.
+fn bind(driver: &mut Driver, path: &Path, stale: Stale) -> io::Result<IpcListener> {
+    let bind = driver.bind_ipc(path, stale).expect("the test driver has room");
     drive(driver, bind).expect("the driver runs")
 }
 
 /// Receives on `stream` into buffers of `capacity` bytes until the end of the stream.
-fn receive_all(driver: &mut Driver, stream: &mut LocalStream, capacity: usize) -> Vec<u8> {
+fn receive_all(driver: &mut Driver, stream: &mut IpcStream, capacity: usize) -> Vec<u8> {
     let mut received = Vec::new();
     loop {
         let receive = driver
@@ -70,26 +70,26 @@ fn receive_all(driver: &mut Driver, stream: &mut LocalStream, capacity: usize) -
     }
 }
 
-/// A numbered byte stream crosses a local stream in each direction with no gap and no repeat,
+/// A numbered byte stream crosses an IPC stream in each direction with no gap and no repeat,
 /// through the abandoned operations of the stream rules: a dropped accept leaves its connection to
 /// the next accept, a dropped send that sends all its bytes reports nothing, and a dropped or a
 /// forgotten receive leaves its bytes to the next receive. A half-close ends the receive of the
 /// peer at the sent count.
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
-pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations(
+pub(in crate::driver) fn a_numbered_stream_crosses_an_ipc_stream_with_no_gap_through_the_abandoned_operations(
     backend: Backend,
 ) {
     let scratch = Scratch::new("stream");
     let path = scratch.join("socket");
     let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let id = hold(&mut driver, &accept);
     let mut peer = UnixStream::connect(&path).unwrap();
     posted(&mut driver, id).unwrap();
     drop(accept);
     driver.turn().unwrap();
-    let next = driver.accept_local(&mut listener).unwrap();
+    let next = driver.accept_ipc(&mut listener).unwrap();
     assert_eq!(driver.queue.unsubmitted(), 0, "the accept submitted");
     let mut stream = drive(&mut driver, next).unwrap().unwrap();
 
@@ -105,7 +105,7 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
     peer.read_to_end(&mut received).unwrap();
     assert_eq!(received, numbered(0, 2000));
 
-    // A write to a local stream is in the receive queue of the peer when it returns, so the first
+    // A write to an IPC stream is in the receive queue of the peer when it returns, so the first
     // receive takes 600 bytes, and 400 bytes wait for the forgotten receive.
     peer.write_all(&numbered(0, 1000)).unwrap();
     let dropped = driver
@@ -132,9 +132,9 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_local_stream_with_no_gap_th
     assert_eq!(received, numbered(0, 1500));
 }
 
-/// The socket file of a local listener has mode 0600 when the bind ends, before any connect, also
+/// The socket file of an IPC listener has mode 0600 when the bind ends, before any connect, also
 /// with the usual umask of 022, which leaves the group and others the read and execute bits.
-pub(in crate::driver) fn the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends(backend: Backend) {
+pub(in crate::driver) fn the_socket_file_of_an_ipc_listener_has_mode_0600_when_its_bind_ends(backend: Backend) {
     let scratch = Scratch::new("mode");
     let path = scratch.join("socket");
     let mut driver = suite::driver(Config::new(), backend);
@@ -157,7 +157,7 @@ pub(in crate::driver) fn a_bind_refuses_a_live_listener_path_and_replaces_only_a
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{stale:?}");
     }
     let live = UnixStream::connect(&path).expect("the live listener keeps its socket file");
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
     drop(live);
 
@@ -166,7 +166,7 @@ pub(in crate::driver) fn a_bind_refuses_a_live_listener_path_and_replaces_only_a
     assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     let mut listener = bind(&mut driver, &path, Stale::Replace).unwrap();
     let mut peer = UnixStream::connect(&path).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let mut stream = drive(&mut driver, accept).unwrap().unwrap();
     peer.write_all(b"new").unwrap();
     let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
@@ -195,7 +195,7 @@ pub(in crate::driver) fn a_bind_refuses_while_a_listener_holds_the_lock_of_its_p
         let error = bind(&mut driver, &path, stale).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{stale:?}");
     }
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
     assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_file());
     let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
@@ -247,7 +247,7 @@ fn hold_lock(path: &Path) -> fs::File {
 }
 
 /// Connects to the listener at `path` until a connect fails, and gives the streams and the error.
-fn fill(driver: &mut Driver, path: &Path) -> (Vec<LocalStream>, io::Error) {
+fn fill(driver: &mut Driver, path: &Path) -> (Vec<IpcStream>, io::Error) {
     /// More connects than a queue of one connection takes: two on Linux, and one on macOS.
     const CONNECTS_MAX: usize = 8;
     let mut streams = Vec::new();
@@ -256,7 +256,7 @@ fn fill(driver: &mut Driver, path: &Path) -> (Vec<LocalStream>, io::Error) {
             streams.len() < CONNECTS_MAX,
             "the queue took {CONNECTS_MAX} connections"
         );
-        let connect = driver.connect_local(path).unwrap();
+        let connect = driver.connect_ipc(path).unwrap();
         match drive(driver, connect).unwrap() {
             Ok(stream) => streams.push(stream),
             Err(error) => return (streams, error),
@@ -281,7 +281,7 @@ pub(in crate::driver) fn a_connect_to_a_full_listener_is_busy_and_to_a_closed_on
         "the listener took a connection before its queue was full"
     );
     drop((listener, lock));
-    let connect = driver.connect_local(&path).unwrap();
+    let connect = driver.connect_ipc(&path).unwrap();
     let error = drive(&mut driver, connect).unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
 }
@@ -329,7 +329,7 @@ pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid
     ] {
         let error = bind(&mut driver, &path, Stale::Refuse).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
-        let connect = driver.connect_local(&path).unwrap();
+        let connect = driver.connect_ipc(&path).unwrap();
         let error = drive(&mut driver, connect).unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
     }
@@ -346,9 +346,9 @@ pub(in crate::driver) fn an_accepted_stream_reports_the_user_group_and_process_o
     let mut driver = suite::driver(Config::new(), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let _peer = UnixStream::connect(&path).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let stream = drive(&mut driver, accept).unwrap().unwrap();
-    let peer = driver.local_peer(&stream).unwrap();
+    let peer = driver.ipc_peer(&stream).unwrap();
     let owner = fs::symlink_metadata(&path).unwrap();
     assert_eq!(
         (peer.user(), peer.group(), peer.process()),
@@ -377,9 +377,9 @@ pub(in crate::driver) fn an_accepted_stream_of_a_closed_peer_reports_its_user_an
     let mut driver = suite::driver(Config::new(), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     drop(UnixStream::connect(&path).unwrap());
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let stream = drive(&mut driver, accept).unwrap().unwrap();
-    let peer = driver.local_peer(&stream).unwrap();
+    let peer = driver.ipc_peer(&stream).unwrap();
     let owner = fs::symlink_metadata(&path).unwrap();
     #[cfg(target_os = "linux")]
     let process = Some(std::process::id());
@@ -436,9 +436,9 @@ pub(in crate::driver) fn an_accepted_stream_reports_the_user_group_and_process_o
     // Only the test opens the socket file to the second user.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
     let connected = connect_as_nobody(&path).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let stream = drive(&mut driver, accept).unwrap().unwrap();
-    let peer = driver.local_peer(&stream).unwrap();
+    let peer = driver.ipc_peer(&stream).unwrap();
     assert_eq!(
         (peer.user(), peer.group(), peer.process()),
         (NOBODY, NOBODY, Some(connected.0.id()))

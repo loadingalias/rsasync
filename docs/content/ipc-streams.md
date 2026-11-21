@@ -1,11 +1,11 @@
-# Local streams on the driver
+# IPC streams on the driver
 
-This page is the reference for local streams on the driver, `rsasync::driver::Driver`:
-Unix-domain stream sockets at a path, for processes on one host. Local streams run on Linux, on
+This page is the reference for IPC (inter-process communication) streams on the driver, `rsasync::driver::Driver`:
+Unix-domain stream sockets at a path, for processes on one host. IPC streams run on Linux, on
 io_uring and on [epoll](epoll.md), on macOS, on [kqueue](kqueue.md), and on Windows as byte-mode
 named pipes, on the [I/O completion port](iocp.md) (see [Windows](#windows)). This page gives each
 operation, its result, the permission rule of the socket file, the lock of the path, and the
-identity of the peer. A local stream follows the stream rules of
+identity of the peer. An IPC stream follows the stream rules of
 [TCP on the driver](tcp.md): one operation for each direction, the rules for a dropped, forgotten,
 or cancelled operation, and close. [Drive the I/O driver yourself](driver-only.md) tells how to
 start, turn, and end the driver.
@@ -17,21 +17,21 @@ Each operation gives an `Operation` future. Turn the driver until the future is 
 
 | Call | Borrows | Output | Refusal |
 | --- | --- | --- | --- |
-| `Driver::bind_local(path, stale)` | Nothing | `io::Result<LocalListener>`, at once: a listener at the socket file `path`. See [Bind at a path](#bind-at-a-path) | `Refused<()>` |
-| `Driver::connect_local(path)` | Nothing | `io::Result<LocalStream>`, at once: a stream to the listener at `path` | `Refused<()>` |
-| `Driver::accept_local(&mut listener)` | The listener | `io::Result<LocalStream>`: the stream. See [The identity of the peer](#the-identity-of-the-peer) | `Refused<()>` |
+| `Driver::bind_ipc(path, stale)` | Nothing | `io::Result<IpcListener>`, at once: a listener at the socket file `path`. See [Bind at a path](#bind-at-a-path) | `Refused<()>` |
+| `Driver::connect_ipc(path)` | Nothing | `io::Result<IpcStream>`, at once: a stream to the listener at `path` | `Refused<()>` |
+| `Driver::accept_ipc(&mut listener)` | The listener | `io::Result<IpcStream>`: the stream. See [The identity of the peer](#the-identity-of-the-peer) | `Refused<()>` |
 | `Driver::recv`, `Driver::recv_selected`, `Driver::send`, `Driver::send_vectored`, `Driver::shutdown_write` | The read half or the write half | As for a TCP stream: see [TCP on the driver](tcp.md#operations) | As for a TCP stream |
-| `Driver::local_peer(&stream)` | Nothing | `io::Result<Peer>`, at once | None |
-| `Driver::close_local(stream)` | Takes the stream | `Closed` | `Refused<LocalStream>`, with the stream |
-| `Driver::close_local_listener(listener)` | Takes the listener | `Closed` | `Refused<LocalListener>`, with the listener |
+| `Driver::ipc_peer(&stream)` | Nothing | `io::Result<Peer>`, at once | None |
+| `Driver::close_ipc(stream)` | Takes the stream | `Closed` | `Refused<IpcStream>`, with the stream |
+| `Driver::close_ipc_listener(listener)` | Takes the listener | `Closed` | `Refused<IpcListener>`, with the listener |
 
-`LocalStream::split` gives the read half and the write half, so that a receive and a send can run
+`IpcStream::split` gives the read half and the write half, so that a receive and a send can run
 at one time. A half-close ends the receive of the peer after the bytes that went before it, as on
 TCP.
 
 The bind and the connect are system calls on the thread of the driver, on each backend, so their
 futures are ready at once. A Unix-domain connect does not wait in the kernel: it connects, or it
-fails at once. The future of `bind_local` and `connect_local` gives these errors:
+fails at once. The future of `bind_ipc` and `connect_ipc` gives these errors:
 
 | Error kind | Cause |
 | --- | --- |
@@ -49,7 +49,7 @@ A refusal gives a `Reason`, as on TCP: `Operations`, `Queue`, `Resource`, or `Bu
 
 ## Bind at a path
 
-`Driver::bind_local` makes a Unix-domain stream socket, binds it to `path`, and listens on it. Only
+`Driver::bind_ipc` makes a Unix-domain stream socket, binds it to `path`, and listens on it. Only
 the user that owns the socket file can connect, because the file has mode 0600 before a connect can
 succeed:
 
@@ -107,7 +107,7 @@ does not fail.
 
 ## The identity of the peer
 
-`Driver::local_peer(&stream)` gives the OS identity of the peer of a stream: `Peer::user()`,
+`Driver::ipc_peer(&stream)` gives the OS identity of the peer of a stream: `Peer::user()`,
 `Peer::group()`, and `Peer::process()`, which is an `Option<u32>`. For an accepted stream, it is the
 process that connected. For a connected stream, it is the process that listened.
 
@@ -128,11 +128,11 @@ socket file so that other users can connect:
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
-use rsasync::driver::{Driver, LocalStream};
+use rsasync::driver::{Driver, IpcStream};
 
 /// Whether the peer of `stream` runs as the user that owns the socket file at `path`.
-fn peer_owns_socket(driver: &Driver, stream: &LocalStream, path: &Path) -> std::io::Result<bool> {
-    Ok(driver.local_peer(stream)?.user() == std::fs::metadata(path)?.uid())
+fn peer_owns_socket(driver: &Driver, stream: &IpcStream, path: &Path) -> std::io::Result<bool> {
+    Ok(driver.ipc_peer(stream)?.user() == std::fs::metadata(path)?.uid())
 }
 ```
 
@@ -152,9 +152,9 @@ change:
 
 ## Close
 
-`Driver::close_local` closes a stream as `Driver::close` closes a TCP stream: it cancels each
+`Driver::close_ipc` closes a stream as `Driver::close` closes a TCP stream: it cancels each
 operation, waits until each one ends, releases the bytes that no receive took, and closes the
-socket. `Driver::close_local_listener` cancels the accept that runs, closes each connection that no
+socket. `Driver::close_ipc_listener` cancels the accept that runs, closes each connection that no
 accept took, and closes the socket.
 
 The close of a listener does not remove its socket file, as in `std` and Tokio, and it keeps the
@@ -177,7 +177,7 @@ listener of another program on macOS, and the named pipes of Windows.
 
 ## Windows
 
-On Windows, a local stream is a byte-mode named pipe. The path of `bind_local` and `connect_local`
+On Windows, an IPC stream is a byte-mode named pipe. The path of `bind_ipc` and `connect_ipc`
 is a pipe name, `\\.\pipe\<name>`, with at most 256 units in all. Each other path gives
 `InvalidInput`. A pipe name has no file, and the name ends when the last instance of the pipe
 closes.
@@ -203,7 +203,7 @@ next accept gives it at once. Each waiting instance is one kernel object and one
 port. The 64 KiB buffer of each direction is a quota that only bytes in the pipe use, and an
 instance takes no resource slot of the driver before its accept.
 
-`connect_local` opens the pipe with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the server
+`connect_ipc` opens the pipe with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the server
 can read the identity of the client, and cannot act as the client. A connect to a pipe name with no
 instance gives `NotFound`.
 
@@ -211,7 +211,7 @@ A named pipe has no half-close: `shutdown_write` refuses with `Reason::Unsupport
 of one end is the end of the stream for the other end, after each byte that went before it.
 `recv_selected` on a named pipe gives `Unsupported`.
 
-`Driver::local_peer` gives the identity of the peer, as on Linux and macOS: of the client for an
+`Driver::ipc_peer` gives the identity of the peer, as on Linux and macOS: of the client for an
 accepted stream, and of the server for a connected stream.
 
 | Stream | `Peer::process()` | `Peer::user()` |
@@ -230,7 +230,7 @@ connect, so a later write of the client under another identity does not change i
   the open, and the driver reads its user at the accept.
 - A client that opens the pipe with no security quality of service, the default of `CreateFileW`,
   of `std::fs`, and of .NET, has dynamic tracking: the system takes its context at its first write.
-  The driver reads its user at the first receive that takes its data. Until then, `local_peer`
+  The driver reads its user at the first receive that takes its data. Until then, `ipc_peer`
   gives an `io::Error` whose `raw_os_error()` is `ERROR_CANNOT_IMPERSONATE` (1368). Receive the
   first bytes, then check the user, before you act on them.
 
@@ -239,3 +239,22 @@ process ID to another process after the client ends. Windows has no group in the
 the user of its server before it sends a secret, so it does not talk to a process of another user
 that took the name. A listener authorizes a client by its user, which the security descriptor
 already limits to the user of the listener.
+
+## Use IPC streams from a task
+
+A task of a [runtime](runtime.md) owner uses `rsasync::local::IpcListener` and
+`rsasync::local::IpcStream` (Linux). Each call takes no driver argument, and it has the meaning
+and the output of its driver call. The rules of [TCP from a task](tcp.md#use-tcp-from-a-task) apply. The types are not `Send`. A call refuses with `Reason::NoDriver` on a thread with no driver, and with `Reason::Resource` on another owner. A drop closes the resource, as `close` does, with no future.
+
+| Local call | Driver call |
+| --- | --- |
+| `IpcListener::bind(path, stale)` | `Driver::bind_ipc` |
+| `listener.accept()` | `Driver::accept_ipc` |
+| `IpcStream::connect(path)` | `Driver::connect_ipc` |
+| `stream.recv`, `send`, `send_vectored`, `shutdown_write` | `Driver::recv`, `send`, `send_vectored`, `shutdown_write` |
+| `stream.peer()` | `Driver::ipc_peer` |
+| `stream.close()`, `listener.close()` | `Driver::close_ipc`, `close_ipc_listener` |
+
+`stream.split()` gives a `rsasync::local::ReadHalf` and a `WriteHalf`, so a receive and a send run
+at one time. `peer()` gives an error of the kind `NotFound` on a thread with no driver, or on
+another owner.

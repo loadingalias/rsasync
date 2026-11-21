@@ -1,4 +1,4 @@
-//! The declarations of local streams, from the C library: glibc or musl on Linux, and libSystem on
+//! The declarations of IPC streams, from the C library: glibc or musl on Linux, and libSystem on
 //! macOS.
 //!
 //! On Linux, each item agrees with `sys/socket.h`, `sys/un.h`, `sys/stat.h`, `sys/file.h`, and

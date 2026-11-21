@@ -9,6 +9,7 @@ use rscrypto::ChaCha20Rng;
 
 use super::placement::{Fallback, Placed, Selection};
 use super::{TimersError, WorkerError, WorkerReport, sys};
+use crate::blocking::Submitter;
 use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
@@ -45,6 +46,8 @@ pub(super) struct Start {
     pub(super) driver: Config,
     pub(super) timers: (NonZeroU32, Duration),
     pub(super) generator: ChaCha20Rng,
+    /// The blocking service of the runtime, which the driver uses.
+    pub(super) blocking: Option<Submitter>,
 }
 
 /// The ready report of a worker, or why it did not start.
@@ -97,6 +100,7 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport), WorkerError> {
         driver,
         timers: limits,
         generator,
+        blocking,
     } = start;
     if let Some(target) = &plan.target {
         match sys::bind(target) {
@@ -106,7 +110,10 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport), WorkerError> {
         }
     }
     // On Linux, the driver runs io_uring, or epoll, and the home of an owner runs on both.
-    let driver = Driver::new(driver).map_err(WorkerError::Driver)?;
+    let mut driver = Driver::new(driver).map_err(WorkerError::Driver)?;
+    if let Some(submitter) = blocking {
+        driver.use_blocking(submitter);
+    }
     let report = driver.report();
     let mut owner = RingOwner::new(&budget, slots, driver).map_err(WorkerError::Owner)?;
     let (timers, clock) = timers(&budget, limits).map_err(WorkerError::Timers)?;

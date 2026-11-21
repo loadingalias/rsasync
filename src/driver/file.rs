@@ -301,6 +301,12 @@ pub struct File {
 }
 
 impl File {
+    /// The resource of the file, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.resource
+    }
+
     /// The alignment of direct I/O, for a file that [`Cache::Direct`] opened. `None` for a file
     /// that uses the page cache.
     #[must_use]
@@ -324,6 +330,14 @@ impl File {
 #[derive(Debug)]
 pub struct Directory {
     resource: Resource,
+}
+
+impl Directory {
+    /// The resource of the directory, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.resource
+    }
 }
 
 /// The alignment that direct I/O needs, from `statx` (`STATX_DIOALIGN`, Linux 6.1).
@@ -867,6 +881,16 @@ fn done(result: i32, held: &Held) -> io::Result<()> {
 }
 
 /// The resource and the alignment of a file that an open gave.
+/// The output of the open of a file.
+pub(crate) fn file_opened(result: i32, held: Held) -> Option<io::Result<File>> {
+    Some(opened(result, &held).map(|(resource, alignment)| File { resource, alignment }))
+}
+
+/// The output of the open of a directory.
+pub(crate) fn directory_opened(result: i32, held: Held) -> Option<io::Result<Directory>> {
+    Some(opened(result, &held).map(|(resource, _)| Directory { resource }))
+}
+
 fn opened(result: i32, held: &Held) -> io::Result<(Resource, Option<Alignment>)> {
     count(result)?;
     if let Some(kind) = held.error {
@@ -1009,9 +1033,7 @@ impl Driver {
         // An open that changes the file system runs to its end.
         let changes = options.create || options.create_new || options.truncate;
         let completion = self.begin_open(Opening::file(path, options), op, !changes)?;
-        Ok(Operation::new(completion, |result, held| {
-            Some(opened(result, &held).map(|(resource, alignment)| File { resource, alignment }))
-        }))
+        Ok(Operation::new(completion, file_opened))
     }
 
     /// Opens the directory at `path` (`O_DIRECTORY`, and `FILE_FLAG_BACKUP_SEMANTICS` on Windows),
@@ -1024,9 +1046,7 @@ impl Driver {
     /// directory.
     pub fn open_directory(&mut self, path: &Path) -> Result<Operation<'static, io::Result<Directory>>, Refused<()>> {
         let completion = self.begin_open(Opening::directory(path), Op::Open { direct: false }, true)?;
-        Ok(Operation::new(completion, |result, held| {
-            Some(opened(result, &held).map(|(resource, _)| Directory { resource }))
-        }))
+        Ok(Operation::new(completion, directory_opened))
     }
 
     /// Reads into the capacity of `buffer` after its initialized bytes, from the file offset

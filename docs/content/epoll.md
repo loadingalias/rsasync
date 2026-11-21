@@ -36,7 +36,7 @@ refuses with `Error::Unsupported`.
 
 | Operations | On epoll |
 | --- | --- |
-| TCP, [local streams](local-streams.md), and pipes: accept, connect, receive, send, vectored send, half-close, close | One nonblocking call on the thread of the driver when epoll reports the descriptor ready. A local bind and a local connect are system calls, ready at once, as on io_uring. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes |
+| TCP, [IPC streams](ipc-streams.md), and pipes: accept, connect, receive, send, vectored send, half-close, close | One nonblocking call on the thread of the driver when epoll reports the descriptor ready. A local bind and a local connect are system calls, ready at once, as on io_uring. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes |
 | UDP: one datagram, with its metadata, segments, and truncation | One nonblocking `sendmsg` or `recvmsg`, with the control messages of [datagram I/O](datagram-io.md) |
 | UDP batches: `send_batch` and `recv_batch` | One `sendmmsg` or `recvmmsg` for the batch. A send that went only in part sends the rest in the next call |
 | Bind and listen (`Call::Bind`, `Call::BindUdp`) | System calls on the thread of the driver (`Route::SystemCall`) |

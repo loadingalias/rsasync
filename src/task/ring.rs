@@ -54,10 +54,16 @@ impl RingOwner {
     }
 
     /// Makes an owner with `slots` task slots, on this thread, that makes its driver with `config`
-    /// at the first operation that needs a home (`with_driver`).
-    pub(crate) fn lazy(budget: &Budget, slots: u32, config: Config) -> Result<Self, Refused> {
+    /// at the first operation that needs a home (`with_driver`). The driver uses the blocking
+    /// service of `blocking`.
+    pub(crate) fn lazy(
+        budget: &Budget,
+        slots: u32,
+        config: Config,
+        blocking: Option<crate::blocking::Submitter>,
+    ) -> Result<Self, Refused> {
         let local = Local::new(budget, slots, Home::new(thread::current(), None), driver::MESSAGES)?;
-        local.lazy.set(Some(config));
+        local.lazy.set(Some((config, blocking)));
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
         })
@@ -206,11 +212,14 @@ impl Local {
             return Err(value);
         };
         if slot.is_none() {
-            let Some(config) = self.lazy.take() else {
+            let Some((config, blocking)) = self.lazy.take() else {
                 return Err(value);
             };
             match Driver::new(config) {
-                Ok(driver) => {
+                Ok(mut driver) => {
+                    if let Some(submitter) = blocking {
+                        driver.use_blocking(submitter);
+                    }
                     self.shared().set_ring(driver.home());
                     self.sends.set(true);
                     self.switched.set(true);

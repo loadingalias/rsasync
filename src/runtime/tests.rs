@@ -715,14 +715,16 @@ fn a_placed_factory_spawn_keeps_no_charge_of_its_factory() {
     );
 }
 
-/// Each refusal of the allocator in a start with no worker gives `Cause::Allocation`, also the
-/// refusal of the default budget and of the facts of the host, and keeps no memory. A start
-/// whose allocation aborts the process fails.
+/// Each refusal of the allocator in a start with no worker and no blocking service gives
+/// `Cause::Allocation`, also the refusal of the default budget and of the facts of the host, and
+/// keeps no memory. A start whose allocation aborts the process fails.
 #[test]
 fn a_start_that_the_allocator_refuses_gives_allocation() {
     use crate::table::tests::allocations::each_refusal;
 
-    let refusals = each_refusal(|| Runtime::builder().local_workers(0).build().map(drop));
+    // `std::thread` aborts when the allocator refuses the memory of a new thread, so the start has
+    // no worker and no blocking service, which each start threads.
+    let refusals = each_refusal(|| Runtime::builder().local_workers(0).blocking(None).build().map(drop));
     assert!(!refusals.is_empty());
     for (failure, held) in refusals {
         assert_matches!(failure.cause(), Cause::Allocation);
@@ -759,11 +761,13 @@ fn a_block_on_that_the_allocator_refuses_gives_its_root_back() {
         .budget(budget.clone())
         .build()
         .unwrap();
+    // The blocking service of the runtime keeps its own charge.
+    let before = budget.available();
     let refusals = each_refusal(|| runtime.block_on(async { 7 }));
     assert!(!refusals.is_empty());
     for (error, held) in refusals {
         assert_matches!(error, BlockOnError::Owner(..) | BlockOnError::Timers(..));
-        assert_eq!((held, budget.available()), (0, DEFAULT_BUDGET));
+        assert_eq!((held, budget.available()), (0, before));
         let mut root = core::pin::pin!(error.into_root().expect("a setup refusal gives the root back"));
         let polled = root.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         assert_eq!(polled, Poll::Ready(7));

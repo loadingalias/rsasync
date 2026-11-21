@@ -117,3 +117,12 @@ dropped send too, wait until it ends, and close the descriptor. A close does not
 end: it returns also when the other end neither reads nor writes. The `Closed` result of a writer
 reports the progress that its dropped sends owe, for example `Some(0)` for a send that waited for
 room in a full pipe.
+
+## Use pipes from a task
+
+A task of a [runtime](runtime.md) owner uses `rsasync::local::PipeReader` and
+`rsasync::local::PipeWriter` (Linux). `PipeReader::adopt(fd)` and `PipeWriter::adopt(fd)` take a
+pipe end, as `Driver::adopt_reader` and `Driver::adopt_writer` do. A local
+[child](processes.md#use-child-processes-from-a-task) gives its piped standard streams as these
+types. `recv`, `send`, `send_vectored`, and `close` have the meaning and the output of their driver
+calls. The rules of [TCP from a task](tcp.md#use-tcp-from-a-task) apply. The types are not `Send`. A call refuses with `Reason::NoDriver` on a thread with no driver, and with `Reason::Resource` on another owner. A drop closes the resource, as `close` does, with no future. The drop of a write end is the end of the stream for its reader.

@@ -2,10 +2,10 @@
 
 On Windows, the driver runs on an I/O completion port (IOCP). Where the system has an I/O ring
 (IoRing) of version 3 or later, the reads, writes, and syncs of files run on the ring, and all else
-stays on the port. TCP, UDP, files, and local streams have the same API and the same ownership rules
+stays on the port. TCP, UDP, files, and IPC streams have the same API and the same ownership rules
 as on io_uring and epoll: the terminal event of an operation releases its buffer and its charge, and
 a dropped or forgotten future ends only the interest. This page tells how each TCP, UDP, file, and
-local stream operation runs, when the port skips a packet, which file operations run on your
+IPC stream operation runs, when the port skips a packet, which file operations run on your
 blocking service, and what differs from Linux. rsasync is in development, and these backends are
 not in a published release yet.
 
@@ -146,7 +146,7 @@ operation, and the rest stays for the next one, as on Linux.
 
 On `Backend::IoRing`, the driver keeps one I/O ring beside its port, and no file is on the port:
 the ring refuses a read or a write of a file on a port with `E_INVALIDARG` (`0x80070057`). Sockets
-and local streams stay on the port, as on `Backend::Iocp`.
+and IPC streams stay on the port, as on `Backend::Iocp`.
 
 | Operation | On IoRing |
 | --- | --- |
@@ -197,10 +197,10 @@ each disk (`nvmedisk` for the native path, `disk` for the disk class driver over
 translation of the port driver). It never infers the path from the version of the system. When
 the allocator refuses the list of the devices, the report gives `OutOfMemory`.
 
-## Local streams
+## IPC streams
 
-A local stream is a byte-mode named pipe, with the API of
-[local streams on the driver](local-streams.md#windows). The bind (`CreateNamedPipeW`) and the
+An IPC stream is a byte-mode named pipe, with the API of
+[IPC streams on the driver](ipc-streams.md#windows). The bind (`CreateNamedPipeW`) and the
 connect (`CreateFileW`) are calls on the thread of the driver, which end at once. An accept is one
 overlapped `ConnectNamedPipe` on the instance of the listener, and a receive, a send, and a
 vectored send are overlapped `ReadFile` and `WriteFile` calls, as for a file: a vectored send is one
@@ -263,7 +263,7 @@ inspection and change, preallocation, sync, rename, unlink, and the NVMe report.
 
 ## Limits
 
-- TCP, UDP, files, and local streams only. Pipes, processes, and signals have no Windows form yet.
+- TCP, UDP, files, and IPC streams only. Pipes, processes, and signals have no Windows form yet.
 - Windows x86_64 only. Windows on aarch64 has no run evidence.
 - IoRing has run evidence only on Windows Server 2025. Windows 11 is not run.
 - The ring registers no file handle and no buffer: each entry names its handle and its buffer.

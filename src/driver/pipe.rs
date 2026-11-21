@@ -64,6 +64,14 @@ pub struct PipeReader {
     pub(super) read: ReadHalf,
 }
 
+impl PipeReader {
+    /// The resource of the read end, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.read.resource
+    }
+}
+
 /// The write end of a pipe, which the driver owns. [`Driver::send`] and [`Driver::send_vectored`]
 /// borrow it, as they borrow a [`TcpStream`](super::TcpStream), under the same rules: a dropped
 /// send still runs, and a failed or partial dropped send fails the write direction. Its close is
@@ -75,6 +83,14 @@ pub struct PipeReader {
 #[derive(Debug)]
 pub struct PipeWriter {
     pub(super) write: WriteHalf,
+}
+
+impl PipeWriter {
+    /// The resource of the write end, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.write.resource
+    }
 }
 
 impl AsMut<ReadHalf> for PipeReader {

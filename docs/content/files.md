@@ -279,3 +279,24 @@ its future.
 `Driver::close_file` takes the file. It waits until each operation of the file ends, also each
 operation whose future dropped, and then closes the descriptor. A close makes nothing durable: sync
 before it. `Driver::close_directory` closes a directory in the same way.
+
+## Use files from a task
+
+A task of a [runtime](runtime.md) owner uses `rsasync::local::File` and
+`rsasync::local::Directory` (Linux). Each call takes no driver argument, and it has the meaning and
+the output of its driver call. The rules of [TCP from a task](tcp.md#use-tcp-from-a-task) apply. The types are not `Send`. A call refuses with `Reason::NoDriver` on a thread with no driver, and with `Reason::Resource` on another owner. A drop closes the resource, as `close` does, with no future. The drop of a file waits, as its close does, until each
+operation of the file ends.
+
+| Local call | Driver call |
+| --- | --- |
+| `File::open(path, options)`, `Directory::open(path)` | `Driver::open_file`, `Driver::open_directory` |
+| `file.read_at`, `read_exact_at`, `read_vectored_at` | `Driver::read_at`, `read_exact_at`, `read_vectored_at` |
+| `file.write_at`, `write_vectored_at` | `Driver::write_at`, `write_vectored_at` |
+| `file.len()`, `set_len(len)` | `Driver::file_len`, `set_file_len` |
+| `file.allocate`, `punch_hole` | `Driver::allocate`, `punch_hole` |
+| `file.sync(mode)`, `directory.sync()` | `Driver::sync`, `sync_directory` |
+| `rename(from, to)`, `unlink(path)` | `Driver::rename`, `unlink` |
+| `file.close()`, `directory.close()` | `Driver::close_file`, `close_directory` |
+
+On an epoll worker, each file call runs on the [blocking service of the
+runtime](runtime.md#the-blocking-service).

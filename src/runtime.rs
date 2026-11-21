@@ -82,6 +82,7 @@ pub use placement::{CpuSet, Fallback, MAX_CPUS, Placed, Placement, PlanError, Re
 pub use rscrypto::ChaCha20Rng;
 pub use topology::{Host, Quota};
 
+use crate::blocking::{self, Service, Submitter};
 use crate::capacity::Budget;
 use crate::channel::{self, TrySendError, mpsc};
 use crate::clock;
@@ -115,12 +116,14 @@ pub struct Builder {
     selection: Selection,
     generator: Option<ChaCha20Rng>,
     handles: u32,
+    blocking: Option<blocking::Config>,
 }
 
 impl Builder {
     /// No local worker, [`DEFAULT_TASK_SLOTS`], a budget of [`DEFAULT_BUDGET`] bytes, the driver of
     /// [`Config::new`], [`DEFAULT_TIMERS`] at [`DEFAULT_TIMER_RESOLUTION`], `Domain` placement that
-    /// is permissive, a seed from the operating system, and [`DEFAULT_HANDLES`].
+    /// is permissive, a seed from the operating system, [`DEFAULT_HANDLES`], and a blocking service
+    /// of [`blocking::Config::new`].
     fn new() -> Self {
         Self {
             local_workers: 0,
@@ -135,6 +138,7 @@ impl Builder {
             selection: Selection::Permissive,
             generator: None,
             handles: DEFAULT_HANDLES,
+            blocking: Some(blocking::Config::new()),
         }
     }
 
@@ -217,6 +221,20 @@ impl Builder {
         Self { handles, ..self }
     }
 
+    /// The blocking service of the runtime, which each driver of the runtime uses: the spawn of a
+    /// child runs on it, and each file call that the backend has no operation for
+    /// ([`Route::BlockingService`](driver::Route::BlockingService)), such as each file call on
+    /// epoll. The budget charges it, and [`Handle::blocking`] gives its submitter for your own
+    /// blocking jobs. `None` starts no service: those calls then refuse with
+    /// [`Reason::Blocking`](driver::Reason::Blocking).
+    #[must_use]
+    pub fn blocking(self, config: Option<blocking::Config>) -> Self {
+        Self {
+            blocking: config,
+            ..self
+        }
+    }
+
     /// Validates the plan, places the workers, and starts them one at a time. The runtime is
     /// ready after each worker made its driver and its tables and applied its placement.
     ///
@@ -249,6 +267,12 @@ impl Builder {
             None => entropy::generator().map_err(|error| fail(Cause::Seed(error)))?,
         };
         let mut started = Started::with_capacity(plans.len()).ok_or_else(|| fail(Cause::Allocation))?;
+        let service = self
+            .blocking
+            .map(|config| Service::new(&budget, config))
+            .transpose()
+            .map_err(|error| fail(Cause::Blocking(error)))?;
+        let submitter = service.as_ref().map(Service::submitter);
         for (index, plan) in (0..).zip(plans) {
             let start = worker::Start {
                 index,
@@ -259,10 +283,15 @@ impl Builder {
                 driver: self.driver,
                 timers: self.timers,
                 generator: generator.child(b"worker\0\0", u64::from(index)),
+                blocking: submitter.clone(),
             };
             if let Err((cause, failed)) = started.start(start, self.handles) {
                 let mut cleanup = started.stop();
                 cleanup.extend(failed);
+                // No thread of the start remains, also no thread of the service.
+                if let Some(service) = service {
+                    let _teardown = service.teardown();
+                }
                 return Err(StartFailure { cause, cleanup });
             }
         }
@@ -276,7 +305,9 @@ impl Builder {
             workers: workers.into_boxed_slice(),
             handle: Handle {
                 routes: routes.into_boxed_slice(),
+                blocking: submitter,
             },
+            blocking: service,
             budget,
             slots: self.task_slots,
             driver: self.driver,
@@ -303,6 +334,7 @@ impl fmt::Debug for Builder {
             .field("placement", &self.placement)
             .field("selection", &self.selection)
             .field("handles", &self.handles)
+            .field("blocking", &self.blocking)
             .finish_non_exhaustive()
     }
 }
@@ -420,6 +452,8 @@ pub struct Runtime {
     /// The calls of `block_on` so far: the index of the generator of the next call.
     calls: Cell<u64>,
     report: Startup,
+    /// The blocking service of each driver of the runtime ([`Builder::blocking`]).
+    blocking: Option<Service>,
 }
 
 impl Runtime {
@@ -467,7 +501,8 @@ impl Runtime {
     pub fn block_on<F: Future>(&self, root: F) -> Result<F::Output, BlockOnError<F>> {
         let call = self.calls.get();
         self.calls.set(call.wrapping_add(1));
-        let mut owner = match RingOwner::lazy(&self.budget, self.slots, self.driver) {
+        let blocking = self.blocking.as_ref().map(Service::submitter);
+        let mut owner = match RingOwner::lazy(&self.budget, self.slots, self.driver, blocking) {
             Ok(owner) => owner,
             Err(refused) => return Err(BlockOnError::Owner(refused, root)),
         };
@@ -492,6 +527,10 @@ impl Drop for Runtime {
         for (index, thread) in (0..).zip(core::mem::take(&mut self.workers)) {
             // The drop is a backstop: the shutdown of R305 reports these outcomes.
             let _outcome = join(index, thread);
+        }
+        // After the workers, whose drivers submit to it.
+        if let Some(service) = self.blocking.take() {
+            let _teardown = service.teardown();
         }
     }
 }
@@ -527,6 +566,7 @@ impl WorkerId {
 /// each worker: [`Builder::handles`] bounds them.
 pub struct Handle {
     routes: Box<[Route]>,
+    blocking: Option<Submitter>,
 }
 
 /// The way of a handle to one worker: a sender of its inbox, and the side of its owner that
@@ -595,7 +635,15 @@ impl Handle {
         }
         Ok(Self {
             routes: routes.into_boxed_slice(),
+            blocking: self.blocking.clone(),
         })
+    }
+
+    /// The submitter of the blocking service of the runtime ([`Builder::blocking`]), for blocking
+    /// jobs of your own, or `None` when the runtime has no service.
+    #[must_use]
+    pub const fn blocking(&self) -> Option<&Submitter> {
+        self.blocking.as_ref()
     }
 }
 
@@ -727,6 +775,8 @@ pub enum Cause {
         /// Its failure.
         error: WorkerError,
     },
+    /// The blocking service did not start ([`Builder::blocking`]). No worker started.
+    Blocking(blocking::Error),
 }
 
 impl fmt::Display for Cause {
@@ -736,6 +786,7 @@ impl fmt::Display for Cause {
             Self::Seed(error) => write!(f, "the system gave no seed: {error}"),
             Self::Allocation => f.write_str("the allocator did not give the tables of the start"),
             Self::Worker { index, error } => write!(f, "worker {index} did not start: {error}"),
+            Self::Blocking(error) => write!(f, "the blocking service did not start: {error}"),
         }
     }
 }
@@ -747,6 +798,7 @@ impl core::error::Error for Cause {
             Self::Seed(error) => Some(error),
             Self::Allocation => None,
             Self::Worker { error, .. } => Some(error),
+            Self::Blocking(error) => Some(error),
         }
     }
 }

@@ -61,6 +61,16 @@ impl Cleanup {
     }
 }
 
+impl Driver {
+    /// The home of `resource`, which this driver adopted, for the local type that owns it.
+    pub(crate) fn cleanup(&self, resource: Resource) -> Cleanup {
+        Cleanup {
+            shared: Arc::clone(&self.shared),
+            resource,
+        }
+    }
+}
+
 impl Completion {
     /// The home of `resource`, which this operation made, for the local type that owns it.
     pub(crate) fn cleanup(&self, resource: Resource) -> Cleanup {

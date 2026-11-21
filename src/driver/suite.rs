@@ -30,7 +30,7 @@
 //! a blocking service of the case. Both pin `Config::backend(Backend::Iocp)`, so the file path of
 //! IOCP runs on a host that has an I/O ring too. `Backend::IoRing` pins the IoRing backend: the cases of the `files` block run there, with
 //! each read, write, and sync of a file as an entry of the ring, and each other file operation,
-//! also a hole punch, on a blocking service of the case. Only the TCP, UDP, local stream, and file
+//! also a hole punch, on a blocking service of the case. Only the TCP, UDP, IPC stream, and file
 //! cases run on Windows: its pipes, processes, and signals have no IOCP form yet. The cases whose
 //! kernel facts differ on Windows state the
 //! difference beside their bodies: a send there goes whole or fails, so a send goes in part only at
@@ -120,13 +120,13 @@
 //!     and `a_half_close_on_a_failed_write_direction_sends_no_end_of_stream`.
 //!   - Zero-copy send: no case before R611 adds the operation.
 //!   - A listener group for each worker: no case before the local workers of R307.
-//! - Local stream
-//!   - Bind with mode 0600: `the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends`.
+//! - IPC stream
+//!   - Bind with mode 0600: `the_socket_file_of_an_ipc_listener_has_mode_0600_when_its_bind_ends`.
 //!   - Bind on an existing path:
 //!     `a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file` and
 //!     `a_path_that_does_not_fit_a_socket_address_gives_invalid_input`.
 //!   - Accept, connect, receive, send, vectored send, half-close, and close (`law`):
-//!     `a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations`.
+//!     `a_numbered_stream_crosses_an_ipc_stream_with_no_gap_through_the_abandoned_operations`.
 //!   - The identity of the peer:
 //!     `an_accepted_stream_reports_the_user_group_and_process_of_this_process`.
 //! - UDP
@@ -347,9 +347,9 @@ mod law {
         #[cfg(unix)]
         pipe::tests => a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_at_the_close_of_the_writer,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_numbered_stream_crosses_a_local_stream_with_no_gap_through_the_abandoned_operations,
+        ipc::tests => a_numbered_stream_crosses_an_ipc_stream_with_no_gap_through_the_abandoned_operations,
         #[cfg(target_os = "windows")]
-        local::windows::tests => a_numbered_stream_crosses_a_named_pipe_with_no_gap_through_the_abandoned_operations,
+        ipc::windows::tests => a_numbered_stream_crosses_a_named_pipe_with_no_gap_through_the_abandoned_operations,
         tests => a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive,
         #[cfg(unix)]
         process::tests => a_dropped_spawn_ends_at_the_return_of_its_job_and_its_child_ends_by_its_policy,
@@ -508,52 +508,52 @@ mod operation {
         tests => idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer,
         tests => a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on,
         tests => a_half_close_on_a_failed_write_direction_sends_no_end_of_stream,
-        // Local stream.
+        // IPC stream.
         #[cfg(target_os = "windows")]
-        local::windows::tests => an_accepted_stream_reports_the_process_and_user_of_its_client,
+        ipc::windows::tests => an_accepted_stream_reports_the_process_and_user_of_its_client,
         #[cfg(target_os = "windows")]
-        local::windows::tests => a_bind_refuses_a_pipe_name_with_an_instance_also_one_that_a_squatter_made_first,
+        ipc::windows::tests => a_bind_refuses_a_pipe_name_with_an_instance_also_one_that_a_squatter_made_first,
         #[cfg(target_os = "windows")]
-        local::windows::tests => a_remote_client_of_a_pipe_is_rejected,
+        ipc::windows::tests => a_remote_client_of_a_pipe_is_rejected,
         #[cfg(target_os = "windows")]
-        local::windows::tests => a_waiting_accept_ends_at_the_close_of_its_listener_and_the_name_binds_again,
+        ipc::windows::tests => a_waiting_accept_ends_at_the_close_of_its_listener_and_the_name_binds_again,
         #[cfg(target_os = "windows")]
-        local::windows::tests => a_path_that_is_not_a_pipe_name_gives_invalid_input,
+        ipc::windows::tests => a_path_that_is_not_a_pipe_name_gives_invalid_input,
         #[cfg(target_os = "windows")]
-        local::windows::tests => a_burst_of_backlog_clients_connects_and_each_one_is_accepted,
-        #[cfg(target_os = "windows")]
-        #[ignore = "needs a second OS user with a password, which the Windows run makes"]
-        local::windows::tests => a_connect_of_a_second_os_user_is_denied,
+        ipc::windows::tests => a_burst_of_backlog_clients_connects_and_each_one_is_accepted,
         #[cfg(target_os = "windows")]
         #[ignore = "needs a second OS user with a password, which the Windows run makes"]
-        local::windows::tests => a_client_reads_the_process_and_user_of_a_server_of_a_second_os_user,
+        ipc::windows::tests => a_connect_of_a_second_os_user_is_denied,
+        #[cfg(target_os = "windows")]
+        #[ignore = "needs a second OS user with a password, which the Windows run makes"]
+        ipc::windows::tests => a_client_reads_the_process_and_user_of_a_server_of_a_second_os_user,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => the_socket_file_of_a_local_listener_has_mode_0600_when_its_bind_ends,
+        ipc::tests => the_socket_file_of_an_ipc_listener_has_mode_0600_when_its_bind_ends,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file,
+        ipc::tests => a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_bind_refuses_while_a_listener_holds_the_lock_of_its_path,
+        ipc::tests => a_bind_refuses_while_a_listener_holds_the_lock_of_its_path,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_bind_does_not_replace_the_socket_file_of_a_live_listener_with_no_lock,
+        ipc::tests => a_bind_does_not_replace_the_socket_file_of_a_live_listener_with_no_lock,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused,
+        ipc::tests => a_connect_to_a_full_listener_is_busy_and_to_a_closed_one_is_refused,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_bind_does_not_replace_the_socket_file_of_a_busy_listener_that_holds_the_lock,
+        ipc::tests => a_bind_does_not_replace_the_socket_file_of_a_busy_listener_that_holds_the_lock,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => a_path_that_does_not_fit_a_socket_address_gives_invalid_input,
+        ipc::tests => a_path_that_does_not_fit_a_socket_address_gives_invalid_input,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,
+        ipc::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        local::tests => an_accepted_stream_of_a_closed_peer_reports_its_user_and_group,
+        ipc::tests => an_accepted_stream_of_a_closed_peer_reports_its_user_and_group,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[ignore = "starts a process as a second OS user, which only root can do"]
-        local::tests => a_connect_of_a_second_os_user_is_refused,
+        ipc::tests => a_connect_of_a_second_os_user_is_refused,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[ignore = "starts a process as a second OS user, which only root can do"]
-        local::tests => an_accepted_stream_reports_the_user_group_and_process_of_its_peer,
+        ipc::tests => an_accepted_stream_reports_the_user_group_and_process_of_its_peer,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         #[ignore = "changes the owner of a file to a second OS user, which only root can do"]
-        local::tests => a_bind_does_not_replace_a_stale_socket_file_of_another_user,
+        ipc::tests => a_bind_does_not_replace_a_stale_socket_file_of_another_user,
         // UDP.
         tests => send_metadata_sets_the_source_and_ecn_that_the_receive_metadata_reports,
         #[cfg(not(target_os = "macos"))]

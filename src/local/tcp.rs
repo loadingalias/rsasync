@@ -7,7 +7,7 @@
 use core::net::SocketAddr;
 use std::io;
 
-use super::{Home, Homed, call, rewrap, submit};
+use super::{Home, Homed, ReadHalf, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Closed, Completion, Driver, Operation, Refused, Regions, TcpOptions};
 
@@ -228,67 +228,5 @@ impl TcpStream {
         self.inner
             .close(Driver::close)
             .map_err(|refused| rewrap(refused, |inner| Self { inner }))
-    }
-}
-
-/// The read half of a [`TcpStream`]: its receives borrow it.
-#[derive(Debug)]
-pub struct ReadHalf<'a> {
-    read: &'a mut driver::ReadHalf,
-    _home: Home,
-}
-
-impl ReadHalf<'_> {
-    /// Receives into the capacity of `buffer` after its initialized bytes, as
-    /// [`TcpStream::recv`] does.
-    ///
-    /// # Errors
-    ///
-    /// As for [`TcpStream::recv`].
-    pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
-        let read = &mut *self.read;
-        submit(buffer, |driver, buffer| driver.recv(read, buffer))
-    }
-}
-
-/// The write half of a [`TcpStream`]: its sends borrow it.
-#[derive(Debug)]
-pub struct WriteHalf<'a> {
-    write: &'a mut driver::WriteHalf,
-    _home: Home,
-}
-
-impl WriteHalf<'_> {
-    /// Sends the bytes of `lease`, as [`TcpStream::send`] does.
-    ///
-    /// # Errors
-    ///
-    /// As for [`TcpStream::send`].
-    pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
-        let write = &mut *self.write;
-        submit(lease, |driver, lease| driver.send(write, lease))
-    }
-
-    /// Sends the bytes of `regions` in order, as [`TcpStream::send_vectored`] does.
-    ///
-    /// # Errors
-    ///
-    /// As for [`TcpStream::send_vectored`].
-    pub fn send_vectored(
-        &mut self,
-        regions: Regions,
-    ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
-        let write = &mut *self.write;
-        submit(regions, |driver, regions| driver.send_vectored(write, regions))
-    }
-
-    /// Ends the write direction after the sent bytes, as [`TcpStream::shutdown_write`] does.
-    ///
-    /// # Errors
-    ///
-    /// As for [`TcpStream::shutdown_write`].
-    pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
-        let write = &mut *self.write;
-        submit((), |driver, ()| driver.shutdown_write(write))
     }
 }

@@ -6,9 +6,9 @@ it, and end it. The type is `rsasync::driver::Driver`. rsasync is in development
 releases are on crates.io.
 
 The driver has TCP bind, connect, accept, receive, send, half-close, and close. It also has UDP
-datagrams with their metadata, local streams at a path, the receive, send, and close of pipe ends,
+datagrams with their metadata, IPC (inter-process communication) streams at a path, the receive, send, and close of pipe ends,
 files, and child processes. The other operations come in later changes. [TCP on the driver](tcp.md),
-[UDP on the driver](udp.md), [Local streams on the driver](local-streams.md),
+[UDP on the driver](udp.md), [IPC streams on the driver](ipc-streams.md),
 [Pipes on the driver](pipes.md), [Files on the driver](files.md), and
 [Child processes on the driver](processes.md) are the references for each operation and its
 results.
@@ -16,7 +16,7 @@ results.
 The driver needs the `std` feature, and Linux on x86_64 or aarch64, macOS on aarch64, or Windows on
 x86_64. On Linux, it runs on io_uring, and on [epoll](epoll.md) where the kernel refuses io_uring,
 with the same operations. On macOS, it runs TCP, UDP, and files on [kqueue](kqueue.md), and on
-Windows TCP, UDP, files, and local streams (named pipes) on an [I/O completion port](iocp.md), with
+Windows TCP, UDP, files, and IPC streams (named pipes) on an [I/O completion port](iocp.md), with
 the reads, writes, and syncs of files on an [I/O ring](iocp.md#ioring-files) where the system has
 one. The other operations of this page
 have no macOS or Windows form yet. It does not need

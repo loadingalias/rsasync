@@ -1,4 +1,5 @@
-//! The I/O types of a local owner: TCP and UDP resources that a task uses with no driver argument.
+//! The I/O types of a local owner: TCP, UDP, file, IPC stream, pipe, and child process resources,
+//! and signal streams, that a task uses with no driver argument.
 //!
 //! A worker of a [`Runtime`](crate::runtime::Runtime), and the owner of
 //! [`Runtime::block_on`](crate::runtime::Runtime::block_on), each have a driver. A call of this
@@ -19,7 +20,7 @@
 //! to_other_thread(TcpListener::bind("127.0.0.1:0".parse().unwrap(), TcpOptions::default()));
 //! ```
 //!
-//! Each call has the meaning of its [`driver`](crate::driver) call, and gives the same [`Operation`]
+//! Each call has the meaning of its [`driver`] call, and gives the same [`Operation`]
 //! future:
 //!
 //! - The call gives `Err(Refused)` before the wait, with what the caller gave, such as the buffer
@@ -62,13 +63,22 @@ use core::marker::PhantomData;
 use core::mem::DropGuard;
 use std::io;
 
-use crate::driver::{Cleanup, Closed, Driver, Reason, Refused};
+use crate::buffer::{Backing, Lease};
+use crate::driver::{self, Cleanup, Driver, Reason, Refused, Regions};
 use crate::task::with_driver;
 
+pub mod file;
+pub mod ipc;
+pub mod pipe;
+pub mod process;
 pub mod tcp;
 pub mod udp;
 
 pub use crate::driver::Operation;
+pub use file::{Directory, File, rename, unlink};
+pub use ipc::{IpcListener, IpcStream};
+pub use pipe::{PipeReader, PipeWriter};
+pub use process::Child;
 pub use tcp::{TcpListener, TcpStream};
 pub use udp::UdpSocket;
 
@@ -103,10 +113,10 @@ impl<R> Homed<R> {
 
     /// Closes the resource with `close`, whose future gets the report. A refusal gives the resource
     /// back with its home, so its drop still closes it.
-    fn close(
+    fn close<T>(
         self,
-        close: impl FnOnce(&mut Driver, R) -> Result<Operation<'static, Closed>, Refused<R>>,
-    ) -> Result<Operation<'static, Closed>, Refused<Self>> {
+        close: impl FnOnce(&mut Driver, R) -> Result<Operation<'static, T>, Refused<R>>,
+    ) -> Result<Operation<'static, T>, Refused<Self>> {
         let Self {
             resource,
             cleanup,
@@ -124,6 +134,84 @@ impl<R> Homed<R> {
             })),
         }
     }
+}
+
+/// The read half of a stream of this module, a [`TcpStream`] or an [`IpcStream`]: its receives
+/// borrow it.
+#[derive(Debug)]
+pub struct ReadHalf<'a> {
+    read: &'a mut driver::ReadHalf,
+    _home: Home,
+}
+
+impl ReadHalf<'_> {
+    /// Receives into the capacity of `buffer` after its initialized bytes, as
+    /// [`TcpStream::recv`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`].
+    pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
+        let read = &mut *self.read;
+        submit(buffer, |driver, buffer| driver.recv(read, buffer))
+    }
+}
+
+/// The write half of a stream of this module, a [`TcpStream`] or an [`IpcStream`]: its sends
+/// borrow it.
+#[derive(Debug)]
+pub struct WriteHalf<'a> {
+    write: &'a mut driver::WriteHalf,
+    _home: Home,
+}
+
+impl WriteHalf<'_> {
+    /// Sends the bytes of `lease`, as [`TcpStream::send`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::send`].
+    pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
+        let write = &mut *self.write;
+        submit(lease, |driver, lease| driver.send(write, lease))
+    }
+
+    /// Sends the bytes of `regions` in order, as [`TcpStream::send_vectored`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::send_vectored`].
+    pub fn send_vectored(
+        &mut self,
+        regions: Regions,
+    ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
+        let write = &mut *self.write;
+        submit(regions, |driver, regions| driver.send_vectored(write, regions))
+    }
+
+    /// Ends the write direction after the sent bytes, as [`TcpStream::shutdown_write`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::shutdown_write`].
+    pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
+        let write = &mut *self.write;
+        submit((), |driver, ()| driver.shutdown_write(write))
+    }
+}
+
+/// A stream of `signal`, whose home is the driver of the owner of this thread, as
+/// [`Driver::signal`] gives it. The stream can move to another thread: a turn of its home wakes it.
+///
+/// # Errors
+///
+/// The [`SignalError`](driver::SignalError) of the driver, and `NoDriver` when no driver runs on
+/// this thread.
+pub fn signal(
+    signal: driver::Signal,
+    escalation: driver::Escalation,
+) -> Result<driver::SignalStream, driver::SignalError> {
+    with_driver((), |driver, ()| driver.signal(signal, escalation)).unwrap_or(Err(driver::SignalError::NoDriver))
 }
 
 /// Calls `f` with the driver of the owner of this thread and `value`. With no driver, it refuses

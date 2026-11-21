@@ -1,6 +1,6 @@
 //! The declarations of the wake descriptor, `eventfd`, of `poll`, which the probe of the
 //! descriptor uses, of `fcntl`, which the adoption of a pipe end uses, of the file calls, of
-//! `connect`, which the poller and local streams use, and of `syscall`, from the C library, glibc
+//! `connect`, which the poller and IPC streams use, and of `syscall`, from the C library, glibc
 //! or musl. Child processes have their own declarations (`process/sys.rs`).
 //!
 //! Each item agrees with `sys/eventfd.h`, `poll.h`, and `fcntl.h` of glibc and musl, and with

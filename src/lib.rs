@@ -75,7 +75,7 @@ mod table;
 mod wait;
 
 pub mod clock;
-/// The TCP and UDP types of a local owner, on Linux, where the runtime has its workers.
+/// The I/O types of a local owner, on Linux, where the runtime has its workers.
 #[cfg(all(
     feature = "local",
     target_os = "linux",

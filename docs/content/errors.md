@@ -65,7 +65,7 @@ The errors of `rsasync::runtime`, on Linux (see [Runtime](runtime.md)).
 
 | Error | When | Recovery |
 | --- | --- | --- |
-| `StartFailure` | `Builder::build` failed. `cause()` gives a `Cause`, and `cleanup()` the `Outcome` of each worker that started | See [A failed start](runtime.md#a-failed-start) |
+| `StartFailure` | `Builder::build` failed. `cause()` gives a `Cause`, and `cleanup()` the `Outcome` of each worker that started. `Cause::Blocking` says that the blocking service did not start | See [A failed start](runtime.md#a-failed-start) |
 | `PlanError` | A setting is invalid, or a strict placement falls back | See [Placement](runtime.md#placement) |
 | `BlockOnError<F>` | `Runtime::block_on` got no task tables or timers, and `into_root` gives the root back, or its driver did not start (`Start`, with the `driver::Error`), or its driver failed (`Driver`) | See [Run the calling thread with block_on](runtime.md#run-the-calling-thread-with-block_on) |
 | `GroupError` | `Handle::tcp_group` or `Handle::udp_group` started no group: `Budget`, `Allocation`, or `Channel` for the state of the start, or `Spawn`, `Refused`, `Bind`, or `Ended` with the worker | See [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker). Each member that bound closed |
@@ -151,7 +151,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::Unsupported` | The operation does not apply to the resource | Use an operation of that resource |
 | `Refused` with `Reason::Alignment` | A direct-I/O buffer, length, or offset is not aligned | Align each one to the `Alignment` of the file |
 | `Refused` with `Reason::Register` | epoll did not take the descriptor, for example at the limit of `fs.epoll.max_user_watches`. On macOS, [kqueue](kqueue.md) refused the registration. On Windows, the association of a socket with the [port](iocp.md) failed | The refusal gives the descriptor back, open. Close other resources, or raise the limit |
-| `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`. `Driver::report` gives the route of each call |
+| `Refused` with `Reason::Blocking` | The operation needs the blocking service, and it has none or it refused | Give a service with `Driver::use_blocking`, or keep the service of the runtime (`Builder::blocking`). `Driver::report` gives the route of each call |
 | `Refused` with `Reason::Allocation` | The allocator did not give the memory of the operation, such as its job on the blocking service | Try again when memory is free |
 | `Ended` | The driver ended before the operation gave its result | Keep the driver driven until each future takes its result |
 | `ControlError` | A call of the `Control` of a driver under controlled delivery changed nothing: `OtherDriver`, `NoCompletion`, `Full`, `NoCode`, or `NoRegistration` | See [Control calls](controlled-delivery.md#control-calls) |
@@ -159,6 +159,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `SignalError::Full` | Each of the 64 streams of the process is in use | Close a stream, then try again |
 | `SignalError::Escalation` | An `Escalation::At` on a signal whose default action does not end the process | Register the signal with `Escalation::Never` |
 | `SignalError::Allocation` | The allocator did not give the memory of the stream | Register the stream when memory is free |
+| `SignalError::NoDriver` | `rsasync::local::signal` found no driver on its thread | Register the stream in a task or the root of a `Runtime` |
 | `SignalChildError::Reaped` | The driver reaped the child, so no process has its identity for the driver | Take the status with `Child::wait` |
 | `SignalChildError::OtherDriver` | Another driver spawned or adopted the child | Signal the child through that driver |
 | `SignalChildError::NoTree` | A tree call on a child with no process tree | Spawn with `ChildOptions::tree(true)`, or signal the child alone |

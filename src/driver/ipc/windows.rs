@@ -1,4 +1,4 @@
-//! Local streams on Windows: byte-mode named pipes at `\\.\pipe\<name>`.
+//! IPC streams on Windows: byte-mode named pipes at `\\.\pipe\<name>`.
 //!
 //! A listener holds [`BACKLOG`] instances of its pipe, which wait for clients, as the queue of a
 //! listening socket does. The first instance takes the name (`FILE_FLAG_FIRST_PIPE_INSTANCE`), so a
@@ -284,7 +284,7 @@ pub(crate) fn connect(name: &[u16]) -> Result<OwnedHandle, i32> {
 
 /// What the driver knows of the user of the client of an accepted pipe stream. Windows has the
 /// user of a client when it has its security context: a client of static tracking, as one of
-/// `connect_local`, gives it at the open, and a client of dynamic tracking, the default of
+/// `connect_ipc`, gives it at the open, and a client of dynamic tracking, the default of
 /// `CreateFileW`, at its first write. The driver reads the user one time, at the accept or at the
 /// first receive that takes data, and keeps it for the life of the stream, as Unix records it at
 /// the connect.
@@ -294,7 +294,7 @@ pub(crate) enum Client {
     Pending,
     /// The user that the driver read.
     Known(Sid),
-    /// The Win32 error of the read of the user, which `local_peer` gives.
+    /// The Win32 error of the read of the user, which `ipc_peer` gives.
     Failed(i32),
 }
 

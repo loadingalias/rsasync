@@ -261,7 +261,7 @@ pub(super) struct Local {
     /// The limits of the driver that this owner makes at the first operation that needs a home,
     /// if it has no driver.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub(super) lazy: Cell<Option<crate::driver::Config>>,
+    pub(super) lazy: Cell<Option<(crate::driver::Config, Option<crate::blocking::Submitter>)>>,
     /// The owner has a driver, so the messages of its outbox go out at its next turn or wait.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) sends: Cell<bool>,

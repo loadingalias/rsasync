@@ -815,7 +815,7 @@ fn again_poll(slot: &Slot) -> Option<Sqe> {
 }
 
 /// The output of a spawn: the child, or the error of the spawn.
-fn spawned_child(result: i32, held: Held) -> Option<io::Result<Child>> {
+pub(crate) fn spawned_child(result: i32, held: Held) -> Option<io::Result<Child>> {
     Some(match held.payload {
         Payload::Spawn { child: Some(child), .. } if result >= 0 => Ok(child),
         _ => Err(io::Error::from_raw_os_error(

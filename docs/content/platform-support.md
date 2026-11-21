@@ -41,7 +41,7 @@ cargo run -p driver_only
 Each test command ran 276 tests of the whole workspace, and the glibc command also ran the doctests.
 Six tests need root or `CAP_SYS_TIME`, so they did not run. The last command runs the example of
 [Drive the I/O driver yourself](driver-only.md#run-the-example), and it printed the documented
-output on each host. The tests cover file, TCP, UDP, local stream, and pipe operations on owned
+output on each host. The tests cover file, TCP, UDP, IPC stream, and pipe operations on owned
 buffers, child processes, signal streams, cancellation, close, teardown, and the capability report.
 The negative-path cases also ran with injected completions, from the test seam that
 [controlled delivery](controlled-delivery.md) replaced. Debian 12 and Ubuntu 26.04 take
@@ -73,7 +73,7 @@ check that a dropped receive keeps its datagram. The [file](files.md) tests, on 
 at an offset, also vectored and with direct I/O, read exactly, inspect and change the length,
 preallocate, punch holes, sync, rename, unlink, and sync a directory. The length change runs on the
 ring on Ubuntu 26.04, and on the blocking service on Debian 12. They also check that a dropped write
-changes the file and keeps its lease until its completion. The [local stream](local-streams.md)
+changes the file and keeps its lease until its completion. The [IPC stream](ipc-streams.md)
 tests bind at a path with a socket file of mode 0600, refuse the path of a live listener, replace
 only a stale socket file, refuse a path that does not fit a socket address, and carry a numbered
 stream with no gap through a dropped accept, send, and receive. Run as root on Debian 12 on x86_64,
@@ -122,7 +122,7 @@ nodes and domains has only the test of the plan on the facts of such a host.
 
 ## macOS
 
-The driver runs TCP, UDP, local streams, [pipes](pipes.md), [child processes](processes.md),
+The driver runs TCP, UDP, IPC streams, [pipes](pipes.md), [child processes](processes.md),
 [signal streams](signals.md), and files on macOS on aarch64 (`aarch64-apple-darwin`), on
 [kqueue](kqueue.md), in driver-only use. The files run on your blocking service, with the macOS
 calls of [Files](kqueue.md#files). The datagram calls of `rsnetwork-udp` also support macOS on aarch64:
@@ -160,7 +160,7 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 ## Windows
 
 The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
-[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP, UDP, files, and local
+[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP, UDP, files, and IPC
 streams on Windows x86_64, on an [I/O completion port](iocp.md), in driver-only use. Where the
 system has an I/O ring of version 3, the reads, writes, and syncs of files run on the ring
 ([IoRing files](iocp.md#ioring-files)). The files run on NTFS, with the other file calls on your

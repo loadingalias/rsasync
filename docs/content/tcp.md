@@ -214,7 +214,7 @@ same as on the driver.
 | `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
 | `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
 
-`stream.split()` gives a `rsasync::local::tcp::ReadHalf` and a `WriteHalf`, so a receive and a
+`stream.split()` gives a `rsasync::local::ReadHalf` and a `WriteHalf`, so a receive and a
 send run at one time. A receive into a buffer that the kernel selects is not a local call yet: it
 needs a pool on each worker.
 

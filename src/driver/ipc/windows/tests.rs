@@ -11,7 +11,7 @@ use super::super::super::iocp::sys;
 use super::super::super::suite::{self, Backend};
 use super::super::super::tests::{drive, hold, numbered, posted};
 use super::super::super::{Config, Delivery, Driver, Reason, Regions};
-use super::super::{LocalListener, LocalStream, Stale};
+use super::super::{IpcListener, IpcStream, Stale};
 use crate::buffer::{Backing, Buffer as _, Lease};
 
 /// The pipe name of the case `case`, which no other test process uses.
@@ -19,15 +19,15 @@ fn pipe(case: &str) -> PathBuf {
     PathBuf::from(alloc::format!(r"\\.\pipe\rsasync-{case}-{}", std::process::id()))
 }
 
-/// Binds a local listener at `path` with `stale`, and gives the result of the bind.
-fn bind(driver: &mut Driver, path: &Path, stale: Stale) -> io::Result<LocalListener> {
-    let bind = driver.bind_local(path, stale).expect("the test driver has room");
+/// Binds an IPC listener at `path` with `stale`, and gives the result of the bind.
+fn bind(driver: &mut Driver, path: &Path, stale: Stale) -> io::Result<IpcListener> {
+    let bind = driver.bind_ipc(path, stale).expect("the test driver has room");
     drive(driver, bind).expect("the driver runs")
 }
 
-/// Connects a local stream to the listener at `path`, and gives the result of the connect.
-fn connect(driver: &mut Driver, path: &Path) -> io::Result<LocalStream> {
-    let connect = driver.connect_local(path).expect("the test driver has room");
+/// Connects an IPC stream to the listener at `path`, and gives the result of the connect.
+fn connect(driver: &mut Driver, path: &Path) -> io::Result<IpcStream> {
+    let connect = driver.connect_ipc(path).expect("the test driver has room");
     drive(driver, connect).expect("the driver runs")
 }
 
@@ -37,7 +37,7 @@ fn client(path: &Path) -> io::Result<fs::File> {
 }
 
 /// Receives on `stream` into buffers of `capacity` bytes until the end of the stream.
-fn receive_all(driver: &mut Driver, stream: &mut LocalStream, capacity: usize) -> Vec<u8> {
+fn receive_all(driver: &mut Driver, stream: &mut IpcStream, capacity: usize) -> Vec<u8> {
     let mut received = Vec::new();
     loop {
         let receive = driver
@@ -63,14 +63,14 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_named_pipe_with_no_gap_thro
     let path = pipe("stream");
     let mut driver = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let id = hold(&mut driver, &accept);
     driver.turn().unwrap();
     let mut peer = client(&path).unwrap();
     posted(&mut driver, id).unwrap();
     drop(accept);
     driver.turn().unwrap();
-    let next = driver.accept_local(&mut listener).unwrap();
+    let next = driver.accept_ipc(&mut listener).unwrap();
     let mut stream = drive(&mut driver, next).unwrap().unwrap();
     assert_eq!(
         driver.shutdown_write(&mut stream).unwrap_err().reason(),
@@ -83,7 +83,7 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_named_pipe_with_no_gap_thro
     regions.push(Lease::from(numbered(1300, 700)));
     let vectored = driver.send_vectored(&mut stream, regions).unwrap();
     assert_eq!(drive(&mut driver, vectored).unwrap().0.unwrap(), 1000);
-    let close = driver.close_local(stream).unwrap();
+    let close = driver.close_ipc(stream).unwrap();
     drive(&mut driver, close).unwrap();
     let mut received = Vec::new();
     peer.read_to_end(&mut received).unwrap();
@@ -92,7 +92,7 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_named_pipe_with_no_gap_thro
 
     // A write of the client is in the buffer of the pipe when it returns, so the first receive
     // takes 600 bytes, and 400 bytes wait for the forgotten receive.
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     driver.turn().unwrap();
     let mut peer = client(&path).unwrap();
     let mut stream = drive(&mut driver, accept).unwrap().unwrap();
@@ -137,7 +137,7 @@ fn this_user() -> String {
 }
 
 /// Receives on `stream` into a buffer of 8 bytes, and gives the bytes.
-fn receive(driver: &mut Driver, stream: &mut LocalStream) -> Vec<u8> {
+fn receive(driver: &mut Driver, stream: &mut IpcStream) -> Vec<u8> {
     let receive = driver.recv(stream, Backing::from(Vec::with_capacity(8))).unwrap();
     let (count, buffer) = drive(driver, receive).unwrap();
     count.unwrap();
@@ -148,7 +148,7 @@ fn receive(driver: &mut Driver, stream: &mut LocalStream) -> Vec<u8> {
 /// keeps. A client of dynamic tracking, here of `std::fs`, gives `ERROR_CANNOT_IMPERSONATE` until
 /// the first receive takes its data, then its user, as `whoami` gives it, and the user stays after
 /// a later write. A client in another process, here PowerShell, gives its process ID. A client of
-/// `connect_local` gives its user at the accept, and its stream gives the identity of its server,
+/// `connect_ipc` gives its user at the accept, and its stream gives the identity of its server,
 /// this process: its process ID and the owner of the pipe, the user of this process.
 pub(in crate::driver) fn an_accepted_stream_reports_the_process_and_user_of_its_client(backend: Backend) {
     let path = pipe("peer");
@@ -156,22 +156,22 @@ pub(in crate::driver) fn an_accepted_stream_reports_the_process_and_user_of_its_
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
     let user = this_user();
 
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     driver.turn().unwrap();
     let mut peer = client(&path).unwrap();
     let mut stream = drive(&mut driver, accept).unwrap().unwrap();
-    let early = driver.local_peer(&stream).unwrap_err();
+    let early = driver.ipc_peer(&stream).unwrap_err();
     assert_eq!(early.raw_os_error(), Some(ERROR_CANNOT_IMPERSONATE), "{early}");
     peer.write_all(&[1]).unwrap();
     assert_eq!(receive(&mut driver, &mut stream), [1]);
-    let first = driver.local_peer(&stream).unwrap();
+    let first = driver.ipc_peer(&stream).unwrap();
     assert_eq!(first.process(), Some(std::process::id()));
     assert_eq!(alloc::format!("{}", first.user()), user);
     peer.write_all(&[2]).unwrap();
     assert_eq!(receive(&mut driver, &mut stream), [2]);
-    assert_eq!(driver.local_peer(&stream).unwrap(), first);
+    assert_eq!(driver.ipc_peer(&stream).unwrap(), first);
 
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let name = path.to_str().unwrap().trim_start_matches(r"\\.\pipe\");
     // The client connects, writes one byte, and waits until its input ends.
     let script = alloc::format!(
@@ -185,19 +185,19 @@ pub(in crate::driver) fn an_accepted_stream_reports_the_process_and_user_of_its_
         .unwrap();
     let mut stream = drive(&mut driver, accept).unwrap().unwrap();
     assert_eq!(receive(&mut driver, &mut stream), [7]);
-    let peer = driver.local_peer(&stream).unwrap();
+    let peer = driver.ipc_peer(&stream).unwrap();
     assert_eq!(peer.process(), Some(child.id()));
     assert_eq!(alloc::format!("{}", peer.user()), user);
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
 
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let connected = connect(&mut driver, &path).unwrap();
     let accepted = drive(&mut driver, accept).unwrap().unwrap();
-    let peer = driver.local_peer(&accepted).unwrap();
+    let peer = driver.ipc_peer(&accepted).unwrap();
     assert_eq!(peer.process(), Some(std::process::id()));
     assert_eq!(alloc::format!("{}", peer.user()), user);
-    let server = driver.local_peer(&connected).unwrap();
+    let server = driver.ipc_peer(&connected).unwrap();
     assert_eq!(server.process(), Some(std::process::id()));
     assert_eq!(alloc::format!("{}", server.user()), user);
 }
@@ -222,7 +222,7 @@ pub(in crate::driver) fn a_burst_of_backlog_clients_connects_and_each_one_is_acc
         io::ErrorKind::ResourceBusy
     );
     for number in 0..clients.len() {
-        let accept = driver.accept_local(&mut listener).unwrap();
+        let accept = driver.accept_ipc(&mut listener).unwrap();
         let mut stream = drive(&mut driver, accept).unwrap().unwrap();
         let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
         let (count, buffer) = drive(&mut driver, receive).unwrap();
@@ -231,7 +231,7 @@ pub(in crate::driver) fn a_burst_of_backlog_clients_connects_and_each_one_is_acc
             (1, &[u8::try_from(number).unwrap()][..])
         );
     }
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let _late = connect(&mut driver, &path).unwrap();
     drive(&mut driver, accept).unwrap().unwrap();
 }
@@ -278,7 +278,7 @@ pub(in crate::driver) fn a_bind_refuses_a_pipe_name_with_an_instance_also_one_th
         let error = bind(&mut driver, &path, stale).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
     }
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
 
     let path = pipe("squatted");
@@ -289,7 +289,7 @@ pub(in crate::driver) fn a_bind_refuses_a_pipe_name_with_an_instance_also_one_th
     }
     drop(squatter);
     let listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
 }
 
@@ -305,7 +305,7 @@ pub(in crate::driver) fn a_remote_client_of_a_pipe_is_rejected(backend: Backend)
     let path = pipe("remote");
     let mut driver = suite::driver(Config::new(), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     driver.turn().unwrap();
     assert!(client(&remote(&path)).is_err(), "a remote client opened the pipe");
     client(&path).unwrap();
@@ -318,15 +318,15 @@ pub(in crate::driver) fn a_waiting_accept_ends_at_the_close_of_its_listener_and_
     let path = pipe("cancel");
     let mut driver = suite::driver(Config::new(), backend);
     let mut listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     driver.turn().unwrap();
     // The accept borrows the listener, so the close comes after the drop of the future, which asks
     // for the cancel, as a close does.
     drop(accept);
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
     let listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
 }
 
@@ -348,7 +348,7 @@ pub(in crate::driver) fn a_path_that_is_not_a_pipe_name_gives_invalid_input(back
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}: {error}");
     }
     let listener = bind(&mut driver, Path::new(&long), Stale::Refuse).unwrap();
-    let close = driver.close_local_listener(listener).unwrap();
+    let close = driver.close_ipc_listener(listener).unwrap();
     drive(&mut driver, close).unwrap();
 }
 
@@ -411,7 +411,7 @@ pub(in crate::driver) fn a_connect_of_a_second_os_user_is_denied(backend: Backen
     assert_ne!(unsafe { sys::RevertToSelf() }, 0);
     assert_eq!(denied.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
 
-    let accept = driver.accept_local(&mut listener).unwrap();
+    let accept = driver.accept_ipc(&mut listener).unwrap();
     let _stream = connect(&mut driver, &path).unwrap();
     drive(&mut driver, accept).unwrap().unwrap();
 }
@@ -463,7 +463,7 @@ pub(in crate::driver) fn a_client_reads_the_process_and_user_of_a_server_of_a_se
 
     let mut driver = suite::driver(Config::new(), backend);
     let stream = connect(&mut driver, &path).unwrap();
-    let peer = driver.local_peer(&stream).unwrap();
+    let peer = driver.ipc_peer(&stream).unwrap();
     assert_eq!(peer.process(), Some(std::process::id()));
     assert_eq!(alloc::format!("{}", peer.user()), sid_of(&user));
     drop(server);

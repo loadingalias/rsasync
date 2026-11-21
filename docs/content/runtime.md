@@ -49,6 +49,7 @@ Each setting has a default:
 | `placement(placement, selection)` | `Domain`, `Permissive` | Where the workers run. See [Placement](#placement) |
 | `seed(seed)` or `generator(generator)` | A seed from the operating system | The generator of the runtime. See [Random values](#random-values) |
 | `handles(n)` | 64 | The handles that can exist at one time |
+| `blocking(config)` | `Some(blocking::Config::new())`: 4 threads, 64 jobs, 2 MiB of stack each | The blocking service of the runtime, or `None` for no service. See [The blocking service](#the-blocking-service) |
 
 ## How a start works
 
@@ -58,7 +59,9 @@ Each setting has a default:
    `/sys/devices/system`, and the CPU limit of the cgroup.
 2. It resolves the placement of each worker. A strict placement that falls back refuses here.
 3. It reads the seed from the kernel with `getrandom(2)`, unless `seed` or `generator` gives one.
-4. It starts the workers one at a time. Each worker binds its thread, makes its driver, its task
+4. It starts the blocking service, unless `blocking(None)` turns it off. A failure gives
+   `Cause::Blocking` with the `blocking::Error`, and no worker starts.
+5. It starts the workers one at a time. Each worker binds its thread, makes its driver, its task
    tables, and its timers on that thread, and then reports that it is ready. The next worker
    starts only after that report.
 
@@ -141,8 +144,14 @@ timers, driver, and generator. A waker of the call that you keep after the retur
 descriptor of that driver, and a wake through it does nothing.
 
 The tasks of an owner reach its driver only through types that own their resources, so no task
-can replace the driver that the owner waits in. These are the types of `rsasync::local`: see
-[TCP from a task](tcp.md#use-tcp-from-a-task) and [UDP from a task](udp.md#use-udp-from-a-task).
+can replace the driver that the owner waits in. These are the types of `rsasync::local`:
+
+- [TCP from a task](tcp.md#use-tcp-from-a-task) and [UDP from a task](udp.md#use-udp-from-a-task)
+- [Files from a task](files.md#use-files-from-a-task)
+- [IPC streams from a task](ipc-streams.md#use-ipc-streams-from-a-task)
+- [Pipes from a task](pipes.md#use-pipes-from-a-task)
+- [Child processes from a task](processes.md#use-child-processes-from-a-task)
+- [Signals from a task](signals.md#use-signals-from-a-task)
 
 `block_on` gives a `BlockOnError` when the owner gets no task tables (`Owner`) or no timers
 (`Timers`, `Time`), when its driver does not start (`Start`), or when its driver fails (`Driver`).
@@ -334,9 +343,24 @@ if let Outcome::Completed(draw) = task.join_blocking() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## The blocking service
+
+A runtime owns one bounded [blocking service](blocking-service.md), which each driver of the
+runtime uses: each worker, and the driver of each `block_on`. A spawn of a child runs on it, and
+so does each file call that the backend has no operation for (`Route::BlockingService`). On epoll,
+for example in a container that refuses io_uring, that is each file call. The budget of the runtime
+charges the service, and `runtime.report()` does not list it.
+
+- `handle.blocking()` gives the `blocking::Submitter` of the service for your own blocking work,
+  such as a name lookup. A full service gives the job back with the reason.
+- `blocking(None)` starts no service. Those calls then refuse with `Reason::Blocking`, and
+  `handle.blocking()` gives `None`.
+
 ## Stop a runtime
 
 A drop of the runtime stops each worker. The worker closes its inbox, ends each factory that waits
 there with `Outcome::Cancelled`, cancels each of its tasks, waits until each one ended, tears its
-driver down, and ends its thread. The drop then joins each thread. A drop waits for each task, so a
-task that never returns from its poll stops the drop. The drop gives no report.
+driver down, and ends its thread. The drop then joins each thread. Then it tears the blocking
+service down: a job of its queue drops with no run, and the drop waits for each running job. So a
+task that never returns from its poll, or a job that never returns, stops the drop. The drop gives
+no report.

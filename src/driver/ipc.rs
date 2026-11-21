@@ -1,9 +1,9 @@
-//! Local streams on the driver: Unix-domain stream sockets at a path on Linux and macOS, and
+//! IPC (inter-process communication) streams on the driver: Unix-domain stream sockets at a path on Linux and macOS, and
 //! byte-mode named pipes on Windows ([`windows`]), under the stream rules of TCP.
 //!
-//! A local stream has the directions of a TCP stream ([`ReadHalf`] and [`WriteHalf`]), so the
+//! An IPC stream has the directions of a TCP stream ([`ReadHalf`] and [`WriteHalf`]), so the
 //! receive, send, vectored send, and half-close operations of [`TcpStream`](super::TcpStream)
-//! serve it, with the same rules for a dropped, forgotten, or cancelled operation. A local
+//! serve it, with the same rules for a dropped, forgotten, or cancelled operation. An IPC
 //! listener has the rules of a [`TcpListener`](super::TcpListener). A named pipe has no
 //! half-close.
 
@@ -63,7 +63,7 @@ const OWNER_ONLY: u16 = 0o600;
 /// [`Driver::send`], [`Driver::send_vectored`], and [`Driver::shutdown_write`] take it, with the
 /// rules of a TCP stream for a dropped, forgotten, or cancelled operation.
 ///
-/// A request and its reply over a local stream, with `run` as in
+/// A request and its reply over an IPC stream, with `run` as in
 /// [`Operation`](super::Operation):
 ///
 /// ```no_run
@@ -90,15 +90,15 @@ const OWNER_ONLY: u16 = 0o600;
 /// let mut driver = Driver::new(Config::new())?;
 /// let path = std::env::temp_dir().join("service.sock");
 /// // The socket file has mode 0600. A file that a closed listener left is replaced.
-/// let bind = driver.bind_local(&path, Stale::Replace)?;
+/// let bind = driver.bind_ipc(&path, Stale::Replace)?;
 /// let mut listener = run(&mut driver, bind)???;
 ///
-/// let connect = driver.connect_local(&path)?;
+/// let connect = driver.connect_ipc(&path)?;
 /// let mut client = run(&mut driver, connect)???;
-/// let accept = driver.accept_local(&mut listener)?;
+/// let accept = driver.accept_ipc(&mut listener)?;
 /// let mut server = run(&mut driver, accept)???;
 /// // The kernel recorded the user and the process of the client at its connect.
-/// assert_eq!(driver.local_peer(&server)?.process(), Some(std::process::id()));
+/// assert_eq!(driver.ipc_peer(&server)?.process(), Some(std::process::id()));
 ///
 /// let send = driver.send(&mut client, Lease::from(b"ping".to_vec()))?;
 /// let (sent, _lease) = run(&mut driver, send)??;
@@ -108,26 +108,48 @@ const OWNER_ONLY: u16 = 0o600;
 /// assert_eq!((received?, buffer.bytes()), (4, &b"ping"[..]));
 ///
 /// for stream in [client, server] {
-///     let close = driver.close_local(stream)?;
+///     let close = driver.close_ipc(stream)?;
 ///     run(&mut driver, close)??;
 /// }
-/// let close = driver.close_local_listener(listener)?;
+/// let close = driver.close_ipc_listener(listener)?;
 /// run(&mut driver, close)??;
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct LocalStream {
+pub struct IpcStream {
     read: ReadHalf,
     write: WriteHalf,
 }
 
-impl LocalStream {
+/// The output of a bind of an IPC listener.
+pub(crate) fn ipc_bound(result: i32, held: Held) -> Option<io::Result<IpcListener>> {
+    Some(tcp::count(result).and_then(|_| {
+        let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
+        Ok(IpcListener { resource })
+    }))
+}
+
+/// The output of a connect or an accept of an IPC stream.
+pub(crate) fn ipc_connected(result: i32, held: Held) -> Option<io::Result<IpcStream>> {
+    Some(tcp::count(result).and_then(|_| {
+        let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
+        Ok(IpcStream::new(resource))
+    }))
+}
+
+impl IpcStream {
     fn new(resource: Resource) -> Self {
         Self {
             read: ReadHalf { resource },
             write: WriteHalf { resource },
         }
+    }
+
+    /// The resource of the stream, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.read.resource
     }
 
     /// The read half and the write half, so that a receive and a send can run at one time.
@@ -136,13 +158,13 @@ impl LocalStream {
     }
 }
 
-impl AsMut<ReadHalf> for LocalStream {
+impl AsMut<ReadHalf> for IpcStream {
     fn as_mut(&mut self) -> &mut ReadHalf {
         &mut self.read
     }
 }
 
-impl AsMut<WriteHalf> for LocalStream {
+impl AsMut<WriteHalf> for IpcStream {
     fn as_mut(&mut self) -> &mut WriteHalf {
         &mut self.write
     }
@@ -155,11 +177,19 @@ impl AsMut<WriteHalf> for LocalStream {
 /// the cancel took effect stays with the listener, and the next accept gives it before it submits.
 /// A close of the listener closes it, and the socket file stays at its path.
 #[derive(Debug)]
-pub struct LocalListener {
+pub struct IpcListener {
     resource: Resource,
 }
 
-/// What a bind of a local listener does when its path exists.
+impl IpcListener {
+    /// The resource of the listener, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.resource
+    }
+}
+
+/// What a bind of an IPC listener does when its path exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stale {
     /// The bind gives `AddrInUse`.
@@ -177,7 +207,7 @@ pub enum Stale {
     Replace,
 }
 
-/// The OS identity of the peer of a local stream: `SO_PEERCRED` on Linux, `getpeereid` and
+/// The OS identity of the peer of an IPC stream: `SO_PEERCRED` on Linux, `getpeereid` and
 /// `LOCAL_PEERPID` on macOS, and on Windows the process ID that the system recorded at the connect
 /// of the pipe client and the user of the token of the client. Check the user to authorize a peer:
 /// the system recorded it at the connect on each system. On macOS, the process is advisory.
@@ -251,11 +281,11 @@ impl Driver {
     /// for a pipe name with an instance, `PermissionDenied` for a lock file of another user,
     /// another error of the system, or `OutOfMemory` when each resource slot of the driver is in
     /// use.
-    pub fn bind_local(
+    pub fn bind_ipc(
         &mut self,
         path: &Path,
         stale: Stale,
-    ) -> Result<Operation<'static, io::Result<LocalListener>>, Refused<()>> {
+    ) -> Result<Operation<'static, io::Result<IpcListener>>, Refused<()>> {
         let id = self.begin_now(Kind::Bind)?;
         #[cfg(unix)]
         {
@@ -275,12 +305,7 @@ impl Driver {
         }
         Ok(Operation::new(
             Completion::new(Arc::clone(&self.shared), id, false),
-            |result, held| {
-                Some(tcp::count(result).and_then(|_| {
-                    let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                    Ok(LocalListener { resource })
-                }))
-            },
+            ipc_bound,
         ))
     }
 
@@ -292,7 +317,7 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation. The future gives `InvalidInput`
-    /// for a path as for [`Driver::bind_local`], `NotFound` for a path with no file,
+    /// for a path as for [`Driver::bind_ipc`], `NotFound` for a path with no file,
     /// `ConnectionRefused` for a socket file with no listener, `ResourceBusy` for a live listener
     /// whose queue of connections that wait for an accept is full, so that a later connect can
     /// succeed, `PermissionDenied` for a socket file that the user of the process cannot write,
@@ -304,7 +329,7 @@ impl Driver {
     /// with no instance, `ResourceBusy` when each instance of the pipe has a client, so that a
     /// later connect can succeed, and `PermissionDenied` for a pipe that the user of this process
     /// cannot open, for example one of another user.
-    pub fn connect_local(&mut self, path: &Path) -> Result<Operation<'static, io::Result<LocalStream>>, Refused<()>> {
+    pub fn connect_ipc(&mut self, path: &Path) -> Result<Operation<'static, io::Result<IpcStream>>, Refused<()>> {
         let id = self.begin_now(Kind::Connect)?;
         #[cfg(unix)]
         {
@@ -330,16 +355,11 @@ impl Driver {
         }
         Ok(Operation::new(
             Completion::new(Arc::clone(&self.shared), id, false),
-            |result, held| {
-                Some(tcp::count(result).and_then(|_| {
-                    let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                    Ok(LocalStream::new(resource))
-                }))
-            },
+            ipc_connected,
         ))
     }
 
-    /// Accepts a connection on `listener`. The future gives the stream; [`Driver::local_peer`]
+    /// Accepts a connection on `listener`. The future gives the stream; [`Driver::ipc_peer`]
     /// gives the identity of its peer. A drop of the future asks for a cancel, and a connection
     /// that the accept took stays with the listener for the next accept. On Windows, the accept is
     /// one overlapped `ConnectNamedPipe` on the instance of the listener, which the stream then
@@ -349,17 +369,12 @@ impl Driver {
     ///
     /// A refusal when the driver has no room for the operation. The future gives an error of the
     /// system, or `OutOfMemory` when each resource slot of the driver is in use.
-    pub fn accept_local<'a>(
+    pub fn accept_ipc<'a>(
         &mut self,
-        listener: &'a mut LocalListener,
-    ) -> Result<Operation<'a, io::Result<LocalStream>>, Refused<()>> {
+        listener: &'a mut IpcListener,
+    ) -> Result<Operation<'a, io::Result<IpcStream>>, Refused<()>> {
         let completion = self.begin_accept(listener.resource)?;
-        Ok(Operation::new(completion, |result, held| {
-            Some(tcp::count(result).and_then(|_| {
-                let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                Ok(LocalStream::new(resource))
-            }))
-        }))
+        Ok(Operation::new(completion, ipc_connected))
     }
 
     /// The OS identity of the peer of `stream`. For an accepted stream, it is the process that
@@ -377,7 +392,7 @@ impl Driver {
     /// On Windows, the peer of an accepted stream is the process ID that the system recorded at the
     /// connect of the client, and the user of the token of the client, which the thread of the
     /// driver reads one time while it impersonates the client at the identification level, and
-    /// then keeps for the life of the stream. A client of [`Driver::connect_local`] gives its user
+    /// then keeps for the life of the stream. A client of [`Driver::connect_ipc`] gives its user
     /// at the accept. A client that opened the pipe with dynamic tracking, the default of
     /// `CreateFileW`, of `std::fs`, and of .NET, gives it at the first receive that takes its data.
     /// The peer of a connected stream is the process ID that the system recorded at the bind of the
@@ -390,7 +405,7 @@ impl Driver {
     /// data of a client of dynamic tracking, `ERROR_CANNOT_IMPERSONATE` (1368) as the raw OS error:
     /// receive the first bytes, then check the user, before you act on them.
     #[cfg(unix)]
-    pub fn local_peer(&self, stream: &LocalStream) -> io::Result<Peer> {
+    pub fn ipc_peer(&self, stream: &IpcStream) -> io::Result<Peer> {
         let fd = self
             .resources
             .borrow(stream.read.resource)
@@ -404,7 +419,7 @@ impl Driver {
     ///
     /// As above.
     #[cfg(target_os = "windows")]
-    pub fn local_peer(&self, stream: &LocalStream) -> io::Result<Peer> {
+    pub fn ipc_peer(&self, stream: &IpcStream) -> io::Result<Peer> {
         let owned = self
             .resources
             .slot(stream.read.resource)
@@ -429,7 +444,7 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal, with the stream, when the driver has no room for the operation.
-    pub fn close_local(&mut self, stream: LocalStream) -> Result<Operation<'static, Closed>, Refused<LocalStream>> {
+    pub fn close_ipc(&mut self, stream: IpcStream) -> Result<Operation<'static, Closed>, Refused<IpcStream>> {
         let resource = stream.read.resource;
         let completion = self.close_resource(resource, stream)?;
         Ok(Operation::new(completion, |_, held| held.closed))
@@ -442,10 +457,10 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal, with the listener, when the driver has no room for the operation.
-    pub fn close_local_listener(
+    pub fn close_ipc_listener(
         &mut self,
-        listener: LocalListener,
-    ) -> Result<Operation<'static, Closed>, Refused<LocalListener>> {
+        listener: IpcListener,
+    ) -> Result<Operation<'static, Closed>, Refused<IpcListener>> {
         let resource = listener.resource;
         let completion = self.close_resource(resource, listener)?;
         Ok(Operation::new(completion, |_, held| held.closed))

@@ -186,6 +186,10 @@ pub enum SignalError {
     Escalation,
     /// The allocator did not give the memory of the stream.
     Allocation,
+    /// A call of `rsasync::local` has no driver on this thread, as for
+    /// [`Reason::NoDriver`](super::Reason::NoDriver).
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    NoDriver,
 }
 
 impl fmt::Display for SignalError {
@@ -197,6 +201,8 @@ impl fmt::Display for SignalError {
             Self::Full => "each signal stream of the process is in use",
             Self::Escalation => "the default action of this signal does not end the process",
             Self::Allocation => "the allocator did not give the memory of the stream",
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            Self::NoDriver => "no driver runs on this thread for the call",
         })
     }
 }

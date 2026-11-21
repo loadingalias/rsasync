@@ -52,12 +52,12 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 On epoll, kqueue, IOCP, and IoRing, no feature is probed. So `Call::Bind`, `Call::BindUdp`,
 `Call::SetFileLen`, and `Call::WaitChild` take the route of the last column there.
 
-The identity of the peer of a local stream (`Driver::local_peer`) has one rule that only Windows
+The identity of the peer of an IPC stream (`Driver::ipc_peer`) has one rule that only Windows
 has: Windows gives the user of a named pipe client only after its security context exists. A
 client of the driver gives its user at the accept. A client of dynamic tracking, the default of
-`CreateFileW`, gives it at the first receive that takes its data, and before it `local_peer` gives
+`CreateFileW`, gives it at the first receive that takes its data, and before it `ipc_peer` gives
 `ERROR_CANNOT_IMPERSONATE` (1368): receive the first bytes, then check the user (see
-[local streams on Windows](local-streams.md#windows)).
+[IPC streams on Windows](ipc-streams.md#windows)).
 On IOCP and IoRing, `Call::Bind` and `Call::BindUdp` are `Route::SystemCall`, and
 `Call::SetFileLen` is `Route::BlockingService`, because Windows has no overlapped form of a length
 change.

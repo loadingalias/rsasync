@@ -14,11 +14,23 @@ use std::thread::{self, ThreadId};
 use std::thread_local;
 use std::time::Instant;
 
-use super::{TcpListener, TcpStream, UdpSocket};
+use std::fs;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use super::{
+    Child, Directory, File, IpcListener, IpcStream, PipeReader, PipeWriter, TcpListener, TcpStream, UdpSocket, rename,
+    signal, unlink,
+};
 use crate::buffer::{Backing, Buffer as _, Lease};
 use crate::capacity::Budget;
 use crate::channel::oneshot;
-use crate::driver::{Config, Datagram, Reason, SendCount, TcpOptions, UdpOptions};
+use crate::driver::{
+    ChildOptions, Config, Datagram, End, Escalation, OpenOptions, Reason, SendCount, Signal, Stale, SyncMode,
+    TcpOptions, UdpOptions, WriteMode,
+};
 use crate::runtime::{GroupError, Runtime, WorkerId};
 use crate::task;
 use crate::task::tests::yield_once;
@@ -545,4 +557,227 @@ fn a_group_that_worker_1_refuses_fails_only_after_the_listener_of_worker_0_close
         task::Outcome::Completed(None),
         "the listener of worker 0 holds its slot after the error"
     );
+}
+
+/// A directory of a test beside its binary, which its drop removes.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let mut path = std::env::current_exe().unwrap();
+        path.pop();
+        path.push(alloc::format!("rsasync-local-{name}-{}", std::process::id()));
+        drop(fs::remove_dir_all(&path));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        drop(fs::remove_dir_all(&self.0));
+    }
+}
+
+/// A file and a directory run each operation on the driver of their owner, with no driver
+/// argument: a write, a read, the length, a sync, a rename, a directory sync, an unlink, and each
+/// close.
+#[test]
+fn a_file_and_a_directory_run_their_operations_with_no_driver_argument() {
+    let scratch = Scratch::new("file");
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let path = scratch.join("data");
+            let options = OpenOptions::new().read(true).write(true).create(true);
+            let file = File::open(&path, options).unwrap().await.unwrap().unwrap();
+            let (written, _lease) = file
+                .write_at(Lease::from(b"hello".to_vec()), 0, WriteMode::Plain)
+                .unwrap()
+                .await
+                .unwrap();
+            assert_eq!(written.unwrap(), 5);
+            let (read, data) = file.read_at(buffer(), 0).unwrap().await.unwrap();
+            assert_eq!((read.unwrap(), data.bytes()), (5, &b"hello"[..]));
+            assert_eq!(file.len().unwrap().await.unwrap().unwrap(), 5);
+            file.sync(SyncMode::Data).unwrap().await.unwrap().unwrap();
+            file.close().unwrap().await.unwrap();
+
+            let moved = scratch.join("moved");
+            rename(&path, &moved).unwrap().await.unwrap().unwrap();
+            let directory = Directory::open(&scratch.0).unwrap().await.unwrap().unwrap();
+            directory.sync().unwrap().await.unwrap().unwrap();
+            directory.close().unwrap().await.unwrap();
+            unlink(&moved).unwrap().await.unwrap().unwrap();
+            assert!(!moved.exists(), "the unlink left the name");
+        })
+        .unwrap();
+}
+
+/// A write whose future dropped runs to its end, and the close of its file returns only after it:
+/// the file then holds each byte of the write.
+#[test]
+fn the_close_of_a_file_returns_after_its_dropped_write_ends() {
+    const LEN: usize = 4 << 20;
+    let scratch = Scratch::new("dropped");
+    let path = scratch.join("data");
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let options = OpenOptions::new().write(true).create(true);
+            let file = File::open(&path, options).unwrap().await.unwrap().unwrap();
+            drop(file.write_at(Lease::from(vec![7; LEN]), 0, WriteMode::Plain).unwrap());
+            file.close().unwrap().await.unwrap();
+        })
+        .unwrap();
+    assert!(
+        fs::read(&path).unwrap() == vec![7; LEN],
+        "the close came before the end of the write"
+    );
+}
+
+/// An IPC listener and its streams run each operation with no driver argument, and the peer has
+/// the user of the socket file. The close of a stream cancels a receive that waits in the kernel
+/// and returns after its terminal event: the receive is forgotten, so only the close can end it.
+#[test]
+#[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
+fn an_ipc_stream_carries_bytes_and_its_close_cancels_a_waiting_receive() {
+    let scratch = Scratch::new("ipc");
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let path = scratch.join("socket");
+            let mut listener = IpcListener::bind(&path, Stale::Refuse).unwrap().await.unwrap().unwrap();
+            let connect = IpcStream::connect(&path).unwrap();
+            let mut server = listener.accept().unwrap().await.unwrap().unwrap();
+            let mut client = connect.await.unwrap().unwrap();
+            let (sent, _lease) = client.send(Lease::from(b"ping".to_vec())).unwrap().await.unwrap();
+            assert_eq!(sent.unwrap(), 4);
+            let (received, ping) = server.recv(buffer()).unwrap().await.unwrap();
+            assert_eq!((received.unwrap(), ping.bytes()), (4, &b"ping"[..]));
+            assert_eq!(server.peer().unwrap().user(), fs::metadata(&path).unwrap().uid());
+
+            core::mem::forget(server.recv(buffer()).unwrap());
+            server.close().unwrap().await.unwrap();
+            client.close().unwrap().await.unwrap();
+            listener.close().unwrap().await.unwrap();
+        })
+        .unwrap();
+}
+
+/// Pipe ends that a task adopts run their operations with no driver argument, and the close of the
+/// write end is the end of the stream for the read end.
+#[test]
+fn a_pipe_carries_bytes_and_the_close_of_its_writer_ends_its_reader() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let (read, write) = std::io::pipe().unwrap();
+            let mut reader = PipeReader::adopt(OwnedFd::from(read)).unwrap();
+            let mut writer = PipeWriter::adopt(OwnedFd::from(write)).unwrap();
+            let (sent, _lease) = writer.send(Lease::from(b"pipe".to_vec())).unwrap().await.unwrap();
+            assert_eq!(sent.unwrap(), 4);
+            writer.close().unwrap().await.unwrap();
+            let (received, bytes) = reader.recv(buffer()).unwrap().await.unwrap();
+            assert_eq!((received.unwrap(), bytes.bytes()), (4, &b"pipe"[..]));
+            assert_eq!(reader.recv(buffer()).unwrap().await.unwrap().0.unwrap(), 0);
+            reader.close().unwrap().await.unwrap();
+        })
+        .unwrap();
+}
+
+/// On a worker, a child spawns on the blocking service of the runtime with no driver argument, its
+/// piped output arrives, and its status comes. A child with the kill policy dies at its close, and
+/// the driver reaps it, so its process entry goes.
+#[test]
+fn a_child_on_a_worker_gives_its_output_and_a_child_with_the_kill_policy_dies_at_its_close() {
+    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let task = handle
+        .spawn_on(WorkerId::new(0), || async {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf out"]).stdout(Stdio::piped());
+            let mut child = Child::spawn(command, ChildOptions::new())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut output = Vec::new();
+            loop {
+                let (received, bytes) = stdout.recv(buffer()).unwrap().await.unwrap();
+                if received.unwrap() == 0 {
+                    break;
+                }
+                output.extend_from_slice(bytes.bytes());
+            }
+            assert_eq!(output, b"out");
+            assert!(child.wait().await.unwrap().unwrap().success());
+
+            let mut command = Command::new("sleep");
+            command.arg("600");
+            let child = Child::spawn(command, ChildOptions::new().end(End::Kill))
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let entry = PathBuf::from(alloc::format!("/proc/{}", child.id()));
+            child.close().unwrap();
+            let start = Instant::now();
+            while entry.exists() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "the child of the kill policy runs on"
+                );
+                yield_once().await;
+            }
+        })
+        .unwrap();
+    assert_matches!(task.join_blocking(), task::Outcome::Completed(()));
+}
+
+// `raise` of the C library.
+#[expect(unsafe_code, reason = "the C library gives this function")]
+unsafe extern "C" {
+    fn raise(signal: core::ffi::c_int) -> core::ffi::c_int;
+}
+
+/// A signal stream of a task registers on the driver of its owner, and a raised signal reaches
+/// it. `SIGWINCH` ends no process by default.
+#[test]
+#[expect(unsafe_code, reason = "raise names no memory")]
+fn a_signal_stream_of_a_task_reports_a_raised_signal() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let mut stream = signal(Signal::WINDOW_CHANGE, Escalation::Never).unwrap();
+            // SAFETY: `raise` names no memory.
+            assert_eq!(unsafe { raise(28) }, 0);
+            stream.recv().await.unwrap();
+        })
+        .unwrap();
+}
+
+/// A runtime with no blocking service refuses a spawn with `Reason::Blocking` and gives the command
+/// back. The service of a runtime runs a job of the caller.
+#[test]
+fn a_runtime_with_no_blocking_service_refuses_a_spawn_and_its_service_runs_a_job() {
+    let runtime = Runtime::builder().blocking(None).build().unwrap();
+    assert!(runtime.handle().unwrap().blocking().is_none());
+    runtime
+        .block_on(async {
+            let refused = Child::spawn(Command::new("true"), ChildOptions::new()).unwrap_err();
+            assert_eq!(refused.reason(), Reason::Blocking);
+            assert_eq!(refused.into_inner().get_program(), "true");
+        })
+        .unwrap();
+
+    let runtime = Runtime::builder().build().unwrap();
+    let handle = runtime.handle().unwrap();
+    let mut waiter = handle.blocking().unwrap().submit(|| 6 * 7).unwrap();
+    assert_eq!(waiter.wait_blocking().unwrap(), 42);
 }

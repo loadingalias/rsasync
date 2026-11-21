@@ -109,3 +109,11 @@ signal that comes during a turn gives its report at that turn or wakes the next 
 differ between the systems, so each constant gives the number of the target: `Signal::USER1` is 10
 on Linux and 30 on macOS. `Signal::from_raw(number)` gives each other signal, such as a real-time
 signal on Linux.
+
+## Use signals from a task
+
+A task of a [runtime](runtime.md) owner calls `rsasync::local::signal(signal, escalation)` (Linux).
+It registers a stream, as `Driver::signal` does, whose home is the driver of the owner of the
+thread, and it gives the same `SignalStream`. A turn of that driver wakes the stream, so the
+stream can move to another thread. On a thread with no driver, the call gives
+`SignalError::NoDriver`.

@@ -1,7 +1,7 @@
 //! Driver-only use: the caller owns a driver, submits operations to it, and drives it with bounded
 //! nonblocking turns. No scheduler runs. On Linux, the driver runs on io_uring, or on epoll where the
-//! kernel refuses io_uring. On macOS, it runs TCP, UDP, local streams, pipes, child processes, and
-//! signal streams on kqueue, and files on the blocking service. On Windows, it runs TCP, UDP, local
+//! kernel refuses io_uring. On macOS, it runs TCP, UDP, IPC (inter-process communication) streams, pipes, child processes, and
+//! signal streams on kqueue, and files on the blocking service. On Windows, it runs TCP, UDP, IPC
 //! streams, and files on an I/O completion port, with the reads, writes, and syncs of files on an
 //! I/O ring where the system has one, and the other file calls on the blocking service
 //! ([`Backend`]). Each backend has
@@ -64,7 +64,7 @@ mod file;
 mod home;
 #[cfg(target_os = "windows")]
 mod iocp;
-mod local;
+mod ipc;
 #[cfg(unix)]
 mod pipe;
 #[cfg(unix)]
@@ -135,8 +135,8 @@ pub use control::{Control, ControlError, Delivery, OperationId};
 pub use file::NvmePath;
 pub use file::{Alignment, Buffers, Cache, Directory, File, Incomplete, Length, OpenOptions, SyncMode, WriteMode};
 #[cfg(target_os = "windows")]
-pub use local::Sid;
-pub use local::{LocalListener, LocalStream, Peer, Stale};
+pub use ipc::Sid;
+pub use ipc::{IpcListener, IpcStream, Peer, Stale};
 #[cfg(unix)]
 pub use pipe::{PipeReader, PipeWriter};
 #[cfg(unix)]
@@ -152,6 +152,12 @@ pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
 pub(crate) use tcp::{accepted, bound as tcp_bound, connected};
 #[cfg(all(feature = "local", target_os = "linux"))]
 pub(crate) use udp::bound as udp_bound;
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) use {
+    file::{directory_opened, file_opened},
+    ipc::{ipc_bound, ipc_connected},
+    process::spawned_child,
+};
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
@@ -854,11 +860,11 @@ struct Owned {
     file: Option<file::Handles>,
     /// What a pipe listener keeps to make its next instance, on Windows.
     #[cfg(target_os = "windows")]
-    listening: Option<Box<local::Listening>>,
+    listening: Option<Box<ipc::Listening>>,
     /// What the driver knows of the user of the client of an accepted pipe stream, on Windows.
     #[cfg(target_os = "windows")]
-    client: Option<local::Client>,
-    /// The lock file of a local listener, whose lock lives while the socket lives.
+    client: Option<ipc::Client>,
+    /// The lock file of an IPC listener, whose lock lives while the socket lives.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     lock: Option<OwnedFd>,
 }
@@ -870,7 +876,7 @@ enum Medium {
     #[default]
     Stream,
     /// A pipe end: its operations are reads and writes, because a receive and a send need a
-    /// socket. It has no half-close. On Windows, a named pipe of a local stream.
+    /// socket. It has no half-close. On Windows, a named pipe of an IPC stream.
     Pipe,
     /// A UDP socket: its operations are datagram receives and sends. It has no half-close.
     Udp,
@@ -2427,7 +2433,7 @@ fn finish(
                 // The first data of a client of a pipe gives its user.
                 #[cfg(target_os = "windows")]
                 if count > 0 {
-                    local::first_data(resources, tag.resource);
+                    ipc::first_data(resources, tag.resource);
                 }
             }
         }
@@ -2453,7 +2459,7 @@ fn finish(
                 .and_then(|listener| resources.get(listener))
                 .is_some_and(|owned| owned.medium == Medium::Pipe) =>
         {
-            local::accepted(held, tag, cqe.res, abandoned, resources);
+            ipc::accepted(held, tag, cqe.res, abandoned, resources);
         }
         Kind::Accept => {
             if cqe.res >= 0 {

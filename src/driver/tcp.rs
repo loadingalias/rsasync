@@ -1190,7 +1190,7 @@ impl Driver {
     /// # Errors
     ///
     /// A refusal when the driver has no room for the operation, and [`Reason::Unsupported`] for a
-    /// resource that is not a TCP or local stream: a `PipeWriter`, which you close instead, or a
+    /// resource that is not a TCP or IPC stream: a `PipeWriter`, which you close instead, or a
     /// `UdpSocket`. A refusal changes nothing.
     pub fn shutdown_write<'a, W: AsMut<WriteHalf>>(
         &mut self,
