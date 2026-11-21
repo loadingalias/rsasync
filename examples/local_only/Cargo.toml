@@ -1,0 +1,14 @@
+[package]
+name = "local_only"
+version = "0.0.0"
+description = "The local-only example of rsasync: Rc state with file, TCP, UDP, and IPC stream I/O in one task on one worker."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The local workers of the runtime need Linux on x86_64 or aarch64.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../.." }
+
+[lints]
+workspace = true

@@ -45,7 +45,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = [".", "examples/driver_only", "rsnetwork-udp", "rstypes", "xtask"]
+members = [".", "examples/driver_only", "examples/local_only", "examples/standard_futures", "rsnetwork-udp", "rstypes", "xtask"]
 
 # No `rust-version`: development requires the nightly pinned in
 # rust-toolchain.toml, which a release number cannot express.

@@ -1,0 +1,14 @@
+[package]
+name = "standard_futures"
+version = "0.0.0"
+description = "The standard-futures example of rsasync: a task that combines its I/O with the futures and combinators of the standard library."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The local workers of the runtime need Linux on x86_64 or aarch64.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../.." }
+
+[lints]
+workspace = true

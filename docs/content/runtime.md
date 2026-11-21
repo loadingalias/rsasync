@@ -357,6 +357,54 @@ charges the service, and `runtime.report()` does not list it.
 - `blocking(None)` starts no service. Those calls then refuse with `Reason::Blocking`, and
   `handle.blocking()` gives `None`.
 
+## Run the examples
+
+Two examples use the runtime with the types of `rsasync::local`, on Linux. Each one runs one task on
+worker 0, prints one line for each outcome, and ends with a shutdown that has no live debt.
+
+- `cargo run -p local_only` keeps the state of its task in an `Rc` across each wait, and it does
+  file, TCP, UDP, and IPC stream I/O. It shows partial progress, the reuse of a buffer after a
+  success and after a failure, a dropped receive, and the close of each resource.
+- `cargo run -p standard_futures` combines its I/O with the standard library only:
+  `core::future::join!`, `poll_fn`, and a small select. Its join borrows data on the stack of the
+  task, and its select abandons a receive. It shows partial progress, and the reuse of a lease
+  after a failure.
+
+The expected output of `local_only`:
+
+<!-- The same text as `EXPECTED` of `examples/local_only/src/main.rs`. Edit both. -->
+```text
+file: wrote 11 bytes and made them durable
+file: an exact read of 16 bytes stopped at the end of the file after 11 bytes: "hello world"
+file: the same buffer then read 5 bytes: "world"
+file: closed and removed the file
+tcp: the receive gave 8 of the 11 sent bytes: "hello wo"
+tcp: the same buffer then received the rest: "rld"
+tcp: after a dropped receive, the next receive gave "late"
+tcp: closed both streams and the listener
+udp: a receive into 4 bytes gave "ping", truncated: true
+udp: the same buffer then received "pong", truncated: false
+udp: closed both sockets
+ipc: the server received "hello" from a peer of this user: true
+ipc: closed both streams and the listener
+state: one Rc kept the 13 notes of the task on worker 0
+shutdown: 0 tasks cancelled, 0 operations of debt, grace period expired: false
+```
+
+The expected output of `standard_futures`:
+
+<!-- The same text as `EXPECTED` of `examples/standard_futures/src/main.rs`. Edit both. -->
+```text
+join: a send and a receive ran together, and the receive gave "hello", as the stack data of the task says
+partial: a receive into 4 bytes gave "hell"
+partial: the same buffer then received the rest: "o"
+select: the timer came first, and the receive with no data dropped
+select: the next receive on the same stream gave "after"
+failure: a send after the half-close gave BrokenPipe and its lease back
+failure: the same lease then sent "again" on a new stream
+shutdown: 0 tasks cancelled, 0 operations of debt, grace period expired: false
+```
+
 ## Stop a runtime
 
 Call `runtime.shutdown()`. It stops the runtime in one bounded lifecycle, and it gives a
