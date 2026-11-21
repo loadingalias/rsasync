@@ -156,6 +156,10 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `SignalError::Full` | Each of the 64 streams of the process is in use | Close a stream, then try again |
 | `SignalError::Escalation` | An `Escalation::At` on a signal whose default action does not end the process | Register the signal with `Escalation::Never` |
 | `SignalError::Allocation` | The allocator did not give the memory of the stream | Register the stream when memory is free |
+| `SignalChildError::Reaped` | The driver reaped the child, so no process has its identity for the driver | Take the status with `Child::wait` |
+| `SignalChildError::OtherDriver` | Another driver spawned or adopted the child | Signal the child through that driver |
+| `SignalChildError::NoTree` | A tree call on a child with no process tree | Spawn with `ChildOptions::tree(true)`, or signal the child alone |
+| `SignalChildError::System(io::Error)` | The system refused the signal, for example a number that is not a signal | Read the `io::Error` |
 | `Incomplete` | An exact read ended before the end of its buffer | Continue at the offset of the read plus `Incomplete::read` |
 | `WriteFailed` | A send whose future dropped failed, so the framing of the stream is unknown | Close the stream. `WriteFailed::of` finds it in the `io::Error` of a send, and `WriteFailed::sent` gives the `SendCount` of the dropped sends (see [A failed write direction](tcp.md#a-failed-write-direction)) |
 

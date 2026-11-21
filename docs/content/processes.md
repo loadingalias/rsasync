@@ -147,8 +147,9 @@ it. A `Signal` is the type of [signal streams](signals.md), for example
 
 A signal ends no wait: the wait ends when the child ends, and it then gives the status, for example
 the signal that ended the child. Each call gives `SignalChildError::Reaped` after the reap,
-`SignalChildError::NoTree` for a tree call on a child with no tree, and `SignalChildError::System`
-when the system refuses the signal.
+`SignalChildError::OtherDriver` for a child of another driver, `SignalChildError::NoTree` for a
+tree call on a child with no tree, and `SignalChildError::System` when the system refuses the
+signal.
 
 ## Process tree
 

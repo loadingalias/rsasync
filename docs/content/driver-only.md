@@ -108,6 +108,11 @@ operation. You keep the driver driven until that event, also after you drop or f
 the operation. The future can move to another thread; the driver stays on the thread that created
 it.
 
+Each resource and each child belongs to the driver that made it, also after it moves to another
+thread. Use it only with that driver. Another driver refuses it and changes nothing: an operation
+gives `Refused` with `Reason::Resource`, a call that gives an `io::Result` gives an error, and a
+signal of a child gives `SignalChildError::OtherDriver`.
+
 | Call | What it does |
 | --- | --- |
 | `Driver::new(Config)` | Starts the driver and allocates its bounded memory one time. When the allocator refuses, it gives `Error::System` of the kind `OutOfMemory`. If the kernel or its policy refuses io_uring, for example in a container with the default seccomp profile, it runs [epoll](epoll.md), or it gives `Error::Refused` when `Config::backend` requires io_uring |

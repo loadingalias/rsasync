@@ -418,6 +418,29 @@ pub(in crate::driver) fn a_kill_ends_the_child_and_a_signal_after_the_reap_refus
     assert_matches!(signal, Err(SignalChildError::Reaped));
 }
 
+/// Each driver spawns its first child in slot 0 with generation 0. On the other driver, a kill of
+/// that child gives `OtherDriver`, so the kill reaches neither child. Each child runs on until a
+/// kill of its own driver ends it.
+pub(in crate::driver) fn a_child_of_another_driver_gives_other_driver_and_no_child_gets_the_kill() {
+    let backend = cfg_select! {
+        target_os = "linux" => Backend::Kernel,
+        _ => Backend::Kqueue,
+    };
+    let (mut first, _first_service) = with_service(Config::new(), 4, backend);
+    let (mut second, _second_service) = with_service(Config::new(), 4, backend);
+    let mut theirs = spawn(&mut first, sleeper(), ChildOptions::new());
+    let mut ours = spawn(&mut second, sleeper(), ChildOptions::new());
+
+    assert_matches!(second.kill_child(&theirs), Err(SignalChildError::OtherDriver));
+    assert_eq!([theirs.id(), ours.id()].map(state), [State::Running; 2]);
+
+    for (driver, child) in [(&mut first, &mut theirs), (&mut second, &mut ours)] {
+        driver.kill_child(child).expect("the child runs");
+        let status = drive(driver, child.wait()).expect("the driver runs");
+        assert_eq!(status.expect("the wait works").signal(), Some(9));
+    }
+}
+
 /// A tree kill ends each process of the group of the child, also a grandchild. A tree signal
 /// after the reap of the leader refuses, because its group ID can name another group then.
 pub(in crate::driver) fn a_tree_kill_ends_a_grandchild_and_a_tree_signal_after_the_reap_refuses(backend: Backend) {

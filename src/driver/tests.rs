@@ -2085,6 +2085,25 @@ pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts
     );
 }
 
+/// Each driver makes its first listener in slot 0 with generation 0. On the other driver, an accept
+/// of that listener refuses with `Reason::Resource`, and an option read gives an error, so no call
+/// reaches the listener in the same slot there. Each listener then accepts on its own driver.
+pub(in crate::driver) fn a_resource_of_another_driver_refuses_and_each_driver_keeps_its_own() {
+    let mut first = driver(Config::new());
+    let mut second = driver(Config::new());
+    let mut theirs = listen(&mut first, "127.0.0.1:0");
+    let mut ours = listen(&mut second, "127.0.0.1:0");
+
+    assert_eq!(second.accept(&mut theirs).unwrap_err().reason(), Reason::Resource);
+    second.options(&theirs).unwrap_err();
+
+    for (driver, listener) in [(&mut first, &mut theirs), (&mut second, &mut ours)] {
+        let _peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+        let accept = driver.accept(listener).unwrap();
+        drive(driver, accept).unwrap().unwrap();
+    }
+}
+
 /// A batch with more datagrams than the submission queue has entries can never start, so it
 /// refuses with `Reason::Queue` and gives its datagrams back. The socket then sends a datagram.
 pub(in crate::driver) fn a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back() {

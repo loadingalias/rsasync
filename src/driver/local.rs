@@ -405,12 +405,9 @@ impl Driver {
     /// As above.
     #[cfg(target_os = "windows")]
     pub fn local_peer(&self, stream: &LocalStream) -> io::Result<Peer> {
-        let resource = stream.read.resource;
         let owned = self
             .resources
-            .slots
-            .get(resource.index as usize)
-            .filter(|owned| owned.generation == resource.generation)
+            .slot(stream.read.resource)
             .ok_or(io::ErrorKind::NotFound)?;
         let handles = owned.file.as_ref().ok_or(io::ErrorKind::NotFound)?;
         let (process, user) = match owned.client {

@@ -94,7 +94,9 @@ use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop};
+use core::num::NonZeroU64;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 #[cfg(unix)]
@@ -555,7 +557,7 @@ pub enum Reason {
     Operations,
     /// The submission queue is full, also after one submit.
     Queue,
-    /// The descriptor is not one that this driver owns, for example after its close.
+    /// The descriptor is not one that this driver owns: another driver made it, or it closed.
     Resource,
     /// The driver has no provided buffers ([`Driver::provide`]).
     Buffers,
@@ -725,9 +727,24 @@ impl<T> fmt::Debug for Operation<'_, T> {
     }
 }
 
+/// The identity of a driver. No two drivers of the process have one identity, so a resource or a
+/// child that one driver made never names a slot of another driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriverId(NonZeroU64);
+
+impl DriverId {
+    fn next() -> Self {
+        // At one new driver each nanosecond, the count needs 584 years to reach its end. Not 0 is
+        // the niche that keeps `Option<Resource>` at 16 bytes.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NonZeroU64::MIN.saturating_add(NEXT.fetch_add(1, Ordering::Relaxed)))
+    }
+}
+
 /// A descriptor that the driver owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Resource {
+    driver: DriverId,
     index: u32,
     generation: u32,
 }
@@ -813,6 +830,8 @@ impl Owned {
 /// The descriptors that the driver owns, in a slice that it allocates once.
 #[derive(Debug)]
 struct Resources {
+    /// The driver of the resources.
+    driver: DriverId,
     slots: Box<[Owned]>,
     /// The free slots that spawns keep for the pipe ends of their children.
     reserved: u32,
@@ -900,6 +919,7 @@ impl Resources {
         slot.fd = Some(fd);
         slot.medium = medium;
         Ok(Resource {
+            driver: self.driver,
             index,
             generation: slot.generation,
         })
@@ -936,25 +956,29 @@ impl Resources {
         slot.medium = medium;
         slot.skips = false;
         Ok(Resource {
+            driver: self.driver,
             index,
             generation: slot.generation,
         })
     }
 
     fn get(&mut self, resource: Resource) -> Option<&mut Owned> {
+        let driver = self.driver;
         self.slots
             .get_mut(resource.index as usize)
-            .filter(|slot| slot.generation == resource.generation && slot.used())
+            .filter(|slot| resource.driver == driver && slot.generation == resource.generation && slot.used())
+    }
+
+    /// The slot of `resource`, when this driver made it and the slot has its generation.
+    fn slot(&self, resource: Resource) -> Option<&Owned> {
+        self.slots
+            .get(resource.index as usize)
+            .filter(|slot| resource.driver == self.driver && slot.generation == resource.generation)
     }
 
     /// The descriptor of `resource`, while the driver owns it.
     fn borrow(&self, resource: Resource) -> Option<Borrowed<'_>> {
-        self.slots
-            .get(resource.index as usize)
-            .filter(|slot| slot.generation == resource.generation)?
-            .fd
-            .as_ref()
-            .map(borrow)
+        self.slot(resource)?.fd.as_ref().map(borrow)
     }
 
     /// Ends `resource` and its registration, and gives its descriptor. The identity is stale from
@@ -965,7 +989,7 @@ impl Resources {
         let slot = self
             .slots
             .get_mut(resource.index as usize)
-            .filter(|slot| slot.generation == resource.generation && slot.used())?;
+            .filter(|slot| resource.driver == self.driver && slot.generation == resource.generation && slot.used())?;
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
         slot.running = 0;
@@ -1307,6 +1331,7 @@ impl Driver {
             table,
             shared,
             resources: Resources {
+                driver: DriverId::next(),
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
@@ -1363,11 +1388,13 @@ impl Driver {
         })
         .map_err(refused)?;
         let job_waker = file::job_waker(&shared).map_err(refused)?;
+        let driver = DriverId::next();
         Ok(Self {
             queue: Queue::Poller(poller),
             table,
             shared,
             resources: Resources {
+                driver,
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar: Some(registrar),
@@ -1379,7 +1406,7 @@ impl Driver {
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
             signals: filled(signal::STREAMS, || None).map_err(refused)?.into_boxed_slice(),
-            children: process::Children::new(config.children).map_err(Error::System)?,
+            children: process::Children::new(config.children, driver).map_err(Error::System)?,
             blocking: None,
             job_waker,
             jobs: room(config.operations as usize).map_err(refused)?,
@@ -1470,16 +1497,18 @@ impl Driver {
         let job_waker = file::job_waker(&shared).map_err(refused)?;
         #[cfg(all(feature = "local", target_os = "linux"))]
         let wakes = home::Wakes::new(&queue, &shared).map_err(Error::System)?;
+        let driver = DriverId::next();
         Ok(Self {
             queue,
             table,
             shared,
             resources: Resources {
+                driver,
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
             },
-            children: process::Children::new(config.children).map_err(Error::System)?,
+            children: process::Children::new(config.children, driver).map_err(Error::System)?,
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
@@ -1727,6 +1756,7 @@ impl Driver {
         }
         for index in 0..self.resources.slots.len() {
             let Some(resource) = self.resources.slots.get(index).map(|owned| Resource {
+                driver: self.resources.driver,
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 generation: owned.generation,
             }) else {

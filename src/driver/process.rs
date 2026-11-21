@@ -36,8 +36,8 @@ pub(super) use sys::SigInfo;
 
 use super::tcp::{ReadHalf, WriteHalf};
 use super::{
-    Call, Completion, Driver, ECANCELED, Ended, Held, Kind, Medium, Operation, Payload, PipeReader, PipeWriter, Reason,
-    Refused, Route, Signal, Tag,
+    Call, Completion, Driver, DriverId, ECANCELED, Ended, Held, Kind, Medium, Operation, Payload, PipeReader,
+    PipeWriter, Reason, Refused, Route, Signal, Tag,
 };
 use crate::blocking::{Failed, Job};
 use crate::driver::out_of_memory;
@@ -150,6 +150,8 @@ impl ChildOptions {
 pub enum SignalChildError {
     /// The driver reaped the child: no process has its identity for the driver now.
     Reaped,
+    /// Another driver spawned or adopted the child. Signal it through that driver.
+    OtherDriver,
     /// A tree signal of a child that leads no process tree ([`ChildOptions::tree`]).
     NoTree,
     /// The system refused the signal, for example `EINVAL` for a number that is not a signal.
@@ -160,6 +162,7 @@ impl fmt::Display for SignalChildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Reaped => f.write_str("the driver reaped the child"),
+            Self::OtherDriver => f.write_str("another driver owns the child"),
             Self::NoTree => f.write_str("the child leads no process tree"),
             Self::System(error) => write!(f, "the system refused the signal: {error}"),
         }
@@ -170,7 +173,7 @@ impl core::error::Error for SignalChildError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::System(error) => Some(error),
-            Self::Reaped | Self::NoTree => None,
+            Self::Reaped | Self::OtherDriver | Self::NoTree => None,
         }
     }
 }
@@ -178,6 +181,7 @@ impl core::error::Error for SignalChildError {
 /// The identity of a child slot of a driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChildId {
+    driver: DriverId,
     index: u32,
     generation: u32,
 }
@@ -393,6 +397,8 @@ struct Slot {
 /// The child slots of a driver, in a slice that it allocates once.
 #[derive(Debug)]
 pub(super) struct Children {
+    /// The driver of the children.
+    driver: DriverId,
     slots: Box<[Slot]>,
     /// The kernel gives process descriptors, or the system needs none. The first spawn or adoption
     /// finds it.
@@ -422,8 +428,9 @@ impl Children {
     /// # Errors
     ///
     /// The error of `timerfd_create` on Linux, and `OutOfMemory` when the allocator refuses.
-    pub(super) fn new(children: u32) -> io::Result<Self> {
+    pub(super) fn new(children: u32, driver: DriverId) -> io::Result<Self> {
         Ok(Self {
+            driver,
             slots: items(children, |_| Slot::default()).map_err(out_of_memory)?,
             descriptors: None,
             again: room(children as usize).map_err(out_of_memory)?,
@@ -463,7 +470,7 @@ impl Children {
     fn get(&self, id: ChildId) -> Option<&Slot> {
         self.slots
             .get(id.index as usize)
-            .filter(|slot| slot.generation == id.generation && slot.process.is_some())
+            .filter(|slot| id.driver == self.driver && slot.generation == id.generation && slot.process.is_some())
     }
 
     /// Ends the slot `index`: it closes the descriptor, and the identity is stale from now on.
@@ -488,6 +495,9 @@ impl Children {
 
     /// Sends `signal` to the child of `id`, or to its process group when `tree` holds.
     fn signal(&self, id: ChildId, signal: c_int, tree: bool) -> Result<(), SignalChildError> {
+        if id.driver != self.driver {
+            return Err(SignalChildError::OtherDriver);
+        }
         let slot = self.get(id).ok_or(SignalChildError::Reaped)?;
         let process = slot.process.as_ref().ok_or(SignalChildError::Reaped)?;
         if tree && !slot.tree {
@@ -523,6 +533,7 @@ impl Children {
         };
         if slot.end == End::Kill {
             let id = ChildId {
+                driver: self.driver,
                 index,
                 generation: slot.generation,
             };
@@ -1077,7 +1088,11 @@ impl Driver {
             stdin,
             stdout,
             stderr,
-            id: ChildId { index, generation },
+            id: ChildId {
+                driver: self.children.driver,
+                index,
+                generation,
+            },
             pid: spawned.pid,
             exit: Completion::new(Arc::clone(&self.shared), exit, end == End::Kill),
             status: None,

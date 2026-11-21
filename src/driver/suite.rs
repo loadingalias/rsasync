@@ -390,11 +390,14 @@ mod law {
         process::tests => the_keep_policy_leaves_a_closed_and_a_dropped_child_running_and_teardown_counts_them,
     }
 
-    // The refused submissions.
+    // The refused submissions, also of a resource or a child that another driver made.
     once! {
         #[cfg(target_os = "linux")]
         tests => a_full_driver_refuses_a_submission_and_returns_its_resources,
         tests => a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back,
+        tests => a_resource_of_another_driver_refuses_and_each_driver_keeps_its_own,
+        #[cfg(unix)]
+        process::tests => a_child_of_another_driver_gives_other_driver_and_no_child_gets_the_kill,
     }
 
     /// The cases that a kernel cannot make on demand.
