@@ -97,7 +97,7 @@ use core::mem::{self, ManuallyDrop};
 use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, ready};
 use core::time::Duration;
 #[cfg(unix)]
 use std::fs;
@@ -155,7 +155,7 @@ pub(crate) use udp::bound as udp_bound;
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
 #[cfg(all(feature = "local", target_os = "linux"))]
-pub(crate) use home::{Home, MESSAGES};
+pub(crate) use home::{Cleanup, Home, MESSAGES};
 
 /// The limits of a driver, each of which bounds memory that the driver allocates when it starts,
 /// and the features that it requires.
@@ -562,7 +562,8 @@ pub enum Reason {
     Operations,
     /// The submission queue is full, also after one submit.
     Queue,
-    /// The descriptor is not one that this driver owns: another driver made it, or it closed.
+    /// The descriptor or the child is not one that this driver owns: another driver made it, or it
+    /// closed.
     Resource,
     /// No driver runs on this thread for a call of `rsasync::local`: the thread runs no owner of a
     /// `Runtime`, its owner is a `task::LocalOwner`, which has no driver, or the driver of
@@ -668,7 +669,8 @@ impl core::error::Error for Ended {}
 /// keeps the buffer until the kernel releases it.
 ///
 /// The future borrows the direction of its stream, or its listener, for `'a`, so no other
-/// operation can start in that direction while it exists.
+/// operation can start in that direction while it exists. A poll makes the output on the thread
+/// of the poll, so the future is `Send` only when its output is.
 ///
 /// Poll the future while you turn the driver, for example with this helper:
 ///
@@ -702,27 +704,42 @@ impl core::error::Error for Ended {}
 /// A poll after the future gave `Ready` panics, as for the futures of the standard library.
 pub struct Operation<'a, T> {
     completion: Completion,
-    output: fn(i32, Held) -> Option<T>,
-    direction: PhantomData<&'a mut ()>,
+    output: Output<T>,
+    /// The direction that the future borrows, and the output that its poll makes: a local resource
+    /// is not `Send`, so the future that makes one stays on the thread of its home.
+    marker: PhantomData<(&'a mut (), T)>,
 }
+
+/// How an operation makes its output from its result and its resources.
+enum Output<T> {
+    /// The output of a call of the driver.
+    Driver(fn(i32, Held) -> Option<T>),
+    /// The output of a call of a local type, which also gets the operation: each resource that it
+    /// makes keeps the home of its close ([`Completion::cleanup`]).
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    Local(fn(i32, Held, &Completion) -> Option<T>),
+}
+
+// The future never pins its output, which exists only at the end of a poll.
+impl<T> Unpin for Operation<'_, T> {}
 
 impl<'a, T> Operation<'a, T> {
     fn new(completion: Completion, output: fn(i32, Held) -> Option<T>) -> Self {
         Self {
             completion,
-            output,
-            direction: PhantomData,
+            output: Output::Driver(output),
+            marker: PhantomData,
         }
     }
 
     /// The same operation, with `output` in place of its output: the local I/O types give their own
     /// resources.
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn with_output<U>(self, output: fn(i32, Held) -> Option<U>) -> Operation<'a, U> {
+    pub(crate) fn with_output<U>(self, output: fn(i32, Held, &Completion) -> Option<U>) -> Operation<'a, U> {
         Operation {
             completion: self.completion,
-            output,
-            direction: PhantomData,
+            output: Output::Local(output),
+            marker: PhantomData,
         }
     }
 
@@ -739,10 +756,13 @@ impl<T> Future for Operation<'_, T> {
     type Output = Result<T, Ended>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let output = self.output;
-        Pin::new(&mut self.completion)
-            .poll(cx)
-            .map(|taken| taken.ok().and_then(|(result, held)| output(result, held)).ok_or(Ended))
+        let taken = ready!(Pin::new(&mut self.completion).poll(cx));
+        let output = taken.ok().and_then(|(result, held)| match self.output {
+            Output::Driver(output) => output(result, held),
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            Output::Local(output) => output(result, held, &self.completion),
+        });
+        Poll::Ready(output.ok_or(Ended))
     }
 }
 
@@ -760,11 +780,17 @@ impl<T> fmt::Debug for Operation<'_, T> {
 struct DriverId(NonZeroU64);
 
 impl DriverId {
-    fn next() -> Self {
-        // At one new driver each nanosecond, the count needs 584 years to reach its end. Not 0 is
-        // the niche that keeps `Option<Resource>` at 16 bytes.
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self(NonZeroU64::MIN.saturating_add(NEXT.fetch_add(1, Ordering::Relaxed)))
+    /// A new identity. At the end of the count, `Driver::new` refuses with the kind
+    /// `QuotaExceeded`, so no identity repeats. At one new driver each nanosecond, the count needs
+    /// 584 years to reach its end.
+    fn next() -> Result<Self, Error> {
+        // Not 0 is the niche that keeps `Option<Resource>` at 16 bytes.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .ok()
+            .and_then(NonZeroU64::new)
+            .map(Self)
+            .ok_or_else(|| Error::System(io::ErrorKind::QuotaExceeded.into()))
     }
 }
 
@@ -1137,6 +1163,9 @@ impl Selected {
 struct Shared {
     entries: Box<[Entry<Held>]>,
     requests: Requests,
+    /// The closes that the drops of local resources record ([`home::Cleanup`]).
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    closes: home::Closes,
     /// The wake descriptor. On Linux, an `eventfd` that the kernel also signals at each completion
     /// and for its deferred work. On macOS, the write end of the wake pipe, whose read end the
     /// kqueue watches: a pipe, because a signal handler wakes the home too, and `write` is
@@ -1294,7 +1323,9 @@ impl Driver {
     /// when [`Config::backend`] requires a backend that the target does not have, [`Error::Config`]
     /// for a limit that is 0 or too large, [`Error::Unsupported`] for a required feature that the
     /// kernel or the backend does not have, and [`Error::System`] for another failure, of the kind
-    /// `OutOfMemory` when the allocator does not give the memory of the driver.
+    /// `OutOfMemory` when the allocator does not give the memory of the driver. After 2^64 - 2
+    /// drivers of the process, it gives the kind `QuotaExceeded`, so no two drivers have one
+    /// identity.
     pub fn new(config: Config) -> Result<Self, Error> {
         if config.operations == 0
             || config.operations > MAX_SLOTS
@@ -1358,7 +1389,7 @@ impl Driver {
             table,
             shared,
             resources: Resources {
-                driver: DriverId::next(),
+                driver: DriverId::next()?,
                 slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
                 reserved: 0,
                 registrar,
@@ -1415,7 +1446,7 @@ impl Driver {
         })
         .map_err(refused)?;
         let job_waker = file::job_waker(&shared).map_err(refused)?;
-        let driver = DriverId::next();
+        let driver = DriverId::next()?;
         Ok(Self {
             queue: Queue::Poller(poller),
             table,
@@ -1517,6 +1548,8 @@ impl Driver {
         let shared = try_arc(Shared {
             entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
             requests: table.requests(),
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            closes: home::Closes::new(config.resources).map_err(refused)?,
             wake,
             interrupt: fs::File::from(interrupt),
         })
@@ -1524,7 +1557,7 @@ impl Driver {
         let job_waker = file::job_waker(&shared).map_err(refused)?;
         #[cfg(all(feature = "local", target_os = "linux"))]
         let wakes = home::Wakes::new(&queue, &shared).map_err(Error::System)?;
-        let driver = DriverId::next();
+        let driver = DriverId::next()?;
         Ok(Self {
             queue,
             table,
@@ -1697,6 +1730,12 @@ impl Driver {
         }
         more |=
             self.queue.ready() || self.queue.more() || self.queue.unsubmitted() > 0 || !self.shared.requests.is_empty();
+        // A drop that this turn ran, for example of a buffer, can record a close. The owner turns
+        // again before it waits, so the close needs no wake.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        {
+            more |= self.shared.closes.posted();
+        }
         Ok(Turn { completed, more })
     }
 
@@ -1908,6 +1947,19 @@ impl Driver {
         self.queue.room() >= entries || (self.queue.submit(0).is_ok() && self.queue.room() >= entries)
     }
 
+    /// Gives `value` back when this driver owns `resource`, and else refuses it with
+    /// [`Reason::Resource`]. A call that can refuse for another reason checks this first, so a
+    /// resource of another driver always gives this reason.
+    fn own<P>(&mut self, resource: Resource, value: P) -> Result<P, Refused<P>> {
+        match self.resources.get(resource) {
+            Some(_) => Ok(value),
+            None => Err(Refused {
+                reason: Reason::Resource,
+                value,
+            }),
+        }
+    }
+
     /// Records a new operation at the home, before its submission, with the resources that
     /// `held` makes from `value`, and with room in the queue for its `entries` submission entries.
     /// Refuses with `value` when each operation slot is in use or the queue has no room.
@@ -2046,7 +2098,8 @@ impl Driver {
         }
     }
 
-    /// Applies the requests that other threads posted.
+    /// Applies the requests that other threads posted, and the closes that drops of local resources
+    /// recorded.
     fn take_requests(&mut self) {
         let mut taken = mem::take(&mut self.taken);
         self.table.take_requests(|request| taken.push(request));
@@ -2057,6 +2110,8 @@ impl Driver {
             }
         }
         self.taken = taken;
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        self.take_closes();
         self.attend();
     }
 

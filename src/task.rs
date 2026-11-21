@@ -154,7 +154,7 @@ pub(crate) use factory::{Job, Placer};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use owner::MAX_SLOTS;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use ring::RingOwner;
+pub(crate) use ring::{Failure, RingOwner};
 
 use owner::{Enter, Local};
 use slot::TaskRef;
@@ -321,8 +321,10 @@ where
     }
 }
 
+/// The owner of this thread. A destructor of another thread-local value can run at the exit of the
+/// thread, after the destructor of `CURRENT`, and the thread then has no owner.
 fn current() -> Option<Rc<Local>> {
-    CURRENT.with(|current| current.borrow().clone())
+    CURRENT.try_with(|current| current.borrow().clone()).ok().flatten()
 }
 
 /// Makes a timer that expires at `deadline` in the timer storage of the owner of this thread

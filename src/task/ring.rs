@@ -86,27 +86,32 @@ impl RingOwner {
     ///
     /// # Errors
     ///
-    /// A failure of the driver. If it ends the loop, each live task ends with `OwnerFailed`. If the
-    /// teardown fails, the output of `root` drops.
-    pub(crate) fn block_on<F: Future>(self, root: F) -> io::Result<F::Output> {
+    /// A failure of the driver, or of its start. If it ends the loop, each live task ends with
+    /// `OwnerFailed`. If the teardown fails, the output of `root` drops.
+    pub(crate) fn block_on<F: Future>(self, root: F) -> Result<F::Output, Failure> {
         let mut enter = Enter::new(&self.local);
         let output = self.local.block_on(root, &mut Drive);
         enter.ended = output.is_ok();
         let output = output?;
-        // A driver that did not start fails the owner, also when the root ended after it.
-        if let Some(error) = self.local.failure.take() {
-            return Err(error);
-        }
         // The slot stays borrowed through the teardown, and the owner makes no other driver: a
         // waker that the teardown calls and that asks for the driver gets `InUse`.
         self.local.lazy.set(None);
         let mut slot = self.local.driver.borrow_mut();
         if let Some(driver) = slot.take() {
             // The report counts the operations that the teardown cancelled, which their futures saw.
-            let _cancelled = driver.teardown()?;
+            let _cancelled = driver.teardown().map_err(Failure::Driver)?;
         }
         Ok(output)
     }
+}
+
+/// Why the owner of a home that can have a ring failed.
+#[derive(Debug)]
+pub(crate) enum Failure {
+    /// The driver did not start at its first use.
+    Start(driver::Error),
+    /// The driver failed.
+    Driver(io::Error),
 }
 
 impl Drop for RingOwner {
@@ -121,21 +126,23 @@ impl Drop for RingOwner {
 struct Drive;
 
 impl Park for Drive {
-    type Error = io::Error;
+    type Error = Failure;
 
-    fn drive(&mut self, local: &Local) -> io::Result<bool> {
-        if let Some(error) = local.failure.take() {
-            return Err(error);
-        }
+    fn drive(&mut self, local: &Local) -> Result<bool, Failure> {
+        self.check(local)?;
         let mut driver = local.driver.borrow_mut();
         let Some(driver) = driver.as_mut() else {
             return Ok(false);
         };
         flush(local, driver);
-        Ok(driver.turn()?.more())
+        Ok(driver.turn().map_err(Failure::Driver)?.more())
     }
 
-    fn park(&mut self, local: &Local, until: Option<Until>) -> io::Result<()> {
+    fn check(&mut self, local: &Local) -> Result<(), Failure> {
+        local.failure.take().map_or(Ok(()), |error| Err(Failure::Start(error)))
+    }
+
+    fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Failure> {
         // The home got its ring in this turn. A wake that did not see the ring unparked the thread,
         // so the next turn takes the list and the root flag before a wait in the ring.
         if local.switched.take() {
@@ -152,6 +159,7 @@ impl Park for Drive {
             Some(until) => driver.wait_for(until.remaining()),
             None => driver.wait(),
         }
+        .map_err(Failure::Driver)
     }
 }
 
@@ -209,10 +217,7 @@ impl Local {
                     *slot = Some(driver);
                 }
                 Err(error) => {
-                    self.failure.set(Some(match error {
-                        driver::Error::Refused(error) | driver::Error::System(error) => error,
-                        error => io::Error::other(error),
-                    }));
+                    self.failure.set(Some(error));
                     return Err(value);
                 }
             }

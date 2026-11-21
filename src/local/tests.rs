@@ -1,19 +1,20 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use core::assert_matches;
+use core::cell::RefCell;
 use core::future::pending;
 use core::net::SocketAddr;
 use core::num::NonZeroU64;
 use core::time::Duration;
 use std::io::Read as _;
-use std::thread;
 use std::time::Instant;
+use std::{thread, thread_local};
 
 use super::{TcpListener, TcpStream, UdpSocket};
 use crate::buffer::{Backing, Buffer as _, Lease};
 use crate::capacity::Budget;
 use crate::channel::oneshot;
-use crate::driver::{Datagram, Reason, SendCount, TcpOptions, UdpOptions};
+use crate::driver::{Config, Datagram, Reason, SendCount, TcpOptions, UdpOptions};
 use crate::runtime::{GroupError, Runtime, WorkerId};
 use crate::task;
 use crate::task::tests::yield_once;
@@ -151,7 +152,8 @@ fn a_close_cancels_a_dropped_send_to_a_peer_that_never_reads_and_ends() {
 
 /// A stream that leaves its `block_on` refuses each call and gives the buffer back: with no owner
 /// on the thread with `Reason::NoDriver`, and in the next `block_on`, whose driver has its own
-/// stream in the same slot, with `Reason::Resource`.
+/// stream in the same slot, with `Reason::Resource`. An option read with no owner gives an error
+/// of the kind `NotFound`, which allocates nothing.
 #[test]
 fn a_stream_after_its_block_on_refuses_and_gives_its_buffer_back() {
     let runtime = Runtime::builder().build().unwrap();
@@ -162,6 +164,7 @@ fn a_stream_after_its_block_on_refuses_and_gives_its_buffer_back() {
     let refused = stream.recv(given).unwrap_err();
     assert_eq!(refused.reason(), Reason::NoDriver);
     assert_eq!(refused.into_inner().as_ptr(), address);
+    assert_eq!(stream.options().unwrap_err().kind(), std::io::ErrorKind::NotFound);
 
     runtime
         .block_on(async {
@@ -205,6 +208,117 @@ fn a_dropped_stream_closes_while_its_owner_runs() {
             reader.join().unwrap();
         })
         .unwrap();
+}
+
+/// A listener that drops while each operation slot of its driver is in use closes at its drop, so a
+/// plain listener binds its address at once.
+#[test]
+fn a_listener_that_drops_while_each_operation_slot_is_in_use_closes_at_its_drop() {
+    let runtime = Runtime::builder().driver(Config::new().operations(1)).build().unwrap();
+    runtime
+        .block_on(async {
+            let listener = TcpListener::bind(loopback(), TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let address = listener.local_addr();
+            let mut socket = UdpSocket::bind(loopback(), UdpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            // A receive that no datagram ends holds the one operation slot.
+            let _receive = socket.recv_from(buffer()).unwrap();
+            let refused = TcpStream::connect(address, TcpOptions::default()).unwrap_err();
+            assert_eq!(refused.reason(), Reason::Operations, "each operation slot is in use");
+            drop(listener);
+            assert!(
+                std::net::TcpListener::bind(address).is_ok(),
+                "the listener closed at its drop"
+            );
+        })
+        .unwrap();
+}
+
+thread_local! {
+    /// A listener that a test keeps on its thread.
+    static KEPT: RefCell<Option<TcpListener>> = const { RefCell::new(None) };
+}
+
+/// The bytes of a lease whose drop drops the listener in [`KEPT`].
+struct DropsKept;
+
+impl AsRef<[u8]> for DropsKept {
+    fn as_ref(&self) -> &[u8] {
+        b"drop"
+    }
+}
+
+impl Drop for DropsKept {
+    fn drop(&mut self) {
+        drop(KEPT.take());
+    }
+}
+
+/// A listener that drops in a destructor that a turn of its driver runs closes in a later turn, so
+/// a plain listener then binds its address. The driver drops the lease of a send whose future
+/// dropped at the end of the send, and the drop of the lease drops the listener.
+#[test]
+fn a_listener_that_drops_in_a_turn_of_its_driver_closes_in_a_later_turn() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let listener = TcpListener::bind(loopback(), TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let address = listener.local_addr();
+            KEPT.set(Some(listener));
+            let mut socket = UdpSocket::bind(loopback(), UdpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let datagram = Datagram::new(Lease::from_owner(DropsKept, 4), socket.local_addr());
+            drop(socket.send_to(datagram).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while KEPT.with_borrow(Option::is_some) || std::net::TcpListener::bind(address).is_err() {
+                assert!(Instant::now() < deadline, "the listener stays open");
+                yield_once().await;
+            }
+        })
+        .unwrap();
+}
+
+thread_local! {
+    /// A socket that a thread keeps after its `block_on`, until the thread ends.
+    static CACHED: RefCell<Option<UdpSocket>> = const { RefCell::new(None) };
+}
+
+/// A socket that a thread-local value keeps after its `block_on` drops at the exit of the thread,
+/// after the destructor of the owner of the thread, and the process does not abort.
+#[test]
+fn a_socket_that_a_thread_local_value_keeps_drops_at_the_exit_of_the_thread() {
+    thread::spawn(|| {
+        // The first use registers the destructor of the cache before the destructor of the owner,
+        // so the destructor of the owner runs first at the exit of the thread.
+        CACHED.with(|_| ());
+        let runtime = Runtime::builder().build().unwrap();
+        let socket = runtime
+            .block_on(async {
+                UdpSocket::bind(loopback(), UdpOptions::default())
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+            .unwrap();
+        CACHED.set(Some(socket));
+    })
+    .join()
+    .unwrap();
 }
 
 /// Each member of a TCP group accepts, and sends the index of its worker.
@@ -284,8 +398,60 @@ fn a_udp_group_of_four_workers_receives_datagrams_on_each_worker() {
     assert_eq!(seen, [true; 4], "each worker receives");
 }
 
+/// A group start that the budget or the allocator refuses gives a typed refusal: the budget pays
+/// for the list of the members before each channel, and each allocation of the start on this
+/// thread can fail with no abort.
+#[test]
+fn a_group_start_that_the_budget_or_the_allocator_refuses_gives_a_typed_refusal() {
+    use crate::table::tests::allocations::each_refusal;
+
+    let budget = Budget::new(NonZeroU64::new(1 << 24).unwrap());
+    let runtime = Runtime::builder()
+        .local_workers(2)
+        .budget(budget.clone())
+        .build()
+        .unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let serve = |_worker, _listener| pending::<()>();
+
+    // The owner of `block_on` charges its tables first, so the root takes each free unit after it.
+    let started = runtime
+        .block_on(async {
+            let _all = budget.reserve(budget.available()).unwrap();
+            handle.tcp_group(loopback(), TcpOptions::default(), serve).await
+        })
+        .unwrap();
+    assert_matches!(started, Err(GroupError::Budget(_)));
+
+    let refusals =
+        each_refusal(
+            || match runtime.block_on(handle.tcp_group(loopback(), TcpOptions::default(), serve)) {
+                Ok(started) => started.map_err(Some),
+                // A refusal of the owner of `block_on`, which its own test covers.
+                Err(_owner) => Err(None),
+            },
+        );
+    assert!(
+        refusals
+            .iter()
+            .any(|(refused, _held)| matches!(refused, Some(GroupError::Allocation))),
+        "the allocator can refuse the lists of the group"
+    );
+    for (refused, _held) in refusals {
+        assert_matches!(
+            refused,
+            None | Some(
+                GroupError::Allocation
+                    | GroupError::Channel(crate::channel::Refused::Allocation)
+                    | GroupError::Spawn(_, task::Reason::Allocation)
+            )
+        );
+    }
+}
+
 /// A group that worker 1 refuses, because a task holds its one slot, fails with that worker and
-/// reason. The listener that worker 0 bound closes, so a plain listener then binds its address.
+/// reason. The listener that worker 0 bound closed before the error, so a plain listener binds its
+/// address at once.
 #[test]
 fn a_group_that_worker_1_refuses_closes_the_listener_of_worker_0() {
     let runtime = Runtime::builder().local_workers(2).task_slots(1).build().unwrap();
@@ -296,9 +462,8 @@ fn a_group_that_worker_1_refuses_closes_the_listener_of_worker_0() {
         .block_on(handle.tcp_group(address, TcpOptions::default(), |_worker, _listener| pending::<()>()))
         .unwrap();
     assert_matches!(failed, Err(GroupError::Spawn(worker, task::Reason::NoSlot)) if worker == WorkerId::new(1));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while std::net::TcpListener::bind(address).is_err() {
-        assert!(Instant::now() < deadline, "the listener of worker 0 stays open");
-        thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        std::net::TcpListener::bind(address).is_ok(),
+        "the listener of worker 0 is open after the error"
+    );
 }

@@ -102,6 +102,12 @@ impl UdpSocket {
     pub fn split(&mut self) -> (&mut ReadHalf, &mut WriteHalf) {
         (&mut self.read, &mut self.write)
     }
+
+    /// The resource of the socket, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.read.resource
+    }
 }
 
 impl AsMut<ReadHalf> for UdpSocket {
@@ -820,6 +826,8 @@ impl Driver {
         &mut self,
         reader: &'a mut R,
     ) -> Result<Operation<'a, io::Result<(Received, Backing)>>, Refused<()>> {
+        let resource = reader.as_mut().resource;
+        self.own(resource, ())?;
         if self.selected.is_none() {
             return Err(Refused {
                 reason: Reason::Buffers,
@@ -833,7 +841,7 @@ impl Driver {
             },
             ..Held::default()
         };
-        let completion = self.begin(reader.as_mut().resource, Kind::RecvSelectedFrom, (), held)?;
+        let completion = self.begin(resource, Kind::RecvSelectedFrom, (), held)?;
         Ok(Operation::new(completion, |result, held| {
             let Payload::Receive { received: facts, .. } = held.payload else {
                 return None;
@@ -861,6 +869,7 @@ impl Driver {
         reader: &'a mut R,
         arrivals: Arrivals,
     ) -> Result<Operation<'a, (io::Result<usize>, Arrivals)>, Refused<Arrivals>> {
+        let arrivals = self.own(reader.as_mut().resource, arrivals)?;
         if self.selected.is_none() {
             return Err(Refused {
                 reason: Reason::Buffers,

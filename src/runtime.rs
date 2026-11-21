@@ -479,7 +479,10 @@ impl Runtime {
             return Err(BlockOnError::Time(error, root));
         }
         owner.use_generator(self.generator.child(b"block_on", call));
-        owner.block_on(root).map_err(BlockOnError::Driver)
+        owner.block_on(root).map_err(|failure| match failure {
+            task::Failure::Start(error) => BlockOnError::Start(error),
+            task::Failure::Driver(error) => BlockOnError::Driver(error),
+        })
     }
 }
 
@@ -875,16 +878,20 @@ pub enum BlockOnError<F> {
     Timers(TimersError, F),
     /// The timers of the owner are on another clock domain than its clock.
     Time(crate::time::TimeError, F),
+    /// The driver of the owner did not start at the first operation that needed it, for example at
+    /// the limit of open files.
+    Start(driver::Error),
     /// The driver of the owner failed.
     Driver(io::Error),
 }
 
 impl<F> BlockOnError<F> {
-    /// The root of a refusal before its first poll, or `None` after a driver failure.
+    /// The root of a refusal before its first poll, or `None` after a failure of the driver or of
+    /// its start.
     pub fn into_root(self) -> Option<F> {
         match self {
             Self::Owner(_, root) | Self::Timers(_, root) | Self::Time(_, root) => Some(root),
-            Self::Driver(_) => None,
+            Self::Start(_) | Self::Driver(_) => None,
         }
     }
 }
@@ -896,6 +903,7 @@ impl<F> fmt::Debug for BlockOnError<F> {
             Self::Owner(refused, _) => f.debug_tuple("Owner").field(refused).finish_non_exhaustive(),
             Self::Timers(error, _) => f.debug_tuple("Timers").field(error).finish_non_exhaustive(),
             Self::Time(error, _) => f.debug_tuple("Time").field(error).finish_non_exhaustive(),
+            Self::Start(error) => f.debug_tuple("Start").field(error).finish(),
             Self::Driver(error) => f.debug_tuple("Driver").field(error).finish(),
         }
     }
@@ -907,6 +915,7 @@ impl<F> fmt::Display for BlockOnError<F> {
             Self::Owner(refused, _) => write!(f, "the task tables of the owner did not fit: {refused}"),
             Self::Timers(error, _) => write!(f, "the timers of the owner did not start: {error}"),
             Self::Time(error, _) => write!(f, "the timers of the owner did not start: {error}"),
+            Self::Start(error) => write!(f, "the driver of the owner did not start: {error}"),
             Self::Driver(error) => write!(f, "the driver of the owner failed: {error}"),
         }
     }
@@ -918,6 +927,7 @@ impl<F> core::error::Error for BlockOnError<F> {
             Self::Owner(refused, _) => Some(refused),
             Self::Timers(error, _) => Some(error),
             Self::Time(error, _) => Some(error),
+            Self::Start(error) => Some(error),
             Self::Driver(error) => Some(error),
         }
     }

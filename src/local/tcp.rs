@@ -1,17 +1,15 @@
 //! TCP on a local owner: a listener, a stream, and the two halves of a stream.
 //!
-//! Each call has the meaning of the [`Driver`](crate::driver::Driver) call of the same name. A
+//! Each call has the meaning of the [`Driver`] call of the same name. A
 //! direction of a stream runs one operation at a time: a receive borrows the read half, and a send
 //! the write half. [`TcpStream::split`] gives both halves, so a receive and a send run at one time.
 
-use core::mem::DropGuard;
 use core::net::SocketAddr;
 use std::io;
 
-use super::{Home, call, rewrap, submit};
+use super::{Home, Homed, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
-use crate::driver::{self, Closed, Operation, Refused, Regions, TcpOptions};
-use crate::task::with_driver;
+use crate::driver::{self, Closed, Completion, Driver, Operation, Refused, Regions, TcpOptions};
 
 /// A listening TCP socket whose home is the driver of the owner of this thread.
 ///
@@ -19,19 +17,15 @@ use crate::task::with_driver;
 /// as [`TcpListener::close`] does, with no future.
 #[derive(Debug)]
 pub struct TcpListener {
-    inner: DropGuard<driver::TcpListener, fn(driver::TcpListener)>,
-    _home: Home,
+    inner: Homed<driver::TcpListener>,
 }
 
 impl TcpListener {
-    fn new(inner: driver::TcpListener) -> Self {
+    /// The listener that `operation` made.
+    fn new(listener: driver::TcpListener, operation: &Completion) -> Self {
+        let cleanup = operation.cleanup(listener.resource());
         Self {
-            inner: DropGuard::new(inner, |listener| {
-                drop(with_driver(listener, |driver, listener| {
-                    driver.close_listener(listener)
-                }));
-            }),
-            _home: Home::default(),
+            inner: Homed::new(listener, cleanup),
         }
     }
 
@@ -44,13 +38,15 @@ impl TcpListener {
     /// thread. The future gives an error of the system.
     pub fn bind(address: SocketAddr, options: TcpOptions) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let bind = submit((), |driver, ()| driver.bind(address, options))?;
-        Ok(bind.with_output(|result, held| driver::tcp_bound(result, held).map(|bound| bound.map(Self::new))))
+        Ok(bind.with_output(|result, held, bind| {
+            driver::tcp_bound(result, held).map(|bound| bound.map(|listener| Self::new(listener, bind)))
+        }))
     }
 
     /// The local address of the listener.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr()
+        self.inner.resource.local_addr()
     }
 
     /// Accepts a connection, as [`Driver::accept`](crate::driver::Driver::accept) does. The future
@@ -61,10 +57,11 @@ impl TcpListener {
     /// A refusal when the driver has no room for the operation, when no driver runs on this
     /// thread, or with `Reason::Resource` when the listener has another home.
     pub fn accept(&mut self) -> Result<Operation<'_, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
-        let listener = &mut *self.inner;
+        let listener = &mut self.inner.resource;
         let accept = submit((), |driver, ()| driver.accept(listener))?;
-        Ok(accept.with_output(|result, held| {
-            driver::accepted(result, held).map(|accepted| accepted.map(|(stream, peer)| (TcpStream::new(stream), peer)))
+        Ok(accept.with_output(|result, held, accept| {
+            driver::accepted(result, held)
+                .map(|accepted| accepted.map(|(stream, peer)| (TcpStream::new(stream, accept), peer)))
         }))
     }
 
@@ -72,18 +69,20 @@ impl TcpListener {
     ///
     /// # Errors
     ///
-    /// An error of the system, or when the listener has no driver on this thread.
+    /// An error of the system, or of the kind `NotFound` when no driver of this thread owns the
+    /// listener.
     pub fn options(&self) -> io::Result<TcpOptions> {
-        call(|driver| driver.options(&*self.inner))
+        call(|driver| driver.options(&self.inner.resource))
     }
 
     /// Sets each option of `options` that is not `None`.
     ///
     /// # Errors
     ///
-    /// An error of the system, or when the listener has no driver on this thread.
+    /// An error of the system, or of the kind `NotFound` when no driver of this thread owns the
+    /// listener.
     pub fn set_options(&self, options: TcpOptions) -> io::Result<()> {
-        call(|driver| driver.set_options(&*self.inner, options))
+        call(|driver| driver.set_options(&self.inner.resource, options))
     }
 
     /// Closes the listener, as [`Driver::close_listener`](crate::driver::Driver::close_listener)
@@ -94,9 +93,9 @@ impl TcpListener {
     /// A refusal, with the listener, when the driver has no room for the operation or when no
     /// driver runs on this thread.
     pub fn close(self) -> Result<Operation<'static, Closed>, Refused<Self>> {
-        let listener = DropGuard::dismiss(self.inner);
-        submit(listener, |driver, listener| driver.close_listener(listener))
-            .map_err(|refused| rewrap(refused, Self::new))
+        self.inner
+            .close(Driver::close_listener)
+            .map_err(|refused| rewrap(refused, |inner| Self { inner }))
     }
 }
 
@@ -107,17 +106,15 @@ impl TcpListener {
 /// does, with no future.
 #[derive(Debug)]
 pub struct TcpStream {
-    inner: DropGuard<driver::TcpStream, fn(driver::TcpStream)>,
-    _home: Home,
+    inner: Homed<driver::TcpStream>,
 }
 
 impl TcpStream {
-    fn new(inner: driver::TcpStream) -> Self {
+    /// The stream that `operation` made.
+    fn new(stream: driver::TcpStream, operation: &Completion) -> Self {
+        let cleanup = operation.cleanup(stream.resource());
         Self {
-            inner: DropGuard::new(inner, |stream| {
-                drop(with_driver(stream, |driver, stream| driver.close(stream)));
-            }),
-            _home: Home::default(),
+            inner: Homed::new(stream, cleanup),
         }
     }
 
@@ -133,12 +130,14 @@ impl TcpStream {
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let connect = submit((), |driver, ()| driver.connect(address, options))?;
-        Ok(connect.with_output(|result, held| driver::connected(result, held).map(|stream| stream.map(Self::new))))
+        Ok(connect.with_output(|result, held, connect| {
+            driver::connected(result, held).map(|stream| stream.map(|stream| Self::new(stream, connect)))
+        }))
     }
 
     /// The read half and the write half, so that a receive and a send run at one time.
     pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
-        let (read, write) = self.inner.split();
+        let (read, write) = self.inner.resource.split();
         (
             ReadHalf {
                 read,
@@ -159,7 +158,7 @@ impl TcpStream {
     /// A refusal, with the buffer, when the driver has no room for the operation, when no driver
     /// runs on this thread, or with `Reason::Resource` when the stream has another home.
     pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
-        let stream = &mut *self.inner;
+        let stream = &mut self.inner.resource;
         submit(buffer, |driver, buffer| driver.recv(stream, buffer))
     }
 
@@ -169,7 +168,7 @@ impl TcpStream {
     ///
     /// As for [`TcpStream::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
-        let stream = &mut *self.inner;
+        let stream = &mut self.inner.resource;
         submit(lease, |driver, lease| driver.send(stream, lease))
     }
 
@@ -183,7 +182,7 @@ impl TcpStream {
         &mut self,
         regions: Regions,
     ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
-        let stream = &mut *self.inner;
+        let stream = &mut self.inner.resource;
         submit(regions, |driver, regions| driver.send_vectored(stream, regions))
     }
 
@@ -194,7 +193,7 @@ impl TcpStream {
     ///
     /// As for [`TcpStream::recv`].
     pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
-        let stream = &mut *self.inner;
+        let stream = &mut self.inner.resource;
         submit((), |driver, ()| driver.shutdown_write(stream))
     }
 
@@ -202,18 +201,20 @@ impl TcpStream {
     ///
     /// # Errors
     ///
-    /// An error of the system, or when the stream has no driver on this thread.
+    /// An error of the system, or of the kind `NotFound` when no driver of this thread owns the
+    /// stream.
     pub fn options(&self) -> io::Result<TcpOptions> {
-        call(|driver| driver.options(&*self.inner))
+        call(|driver| driver.options(&self.inner.resource))
     }
 
     /// Sets each option of `options` that is not `None`.
     ///
     /// # Errors
     ///
-    /// An error of the system, or when the stream has no driver on this thread.
+    /// An error of the system, or of the kind `NotFound` when no driver of this thread owns the
+    /// stream.
     pub fn set_options(&self, options: TcpOptions) -> io::Result<()> {
-        call(|driver| driver.set_options(&*self.inner, options))
+        call(|driver| driver.set_options(&self.inner.resource, options))
     }
 
     /// Closes the stream, as [`Driver::close`](crate::driver::Driver::close) does: it cancels each
@@ -224,8 +225,9 @@ impl TcpStream {
     /// A refusal, with the stream, when the driver has no room for the operation or when no driver
     /// runs on this thread.
     pub fn close(self) -> Result<Operation<'static, Closed>, Refused<Self>> {
-        let stream = DropGuard::dismiss(self.inner);
-        submit(stream, |driver, stream| driver.close(stream)).map_err(|refused| rewrap(refused, Self::new))
+        self.inner
+            .close(Driver::close)
+            .map_err(|refused| rewrap(refused, |inner| Self { inner }))
     }
 }
 

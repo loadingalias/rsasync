@@ -419,19 +419,25 @@ pub(in crate::driver) fn a_kill_ends_the_child_and_a_signal_after_the_reap_refus
 }
 
 /// Each driver spawns its first child in slot 0 with generation 0. On the other driver, a kill of
-/// that child gives `OtherDriver`, so the kill reaches neither child. Each child runs on until a
-/// kill of its own driver ends it.
-pub(in crate::driver) fn a_child_of_another_driver_gives_other_driver_and_no_child_gets_the_kill() {
+/// that child gives `OtherDriver`, and a close refuses with `Reason::Resource` and gives the child
+/// back, so its drop does not ask its own driver for the kill of `End::Kill`. No child gets a kill.
+/// Each child runs on until a kill of its own driver ends it.
+pub(in crate::driver) fn a_child_of_another_driver_refuses_and_no_child_gets_the_kill() {
     let backend = cfg_select! {
         target_os = "linux" => Backend::Kernel,
         _ => Backend::Kqueue,
     };
     let (mut first, _first_service) = with_service(Config::new(), 4, backend);
     let (mut second, _second_service) = with_service(Config::new(), 4, backend);
-    let mut theirs = spawn(&mut first, sleeper(), ChildOptions::new());
+    let theirs = spawn(&mut first, sleeper(), ChildOptions::new().end(End::Kill));
     let mut ours = spawn(&mut second, sleeper(), ChildOptions::new());
 
     assert_matches!(second.kill_child(&theirs), Err(SignalChildError::OtherDriver));
+    let refused = second.close_child(theirs).unwrap_err();
+    assert_eq!(refused.reason(), Reason::Resource);
+    let mut theirs = refused.into_inner();
+    // A turn of the first driver applies a kill that a drop asked for.
+    let _turn = first.turn().expect("a turn works");
     assert_eq!([theirs.id(), ours.id()].map(state), [State::Running; 2]);
 
     for (driver, child) in [(&mut first, &mut theirs), (&mut second, &mut ours)] {
@@ -532,7 +538,7 @@ pub(in crate::driver) fn the_keep_policy_leaves_a_closed_and_a_dropped_child_run
     let closed = spawn(&mut driver, sleeper(), ChildOptions::new());
     let dropped = spawn(&mut driver, sleeper(), ChildOptions::new());
     let pids = [closed.id(), dropped.id()];
-    driver.close_child(closed);
+    driver.close_child(closed).expect("the driver made the child");
     drop(dropped);
     // A turn applies the requests of the drop.
     let _turn = driver.turn().expect("a turn works");
@@ -556,7 +562,7 @@ pub(in crate::driver) fn the_kill_policy_close_kills_and_reaps_the_child(backend
     let options = ChildOptions::new().end(End::Kill);
     let child = spawn(&mut driver, sleeper(), options);
     let pid = child.id();
-    driver.close_child(child);
+    driver.close_child(child).expect("the driver made the child");
     let reaped = drive_until(&mut driver, || state(pid) == State::Reaped);
     assert!(reaped, "the child stays {:?}", state(pid));
     assert_eq!(driver.teardown().expect("the teardown works").kept(), 0);

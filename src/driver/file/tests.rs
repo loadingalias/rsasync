@@ -344,6 +344,30 @@ fn sync_directory(driver: &mut Driver, directory: &super::Directory) {
     }
 }
 
+/// A file and a directory of another driver refuse with `Reason::Resource` before each other check,
+/// so no call reaches the slot of either on this driver. This driver has no blocking service, so a
+/// length change on the service would refuse with `Reason::Blocking` first. On Windows, a directory
+/// sync has no qualified form, so it would give an operation that fails with `Unsupported`.
+pub(in crate::driver) fn a_file_of_another_driver_refuses_before_each_other_check(backend: Backend) {
+    let scratch = Scratch::new("foreign");
+    let mut first = suite::driver(Config::new(), backend);
+    let mut second = super::super::tests::driver(Config::new());
+    let file = open(&mut first, &scratch.join("data"), writable());
+    let open = first.open_directory(&scratch.0).unwrap();
+    let directory = drive(&mut first, open).unwrap().unwrap();
+
+    assert_eq!(second.set_file_len(&file, 100).unwrap_err().reason(), Reason::Resource);
+    assert_eq!(
+        second.sync_directory(&directory).unwrap_err().reason(),
+        Reason::Resource
+    );
+
+    let close = first.close_file(file).unwrap();
+    drive(&mut first, close).unwrap();
+    let close = first.close_directory(directory).unwrap();
+    drive(&mut first, close).unwrap();
+}
+
 /// A rename, an unlink, and the sync of their directory complete, and the names change as they
 /// say. On Windows, the sync of the directory gives `Unsupported`.
 pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backend: Backend) {

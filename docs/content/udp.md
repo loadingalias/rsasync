@@ -138,9 +138,11 @@ before any submission, and the socket does not change.
 
 A task of a [runtime](runtime.md) owner uses `rsasync::local::UdpSocket` (Linux), with no driver
 argument, as [TCP from a task](tcp.md#use-tcp-from-a-task) does. `UdpSocket::bind(address,
-options)`, `send_to`, `send_batch`, `recv_from`, `recv_batch`, and `close` are the driver calls
-of this page. `socket.split()` gives a `rsasync::local::udp::ReadHalf` and a `WriteHalf`, so a
-receive and a send run at one time. The socket is not `Send`, its refusals give back what you gave,
-and a drop closes it. A receive into a buffer that the kernel selects is not a local call yet.
+options)`, `send_to`, `send_batch`, `recv_from`, and `close` are the driver calls of this page.
+`socket.split()` gives a `rsasync::local::udp::ReadHalf` and a `WriteHalf`, so a receive and a send
+run at one time. The socket and the future of its bind are not `Send`, and its refusals give back
+what you gave. A drop closes it with no free operation slot, as the [drop of a TCP
+stream](tcp.md#use-tcp-from-a-task) does. A batch receive and a receive into a buffer that the
+kernel selects are not local calls yet: they need a pool on each worker.
 
 For one socket on each worker, see [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker).

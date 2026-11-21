@@ -150,6 +150,12 @@ pub(super) trait Park {
     /// turn.
     fn drive(&mut self, local: &Local) -> Result<bool, Self::Error>;
 
+    /// Gives the failure of the home that a poll or a destructor stored, such as a driver that did
+    /// not start at its first use. A home that cannot fail stores none.
+    fn check(&mut self, _local: &Local) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Waits until a signal of the home comes, or until the instant of `until` at the latest.
     fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Self::Error>;
 }
@@ -265,7 +271,7 @@ pub(super) struct Local {
     pub(super) switched: Cell<bool>,
     /// The error of a driver that did not start, which fails the owner at its next turn (`ring`).
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub(super) failure: Cell<Option<std::io::Error>>,
+    pub(super) failure: Cell<Option<crate::driver::Error>>,
     /// The generator of this owner, and the index of its next child (`task::generator`).
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) generator: RefCell<Option<(rscrypto::ChaCha20Rng, u64)>>,
@@ -624,7 +630,11 @@ impl Local {
         let output = loop {
             if poll_root || self.shared.take_root() {
                 poll_root = false;
-                if let Poll::Ready(output) = coop::with_budget(self.poll_budget.get(), || root.as_mut().poll(&mut cx)) {
+                let polled = coop::with_budget(self.poll_budget.get(), || root.as_mut().poll(&mut cx));
+                // A failure of the home in the poll ends the loop before a task polls or the
+                // cancel of the end, so each live task ends with `OwnerFailed`.
+                home.check(self)?;
+                if let Poll::Ready(output) = polled {
                     break output;
                 }
             }
@@ -646,6 +656,8 @@ impl Local {
             }
         }
         self.closed.set(false);
+        // The destructor of a cancelled task can fail the home, also after the last turn.
+        home.check(self)?;
         Ok(output)
     }
 }

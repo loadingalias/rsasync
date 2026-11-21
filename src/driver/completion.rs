@@ -15,7 +15,7 @@ use super::{Held, Shared};
 /// poll.
 #[derive(Debug)]
 pub(crate) struct Completion {
-    shared: Arc<Shared>,
+    pub(super) shared: Arc<Shared>,
     id: OpId,
     /// A drop asks the home to cancel the operation: a receive, not a send.
     cancel_on_drop: bool,

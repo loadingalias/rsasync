@@ -1,35 +1,31 @@
 //! UDP on a local owner: a socket, and its two halves.
 //!
-//! Each call has the meaning of the [`Driver`](crate::driver::Driver) call of the same name. A
+//! Each call has the meaning of the [`Driver`] call of the same name. A
 //! direction of a socket runs one operation at a time: a receive borrows the read half, and a send
 //! the write half. [`UdpSocket::split`] gives both halves, so a receive and a send run at one time.
 
-use core::mem::DropGuard;
 use core::net::SocketAddr;
 use std::io;
 
-use super::{Home, rewrap, submit};
+use super::{Home, Homed, rewrap, submit};
 use crate::buffer::Backing;
 use crate::datagram::Received;
-use crate::driver::{self, Arrivals, Closed, Datagram, Datagrams, Operation, Refused, UdpOptions};
-use crate::task::with_driver;
+use crate::driver::{self, Closed, Completion, Datagram, Datagrams, Driver, Operation, Refused, UdpOptions};
 
 /// A UDP socket whose home is the driver of the owner of this thread.
 ///
 /// A drop of the socket closes it, as [`UdpSocket::close`] does, with no future.
 #[derive(Debug)]
 pub struct UdpSocket {
-    inner: DropGuard<driver::UdpSocket, fn(driver::UdpSocket)>,
-    _home: Home,
+    inner: Homed<driver::UdpSocket>,
 }
 
 impl UdpSocket {
-    fn new(inner: driver::UdpSocket) -> Self {
+    /// The socket that `operation` made.
+    fn new(socket: driver::UdpSocket, operation: &Completion) -> Self {
+        let cleanup = operation.cleanup(socket.resource());
         Self {
-            inner: DropGuard::new(inner, |socket| {
-                drop(with_driver(socket, |driver, socket| driver.close_udp(socket)));
-            }),
-            _home: Home::default(),
+            inner: Homed::new(socket, cleanup),
         }
     }
 
@@ -42,18 +38,20 @@ impl UdpSocket {
     /// thread. The future gives an error of the system.
     pub fn bind(address: SocketAddr, options: UdpOptions) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let bind = submit((), |driver, ()| driver.bind_udp(address, options))?;
-        Ok(bind.with_output(|result, held| driver::udp_bound(result, held).map(|bound| bound.map(Self::new))))
+        Ok(bind.with_output(|result, held, bind| {
+            driver::udp_bound(result, held).map(|bound| bound.map(|socket| Self::new(socket, bind)))
+        }))
     }
 
     /// The local address of the socket.
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr()
+        self.inner.resource.local_addr()
     }
 
     /// The read half and the write half, so that a receive and a send run at one time.
     pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
-        let (read, write) = self.inner.split();
+        let (read, write) = self.inner.resource.split();
         (
             ReadHalf {
                 read,
@@ -76,7 +74,7 @@ impl UdpSocket {
         &mut self,
         datagram: Datagram,
     ) -> Result<Operation<'_, (io::Result<usize>, Datagram)>, Refused<Datagram>> {
-        let socket = &mut *self.inner;
+        let socket = &mut self.inner.resource;
         submit(datagram, |driver, datagram| driver.send_to(socket, datagram))
     }
 
@@ -90,7 +88,7 @@ impl UdpSocket {
         &mut self,
         datagrams: Datagrams,
     ) -> Result<Operation<'_, (io::Result<usize>, Datagrams)>, Refused<Datagrams>> {
-        let socket = &mut *self.inner;
+        let socket = &mut self.inner.resource;
         submit(datagrams, |driver, datagrams| driver.send_batch(socket, datagrams))
     }
 
@@ -104,22 +102,8 @@ impl UdpSocket {
         &mut self,
         buffer: Backing,
     ) -> Result<Operation<'_, (io::Result<Received>, Backing)>, Refused<Backing>> {
-        let socket = &mut *self.inner;
+        let socket = &mut self.inner.resource;
         submit(buffer, |driver, buffer| driver.recv_from(socket, buffer))
-    }
-
-    /// Receives the datagrams that wait, into the buffers of `arrivals`, as
-    /// [`Driver::recv_batch`](crate::driver::Driver::recv_batch) does.
-    ///
-    /// # Errors
-    ///
-    /// As for [`UdpSocket::send_to`], with the arrivals.
-    pub fn recv_batch(
-        &mut self,
-        arrivals: Arrivals,
-    ) -> Result<Operation<'_, (io::Result<usize>, Arrivals)>, Refused<Arrivals>> {
-        let socket = &mut *self.inner;
-        submit(arrivals, |driver, arrivals| driver.recv_batch(socket, arrivals))
     }
 
     /// Closes the socket, as [`Driver::close_udp`](crate::driver::Driver::close_udp) does.
@@ -129,8 +113,9 @@ impl UdpSocket {
     /// A refusal, with the socket, when the driver has no room for the operation or when no driver
     /// runs on this thread.
     pub fn close(self) -> Result<Operation<'static, Closed>, Refused<Self>> {
-        let socket = DropGuard::dismiss(self.inner);
-        submit(socket, |driver, socket| driver.close_udp(socket)).map_err(|refused| rewrap(refused, Self::new))
+        self.inner
+            .close(Driver::close_udp)
+            .map_err(|refused| rewrap(refused, |inner| Self { inner }))
     }
 }
 
@@ -153,19 +138,6 @@ impl ReadHalf<'_> {
     ) -> Result<Operation<'_, (io::Result<Received>, Backing)>, Refused<Backing>> {
         let read = &mut *self.read;
         submit(buffer, |driver, buffer| driver.recv_from(read, buffer))
-    }
-
-    /// Receives the datagrams that wait, as [`UdpSocket::recv_batch`] does.
-    ///
-    /// # Errors
-    ///
-    /// As for [`UdpSocket::recv_batch`].
-    pub fn recv_batch(
-        &mut self,
-        arrivals: Arrivals,
-    ) -> Result<Operation<'_, (io::Result<usize>, Arrivals)>, Refused<Arrivals>> {
-        let read = &mut *self.read;
-        submit(arrivals, |driver, arrivals| driver.recv_batch(read, arrivals))
     }
 }
 

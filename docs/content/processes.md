@@ -172,7 +172,9 @@ The end policy is stated at the spawn or the adoption:
 | `End::Keep` (the default) | The child runs on, and the driver reaps it when it ends | The child runs on. `Teardown::kept()` counts it |
 | `End::Kill` | The driver kills the child, or each process of its tree, and then reaps it | The same, and teardown waits for the reap |
 
-`Driver::close_child` applies the policy at once. A drop applies it at the next turn. After
+`Driver::close_child` applies the policy at once. A drop applies it at the next turn. A close on
+a driver that did not make the child refuses with `Reason::Resource` and gives the `Child` back:
+close or drop it on its own driver. After
 teardown, nothing reaps a kept child: it stays a zombie after its end until this process ends.
 
 ## Capacity

@@ -245,11 +245,16 @@ runtime.block_on(async {
 
 The local types differ from the driver types in two points:
 
-- They are not `Send`, so a resource stays on the thread of its home. A local call on another
-  owner refuses with `Reason::Resource`, also after the `block_on` that made the resource ended.
-  A local call on a thread with no driver refuses with `Reason::NoDriver`. Each refusal gives back
-  what you gave, such as the buffer.
-- A drop of a listener or a stream closes it, as `close` does, but with no future. The driver
-  ends each operation of the resource and closes its socket.
+- They are not `Send`, so a resource stays on the thread of its home. The future of a bind, a
+  connect, or an accept is not `Send` either, so the resource starts on that thread. A local call
+  on another owner refuses with `Reason::Resource`, also after the `block_on` that made the
+  resource ended. A local call on a thread with no driver refuses with `Reason::NoDriver`. Each
+  refusal gives back what you gave, such as the buffer. An option call gives an `io::Result`
+  instead: with no driver, or on another owner, it gives an error of the kind `NotFound`.
+- A drop of a listener or a stream closes it, as `close` does, but with no future. The drop needs
+  no free operation slot. The driver ends each operation of the resource and closes its socket.
+  When the drop cannot use the driver at once, the next turn of the driver starts the close. For
+  example, the drop runs in a destructor that a turn of the driver runs. A drop after the end of
+  the `block_on` of the resource does nothing, because that `block_on` closed the socket.
 
 For one listener on each worker, see [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker).

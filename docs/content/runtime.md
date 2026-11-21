@@ -145,12 +145,13 @@ can replace the driver that the owner waits in. These are the types of `rsasync:
 [TCP from a task](tcp.md#use-tcp-from-a-task) and [UDP from a task](udp.md#use-udp-from-a-task).
 
 `block_on` gives a `BlockOnError` when the owner gets no task tables (`Owner`) or no timers
-(`Timers`, `Time`), or when its driver fails (`Driver`). The first three come before the first
-poll of `root`, and `into_root` gives `root` back, unpolled, so you can run it later. A driver
-failure during the call ends each live task with `Outcome::OwnerFailed`. A driver that does not
-start at the first operation is a driver failure too: that operation refuses with
-`Reason::NoDriver`, and `block_on` gives the error of the start, for example `EMFILE` at the limit
-of open files, also when `root` ended. A failure of the final teardown drops the output of `root`.
+(`Timers`, `Time`), when its driver does not start (`Start`), or when its driver fails (`Driver`).
+The first three come before the first poll of `root`, and `into_root` gives `root` back, unpolled,
+so you can run it later. A driver failure during the call ends each live task with
+`Outcome::OwnerFailed`. A driver that does not start at the first operation fails the owner in the
+same way: that operation refuses with `Reason::NoDriver`, and `block_on` gives `Start` with the
+`driver::Error` of the start, also when `root` ended. For example, the limit of open files gives
+`Error::System` with `EMFILE`. A failure of the final teardown drops the output of `root`.
 
 The error holds the root, so `?` into `Box<dyn Error>` needs a root that is `'static`, such as an
 `async move` block that owns what it uses. For a root that borrows, match the error, or map it
@@ -226,10 +227,12 @@ println!("listening on {}", group.local_addr());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The future gives `GroupError` with the worker and its cause when a member does not start: no
-channel in the budget (`Channel`), no slot on the worker (`Spawn`), a refused bind (`Refused`), a
-failed bind (`Bind`), or a stopped worker (`Ended`). Each member that bound before then closes, and
-so does each member when you drop the future before its end. `Group::into_tasks` gives the task of
+The future gives `GroupError` with its cause when a member does not start: no room in the budget
+for the list of the members (`Budget`), no memory for the lists of the group (`Allocation`), no
+channel in the budget (`Channel`), or, with the worker, no slot on the worker (`Spawn`), a refused
+bind (`Refused`), a failed bind (`Bind`), or a stopped worker (`Ended`). When the future gives the error, each member
+that bound has closed its socket, so the address is free again. A drop of the future before its end
+cancels each member, and each one closes its socket on its worker soon after. `Group::into_tasks` gives the task of
 each member, in the order of its worker.
 
 ## Placement

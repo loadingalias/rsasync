@@ -1023,9 +1023,21 @@ impl Driver {
     /// Closes `child` now by its [`End`], as its drop does at the next turn: with [`End::Kill`],
     /// the driver kills the child, or each process of its tree, and then reaps it; with
     /// [`End::Keep`], the child runs on, and the driver reaps it when it ends.
-    pub fn close_child(&mut self, child: Child) {
+    ///
+    /// # Errors
+    ///
+    /// A refusal, with `child`, that gives [`Reason::Resource`] when another driver made the child.
+    /// That driver applies the end at a close or a drop of the child.
+    pub fn close_child(&mut self, child: Child) -> Result<(), Refused<Child>> {
+        if child.id.driver != self.resources.driver {
+            return Err(Refused {
+                reason: Reason::Resource,
+                value: child,
+            });
+        }
         drop(child);
         self.take_requests();
+        Ok(())
     }
 
     /// Begins the exit operation of the child slot `index`, with room for `entries` entries.

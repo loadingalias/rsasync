@@ -2087,7 +2087,9 @@ pub(in crate::driver) fn a_refused_datagram_ends_its_batch_and_the_report_counts
 
 /// Each driver makes its first listener in slot 0 with generation 0. On the other driver, an accept
 /// of that listener refuses with `Reason::Resource`, and an option read gives an error, so no call
-/// reaches the listener in the same slot there. Each listener then accepts on its own driver.
+/// reaches the listener in the same slot there. Each listener then accepts on its own driver. The
+/// other driver has no pool, and each selected receive of a stream or a socket of the first driver
+/// still refuses with `Reason::Resource`, before `Reason::Buffers`.
 pub(in crate::driver) fn a_resource_of_another_driver_refuses_and_each_driver_keeps_its_own() {
     let mut first = driver(Config::new());
     let mut second = driver(Config::new());
@@ -2096,6 +2098,21 @@ pub(in crate::driver) fn a_resource_of_another_driver_refuses_and_each_driver_ke
 
     assert_eq!(second.accept(&mut theirs).unwrap_err().reason(), Reason::Resource);
     second.options(&theirs).unwrap_err();
+
+    let _peer = std::net::TcpStream::connect(theirs.local_addr()).unwrap();
+    let accept = first.accept(&mut theirs).unwrap();
+    let (mut stream, _) = drive(&mut first, accept).unwrap().unwrap();
+    let mut socket = udp(&mut first, "127.0.0.1:0", UdpOptions::default());
+    assert_eq!(
+        second.recv_selected(&mut stream).unwrap_err().reason(),
+        Reason::Resource
+    );
+    assert_eq!(
+        second.recv_selected_from(&mut socket).unwrap_err().reason(),
+        Reason::Resource
+    );
+    let refused = second.recv_batch(&mut socket, Arrivals::with_capacity(1)).unwrap_err();
+    assert_eq!(refused.reason(), Reason::Resource);
 
     for (driver, listener) in [(&mut first, &mut theirs), (&mut second, &mut ours)] {
         let _peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();

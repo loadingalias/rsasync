@@ -81,6 +81,12 @@ impl TcpListener {
     pub fn local_addr(&self) -> SocketAddr {
         self.local
     }
+
+    /// The resource of the listener, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.resource
+    }
 }
 
 /// A connected TCP socket that a driver owns: its read half and its write half.
@@ -172,6 +178,12 @@ impl TcpStream {
     /// The read half and the write half, so that a receive and a send can run at one time.
     pub fn split(&mut self) -> (&mut ReadHalf, &mut WriteHalf) {
         (&mut self.read, &mut self.write)
+    }
+
+    /// The resource of the stream, whose close a local type records at its drop.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn resource(&self) -> Resource {
+        self.read.resource
     }
 }
 
@@ -705,9 +717,19 @@ pub(super) struct Directions {
     /// took, or since the last report.
     unreported: usize,
     /// The close that waits for the operations of the resource.
-    closing: Option<OpId>,
+    closing: Option<Closing>,
     /// The resource is in the pending list of the driver.
     pending: bool,
+}
+
+/// Who waits for the close of a resource.
+#[derive(Debug, Clone, Copy)]
+enum Closing {
+    /// The future of the close operation, which gets the report.
+    Future(OpId),
+    /// No one: a drop of a local type recorded the close.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    Dropped,
 }
 
 impl Directions {
@@ -1319,13 +1341,15 @@ impl Driver {
         &mut self,
         reader: &'a mut R,
     ) -> Result<Operation<'a, io::Result<Backing>>, Refused<()>> {
+        let resource = reader.as_mut().resource;
+        self.own(resource, ())?;
         if self.selected.is_none() {
             return Err(Refused {
                 reason: Reason::Buffers,
                 value: (),
             });
         }
-        let completion = self.begin(reader.as_mut().resource, Kind::Selected, (), |()| Held::default())?;
+        let completion = self.begin(resource, Kind::Selected, (), |()| Held::default())?;
         Ok(Operation::new(completion, |result, held| {
             // With no selected buffer, for example at the end of the stream, the backing is empty,
             // and an empty `Vec` allocates nothing.
@@ -1962,8 +1986,24 @@ impl Driver {
         let id = self
             .open(tag, 0, value, |_| Held::default())
             .map_err(|(reason, value)| Refused { reason, value })?;
+        self.start_close(resource, Closing::Future(id));
+        Ok(Completion::new(Arc::clone(&self.shared), id, false))
+    }
+
+    /// Starts the close of `resource` that a drop of a local type recorded, as
+    /// [`Driver::close_resource`] does, with no operation and no report. A record of a resource
+    /// that this driver no longer owns changes nothing.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn close_dropped_resource(&mut self, resource: Resource) {
+        if self.resources.get(resource).is_some() {
+            self.start_close(resource, Closing::Dropped);
+        }
+    }
+
+    /// Marks `resource` closing, cancels each of its operations, and closes it after each one ends.
+    fn start_close(&mut self, resource: Resource, closing: Closing) {
         if let Some(owned) = self.resources.get(resource) {
-            owned.directions.closing = Some(id);
+            owned.directions.closing = Some(closing);
         }
         for kind in [Kind::Recv, Kind::Send] {
             // An operation that waits never ran, so it ends now; a send that waits too.
@@ -1985,18 +2025,17 @@ impl Driver {
         // A close can release a resource that the pending list holds, so the list is empty
         // before a new resource takes that slot.
         self.attend();
-        Ok(Completion::new(Arc::clone(&self.shared), id, false))
     }
 
     /// Ends the close of `resource` when no operation of it runs: releases what its directions
-    /// keep, closes its descriptor, and gives the report.
+    /// keep, closes its descriptor, and gives the report to the future of the close.
     fn close_if_idle(&mut self, resource: Resource) {
         let table = &self.table;
         let Some(owned) = self.resources.get(resource) else {
             return;
         };
         let directions = &owned.directions;
-        let Some(id) = directions.closing else {
+        let Some(closing) = directions.closing else {
             return;
         };
         let runs = [directions.read.current, directions.write.current]
@@ -2014,14 +2053,20 @@ impl Driver {
         };
         // The release drops the kept bytes and connections, and the descriptor.
         drop(self.resources.release(resource));
-        if let Some(slot) = self.shared.entries.get(id.index() as usize) {
-            slot.update(id, |held| {
-                if let Some(held) = held {
-                    held.closed = Some(closed);
+        match closing {
+            Closing::Future(id) => {
+                if let Some(slot) = self.shared.entries.get(id.index() as usize) {
+                    slot.update(id, |held| {
+                        if let Some(held) = held {
+                            held.closed = Some(closed);
+                        }
+                    });
                 }
-            });
+                self.complete_now(id, 0);
+            }
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            Closing::Dropped => {}
         }
-        self.complete_now(id, 0);
     }
 }
 

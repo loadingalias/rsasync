@@ -110,8 +110,9 @@ it.
 
 Each resource and each child belongs to the driver that made it, also after it moves to another
 thread. Use it only with that driver. Another driver refuses it and changes nothing: an operation
-gives `Refused` with `Reason::Resource`, a call that gives an `io::Result` gives an error, and a
-signal of a child gives `SignalChildError::OtherDriver`.
+and `Driver::close_child` give `Refused` with `Reason::Resource` and the value, before each other
+refusal, a call that gives an `io::Result` gives an error of the kind `NotFound`, and a signal of a
+child gives `SignalChildError::OtherDriver`.
 
 | Call | What it does |
 | --- | --- |

@@ -105,6 +105,7 @@
 //!     `an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay`.
 //!   - Sync, rename, unlink, directory open and sync, and close:
 //!     `a_rename_an_unlink_and_a_directory_sync_complete`.
+//!   - A file and a directory of another driver: `a_file_of_another_driver_refuses_before_each_other_check`.
 //!   - The native NVMe path of the device of a file, on Windows:
 //!     `the_nvme_report_of_a_file_follows_the_driver_of_its_disk`.
 //!   - A path longer than `MAX_PATH`, on Windows:
@@ -397,7 +398,7 @@ mod law {
         tests => a_batch_larger_than_the_submission_queue_refuses_and_gives_its_datagrams_back,
         tests => a_resource_of_another_driver_refuses_and_each_driver_keeps_its_own,
         #[cfg(unix)]
-        process::tests => a_child_of_another_driver_gives_other_driver_and_no_child_gets_the_kill,
+        process::tests => a_child_of_another_driver_refuses_and_no_child_gets_the_kill,
     }
 
     /// The cases that a kernel cannot make on demand.
@@ -500,6 +501,7 @@ mod operation {
             file::tests => an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay,
             file::tests => a_write_after_the_end_of_an_extending_allocation_keeps_each_byte,
             file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
+            file::tests => a_file_of_another_driver_refuses_before_each_other_check,
             #[cfg(target_os = "windows")]
             file::tests => the_nvme_report_of_a_file_follows_the_driver_of_its_disk,
             #[cfg(target_os = "windows")]

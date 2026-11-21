@@ -1089,9 +1089,10 @@ impl Driver {
     pub fn read_vectored_at<'a>(
         &mut self,
         file: &'a File,
-        mut buffers: Buffers,
+        buffers: Buffers,
         offset: u64,
     ) -> Result<Operation<'a, (io::Result<usize>, Buffers)>, Refused<Buffers>> {
+        let mut buffers = self.own(file.resource, buffers)?;
         if !buffers.aligned(file, offset) {
             return Err(Refused {
                 reason: Reason::Alignment,
@@ -1135,6 +1136,7 @@ impl Driver {
         offset: u64,
         mode: WriteMode,
     ) -> Result<Operation<'a, (io::Result<usize>, Lease)>, Refused<Lease>> {
+        let lease = self.own(file.resource, lease)?;
         let len = submitted(lease.initialized());
         if !file.allows(lease.as_ptr().addr(), len as usize, offset) {
             return Err(Refused {
@@ -1175,6 +1177,7 @@ impl Driver {
         offset: u64,
         mode: WriteMode,
     ) -> Result<Operation<'a, (io::Result<usize>, Regions)>, Refused<Regions>> {
+        let regions = self.own(file.resource, regions)?;
         let aligned = regions
             .leases()
             .iter()
@@ -1374,6 +1377,7 @@ impl Driver {
         &mut self,
         directory: &'a Directory,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
+        self.own(directory.resource, ())?;
         if self.report.route(Call::SyncDirectory) == Route::Unsupported {
             let completion = self.fail_now(UNSUPPORTED)?;
             return Ok(Operation::new(completion, |result, held| Some(done(result, &held))));
@@ -1574,6 +1578,7 @@ impl Driver {
 
     /// Starts a read of `file` into `buffer` at `offset`.
     fn begin_read(&mut self, file: &File, buffer: Backing, offset: u64) -> Result<Completion, Refused<Backing>> {
+        let buffer = self.own(file.resource, buffer)?;
         let mut loan = WriteLoan::new(buffer);
         let len = submitted(loan.capacity());
         if !file.allows(loan.as_mut_ptr().addr(), len as usize, offset) {
@@ -1940,6 +1945,7 @@ impl Driver {
         resource: Resource,
         job: impl FnOnce(Duplicate) -> i32 + Send + 'static,
     ) -> Result<Completion, Refused<()>> {
+        self.own(resource, ())?;
         let refuse = |reason| Err(Refused { reason, value: () });
         let Some(submitter) = self.blocking.clone() else {
             return refuse(Reason::Blocking);

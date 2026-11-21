@@ -136,20 +136,28 @@ fn limit_for(open: &[u32], free: usize) -> u64 {
 
 /// A lazy driver of `block_on` that the descriptor limit does not let start fails the owner: the
 /// local call refuses with `Reason::NoDriver`, and `block_on` gives the error of the start, also
-/// after its root ended.
+/// after its root ended. A task that is live then ends with `OwnerFailed`, not with the
+/// `Cancelled` of the normal end.
 #[test]
-fn a_lazy_driver_that_does_not_start_fails_block_on_with_its_error() {
+fn a_lazy_driver_that_does_not_start_fails_block_on_and_each_live_task() {
     const EMFILE: i32 = 24;
     let runtime = Runtime::builder().build().unwrap();
     let refused = core::cell::Cell::new(None);
+    let live = core::cell::RefCell::new(None);
     let failed = with_descriptor_limit(limit_for(&descriptors(), 0), || {
         runtime.block_on(async {
+            live.replace(Some(spawn_local(pending::<()>()).unwrap()));
             let bind = crate::local::TcpListener::bind("127.0.0.1:0".parse().unwrap(), driver::TcpOptions::default());
             refused.set(bind.err().map(|refused| refused.reason()));
         })
     });
     assert_eq!(refused.get(), Some(driver::Reason::NoDriver));
-    assert_matches!(failed, Err(BlockOnError::Driver(error)) if error.raw_os_error() == Some(EMFILE));
+    assert_matches!(
+        failed,
+        Err(BlockOnError::Start(driver::Error::System(error))) if error.raw_os_error() == Some(EMFILE)
+    );
+    let task = live.take().unwrap();
+    assert_matches!(task.join_blocking(), TaskOutcome::OwnerFailed(_));
 }
 
 /// A worker that the descriptor limit leaves no room for its driver fails the start. The start
@@ -677,8 +685,18 @@ fn a_placed_factory_spawn_keeps_no_charge_of_its_factory() {
         .build()
         .unwrap();
     let mut handle = runtime.handle().unwrap();
-    let before = budget.available();
     let (polled, first_poll) = mpsc::channel();
+    // The worker can release the charge of its ready report after `build` returns. The first poll
+    // of a task comes after that release, so the free units stay the same from there.
+    let barrier = polled.clone();
+    let _barrier = handle
+        .spawn_on(WorkerId::new(0), move || async move {
+            barrier.send(0).unwrap();
+            pending::<()>().await;
+        })
+        .unwrap();
+    assert_eq!(first_poll.recv().unwrap(), 0);
+    let before = budget.available();
     let capture = [0_u8; CAPTURE];
     let _task = handle
         .spawn_on(WorkerId::new(0), move || {

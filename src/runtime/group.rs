@@ -2,6 +2,7 @@
 //! reuse-port group.
 
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::fmt;
 use core::future::{Future, pending};
 use core::mem::DropGuard;
@@ -9,10 +10,12 @@ use core::net::SocketAddr;
 use std::io;
 
 use super::{Handle, WorkerId};
+use crate::capacity::Exhausted;
 use crate::channel::{self, oneshot};
 use crate::driver::{self, Operation, TcpOptions, UdpOptions};
 use crate::local::{TcpListener, UdpSocket};
-use crate::task::{self, CancelHandle, JoinHandle};
+use crate::memory::room;
+use crate::task::{self, JoinHandle};
 
 /// The members of a group, one for each local worker. [`Group::local_addr`] is the address of
 /// each member.
@@ -36,10 +39,14 @@ impl<T> Group<T> {
     }
 }
 
-/// Why a group did not start. Each member that bound before closes.
+/// Why a group did not start. Each member that bound closed its socket before the error.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum GroupError {
+    /// The budget of the runtime did not hold the list of the members that the group starts.
+    Budget(Exhausted),
+    /// The allocator did not give the memory of the list of the members, or of their tasks.
+    Allocation,
     /// The budget of the runtime did not hold the channels that start a member.
     Channel(channel::Refused),
     /// The worker did not take the task of its member, for example with no free slot.
@@ -48,13 +55,15 @@ pub enum GroupError {
     Refused(WorkerId, driver::Reason),
     /// The bind on the worker failed, for example because another socket has the address.
     Bind(WorkerId, io::Error),
-    /// The task of the member ended before its bind: its worker stopped.
+    /// The task of the member ended before its start: its worker stopped.
     Ended(WorkerId),
 }
 
 impl fmt::Display for GroupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Budget(exhausted) => write!(f, "the budget cannot charge the list of the members: {exhausted}"),
+            Self::Allocation => f.write_str("the allocator did not give the lists of the group"),
             Self::Channel(refused) => write!(f, "the group got no channel: {refused}"),
             Self::Spawn(worker, reason) => write!(f, "worker {} took no member: {reason:?}", worker.index()),
             Self::Refused(worker, reason) => write!(
@@ -63,7 +72,7 @@ impl fmt::Display for GroupError {
                 worker.index()
             ),
             Self::Bind(worker, error) => write!(f, "the bind on worker {} failed: {error}", worker.index()),
-            Self::Ended(worker) => write!(f, "the member on worker {} ended before its bind", worker.index()),
+            Self::Ended(worker) => write!(f, "the member on worker {} ended before its start", worker.index()),
         }
     }
 }
@@ -71,9 +80,10 @@ impl fmt::Display for GroupError {
 impl core::error::Error for GroupError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
+            Self::Budget(exhausted) => Some(exhausted),
             Self::Channel(refused) => Some(refused),
             Self::Bind(_, error) => Some(error),
-            Self::Spawn(..) | Self::Refused(..) | Self::Ended(_) => None,
+            Self::Allocation | Self::Spawn(..) | Self::Refused(..) | Self::Ended(_) => None,
         }
     }
 }
@@ -143,11 +153,13 @@ impl Handle {
     /// kernel spreads the connections between the listeners.
     ///
     /// The bind of worker 0 comes first, so a port 0 gives one port to each member. No member runs
-    /// `serve` before each member bound. A drop of the future before its end closes each listener.
+    /// `serve` before each member bound and got its start. A drop of the future before its end
+    /// cancels each member, and each one closes its listener on its worker soon after.
     ///
     /// # Errors
     ///
-    /// [`GroupError`] with the worker and its cause. Each listener that bound before closes.
+    /// [`GroupError`] with its cause, and the worker when one failed. Each listener that bound
+    /// closed before the error, so its address is free again.
     pub async fn tcp_group<S, F>(
         &mut self,
         address: SocketAddr,
@@ -202,44 +214,73 @@ where
     let Some(budget) = handle.routes.first().map(|route| route.placer.budget().clone()) else {
         return Err(GroupError::Spawn(WorkerId::new(0), task::Reason::NoWorker));
     };
-    // Until the start, a failure or a drop of this future cancels each member, and a member closes
-    // its socket at its drop.
-    let mut started = DropGuard::new(
-        Vec::with_capacity(workers as usize),
-        |members: Vec<(CancelHandle, _)>| {
-            for (cancel, _start) in members {
-                cancel.cancel();
+    // The start signals are state of the runtime, so the budget pays for their list. The list of
+    // the tasks goes to the caller, so no charge pays for it, but a refusal of its memory still
+    // refuses the group.
+    let list = Layout::array::<oneshot::Sender<()>>(workers as usize)
+        .ok()
+        .and_then(|list| u64::try_from(list.size()).ok())
+        .ok_or(GroupError::Allocation)?;
+    let _charge = budget.reserve(list).map_err(GroupError::Budget)?;
+    let mut starts = room(workers as usize).map_err(|_| GroupError::Allocation)?;
+    // Until the start, a drop of this future cancels each member, and a member closes its socket at
+    // its drop, on its worker.
+    let mut tasks = DropGuard::new(
+        room(workers as usize).map_err(|_| GroupError::Allocation)?,
+        |tasks: Vec<JoinHandle<F::Output>>| {
+            for task in &tasks {
+                task.cancel_handle().cancel();
             }
         },
     );
-    let mut tasks = Vec::with_capacity(workers as usize);
-    for index in 0..workers {
-        let worker = WorkerId::new(index);
-        let (bound, mut binding) = oneshot::channel(&budget).map_err(GroupError::Channel)?;
-        let (start, waiting) = oneshot::channel::<()>(&budget).map_err(GroupError::Channel)?;
-        let serve = serve.clone();
-        let task = handle
-            .spawn_on(worker, move || {
-                member::<M, S, F>(worker, address, options, serve, bound, waiting)
-            })
-            .map_err(|refused| GroupError::Spawn(worker, refused.reason()))?;
-        started.push((task.cancel_handle(), start));
-        tasks.push(task);
-        match binding.recv().await {
-            Ok(Ok(local)) => address = local,
-            Ok(Err(cause)) => return Err(cause.at(worker)),
-            Err(channel::Closed) => return Err(GroupError::Ended(worker)),
+    let bound = async {
+        for index in 0..workers {
+            let worker = WorkerId::new(index);
+            let (bound, mut binding) = oneshot::channel(&budget).map_err(GroupError::Channel)?;
+            let (start, waiting) = oneshot::channel::<()>(&budget).map_err(GroupError::Channel)?;
+            let serve = serve.clone();
+            let task = handle
+                .spawn_on(worker, move || {
+                    member::<M, S, F>(worker, address, options, serve, bound, waiting)
+                })
+                .map_err(|refused| GroupError::Spawn(worker, refused.reason()))?;
+            tasks.push(task);
+            starts.push(start);
+            match binding.recv().await {
+                Ok(Ok(local)) => address = local,
+                Ok(Err(cause)) => return Err(cause.at(worker)),
+                Err(channel::Closed) => return Err(GroupError::Ended(worker)),
+            }
         }
+        Ok(())
     }
-    for (_cancel, start) in DropGuard::dismiss(started) {
-        // A member whose worker stopped since its bind ends with `Cancelled`, so a failed send needs
-        // nothing more.
-        let _sent = start.send(());
+    .await;
+    // A member whose task ended after its bind never serves, so the group fails then too.
+    let failed = match bound {
+        Ok(()) => (0..).zip(starts).find_map(|(index, start)| {
+            start
+                .send(())
+                .err()
+                .map(|_unsent| GroupError::Ended(WorkerId::new(index)))
+        }),
+        Err(error) => Some(error),
+    };
+    let tasks = DropGuard::dismiss(tasks);
+    let Some(error) = failed else {
+        return Ok(Group {
+            local_addr: address,
+            tasks,
+        });
+    };
+    // A task ends after the drop of its member, which closes its socket. So when the error comes,
+    // the address of each member is free again.
+    for task in &tasks {
+        task.cancel_handle().cancel();
     }
-    Ok(Group {
-        local_addr: address,
-        tasks,
-    })
+    for task in tasks {
+        let _outcome = task.join().await;
+    }
+    Err(error)
 }
 
 /// Why the bind of a member failed.

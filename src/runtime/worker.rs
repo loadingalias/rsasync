@@ -13,7 +13,7 @@ use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
 use crate::driver::{Config, Driver};
-use crate::task::{Job, Placer, RingOwner};
+use crate::task::{Failure, Job, Placer, RingOwner};
 use crate::time::Suspend;
 use crate::timer::Timers;
 
@@ -72,7 +72,11 @@ pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::
             if ready.send(Ok((report, placer))).is_err() {
                 return Ok(());
             }
-            owner.block_on(serve(inbox))
+            owner.block_on(serve(inbox)).map_err(|failure| match failure {
+                Failure::Driver(error) => error,
+                // A worker has its driver from its start, so no first use starts one.
+                Failure::Start(error) => io::Error::other(error),
+            })
         }
         Err(error) => {
             let _unreported = ready.send(Err(error));
