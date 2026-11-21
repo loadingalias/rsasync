@@ -44,9 +44,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ptr::{self, NonNull};
-use core::slice::SliceIndex;
+use core::slice::{self, SliceIndex};
 
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicPtr, Ordering};
@@ -897,23 +897,58 @@ impl<B: BufferMut> WriteLoan<B> {
         unsafe { self.buffer.set_initialized(self.start + len) };
     }
 
+    /// Lends the capacity after the filled bytes to `init` as uninitialized bytes, and records the
+    /// bytes that `init` initialized. Gives the number of bytes that it recorded.
+    ///
+    /// `init` gives back the slice that it initialized, for example the result of
+    /// [`write_copy_of_slice`](slice::write_copy_of_slice), or of a cipher that encrypts into
+    /// uninitialized memory. The loan records the slice only when it starts at the first byte that
+    /// `init` got. For each other slice, the loan records no byte and gives 0.
+    ///
+    /// ```
+    /// # extern crate rstypes as rsasync;
+    /// use rsasync::buffer::WriteLoan;
+    ///
+    /// let mut loan = WriteLoan::new(Vec::with_capacity(64));
+    /// let count = loan.fill_with(|spare| spare[..4].write_copy_of_slice(b"DATA"));
+    /// assert_eq!(count, 4);
+    /// assert_eq!(loan.filled(), b"DATA");
+    /// ```
+    #[must_use = "a slice that is not at the start of the spare capacity fills nothing"]
+    #[expect(
+        unsafe_code,
+        reason = "the loan lends its spare capacity, and records only an initialized slice at its start"
+    )]
+    pub fn fill_with(&mut self, init: impl FnOnce(&mut [MaybeUninit<u8>]) -> &mut [u8]) -> usize {
+        let filled = self.filled().len();
+        let len = self.capacity() - filled;
+        // SAFETY: the loan is valid for reads and writes of `capacity` bytes, and while it holds
+        // the buffer, no other code reaches them. The `len` bytes after the `filled` bytes are in
+        // that region. `MaybeUninit` makes no claim about their values.
+        let spare = unsafe { slice::from_raw_parts_mut(self.as_mut_ptr().add(filled).cast::<MaybeUninit<u8>>(), len) };
+        let start = spare.as_ptr().cast::<u8>();
+        let initialized = init(spare);
+        // A `&mut [u8]` holds only initialized bytes. It is in the spare capacity only when it
+        // starts at its first byte and is not longer: another region can start at its end.
+        if initialized.as_ptr() != start || initialized.len() > len {
+            return 0;
+        }
+        let count = initialized.len();
+        // SAFETY: the first `filled` bytes of the loan were initialized before, and `init`
+        // initialized the next `count` bytes. `filled + count` is at most `capacity`.
+        unsafe { self.set_filled(filled + count) };
+        count
+    }
+
     /// Copies the most bytes of `bytes` that fit after the filled bytes, and records them. Gives
     /// the number of bytes that it copied.
     ///
     /// A driver uses it to give data that it holds already, with no call to the backend.
-    #[expect(unsafe_code, reason = "the copy writes only in the loan, after its filled bytes")]
     pub fn fill_from(&mut self, bytes: &[u8]) -> usize {
-        let filled = self.filled().len();
-        let count = bytes.len().min(self.capacity() - filled);
-        // SAFETY: the loan is valid for writes of `capacity` bytes, and `filled + count` is at
-        // most `capacity`. `bytes` is a shared slice, so it is not in the region that the loan
-        // owns exclusively. After the copy, the first `filled + count` bytes of the loan are
-        // initialized.
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), self.as_mut_ptr().add(filled), count);
-            self.set_filled(filled + count);
-        }
-        count
+        self.fill_with(|spare| {
+            let count = bytes.len().min(spare.len());
+            spare[..count].write_copy_of_slice(&bytes[..count])
+        })
     }
 
     /// The bytes that the backend filled: exactly the recorded extent, and no uninitialized

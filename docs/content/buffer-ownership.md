@@ -89,8 +89,34 @@ let buf = loan.into_inner();
 assert_eq!(buf, b"GET /index.html");
 ```
 
-A backend writes through `WriteLoan::as_mut_ptr` and then records its extent with the unsafe
-`WriteLoan::set_filled`.
+Code that writes into uninitialized memory, for example a cipher, fills a loan with
+`WriteLoan::fill_with` and no unsafe code. The loan lends its capacity after the filled bytes to
+a closure, as `&mut [MaybeUninit<u8>]`. The closure gives back the `&mut [u8]` that it
+initialized:
+
+- The loan records the slice only when it starts at the first byte that the closure got. Then it
+  gives the number of bytes that it recorded.
+- For each other slice, the loan records no byte and gives 0. Compare the count with the number
+  of bytes that you expect.
+- Each fill starts after the bytes that the loan filled before. Thus a header, a body, and a tag
+  go in three fills.
+- To give out an error or a value, for example a tag, set a variable that the closure captures.
+  On an error, give back an empty slice, for example with `unwrap_or_default()`.
+
+```rust
+use rsasync::buffer::WriteLoan;
+
+let mut loan = WriteLoan::new(Vec::with_capacity(64));
+loan.fill_from(b"HDR|");
+
+// The closure initializes the first 4 spare bytes, here with a copy, and gives them back.
+let count = loan.fill_with(|spare| spare[..4].write_copy_of_slice(b"BODY"));
+assert_eq!(count, 4);
+assert_eq!(loan.filled(), b"HDR|BODY");
+```
+
+A backend writes through `WriteLoan::as_mut_ptr`, for example from the kernel, and then records
+its extent with the unsafe `WriteLoan::set_filled`.
 
 ## Share bytes with leases and views
 

@@ -141,6 +141,40 @@ fn a_copy_into_a_loan_stops_at_its_capacity() {
 }
 
 #[test]
+fn a_fill_gets_the_spare_capacity_and_records_the_slice_that_it_initialized() {
+    let mut vec = Vec::with_capacity(64);
+    vec.extend_from_slice(b"head");
+    // The expected address and length come from `Vec` itself.
+    let (address, capacity) = (vec.as_ptr(), vec.capacity());
+    let mut loan = WriteLoan::new(vec);
+    assert_eq!(loan.fill_from(b"AB"), 2);
+
+    let mut lent = None;
+    let count = loan.fill_with(|spare| {
+        lent = Some((spare.as_ptr().cast::<u8>(), spare.len()));
+        spare[..4].write_copy_of_slice(b"tail")
+    });
+    assert_eq!(lent, Some((address.wrapping_add(6), capacity - 6)));
+    assert_eq!(count, 4);
+    assert_eq!(loan.filled(), b"ABtail");
+    assert_eq!(loan.into_inner(), b"headABtail");
+}
+
+#[test]
+fn a_fill_that_gives_back_another_slice_records_nothing() {
+    let mut vec = Vec::with_capacity(64);
+    vec.extend_from_slice(b"head");
+    let mut loan = WriteLoan::new(vec);
+
+    // The closure initializes 4 bytes after 4 uninitialized bytes, for example a record body
+    // after its header, and gives back only these 4.
+    let count = loan.fill_with(|spare| spare[4..8].write_copy_of_slice(b"body"));
+    assert_eq!(count, 0);
+    assert_eq!(loan.filled(), b"");
+    assert_eq!(loan.into_inner(), b"head");
+}
+
+#[test]
 fn the_allocation_size_and_the_alignment_are_separate_from_the_capacity() {
     let releases = Arc::default();
     let backing = page(&releases);
