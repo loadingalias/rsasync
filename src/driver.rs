@@ -146,6 +146,11 @@ pub use tcp::{
     Closed, ReadHalf, Regions, SendCount, Socket, TcpListener, TcpOptions, TcpStream, WriteFailed, WriteHalf,
 };
 pub use udp::{Arrivals, Datagram, Datagrams, UdpOptions, UdpSocket};
+// The outputs of the operations that make a resource, which the local I/O types wrap.
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) use tcp::{accepted, bound as tcp_bound, connected};
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) use udp::bound as udp_bound;
 
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
@@ -559,6 +564,11 @@ pub enum Reason {
     Queue,
     /// The descriptor is not one that this driver owns: another driver made it, or it closed.
     Resource,
+    /// No driver runs on this thread for a call of `rsasync::local`: the thread runs no owner of a
+    /// `Runtime`, its owner is a `task::LocalOwner`, which has no driver, or the driver of
+    /// `Runtime::block_on` did not start, and `block_on` then gives its error.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    NoDriver,
     /// The driver has no provided buffers ([`Driver::provide`]).
     Buffers,
     /// Each resource slot of the driver is in use.
@@ -603,6 +613,12 @@ pub struct Refused<T> {
 }
 
 impl<T> Refused<T> {
+    /// A refusal with `reason` that gives `value` back.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn new(reason: Reason, value: T) -> Self {
+        Self { reason, value }
+    }
+
     /// Why the driver refused.
     #[must_use]
     pub fn reason(&self) -> Reason {
@@ -690,10 +706,21 @@ pub struct Operation<'a, T> {
     direction: PhantomData<&'a mut ()>,
 }
 
-impl<T> Operation<'_, T> {
+impl<'a, T> Operation<'a, T> {
     fn new(completion: Completion, output: fn(i32, Held) -> Option<T>) -> Self {
         Self {
             completion,
+            output,
+            direction: PhantomData,
+        }
+    }
+
+    /// The same operation, with `output` in place of its output: the local I/O types give their own
+    /// resources.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn with_output<U>(self, output: fn(i32, Held) -> Option<U>) -> Operation<'a, U> {
+        Operation {
+            completion: self.completion,
             output,
             direction: PhantomData,
         }

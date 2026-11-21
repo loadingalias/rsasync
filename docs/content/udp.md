@@ -133,3 +133,14 @@ releases the datagrams that no receive took, and closes the socket.
 
 A UDP socket has no half-close. `Driver::shutdown_write` on it refuses with `Reason::Unsupported`
 before any submission, and the socket does not change.
+
+## Use UDP from a task
+
+A task of a [runtime](runtime.md) owner uses `rsasync::local::UdpSocket` (Linux), with no driver
+argument, as [TCP from a task](tcp.md#use-tcp-from-a-task) does. `UdpSocket::bind(address,
+options)`, `send_to`, `send_batch`, `recv_from`, `recv_batch`, and `close` are the driver calls
+of this page. `socket.split()` gives a `rsasync::local::udp::ReadHalf` and a `WriteHalf`, so a
+receive and a send run at one time. The socket is not `Send`, its refusals give back what you gave,
+and a drop closes it. A receive into a buffer that the kernel selects is not a local call yet.
+
+For one socket on each worker, see [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker).

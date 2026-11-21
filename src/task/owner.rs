@@ -263,6 +263,9 @@ pub(super) struct Local {
     /// after it takes the list and the root flag before a wait in the ring (`slot`).
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) switched: Cell<bool>,
+    /// The error of a driver that did not start, which fails the owner at its next turn (`ring`).
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) failure: Cell<Option<std::io::Error>>,
     /// The generator of this owner, and the index of its next child (`task::generator`).
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) generator: RefCell<Option<(rscrypto::ChaCha20Rng, u64)>>,
@@ -340,6 +343,8 @@ impl Local {
             sends: Cell::new(false),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             switched: Cell::new(false),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            failure: Cell::new(None),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             generator: RefCell::new(None),
             live: Cell::new(0),

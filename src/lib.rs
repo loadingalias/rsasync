@@ -76,6 +76,13 @@ mod table;
 mod wait;
 
 pub mod clock;
+/// The TCP and UDP types of a local owner, on Linux, where the runtime has its workers.
+#[cfg(all(
+    feature = "local",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod local;
 /// Local workers and `block_on` on one lifecycle, on Linux: macOS and Windows get them with their
 /// worker topologies.
 #[cfg(all(

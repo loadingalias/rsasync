@@ -195,3 +195,61 @@ send owes a count, also when a send already gave the count with `WriteFailed`.
 
 `Driver::close_listener` cancels the accept that runs, waits until it ends, closes each connection
 that no accept took, and closes the socket.
+
+## Use TCP from a task
+
+A task of a [runtime](runtime.md) owner uses `rsasync::local::TcpListener` and
+`rsasync::local::TcpStream` (Linux). Each call takes no driver argument: it submits its operation
+to the driver of the owner of its thread, and that driver is the home of the resource that it
+makes. The operations, their outputs, the `Operation` future, and the rules of this page are the
+same as on the driver.
+
+| Local call | Driver call |
+| --- | --- |
+| `TcpListener::bind(address, options)` | `Driver::bind` |
+| `listener.accept()` | `Driver::accept` |
+| `TcpStream::connect(address, options)` | `Driver::connect` |
+| `stream.recv(backing)`, `stream.send(lease)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send`, `Driver::send_vectored` |
+| `stream.shutdown_write()` | `Driver::shutdown_write` |
+| `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
+| `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
+
+`stream.split()` gives a `rsasync::local::tcp::ReadHalf` and a `WriteHalf`, so a receive and a
+send run at one time. A receive into a buffer that the kernel selects is not a local call yet: it
+needs a pool on each worker.
+
+```rust
+use rsasync::buffer::{Backing, Buffer as _, Lease};
+use rsasync::driver::TcpOptions;
+use rsasync::local::{TcpListener, TcpStream};
+use rsasync::runtime::Runtime;
+
+let runtime = Runtime::builder().build()?;
+runtime.block_on(async {
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse()?, TcpOptions::default())?.await??;
+    let connect = TcpStream::connect(listener.local_addr(), TcpOptions::default())?;
+    let (mut server, _peer) = listener.accept()?.await??;
+    let mut client = connect.await??;
+
+    let (sent, _lease) = client.send(Lease::from(b"ping".to_vec()))?.await?;
+    assert_eq!(sent?, 4);
+    let (received, buffer) = server.recv(Backing::from(Vec::with_capacity(64)))?.await?;
+    assert_eq!(&buffer.bytes()[..received?], b"ping");
+
+    server.close()?.await?;
+    client.close()?.await?;
+    Ok::<(), Box<dyn std::error::Error>>(())
+})??;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The local types differ from the driver types in two points:
+
+- They are not `Send`, so a resource stays on the thread of its home. A local call on another
+  owner refuses with `Reason::Resource`, also after the `block_on` that made the resource ended.
+  A local call on a thread with no driver refuses with `Reason::NoDriver`. Each refusal gives back
+  what you gave, such as the buffer.
+- A drop of a listener or a stream closes it, as `close` does, but with no future. The driver
+  ends each operation of the resource and closes its socket.
+
+For one listener on each worker, see [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker).

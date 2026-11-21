@@ -93,6 +93,10 @@ impl RingOwner {
         let output = self.local.block_on(root, &mut Drive);
         enter.ended = output.is_ok();
         let output = output?;
+        // A driver that did not start fails the owner, also when the root ended after it.
+        if let Some(error) = self.local.failure.take() {
+            return Err(error);
+        }
         // The slot stays borrowed through the teardown, and the owner makes no other driver: a
         // waker that the teardown calls and that asks for the driver gets `InUse`.
         self.local.lazy.set(None);
@@ -120,6 +124,9 @@ impl Park for Drive {
     type Error = io::Error;
 
     fn drive(&mut self, local: &Local) -> io::Result<bool> {
+        if let Some(error) = local.failure.take() {
+            return Err(error);
+        }
         let mut driver = local.driver.borrow_mut();
         let Some(driver) = driver.as_mut() else {
             return Ok(false);
@@ -183,24 +190,37 @@ pub(super) fn post(home: &Arc<driver::Home>) -> bool {
 }
 
 impl Local {
-    /// Calls `f` with the driver of this owner. The owner of `block_on` makes its driver here the
-    /// first time, and its home gets its ring.
-    #[cfg_attr(
-        not(all(test, not(loom))),
-        expect(dead_code, reason = "the local I/O types of R307 build on it")
-    )]
-    pub(super) fn with_driver<R>(&self, f: impl FnOnce(&mut Driver) -> R) -> Result<R, super::DriverRefused> {
-        let mut slot = self.driver.try_borrow_mut().map_err(|_| super::DriverRefused::InUse)?;
+    /// Calls `f` with the driver of this owner and `value`, or gives `value` back. The owner of
+    /// `block_on` makes its driver here the first time, and its home gets its ring. A driver that
+    /// does not start fails the owner: the next turn gives its error (`Drive`).
+    pub(super) fn with_driver<V, R>(&self, value: V, f: impl FnOnce(&mut Driver, V) -> R) -> Result<R, V> {
+        let Ok(mut slot) = self.driver.try_borrow_mut() else {
+            return Err(value);
+        };
         if slot.is_none() {
-            let config = self.lazy.get().ok_or(super::DriverRefused::NoDriver)?;
-            let driver = Driver::new(config).map_err(super::DriverRefused::Start)?;
-            self.shared().set_ring(driver.home());
-            self.sends.set(true);
-            self.switched.set(true);
-            *slot = Some(driver);
+            let Some(config) = self.lazy.take() else {
+                return Err(value);
+            };
+            match Driver::new(config) {
+                Ok(driver) => {
+                    self.shared().set_ring(driver.home());
+                    self.sends.set(true);
+                    self.switched.set(true);
+                    *slot = Some(driver);
+                }
+                Err(error) => {
+                    self.failure.set(Some(match error {
+                        driver::Error::Refused(error) | driver::Error::System(error) => error,
+                        error => io::Error::other(error),
+                    }));
+                    return Err(value);
+                }
+            }
         }
-        let driver = slot.as_mut().expect("the owner has its driver");
-        Ok(f(driver))
+        match slot.as_mut() {
+            Some(driver) => Ok(f(driver, value)),
+            None => Err(value),
+        }
     }
 }
 

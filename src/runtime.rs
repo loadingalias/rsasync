@@ -61,6 +61,7 @@
 //! which the task owns, so no task can read or replace the generator of its owner.
 
 mod entropy;
+mod group;
 mod placement;
 mod sys;
 mod topology;
@@ -76,6 +77,7 @@ use core::time::Duration;
 use std::io;
 use std::thread::JoinHandle as Thread;
 
+pub use group::{Group, GroupError};
 pub use placement::{CpuSet, Fallback, MAX_CPUS, Placed, Placement, PlanError, Request, Selection};
 pub use rscrypto::ChaCha20Rng;
 pub use topology::{Host, Quota};

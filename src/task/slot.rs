@@ -176,10 +176,6 @@ impl Shared {
     /// Gives the home its ring, the first time the owner needs one. The next turn of the owner then
     /// takes the list and the root flag before it waits in the ring.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    #[cfg_attr(
-        not(all(test, not(loom))),
-        expect(dead_code, reason = "the local I/O types of R307 build on it")
-    )]
     pub(super) fn set_ring(&self, home: Arc<driver::Home>) {
         self.home.ring.set(home);
     }

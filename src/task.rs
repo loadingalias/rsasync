@@ -372,49 +372,26 @@ impl core::error::Error for TimerRefused {
     }
 }
 
-/// Calls `f` with the driver of the owner of this thread: the home of each operation that `f`
-/// submits. A worker of a runtime has its driver from its start. The owner of `Runtime::block_on`
-/// makes its driver here, the first time, so a root that only waits starts none. The futures of
-/// the operations do not borrow the driver, so a task awaits them after `f` returns.
+/// Calls `f` with the driver of the owner of this thread and `value`. The driver is the home of each
+/// operation that `f` submits. A worker of a runtime has its driver from its start. The owner of
+/// `Runtime::block_on` makes its driver here, the first time, so a root that only waits starts
+/// none. A driver that does not start fails that owner, so `block_on` gives its error. The futures
+/// of the operations do not borrow the driver, so a task awaits them after `f` returns.
 ///
 /// The local I/O types build on it. No public path gives `&mut Driver`: safe code could replace
 /// the driver, and the owner would then wait in a ring that no wake signals.
 ///
 /// # Errors
 ///
-/// [`DriverRefused`] gives the reason, and `f` does not run.
+/// `value`, when `f` does not run: no owner runs on this thread, its owner has no driver (a
+/// [`LocalOwner`]), its driver did not start, or the driver is in use on this thread, by a turn
+/// that calls a waker or a destructor.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[cfg_attr(
-    not(all(test, not(loom))),
-    expect(dead_code, reason = "the local I/O types of R307 build on it")
-)]
-pub(crate) fn with_driver<R>(f: impl FnOnce(&mut crate::driver::Driver) -> R) -> Result<R, DriverRefused> {
-    current().ok_or(DriverRefused::NoOwner)?.with_driver(f)
-}
-
-/// Why [`with_driver`] did not call its closure.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-#[cfg_attr(
-    not(all(test, not(loom))),
-    expect(dead_code, reason = "the local I/O types of R307 build on it")
-)]
-#[derive(Debug)]
-pub(crate) enum DriverRefused {
-    /// No owner runs on this thread.
-    NoOwner,
-    /// The owner of this thread has no driver: a [`LocalOwner`] runs no driver.
-    NoDriver,
-    /// The driver is in use on this thread: by the closure of `with_driver` itself, or by a turn
-    /// of the driver that calls a waker.
-    InUse,
-    /// The driver did not start.
-    Start(
-        #[cfg_attr(
-            all(test, not(loom)),
-            expect(dead_code, reason = "the local I/O types of R307 give it to the caller")
-        )]
-        crate::driver::Error,
-    ),
+pub(crate) fn with_driver<V, R>(value: V, f: impl FnOnce(&mut crate::driver::Driver, V) -> R) -> Result<R, V> {
+    match current() {
+        Some(local) => local.with_driver(value, f),
+        None => Err(value),
+    }
 }
 
 /// Gives a new generator that the caller owns: a child of the generator of the owner of this

@@ -666,6 +666,22 @@ pub(super) fn batch_completion(held: &mut Held, result: i32, buffer: Option<Back
     (progress.remaining > 0, result)
 }
 
+/// The output of a UDP bind: the socket and its local address.
+pub(crate) fn bound(result: i32, mut held: Held) -> Option<io::Result<UdpSocket>> {
+    Some(super::tcp::count(result).and_then(|_| {
+        let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
+        let local = held
+            .payload
+            .peer()
+            .and_then(|(peer, len)| peer.to_socket_addr(*len))
+            .ok_or(io::ErrorKind::InvalidData)?;
+        Ok(UdpSocket {
+            read: ReadHalf { resource },
+            write: WriteHalf { resource },
+            local,
+        })
+    }))
+}
 impl Driver {
     /// Binds a UDP socket to `address` with `options`. The future gives the socket and its local
     /// address. The bind runs on the ring where the kernel has the bind operation, as for
@@ -681,21 +697,7 @@ impl Driver {
         options: UdpOptions,
     ) -> Result<Operation<'static, io::Result<UdpSocket>>, Refused<()>> {
         let completion = self.bind_socket(SockAddrStorage::new(address), false, |socket| options.apply(socket))?;
-        Ok(Operation::new(completion, |result, mut held| {
-            Some(super::tcp::count(result).and_then(|_| {
-                let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                let local = held
-                    .payload
-                    .peer()
-                    .and_then(|(peer, len)| peer.to_socket_addr(*len))
-                    .ok_or(io::ErrorKind::InvalidData)?;
-                Ok(UdpSocket {
-                    read: ReadHalf { resource },
-                    write: WriteHalf { resource },
-                    local,
-                })
-            }))
-        }))
+        Ok(Operation::new(completion, bound))
     }
 
     /// Sends `datagram`. The future gives the number of datagrams that went, all of them or none,

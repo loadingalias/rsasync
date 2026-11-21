@@ -19,7 +19,7 @@ use crate::channel::oneshot;
 use crate::driver::tests::{Log, pipe, recorded, taken};
 use crate::driver::{Backend, Config};
 use crate::task::tests::yield_once;
-use crate::task::{DriverRefused, Outcome as TaskOutcome, Reason, generator, spawn_local, with_driver};
+use crate::task::{Outcome as TaskOutcome, Reason, generator, spawn_local, with_driver};
 
 fn budget() -> Budget {
     Budget::new(NonZeroU64::new(1 << 20).unwrap())
@@ -132,6 +132,24 @@ fn limit_for(open: &[u32], free: usize) -> u64 {
         .find(|limit| *limit as usize - open.iter().filter(|fd| *fd < limit).count() == free)
         .map(u64::from)
         .unwrap()
+}
+
+/// A lazy driver of `block_on` that the descriptor limit does not let start fails the owner: the
+/// local call refuses with `Reason::NoDriver`, and `block_on` gives the error of the start, also
+/// after its root ended.
+#[test]
+fn a_lazy_driver_that_does_not_start_fails_block_on_with_its_error() {
+    const EMFILE: i32 = 24;
+    let runtime = Runtime::builder().build().unwrap();
+    let refused = core::cell::Cell::new(None);
+    let failed = with_descriptor_limit(limit_for(&descriptors(), 0), || {
+        runtime.block_on(async {
+            let bind = crate::local::TcpListener::bind("127.0.0.1:0".parse().unwrap(), driver::TcpOptions::default());
+            refused.set(bind.err().map(|refused| refused.reason()));
+        })
+    });
+    assert_eq!(refused.get(), Some(driver::Reason::NoDriver));
+    assert_matches!(failed, Err(BlockOnError::Driver(error)) if error.raw_os_error() == Some(EMFILE));
 }
 
 /// A worker that the descriptor limit leaves no room for its driver fails the start. The start
@@ -424,9 +442,11 @@ fn block_on_returns_after_its_task_is_cancelled_and_its_receive_is_released(back
             // A drop of the reader would close the pipe, and the turns that wait for the task
             // would then end the receive before the teardown.
             let reader = Box::leak(Box::new(
-                with_driver(|driver| driver.adopt_reader(read)).unwrap().unwrap(),
+                with_driver(read, |driver, read| driver.adopt_reader(read))
+                    .unwrap()
+                    .unwrap(),
             ));
-            let receive = with_driver(|driver| driver.recv(reader, recorded(&log, 64)))
+            let receive = with_driver((), |driver, ()| driver.recv(reader, recorded(&log, 64)))
                 .unwrap()
                 .unwrap();
             // The root holds the `Rc` across an await. A drop of the future would request the
@@ -480,7 +500,7 @@ fn a_wake_from_another_thread_ends_the_wait_after_the_first_operation_made_the_d
     });
     let made_backend = runtime
         .block_on(async {
-            let made_backend = with_driver(|driver| driver.report().backend()).unwrap();
+            let made_backend = with_driver((), |driver, ()| driver.report().backend()).unwrap();
             made.send(()).unwrap();
             receiver.recv().await.unwrap();
             made_backend
@@ -535,8 +555,8 @@ fn one_seed_gives_each_generator_the_same_values_and_no_two_generators_share_a_s
     assert_ne!(draws(Runtime::builder()), draws(Runtime::builder()));
 }
 
-/// Asks for the driver when the teardown of `block_on` wakes it, and records whether the driver was
-/// in use.
+/// Asks for the driver when the teardown of `block_on` wakes it, and records whether the owner
+/// refused.
 struct AsksForTheDriver(Mutex<Option<bool>>);
 
 impl alloc::task::Wake for AsksForTheDriver {
@@ -545,13 +565,13 @@ impl alloc::task::Wake for AsksForTheDriver {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let in_use = matches!(with_driver(|_driver| ()), Err(DriverRefused::InUse));
-        *self.0.lock().unwrap() = Some(in_use);
+        let refused = with_driver((), |_driver, ()| ()).is_err();
+        *self.0.lock().unwrap() = Some(refused);
     }
 }
 
 /// The teardown of `block_on` ends a receive whose future the root forgot, and calls its waker. A
-/// waker that then asks for the driver gets `InUse`, and the owner makes no second driver.
+/// waker that then asks for the driver gets a refusal, and the owner makes no second driver.
 #[test]
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
 fn a_waker_that_the_teardown_calls_makes_no_second_driver() {
@@ -561,12 +581,16 @@ fn a_waker_that_the_teardown_calls_makes_no_second_driver() {
     runtime
         .block_on(async {
             let reader = Box::leak(Box::new(
-                with_driver(|driver| driver.adopt_reader(read)).unwrap().unwrap(),
-            ));
-            let mut receive = Box::pin(
-                with_driver(|driver| driver.recv(reader, crate::buffer::Backing::from(Vec::with_capacity(64))))
+                with_driver(read, |driver, read| driver.adopt_reader(read))
                     .unwrap()
                     .unwrap(),
+            ));
+            let mut receive = Box::pin(
+                with_driver((), |driver, ()| {
+                    driver.recv(reader, crate::buffer::Backing::from(Vec::with_capacity(64)))
+                })
+                .unwrap()
+                .unwrap(),
             );
             let waker = Waker::from(Arc::clone(&asks));
             assert!(receive.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
@@ -584,7 +608,7 @@ fn a_kept_waker_holds_no_descriptor_after_block_on_returns() {
     let before = descriptors().len();
     let waker = runtime
         .block_on(async {
-            with_driver(|_driver| ()).unwrap();
+            with_driver((), |_driver, ()| ()).unwrap();
             core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await
         })
         .unwrap();

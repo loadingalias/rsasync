@@ -921,6 +921,37 @@ pub(super) fn after(resources: &mut Resources, pending: &mut Vec<Resource>, tag:
     }
 }
 
+/// The output of a bind: the listener and its local address.
+pub(crate) fn bound(result: i32, mut held: Held) -> Option<io::Result<TcpListener>> {
+    Some(count(result).and_then(|_| {
+        let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
+        let local = held
+            .payload
+            .peer()
+            .and_then(|(peer, len)| peer.to_socket_addr(*len))
+            .ok_or(io::ErrorKind::InvalidData)?;
+        Ok(TcpListener { resource, local })
+    }))
+}
+
+/// The output of a connect: the stream.
+pub(crate) fn connected(result: i32, held: Held) -> Option<io::Result<TcpStream>> {
+    Some(count(result).and_then(|_| Ok(TcpStream::new(held.accepted.ok_or(io::ErrorKind::OutOfMemory)?))))
+}
+
+/// The output of an accept: the stream and the address of its peer.
+pub(crate) fn accepted(result: i32, mut held: Held) -> Option<io::Result<(TcpStream, SocketAddr)>> {
+    Some(count(result).and_then(|_| {
+        let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
+        let peer = held
+            .payload
+            .peer()
+            .and_then(|(peer, len)| peer.to_socket_addr(*len))
+            .ok_or(io::ErrorKind::InvalidData)?;
+        Ok((TcpStream::new(resource), peer))
+    }))
+}
+
 impl Driver {
     /// Binds a nonblocking TCP socket to `address` with `options`, and listens on it. The
     /// listener reuses its address, as `std` does, and its backlog is the most that the kernel
@@ -948,17 +979,7 @@ impl Driver {
             options.apply(socket)
         };
         let completion = self.bind_socket(SockAddrStorage::new(address), true, setup)?;
-        Ok(Operation::new(completion, |result, mut held| {
-            Some(count(result).and_then(|_| {
-                let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                let local = held
-                    .payload
-                    .peer()
-                    .and_then(|(peer, len)| peer.to_socket_addr(*len))
-                    .ok_or(io::ErrorKind::InvalidData)?;
-                Ok(TcpListener { resource, local })
-            }))
-        }))
+        Ok(Operation::new(completion, bound))
     }
 
     /// Makes a socket of the family of the address `storage` of `len` bytes, sets it up with
@@ -1064,9 +1085,7 @@ impl Driver {
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<TcpStream>>, Refused<()>> {
         let completion = self.connect_socket(SockAddrStorage::new(address), |socket| options.apply(socket))?;
-        Ok(Operation::new(completion, |result, held| {
-            Some(count(result).and_then(|_| Ok(TcpStream::new(held.accepted.ok_or(io::ErrorKind::OutOfMemory)?))))
-        }))
+        Ok(Operation::new(completion, connected))
     }
 
     /// Makes a stream socket of the family of the address `storage` of `len` bytes, sets it up with
@@ -1246,17 +1265,7 @@ impl Driver {
         listener: &'a mut TcpListener,
     ) -> Result<Operation<'a, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
         let completion = self.begin_accept(listener.resource)?;
-        Ok(Operation::new(completion, |result, mut held| {
-            Some(count(result).and_then(|_| {
-                let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
-                let peer = held
-                    .payload
-                    .peer()
-                    .and_then(|(peer, len)| peer.to_socket_addr(*len))
-                    .ok_or(io::ErrorKind::InvalidData)?;
-                Ok((TcpStream::new(resource), peer))
-            }))
-        }))
+        Ok(Operation::new(completion, accepted))
     }
 
     /// Starts an accept on the listener `resource`. Its resources hold the peer address that the

@@ -141,14 +141,16 @@ timers, driver, and generator. A waker of the call that you keep after the retur
 descriptor of that driver, and a wake through it does nothing.
 
 The tasks of an owner reach its driver only through types that own their resources, so no task
-can replace the driver that the owner waits in. rsasync has no such public type yet. Until it
-has, a task of the runtime does no I/O, and [driver-only use](driver-only.md) is the path for I/O.
+can replace the driver that the owner waits in. These are the types of `rsasync::local`: see
+[TCP from a task](tcp.md#use-tcp-from-a-task) and [UDP from a task](udp.md#use-udp-from-a-task).
 
 `block_on` gives a `BlockOnError` when the owner gets no task tables (`Owner`) or no timers
 (`Timers`, `Time`), or when its driver fails (`Driver`). The first three come before the first
 poll of `root`, and `into_root` gives `root` back, unpolled, so you can run it later. A driver
-failure during the call ends each live task with `Outcome::OwnerFailed`. A failure of the final
-teardown drops the output of `root`.
+failure during the call ends each live task with `Outcome::OwnerFailed`. A driver that does not
+start at the first operation is a driver failure too: that operation refuses with
+`Reason::NoDriver`, and `block_on` gives the error of the start, for example `EMFILE` at the limit
+of open files, also when `root` ended. A failure of the final teardown drops the output of `root`.
 
 The error holds the root, so `?` into `Box<dyn Error>` needs a root that is `'static`, such as an
 `async move` block that owns what it uses. For a root that borrows, match the error, or map it
@@ -186,6 +188,49 @@ A `Handle` can move to another thread, also to a task of a worker. Each handle h
 inbox of each worker, so `handles` bounds them: `runtime.handle()` and `handle.try_clone()` refuse
 with `HandleRefused::TooMany` at the limit, and with `HandleRefused::Allocation` when the allocator
 does not give the memory of the handle.
+
+## Bind one socket on each worker
+
+`handle.tcp_group(address, options, serve)` binds one TCP listener on each local worker, in one
+reuse-port group at `address`, and `handle.udp_group` binds one UDP socket on each worker in the
+same way. The kernel spreads the connections, or the datagrams by their addresses, between the
+members, so each connection stays on one worker. On each worker, the group runs the future that
+`serve` makes with the `WorkerId` and the resource. The group:
+
+1. Binds on worker 0 first, so a port 0 gives one port to each member. `Group::local_addr` gives
+   that address.
+2. Binds the same address on each other worker, one at a time.
+3. Starts `serve` on each worker only after each member bound.
+
+```rust,no_run
+use rsasync::buffer::Lease;
+use rsasync::driver::TcpOptions;
+use rsasync::local::TcpListener;
+use rsasync::runtime::{Runtime, WorkerId};
+
+async fn serve(worker: WorkerId, mut listener: TcpListener) {
+    while let Ok(accept) = listener.accept() {
+        let Ok(Ok((mut stream, _peer))) = accept.await else { return };
+        if let Ok(send) = stream.send(Lease::from(format!("worker {}\n", worker.index()).into_bytes())) {
+            drop(send.await);
+        }
+    }
+}
+
+let runtime = Runtime::builder().local_workers(4).build()?;
+let mut handle = runtime.handle()?;
+let address = "127.0.0.1:0".parse()?;
+// The root owns the handle, so `?` can give its error.
+let group = runtime.block_on(async move { handle.tcp_group(address, TcpOptions::default(), serve).await })??;
+println!("listening on {}", group.local_addr());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The future gives `GroupError` with the worker and its cause when a member does not start: no
+channel in the budget (`Channel`), no slot on the worker (`Spawn`), a refused bind (`Refused`), a
+failed bind (`Bind`), or a stopped worker (`Ended`). Each member that bound before then closes, and
+so does each member when you drop the future before its end. `Group::into_tasks` gives the task of
+each member, in the order of its worker.
 
 ## Placement
 

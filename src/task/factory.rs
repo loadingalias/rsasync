@@ -58,6 +58,11 @@ impl Placer {
         }
     }
 
+    /// The budget that charges each spawn on the owner: the budget of its runtime.
+    pub(crate) const fn budget(&self) -> &Budget {
+        &self.budget
+    }
+
     /// Reserves a free slot of the owner and the charge of the task of `factory`, allocates the
     /// memory of the task, and gives the job that spawns it and the handle of the task. The job
     /// holds the charge of its box until the box drops.
