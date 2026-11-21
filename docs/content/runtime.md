@@ -50,6 +50,7 @@ Each setting has a default:
 | `seed(seed)` or `generator(generator)` | A seed from the operating system | The generator of the runtime. See [Random values](#random-values) |
 | `handles(n)` | 64 | The handles that can exist at one time |
 | `blocking(config)` | `Some(blocking::Config::new())`: 4 threads, 64 jobs, 2 MiB of stack each | The blocking service of the runtime, or `None` for no service. See [The blocking service](#the-blocking-service) |
+| `grace_period(duration)` | 5 s (`DEFAULT_GRACE`) | The grace period of `shutdown()`. See [Stop a runtime](#stop-a-runtime) |
 
 ## How a start works
 
@@ -358,9 +359,40 @@ charges the service, and `runtime.report()` does not list it.
 
 ## Stop a runtime
 
-A drop of the runtime stops each worker. The worker closes its inbox, ends each factory that waits
-there with `Outcome::Cancelled`, cancels each of its tasks, waits until each one ended, tears its
-driver down, and ends its thread. The drop then joins each thread. Then it tears the blocking
+Call `runtime.shutdown()`. It stops the runtime in one bounded lifecycle, and it gives a
+`Shutdown` report:
+
+1. Each spawn refuses from now on, with `Reason::Closed`, and gives its future back.
+2. Each worker closes its inbox. Each factory that waits there ends with `Outcome::Cancelled`.
+3. Each task is cancelled at once. Its future drops at its next poll, and the drop closes its
+   resources, which cancels their operations.
+4. Until the end of the grace period, each operation can end by itself. Then each worker closes
+   each resource that remains, cancels each operation that still runs, and kills each child with
+   `End::Kill`. The grace period is one deadline from the request, for each worker.
+5. Each worker waits until each operation reaches its terminal event, with no deadline. No deadline
+   frees a buffer that the kernel can still use, so a shutdown can outlast its grace period.
+6. The shutdown joins each worker, and then it tears the blocking service down.
+
+A graceful drain of work in flight is your work: end your tasks, for example with a message on a
+channel, before you call `shutdown()`. The 5 s default fits inside the 10 s stop timeout of
+`docker stop` and the 30 s default grace of Kubernetes.
+
+| Report | Meaning |
+| --- | --- |
+| `report.expired()` | The grace period ended while an operation of a worker still ran |
+| `report.blocking()` | What the teardown of the blocking service did, or `None` with no service |
+| `worker.outcome()` | How the thread of the worker ended: `Joined`, `Failed`, or `Panicked` |
+| `worker.cancelled()` | The tasks that the shutdown cancelled |
+| `worker.debt()` | The operations that still ran at the end of the grace period. Each one ended before the shutdown returned |
+| `worker.sent()` | The bytes that dropped sends had sent when the shutdown closed their resources |
+| `worker.kept()` | The children with `End::Keep` that run on. Nothing reaps them now |
+
+`report.workers()` gives one entry for each worker, in the order of their indexes.
+
+A drop of the runtime is a backstop, not a bounded or reported stop. A drop stops each worker with
+no grace period. The worker closes its inbox, ends each factory that waits there with
+`Outcome::Cancelled`, cancels each of its tasks, waits until each one ended, tears its driver down,
+and ends its thread. The drop then joins each thread. Then it tears the blocking
 service down: a job of its queue drops with no run, and the drop waits for each running job. So a
 task that never returns from its poll, or a job that never returns, stops the drop. The drop gives
 no report.

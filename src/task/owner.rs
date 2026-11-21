@@ -262,6 +262,8 @@ pub(super) struct Local {
     /// if it has no driver.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) lazy: Cell<Option<(crate::driver::Config, Option<crate::blocking::Submitter>)>>,
+    /// The live tasks that the end of the last `block_on` cancelled.
+    pub(super) cancelled: Cell<u32>,
     /// The owner has a driver, so the messages of its outbox go out at its next turn or wait.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) sends: Cell<bool>,
@@ -345,6 +347,7 @@ impl Local {
             driver: RefCell::new(None),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             lazy: Cell::new(None),
+            cancelled: Cell::new(0),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             sends: Cell::new(false),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -646,6 +649,7 @@ impl Local {
             }
         };
         self.closed.set(true);
+        self.cancelled.set(self.live.get());
         self.cancel_all();
         while self.live.get() > 0 {
             let ran = self.turn();

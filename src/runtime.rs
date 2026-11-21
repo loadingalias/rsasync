@@ -73,9 +73,11 @@ use core::cell::Cell;
 use core::fmt;
 use core::future::Future;
 use core::num::{NonZeroU32, NonZeroU64};
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::io;
 use std::thread::JoinHandle as Thread;
+use std::time::Instant;
 
 pub use group::{Group, GroupError};
 pub use placement::{CpuSet, Fallback, MAX_CPUS, Placed, Placement, PlanError, Request, Selection};
@@ -88,7 +90,8 @@ use crate::channel::{self, TrySendError, mpsc};
 use crate::clock;
 use crate::driver::{self, Config};
 use crate::memory::room;
-use crate::task::{self, JoinHandle, Placer, RingOwner, SpawnRefused};
+use crate::sync::{Arc, try_arc};
+use crate::task::{self, Ended, JoinHandle, Placer, RingOwner, SpawnRefused};
 use crate::timer;
 use worker::Message;
 
@@ -102,6 +105,9 @@ pub const DEFAULT_TIMERS: u32 = 1024;
 pub const DEFAULT_TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 /// The handles that [`Builder::handles`] did not change.
 pub const DEFAULT_HANDLES: u32 = 64;
+/// The grace period that [`Builder::grace_period`] did not change: 5 s, inside the 10 s stop timeout
+/// of `docker stop` and the 30 s default grace of Kubernetes.
+pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
 /// The most local workers of one runtime.
 pub const MAX_WORKERS: u32 = placement::MAX_CPUS;
 
@@ -117,13 +123,14 @@ pub struct Builder {
     generator: Option<ChaCha20Rng>,
     handles: u32,
     blocking: Option<blocking::Config>,
+    grace: Duration,
 }
 
 impl Builder {
     /// No local worker, [`DEFAULT_TASK_SLOTS`], a budget of [`DEFAULT_BUDGET`] bytes, the driver of
     /// [`Config::new`], [`DEFAULT_TIMERS`] at [`DEFAULT_TIMER_RESOLUTION`], `Domain` placement that
-    /// is permissive, a seed from the operating system, [`DEFAULT_HANDLES`], and a blocking service
-    /// of [`blocking::Config::new`].
+    /// is permissive, a seed from the operating system, [`DEFAULT_HANDLES`], a blocking service of
+    /// [`blocking::Config::new`], and [`DEFAULT_GRACE`].
     fn new() -> Self {
         Self {
             local_workers: 0,
@@ -139,6 +146,7 @@ impl Builder {
             generator: None,
             handles: DEFAULT_HANDLES,
             blocking: Some(blocking::Config::new()),
+            grace: DEFAULT_GRACE,
         }
     }
 
@@ -235,6 +243,13 @@ impl Builder {
         }
     }
 
+    /// The grace period of [`Runtime::shutdown`]: the time from the request until the end of the
+    /// wait for the operations to end by themselves.
+    #[must_use]
+    pub fn grace_period(self, grace: Duration) -> Self {
+        Self { grace, ..self }
+    }
+
     /// Validates the plan, places the workers, and starts them one at a time. The runtime is
     /// ready after each worker made its driver and its tables and applied its placement.
     ///
@@ -273,6 +288,7 @@ impl Builder {
             .transpose()
             .map_err(|error| fail(Cause::Blocking(error)))?;
         let submitter = service.as_ref().map(Service::submitter);
+        let closed = try_arc(AtomicBool::new(false)).map_err(|_| fail(Cause::Allocation))?;
         for (index, plan) in (0..).zip(plans) {
             let start = worker::Start {
                 index,
@@ -306,8 +322,10 @@ impl Builder {
             handle: Handle {
                 routes: routes.into_boxed_slice(),
                 blocking: submitter,
+                closed,
             },
             blocking: service,
+            grace: self.grace,
             budget,
             slots: self.task_slots,
             driver: self.driver,
@@ -335,6 +353,7 @@ impl fmt::Debug for Builder {
             .field("selection", &self.selection)
             .field("handles", &self.handles)
             .field("blocking", &self.blocking)
+            .field("grace", &self.grace)
             .finish_non_exhaustive()
     }
 }
@@ -342,7 +361,7 @@ impl fmt::Debug for Builder {
 /// The workers that started, during [`Builder::build`], and the room of the cleanup outcomes of a
 /// failed start. Each table has room for each worker, so no push of the start allocates.
 struct Started {
-    workers: Vec<Thread<io::Result<()>>>,
+    workers: Vec<Thread<io::Result<Ended>>>,
     routes: Vec<Route>,
     reports: Vec<WorkerReport>,
     cleanup: Vec<Cleanup>,
@@ -401,7 +420,7 @@ impl Started {
     /// Stops each worker that started, and joins it. Gives the outcome of each, with room for the
     /// outcome of the worker that failed.
     fn stop(&mut self) -> Vec<Cleanup> {
-        stop(&mut self.routes);
+        stop(&mut self.routes, Some(Instant::now()));
         let mut cleanup = core::mem::take(&mut self.cleanup);
         for (index, thread) in (0..).zip(self.workers.drain(..)) {
             cleanup.push(join(index, thread));
@@ -410,11 +429,12 @@ impl Started {
     }
 }
 
-/// Sends the stop to each worker. Its inbox has a place for it.
-fn stop(routes: &mut [Route]) {
+/// Sends the stop with `deadline` to each worker: the operations of the worker can end by
+/// themselves until it, and with no deadline until each one ended. Its inbox has a place for it.
+fn stop(routes: &mut [Route], deadline: Option<Instant>) {
     for route in routes {
         // A worker whose driver failed ended, and its inbox is closed.
-        let sent = route.sender.try_send(Message::Stop);
+        let sent = route.sender.try_send(Message::Stop(deadline));
         assert!(
             !matches!(sent, Err(TrySendError::Full(_))),
             "the inbox of a worker has a place for the stop"
@@ -423,26 +443,32 @@ fn stop(routes: &mut [Route]) {
 }
 
 /// Joins the thread of worker `index`, and gives its cleanup outcome.
-fn join(index: u32, thread: Thread<io::Result<()>>) -> Cleanup {
-    let outcome = match thread.join() {
-        Ok(Ok(())) => Outcome::Joined,
-        Ok(Err(error)) => Outcome::Failed(error),
-        Err(_payload) => Outcome::Panicked,
-    };
+fn join(index: u32, thread: Thread<io::Result<Ended>>) -> Cleanup {
+    let (outcome, _ended) = finish(thread);
     Cleanup {
         worker: WorkerId(index),
         outcome,
     }
 }
 
+/// Joins `thread`, and gives its outcome and what its end did.
+fn finish(thread: Thread<io::Result<Ended>>) -> (Outcome, Ended) {
+    match thread.join() {
+        Ok(Ok(ended)) => (Outcome::Joined, ended),
+        Ok(Err(error)) => (Outcome::Failed(error), Ended::default()),
+        Err(_payload) => (Outcome::Panicked, Ended::default()),
+    }
+}
+
 /// A started runtime: its local workers, and [`Runtime::block_on`].
 ///
-/// A drop stops each worker: it closes the inbox of the worker, which ends each factory spawn that
-/// waits there with [`Outcome::Cancelled`](crate::task::Outcome::Cancelled), cancels each task of
-/// the worker, tears its driver down, and joins its thread. A drop waits for each task to end, so
-/// a task that never returns from its poll stops the drop.
+/// [`Runtime::shutdown`] stops it with a report. A drop is a backstop with no grace period: it
+/// closes the inbox of each worker, which ends each factory spawn that waits there with
+/// [`Outcome::Cancelled`](crate::task::Outcome::Cancelled), cancels each task of the worker, tears
+/// its driver down, and joins its thread. A drop waits for each task to end, so a task that never
+/// returns from its poll stops the drop.
 pub struct Runtime {
-    workers: Box<[Thread<io::Result<()>>]>,
+    workers: Box<[Thread<io::Result<Ended>>]>,
     handle: Handle,
     budget: Budget,
     slots: u32,
@@ -454,6 +480,8 @@ pub struct Runtime {
     report: Startup,
     /// The blocking service of each driver of the runtime ([`Builder::blocking`]).
     blocking: Option<Service>,
+    /// The grace period of [`Runtime::shutdown`].
+    grace: Duration,
 }
 
 impl Runtime {
@@ -521,9 +549,54 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// Stops the runtime in one bounded, reported lifecycle, and gives its [`Shutdown`] report.
+    ///
+    /// 1. Each spawn refuses from now on, with `Reason::Closed`, and gives its future back.
+    /// 2. Each worker closes its inbox, and each factory that waits there ends with
+    ///    `Outcome::Cancelled`.
+    /// 3. Each task is cancelled at once: its future drops at its next poll, and the drop closes
+    ///    its resources, which cancels their operations. A task that never returns from its poll
+    ///    stops the shutdown.
+    /// 4. Until the end of the grace period ([`Builder::grace_period`]), each operation can end by
+    ///    itself. Then each worker closes each resource that remains, cancels each operation that
+    ///    still runs, and kills each child with `End::Kill`.
+    /// 5. Each worker waits until each operation reaches its terminal event, with no deadline: no
+    ///    deadline frees a buffer that the kernel can still use. So the shutdown can outlast its
+    ///    grace period, and [`Shutdown::expired`] says when the grace period ended first.
+    /// 6. It joins each worker, and then tears the blocking service down.
+    ///
+    /// A graceful drain of work in flight is the work of the application: end your tasks, for
+    /// example with a message, before you call `shutdown`.
+    #[must_use]
+    pub fn shutdown(mut self) -> Shutdown {
+        // One deadline for each worker, which no step restarts. A grace period too long for the
+        // clock has no deadline.
+        let deadline = Instant::now().checked_add(self.grace);
+        self.handle.closed.store(true, Ordering::Release);
+        stop(&mut self.handle.routes, deadline);
+        let workers = core::mem::take(&mut self.workers)
+            .into_iter()
+            .zip(0..)
+            .map(|(thread, index)| {
+                let (outcome, ended) = finish(thread);
+                WorkerShutdown {
+                    worker: WorkerId(index),
+                    outcome,
+                    ended,
+                }
+            })
+            .collect();
+        let blocking = self.blocking.take().map(Service::teardown);
+        Shutdown { workers, blocking }
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
-        stop(&mut self.handle.routes);
+        self.handle.closed.store(true, Ordering::Release);
+        // A backstop: the teardown of each worker comes at once.
+        stop(&mut self.handle.routes, Some(Instant::now()));
         for (index, thread) in (0..).zip(core::mem::take(&mut self.workers)) {
             // The drop is a backstop: the shutdown of R305 reports these outcomes.
             let _outcome = join(index, thread);
@@ -567,6 +640,8 @@ impl WorkerId {
 pub struct Handle {
     routes: Box<[Route]>,
     blocking: Option<Submitter>,
+    /// The runtime stops: each spawn refuses.
+    closed: Arc<AtomicBool>,
 }
 
 /// The way of a handle to one worker: a sender of its inbox, and the side of its owner that
@@ -604,6 +679,10 @@ impl Handle {
         F: Future + 'static,
         F::Output: Send + 'static,
     {
+        // Acquire: a spawn after the start of a shutdown sees it and refuses.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SpawnRefused::new(factory, task::Reason::Closed));
+        }
         let index = worker.0 as usize;
         let Some(Route { sender, placer }) = self.routes.get_mut(index) else {
             return Err(SpawnRefused::new(factory, task::Reason::NoWorker));
@@ -636,6 +715,7 @@ impl Handle {
         Ok(Self {
             routes: routes.into_boxed_slice(),
             blocking: self.blocking.clone(),
+            closed: Arc::clone(&self.closed),
         })
     }
 
@@ -800,6 +880,87 @@ impl core::error::Error for Cause {
             Self::Worker { error, .. } => Some(error),
             Self::Blocking(error) => Some(error),
         }
+    }
+}
+
+/// What [`Runtime::shutdown`] did.
+#[derive(Debug)]
+pub struct Shutdown {
+    workers: Box<[WorkerShutdown]>,
+    blocking: Option<blocking::Teardown>,
+}
+
+impl Shutdown {
+    /// What each worker did, in the order of their indexes.
+    #[must_use]
+    pub fn workers(&self) -> &[WorkerShutdown] {
+        &self.workers
+    }
+
+    /// Whether the grace period ended while an operation of a worker still ran, so that the worker
+    /// closed its resources and cancelled its operations at that time.
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.workers.iter().any(WorkerShutdown::expired)
+    }
+
+    /// What the teardown of the blocking service did, or `None` for a runtime with no service.
+    #[must_use]
+    pub const fn blocking(&self) -> Option<blocking::Teardown> {
+        self.blocking
+    }
+}
+
+/// What the shutdown did on one worker ([`Shutdown::workers`]).
+#[derive(Debug)]
+pub struct WorkerShutdown {
+    worker: WorkerId,
+    outcome: Outcome,
+    ended: Ended,
+}
+
+impl WorkerShutdown {
+    /// The worker.
+    #[must_use]
+    pub const fn worker(&self) -> WorkerId {
+        self.worker
+    }
+
+    /// How its thread ended. A failure or a panic gives 0 for each count below.
+    #[must_use]
+    pub const fn outcome(&self) -> &Outcome {
+        &self.outcome
+    }
+
+    /// The tasks that the shutdown cancelled.
+    #[must_use]
+    pub const fn cancelled(&self) -> u32 {
+        self.ended.cancelled
+    }
+
+    /// The operations that still ran at the end of the grace period. The worker cancelled each
+    /// one then, and each one reached its terminal event before the shutdown returned.
+    #[must_use]
+    pub const fn debt(&self) -> u32 {
+        self.ended.debt
+    }
+
+    /// The bytes that dropped sends had sent when the shutdown closed their resources.
+    #[must_use]
+    pub const fn sent(&self) -> u64 {
+        self.ended.sent
+    }
+
+    /// The children with `End::Keep` that still ran. They run on, and nothing reaps them now.
+    #[must_use]
+    pub const fn kept(&self) -> u32 {
+        self.ended.kept
+    }
+
+    /// Whether the grace period ended while an operation of this worker still ran.
+    #[must_use]
+    pub const fn expired(&self) -> bool {
+        self.ended.expired
     }
 }
 

@@ -790,3 +790,211 @@ fn a_handle_that_the_allocator_refuses_gives_allocation() {
             .all(|refusal| *refusal == (HandleRefused::Allocation, 0))
     );
 }
+
+/// A worker task that connects to `address` and waits for a receive that no byte ends.
+fn waiting_receive(handle: &mut Handle, worker: u32, address: core::net::SocketAddr) -> JoinHandle<()> {
+    handle
+        .spawn_on(WorkerId::new(worker), move || async move {
+            let mut stream = crate::local::TcpStream::connect(address, driver::TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let _received = stream
+                .recv(crate::buffer::Backing::from(Vec::with_capacity(64)))
+                .unwrap()
+                .await;
+        })
+        .unwrap()
+}
+
+/// A shutdown cancels each task at once: the drop of a task closes its stream, which cancels its
+/// receive, and the shutdown returns after each terminal event, inside the grace period. Each peer
+/// then reads the end of the stream, and the report counts the cancelled tasks and no debt.
+#[test]
+fn a_shutdown_cancels_waiting_receives_and_returns_after_their_terminal_events() {
+    use std::io::Read as _;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let runtime = Runtime::builder().local_workers(2).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let tasks = [0, 1].map(|worker| waiting_receive(&mut handle, worker, address));
+    let mut peers = [(); 2].map(|()| listener.accept().unwrap().0);
+    let report = runtime.shutdown();
+    assert!(!report.expired(), "the receives did not end inside the grace period");
+    for worker in report.workers() {
+        assert_eq!(
+            (worker.outcome(), worker.cancelled(), worker.debt()),
+            (&Outcome::Joined, 1, 0)
+        );
+    }
+    for peer in &mut peers {
+        assert_eq!(
+            peer.read(&mut [0; 8]).unwrap(),
+            0,
+            "the stream of a cancelled task stayed open"
+        );
+    }
+    for task in tasks {
+        assert_matches!(task.join_blocking(), TaskOutcome::Cancelled);
+    }
+}
+
+/// A receive whose stream and future a task forgets outlives the task. At the end of the grace
+/// period, the worker cancels it, and the shutdown returns only after its terminal event: its
+/// buffer then has its one release. Gives the time of the shutdown and its report.
+#[expect(
+    clippy::mem_forget,
+    reason = "the test forgets a future and its stream, as a caller can"
+)]
+fn shutdown_with_a_forgotten_receive(builder: Builder) -> (Duration, Shutdown) {
+    let log = Log::default();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let runtime = builder.local_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let (submitted, submit) = mpsc::channel();
+    let buffer = recorded(&log, 64);
+    let task = handle
+        .spawn_on(WorkerId::new(0), move || async move {
+            let mut stream = crate::local::TcpStream::connect(address, driver::TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            core::mem::forget(stream.recv(buffer).unwrap());
+            core::mem::forget(stream);
+            submitted.send(()).unwrap();
+        })
+        .unwrap();
+    let _peer = listener.accept().unwrap();
+    submit.recv().unwrap();
+    assert_matches!(task.join_blocking(), TaskOutcome::Completed(()));
+    assert!(taken(&log).is_empty());
+    let start = std::time::Instant::now();
+    let report = runtime.shutdown();
+    let elapsed = start.elapsed();
+    assert_eq!(taken(&log), ["released"]);
+    (elapsed, report)
+}
+
+/// With a grace period of the builder, the operation that outlives its task ends at that time: the
+/// report counts it as debt.
+#[test]
+fn an_operation_that_outlives_its_task_ends_at_the_grace_period_of_the_builder() {
+    const GRACE: Duration = Duration::from_millis(300);
+    let (elapsed, report) = shutdown_with_a_forgotten_receive(Runtime::builder().grace_period(GRACE));
+    assert!(
+        elapsed >= GRACE,
+        "the shutdown ended the receive before its grace period: {elapsed:?}"
+    );
+    assert!(report.expired());
+    assert_eq!((report.workers()[0].debt(), report.workers()[0].cancelled()), (1, 0));
+}
+
+/// With no grace period of the builder, the operation that outlives its task ends 5 s after the
+/// request.
+#[test]
+fn an_operation_that_outlives_its_task_ends_5_s_after_the_request_by_default() {
+    let (elapsed, report) = shutdown_with_a_forgotten_receive(Runtime::builder());
+    assert!(
+        elapsed >= DEFAULT_GRACE,
+        "the default grace period ended early: {elapsed:?}"
+    );
+    assert!(report.expired());
+}
+
+/// After the start of a shutdown, a spawn refuses with `Reason::Closed` and gives its factory back.
+#[test]
+fn a_spawn_after_the_start_of_a_shutdown_refuses_with_closed() {
+    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let _report = runtime.shutdown();
+    let refused = handle.spawn_on(WorkerId::new(0), || async { 7 }).unwrap_err();
+    assert_eq!(refused.reason(), Reason::Closed);
+    let factory = refused.into_future();
+    let mut future = core::pin::pin!(factory());
+    assert_eq!(
+        future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(7)
+    );
+}
+
+/// A send of a cancelled task to a peer that never reads ends at the close of its stream, and the
+/// report gives the bytes that it had sent: the peer reads exactly that many before the end of the
+/// stream.
+#[test]
+fn the_report_gives_the_count_of_a_send_that_a_peer_never_read() {
+    use std::io::Read as _;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let _task = handle
+        .spawn_on(WorkerId::new(0), move || async move {
+            let mut stream = crate::local::TcpStream::connect(address, driver::TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let lease = crate::buffer::Lease::from(alloc::vec![7; 64 << 20]);
+            let _sent = stream.send(lease).unwrap().await;
+        })
+        .unwrap();
+    let mut peer = listener.accept().unwrap().0;
+    // The send is in the kernel once bytes reach the peer.
+    while peer.peek(&mut [0; 1]).unwrap() == 0 {}
+    let report = runtime.shutdown();
+    let sent = report.workers()[0].sent();
+    assert!(sent > 0, "the report gives no count");
+    let mut received = Vec::new();
+    peer.read_to_end(&mut received).unwrap();
+    assert_eq!(u64::try_from(received.len()).unwrap(), sent);
+}
+
+/// At the shutdown, a child with the kill policy dies and the driver reaps it, so its process entry
+/// goes. A child with the keep policy runs on, and the report counts it.
+#[test]
+fn a_kill_child_dies_and_a_keep_child_runs_on_and_the_report_counts_it() {
+    use std::process::Command;
+
+    use crate::driver::{ChildOptions, End};
+
+    let runtime = Runtime::builder().local_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let (ids, received) = mpsc::channel();
+    let _task = handle
+        .spawn_on(WorkerId::new(0), move || async move {
+            let mut children = [End::Kill, End::Keep].map(|end| {
+                let mut command = Command::new("sleep");
+                command.arg("600");
+                crate::local::Child::spawn(command, ChildOptions::new().end(end)).unwrap()
+            });
+            let mut held = Vec::new();
+            for spawn in &mut children {
+                let child = spawn.await.unwrap().unwrap();
+                ids.send(child.id()).unwrap();
+                held.push(child);
+            }
+            // The task holds both children until the shutdown cancels it.
+            pending::<()>().await;
+            drop(held);
+        })
+        .unwrap();
+    let [killed, kept] = [(); 2].map(|()| received.recv().unwrap());
+    let report = runtime.shutdown();
+    assert_eq!(report.workers()[0].kept(), 1);
+    assert!(
+        !std::path::Path::new(&alloc::format!("/proc/{killed}")).exists(),
+        "the child of the kill policy was not reaped"
+    );
+    let stat = std::fs::read_to_string(alloc::format!("/proc/{kept}/stat")).unwrap();
+    assert!(!stat.contains(") Z "), "the child of the keep policy ended");
+    let killed = Command::new("kill")
+        .args(["-9", &alloc::format!("{kept}")])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+}

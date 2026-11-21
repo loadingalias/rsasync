@@ -2065,7 +2065,12 @@ impl Driver {
                 self.complete_now(id, 0);
             }
             #[cfg(all(feature = "local", target_os = "linux"))]
-            Closing::Dropped => {}
+            Closing::Dropped => {
+                if let SendCount::Sent(sent) = closed.sent {
+                    let sent = u64::try_from(sent).unwrap_or(u64::MAX);
+                    self.dropped_sent = self.dropped_sent.saturating_add(sent);
+                }
+            }
         }
     }
 }

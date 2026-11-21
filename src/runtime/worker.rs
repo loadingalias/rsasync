@@ -4,6 +4,7 @@
 use core::num::NonZeroU32;
 use core::time::Duration;
 use std::io;
+use std::time::Instant;
 
 use rscrypto::ChaCha20Rng;
 
@@ -14,7 +15,7 @@ use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
 use crate::driver::{Config, Driver};
-use crate::task::{Failure, Job, Placer, RingOwner};
+use crate::task::{Ended, Failure, Job, Placer, RingOwner, with_driver};
 use crate::time::Suspend;
 use crate::timer::Timers;
 
@@ -22,8 +23,9 @@ use crate::timer::Timers;
 pub(super) enum Message {
     /// A factory spawn on the worker.
     Job(Job),
-    /// The end of the worker: the inbox closes, and each job in it ends with `Cancelled`.
-    Stop,
+    /// The end of the worker: the inbox closes, and each job in it ends with `Cancelled`. The
+    /// operations of the worker can end by themselves until the deadline ([`RingOwner::serve`]).
+    Stop(Option<Instant>),
 }
 
 impl Message {
@@ -31,7 +33,7 @@ impl Message {
     pub(super) fn into_job(self) -> Option<Job> {
         match self {
             Self::Job(job) => Some(job),
-            Self::Stop => None,
+            Self::Stop(_) => None,
         }
     }
 }
@@ -64,18 +66,18 @@ pub(super) fn timers(
     Ok((timers, clock))
 }
 
-/// The body of the thread of a worker. It gives the cleanup outcome: the result of the teardown of
-/// its driver, or `Ok` if it did not start.
-pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::Sender<Ready>) -> io::Result<()> {
+/// The body of the thread of a worker. It gives the cleanup outcome: what its end did, or the
+/// failure of the teardown of its driver, or `Ok` with nothing if it did not start.
+pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::Sender<Ready>) -> io::Result<Ended> {
     let budget = start.budget.clone();
     match prepare(start) {
         Ok((owner, report)) => {
             let placer = owner.placer(&budget);
             // The start waits for the report, so only a start that ended can refuse it.
             if ready.send(Ok((report, placer))).is_err() {
-                return Ok(());
+                return Ok(Ended::default());
             }
-            owner.block_on(serve(inbox)).map_err(|failure| match failure {
+            owner.serve(serve(inbox)).map_err(|failure| match failure {
                 Failure::Driver(error) => error,
                 // A worker has its driver from its start, so no first use starts one.
                 Failure::Start(error) => io::Error::other(error),
@@ -83,7 +85,7 @@ pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::
         }
         Err(error) => {
             let _unreported = ready.send(Err(error));
-            Ok(())
+            Ok(Ended::default())
         }
     }
 }
@@ -130,12 +132,21 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport), WorkerError> {
 
 /// The root of a worker: it runs each job of the inbox until the stop. Then it closes the inbox,
 /// and each job that waits there drops, so its task ends with `Cancelled`.
-async fn serve(mut inbox: mpsc::Receiver<Message>) {
-    while let Ok(Message::Job(job)) = inbox.recv().await {
-        job.run();
-    }
+/// Gives the deadline of the stop, and the count of `Driver::dropped_sent` at the stop, so the end
+/// counts only what the stop ended.
+async fn serve(mut inbox: mpsc::Receiver<Message>) -> (Option<Instant>, u64) {
+    let deadline = loop {
+        match inbox.recv().await {
+            Ok(Message::Job(job)) => job.run(),
+            Ok(Message::Stop(deadline)) => break deadline,
+            // No stop reaches a closed inbox, so the teardown comes at once.
+            Err(_) => break Some(Instant::now()),
+        }
+    };
     inbox.close();
     while let Ok(message) = inbox.try_recv() {
         drop(message);
     }
+    let sent = with_driver((), |driver, ()| driver.dropped_sent()).unwrap_or(0);
+    (deadline, sent)
 }

@@ -21,6 +21,7 @@
 use alloc::rc::Rc;
 use core::future::Future;
 use std::io;
+use std::time::Instant;
 
 use super::Refused;
 use super::owner::{Enter, Local, Park, Until};
@@ -85,6 +86,55 @@ impl RingOwner {
         super::factory::Placer::new(self.local.shared(), budget)
     }
 
+    /// Runs `root`, the loop of a worker, as [`RingOwner::block_on`] does. `root` gives the deadline
+    /// of the end and the count of [`Driver::dropped_sent`] at its end. After the tasks ended, the
+    /// driver runs until no operation runs or until the deadline, which `None` does not have. Then
+    /// the teardown cancels each operation that still runs, and it waits for each terminal event,
+    /// with no deadline.
+    ///
+    /// # Errors
+    ///
+    /// As for [`RingOwner::block_on`].
+    pub(crate) fn serve<F: Future<Output = (Option<Instant>, u64)>>(self, root: F) -> Result<Ended, Failure> {
+        let mut enter = Enter::new(&self.local);
+        let output = self.local.block_on(root, &mut Drive);
+        enter.ended = output.is_ok();
+        let (deadline, sent) = output?;
+        let cancelled = self.local.cancelled.get();
+        self.local.lazy.set(None);
+        let mut slot = self.local.driver.borrow_mut();
+        let Some(mut driver) = slot.take() else {
+            return Ok(Ended {
+                cancelled,
+                ..Ended::default()
+            });
+        };
+        let mut expired = false;
+        while driver.busy() {
+            let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            if left.is_some_and(|left| left.is_zero()) {
+                expired = true;
+                break;
+            }
+            if !driver.turn().map_err(Failure::Driver)?.more() && driver.busy() {
+                match left {
+                    Some(left) => driver.wait_for(left),
+                    None => driver.wait(),
+                }
+                .map_err(Failure::Driver)?;
+            }
+        }
+        let sent = driver.dropped_sent().saturating_sub(sent);
+        let teardown = driver.teardown().map_err(Failure::Driver)?;
+        Ok(Ended {
+            cancelled,
+            debt: teardown.cancelled(),
+            sent,
+            kept: teardown.kept(),
+            expired,
+        })
+    }
+
     /// Makes this thread the owner, and polls `root`, the tasks of the owner, and the driver until
     /// `root` gives its output, as `LocalOwner::block_on` does. Then it tears the driver down: it
     /// cancels each operation that the driver homes, drives it until each terminal event, and
@@ -109,6 +159,21 @@ impl RingOwner {
         }
         Ok(output)
     }
+}
+
+/// What the end of a worker did ([`RingOwner::serve`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Ended {
+    /// The live tasks that the end cancelled.
+    pub(crate) cancelled: u32,
+    /// The operations that still ran at the deadline, which the teardown cancelled.
+    pub(crate) debt: u32,
+    /// The bytes that dropped sends had sent when the closes of their resources ended them.
+    pub(crate) sent: u64,
+    /// The children with `End::Keep` that still ran at the teardown.
+    pub(crate) kept: u32,
+    /// The deadline came while an operation still ran.
+    pub(crate) expired: bool,
 }
 
 /// Why the owner of a home that can have a ring failed.

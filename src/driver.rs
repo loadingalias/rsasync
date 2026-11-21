@@ -1352,6 +1352,10 @@ pub struct Driver {
     wakes: home::Wakes,
     /// The state of [`Delivery::Controlled`].
     control: Option<control::Controlled>,
+    /// The bytes that dropped sends had sent when the closes of their dropped resources ended
+    /// them, for the shutdown report of a runtime.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    dropped_sent: u64,
 }
 
 impl fmt::Debug for Driver {
@@ -1659,6 +1663,8 @@ impl Driver {
             #[cfg(all(feature = "local", target_os = "linux"))]
             wakes,
             control: None,
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            dropped_sent: 0,
         })
     }
 
@@ -1673,6 +1679,19 @@ impl Driver {
     #[must_use]
     pub const fn copied(&self) -> u64 {
         self.copied
+    }
+
+    /// The bytes that dropped sends had sent when the closes of their dropped resources ended
+    /// them, in total.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) const fn dropped_sent(&self) -> u64 {
+        self.dropped_sent
+    }
+
+    /// Whether an operation of the driver runs, so that a completion can still come.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn busy(&self) -> bool {
+        self.table.busy()
     }
 
     /// The [`Control`] of a driver under [`Delivery::Controlled`], or `None` under native

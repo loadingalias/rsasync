@@ -154,7 +154,7 @@ pub(crate) use factory::{Job, Placer};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use owner::MAX_SLOTS;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) use ring::{Failure, RingOwner};
+pub(crate) use ring::{Ended, Failure, RingOwner};
 
 use owner::{Enter, Local};
 use slot::TaskRef;
