@@ -29,8 +29,6 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::process::{Command, ExitStatus};
-#[cfg(target_os = "linux")]
-use std::time::Instant;
 
 pub(super) use sys::SigInfo;
 
@@ -40,10 +38,14 @@ use super::{
     PipeWriter, Reason, Refused, Route, Signal, Tag,
 };
 use crate::blocking::{Failed, Job};
+#[cfg(target_os = "linux")]
+use crate::clock::NativeClock;
 use crate::driver::out_of_memory;
 use crate::memory::{items, room};
 use crate::sync::Arc;
 use crate::table::OpId;
+#[cfg(target_os = "linux")]
+use crate::time::{Instant, Suspend};
 use crate::uring::Sqe;
 
 /// `SIGKILL`, on Linux and macOS.
@@ -389,7 +391,8 @@ struct Slot {
     end: End,
     /// The polls of the exit that found no status: the wait before the next one doubles.
     misses: u32,
-    /// The time of the next poll of the exit, after a poll that found no status.
+    /// The time of the next poll of the exit, after a poll that found no status, on the clock of
+    /// the children.
     #[cfg(target_os = "linux")]
     due: Option<Instant>,
 }
@@ -418,6 +421,9 @@ pub(super) struct Children {
     timer: std::fs::File,
     #[cfg(target_os = "linux")]
     armed: Option<Instant>,
+    /// The clock of the due times and of the end of the timer: `CLOCK_MONOTONIC`, as the timer's.
+    #[cfg(target_os = "linux")]
+    clock: NativeClock,
     #[cfg(target_os = "linux")]
     timing: bool,
 }
@@ -427,7 +433,8 @@ impl Children {
     ///
     /// # Errors
     ///
-    /// The error of `timerfd_create` on Linux, and `OutOfMemory` when the allocator refuses.
+    /// The error of `timerfd_create` on Linux, `Unsupported` when the target has no native clock
+    /// that pauses while the system is suspended, and `OutOfMemory` when the allocator refuses.
     pub(super) fn new(children: u32, driver: DriverId) -> io::Result<Self> {
         Ok(Self {
             driver,
@@ -442,6 +449,8 @@ impl Children {
             armed: None,
             #[cfg(target_os = "linux")]
             timing: false,
+            #[cfg(target_os = "linux")]
+            clock: NativeClock::new(Suspend::Pauses).map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?,
         })
     }
 
@@ -581,12 +590,15 @@ impl Children {
                 Ok(false) => {
                     // At most one entry for each child, so the capacity of the list holds it.
                     self.again.push(id);
+                    #[cfg(target_os = "linux")]
+                    let now = self.clock.now();
                     if let Some(slot) = self.slot(index) {
                         slot.misses = slot.misses.saturating_add(1);
                         #[cfg(target_os = "linux")]
                         {
                             let delay = core::time::Duration::from_micros(delay_us(slot.misses));
-                            slot.due = Some(Instant::now() + delay);
+                            // A due time past the last instant of the clock never comes.
+                            slot.due = now.checked_add(delay).ok();
                         }
                     }
                     return None;
@@ -1169,7 +1181,7 @@ impl Driver {
     #[expect(unsafe_code, reason = "a poll names no memory")]
     pub(super) fn poll_again(&mut self) {
         #[cfg(target_os = "linux")]
-        let (now, mut earliest) = (Instant::now(), None::<Instant>);
+        let (now, mut earliest) = (self.children.clock.now(), None::<Instant>);
         #[cfg_attr(
             target_os = "macos",
             expect(unused_mut, reason = "only Linux passes over an entry, which waits for its due time")
@@ -1185,9 +1197,19 @@ impl Driver {
                 }) => self.children.slots.get(child as usize),
                 _ => None,
             };
+            // One clock gives each instant of the children, so their nanoseconds compare.
             #[cfg(target_os = "linux")]
-            if let Some(due) = slot.and_then(|slot| slot.due).filter(|&due| due > now) {
-                earliest = Some(earliest.map_or(due, |earliest| earliest.min(due)));
+            if let Some(due) = slot
+                .and_then(|slot| slot.due)
+                .filter(|due| due.as_nanos() > now.as_nanos())
+            {
+                earliest = Some(earliest.map_or(due, |earliest| {
+                    if due.as_nanos() < earliest.as_nanos() {
+                        due
+                    } else {
+                        earliest
+                    }
+                }));
                 index += 1;
                 continue;
             }
@@ -1202,7 +1224,7 @@ impl Driver {
         }
         #[cfg(target_os = "linux")]
         if let Some(earliest) = earliest {
-            self.time_children(earliest - now);
+            self.time_children(earliest.duration_since(now).unwrap_or(core::time::Duration::ZERO));
         }
     }
 
@@ -1213,8 +1235,11 @@ impl Driver {
     #[expect(unsafe_code, reason = "a poll names no memory")]
     fn time_children(&mut self, after: core::time::Duration) {
         let children = &mut self.children;
-        let end = Instant::now() + after;
-        if children.armed.is_none_or(|armed| end < armed) {
+        // An end past the last instant of the clock never comes, and arms nothing.
+        let Ok(end) = children.clock.now().checked_add(after) else {
+            return;
+        };
+        if children.armed.is_none_or(|armed| end.as_nanos() < armed.as_nanos()) {
             unsafe_call::arm(&children.timer, after);
             children.armed = Some(end);
         }

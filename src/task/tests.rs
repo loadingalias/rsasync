@@ -572,7 +572,7 @@ impl super::owner::Park for Record {
         Ok(false)
     }
 
-    fn park(&mut self, _local: &super::owner::Local, until: Option<super::owner::Until>) -> Result<(), Self::Error> {
+    fn park(&mut self, _local: &super::owner::Local, until: Option<crate::clock::Until>) -> Result<(), Self::Error> {
         let until = until.expect("an owner whose task waits for a timer parks with a limit");
         let deadline = self.waiting.get().expect("the task names the deadline before it waits");
         self.parks.push((until.instant, deadline));

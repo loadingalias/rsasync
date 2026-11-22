@@ -37,6 +37,7 @@ pub(super) const SYS_IO_URING_REGISTER: c_long = 427;
 pub(crate) const EPERM: i32 = 1;
 pub(crate) const ENOSYS: i32 = 38;
 /// The time of a wait passed (`errno.h`).
+#[cfg(feature = "local")]
 pub(super) const ETIME: i32 = 62;
 
 pub(super) const PROT_READ: c_int = 0x1;
@@ -60,6 +61,7 @@ pub(super) const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
 pub(super) const IORING_SQ_TASKRUN: u32 = 1 << 2;
 pub(super) const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
 /// The argument of the call is an `io_uring_getevents_arg`, Linux 5.11.
+#[cfg(feature = "local")]
 pub(super) const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
 
 pub(super) const IORING_OFF_SQ_RING: i64 = 0;

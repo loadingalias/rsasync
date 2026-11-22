@@ -111,6 +111,7 @@ match Runtime::builder().local_workers(4).build() {
 | `Plan(PlanError)` | A setting is invalid, or a strict placement falls back. No worker started | Correct the setting. See [Placement](#placement) |
 | `Seed(io::Error)` | The kernel gave no seed. No worker started | Give a seed with `seed`, or start again |
 | `Allocation` | The allocator did not give the memory of the start: the default budget, the facts of the host, the plans, or the tables of the workers. No worker started | Start fewer workers, or start again when memory is free |
+| `Clock(clock::Unsupported)` | The target has no native clock that pauses while the system is suspended, which measures the grace period. No worker started | Use a target of [Native clock of each target](clocks.md#native-clock-of-each-target) |
 | `Worker { index, error }` | Worker `index` did not start | See `WorkerError` below |
 
 | `WorkerError` | When | Recovery |
@@ -444,7 +445,8 @@ Call `runtime.shutdown()`. It stops the runtime in one bounded lifecycle, and it
    resources, which cancels their operations.
 4. Until the end of the grace period, each operation can end by itself. Then each worker closes
    each resource that remains, cancels each operation that still runs, and kills each child with
-   `End::Kill`. The grace period is one deadline from the request, for each worker.
+   `End::Kill`. The grace period is one deadline from the request, for each worker, on the
+   [clock of the runtime](clocks.md#the-clock-of-the-runtime).
 5. Each worker waits until each operation reaches its terminal event, with no deadline. No deadline
    frees a buffer that the kernel can still use, so a shutdown can outlast its grace period.
 6. The shutdown joins each worker, and then it tears the blocking service down.

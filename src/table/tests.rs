@@ -308,8 +308,9 @@ pub(crate) mod allocations {
         HELD.get()
     }
 
-    /// Runs `f`, which this thread runs with each allocation refused.
-    #[cfg(target_os = "macos")]
+    /// Runs `f`, which this thread runs with each allocation refused. Its one user is a driver
+    /// test, which loom does not build.
+    #[cfg(all(target_os = "macos", not(loom)))]
     pub(crate) fn refused<T>(f: impl FnOnce() -> T) -> T {
         REFUSE_FROM.set(ALLOCATIONS.get());
         let output = f();

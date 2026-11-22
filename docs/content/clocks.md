@@ -59,6 +59,13 @@ count above `u64::MAX` nanoseconds, about 584 years, stays at the last instant o
 - Windows: the interrupt time counts sleep and hibernation, and the unbiased interrupt time does
   not.
 
+## The clock of the runtime
+
+The runtime and its driver read the time only through `NativeClock` on `Suspend::Pauses`. This
+clock measures the [timers](timers.md) of each owner, the grace period of `Runtime::shutdown`, the
+timed waits of a worker, and the waits between the exit polls of a child. So the time while the
+system is suspended does not count toward these deadlines.
+
 ## Inject the time in a test
 
 `InjectedClock::new(start)` gives a clock at `start`, on the domain of `start`. Its time moves only

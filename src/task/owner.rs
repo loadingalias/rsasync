@@ -18,7 +18,6 @@ use core::mem::MaybeUninit;
 use core::panic::AssertUnwindSafe;
 use core::pin::{Pin, pin};
 use core::task::{Context, Poll, Waker};
-use core::time::Duration;
 use std::panic::catch_unwind;
 
 use super::slot::{Home, RootRef, Shared, TaskRef};
@@ -26,7 +25,7 @@ use super::waiting::List;
 use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, Refused, SpawnRefused, Target};
 use crate::capacity::{Budget, Permit};
 use crate::channel::oneshot;
-use crate::clock::NativeClock;
+use crate::clock::{NativeClock, Until};
 use crate::coop;
 use crate::memory::{items, room};
 use crate::sync::{
@@ -34,7 +33,7 @@ use crate::sync::{
     atomic::{AtomicU32, AtomicU64},
     thread, try_arc,
 };
-use crate::time::{Instant, TimeError};
+use crate::time::TimeError;
 use crate::timer::Timers;
 
 /// The largest number of task slots of one owner.
@@ -158,21 +157,6 @@ pub(super) trait Park {
 
     /// Waits until a signal of the home comes, or until the instant of `until` at the latest.
     fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Self::Error>;
-}
-
-/// The instant at which a park ends at the latest: the next turn of the timers that has work, on
-/// the clock of the timers.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct Until {
-    pub(super) instant: Instant,
-    clock: NativeClock,
-}
-
-impl Until {
-    /// The time from now until the instant, or zero when it passed.
-    pub(super) fn remaining(self) -> Duration {
-        self.instant.duration_since(self.clock.now()).unwrap_or(Duration::ZERO)
-    }
 }
 
 /// A home with no ring: it has no other work, and it parks its thread.
@@ -585,10 +569,7 @@ impl Local {
     fn until(&self) -> Option<Until> {
         let timers = self.timers.borrow();
         let (timers, clock) = timers.as_ref()?;
-        Some(Until {
-            instant: timers.next_turn()?,
-            clock: *clock,
-        })
+        Some(Until::new(timers.next_turn()?, *clock))
     }
 
     /// Requests the cancel of each live task.

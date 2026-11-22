@@ -12,6 +12,9 @@
 //! domains have the identifier [`NATIVE`]. [`InjectedClock`] moves only when its owner advances it,
 //! so a test controls the time. It works without `std`.
 //!
+//! The runtime and its driver read the time only through a clock of this module: each deadline,
+//! wait, and backoff, too. So the time of a run enters it at one transition.
+//!
 //! ```
 //! use core::time::Duration;
 //!
@@ -123,5 +126,30 @@ impl InjectedClock {
 impl fmt::Debug for InjectedClock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InjectedClock").field("now", &self.now()).finish()
+    }
+}
+
+/// A deadline and the clock that reads it: the end of a timed wait of an owner or a driver.
+#[cfg(feature = "local")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Until {
+    pub(crate) instant: Instant,
+    clock: NativeClock,
+}
+
+#[cfg(feature = "local")]
+impl Until {
+    /// The deadline `instant`, which `clock` reads.
+    pub(crate) fn new(instant: Instant, clock: NativeClock) -> Self {
+        assert!(
+            instant.domain() == clock.domain(),
+            "a deadline is on the domain of its clock"
+        );
+        Self { instant, clock }
+    }
+
+    /// The time from now until the deadline, or zero when it passed.
+    pub(crate) fn remaining(self) -> Duration {
+        self.instant.duration_since(self.clock.now()).unwrap_or(Duration::ZERO)
     }
 }

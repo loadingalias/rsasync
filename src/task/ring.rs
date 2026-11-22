@@ -21,13 +21,12 @@
 use alloc::rc::Rc;
 use core::future::Future;
 use std::io;
-use std::time::Instant;
 
 use super::Refused;
-use super::owner::{Enter, Local, Park, Until};
+use super::owner::{Enter, Local, Park};
 use super::slot::Home;
 use crate::capacity::Budget;
-use crate::clock::NativeClock;
+use crate::clock::{NativeClock, Until};
 use crate::driver::{self, Config, Driver};
 use crate::sync::{Arc, thread};
 use crate::time::TimeError;
@@ -86,20 +85,19 @@ impl RingOwner {
         super::factory::Placer::new(self.local.shared(), budget)
     }
 
-    /// Runs `root`, the loop of a worker, as [`RingOwner::block_on`] does. `root` gives the deadline
+    /// Runs `root`, the loop of a worker, as [`RingOwner::block_on`] does. `root` gives the drain
     /// of the end and the count of [`Driver::dropped_sent`] at its end. After the tasks ended, the
-    /// driver runs until no operation runs or until the deadline, which `None` does not have. Then
-    /// the teardown cancels each operation that still runs, and it waits for each terminal event,
-    /// with no deadline.
+    /// driver runs until no operation runs or until the end of the drain. Then the teardown cancels
+    /// each operation that still runs, and it waits for each terminal event, with no deadline.
     ///
     /// # Errors
     ///
     /// As for [`RingOwner::block_on`].
-    pub(crate) fn serve<F: Future<Output = (Option<Instant>, u64)>>(self, root: F) -> Result<Ended, Failure> {
+    pub(crate) fn serve<F: Future<Output = (Drain, u64)>>(self, root: F) -> Result<Ended, Failure> {
         let mut enter = Enter::new(&self.local);
         let output = self.local.block_on(root, &mut Drive);
         enter.ended = output.is_ok();
-        let (deadline, sent) = output?;
+        let (drain, sent) = output?;
         let cancelled = self.local.cancelled.get();
         self.local.lazy.set(None);
         let mut slot = self.local.driver.borrow_mut();
@@ -111,14 +109,17 @@ impl RingOwner {
         };
         let mut expired = false;
         while driver.busy() {
-            let left = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-            if left.is_some_and(|left| left.is_zero()) {
-                expired = true;
-                break;
-            }
+            let until = match drain {
+                Drain::Until(until) if !until.remaining().is_zero() => Some(until),
+                Drain::Now | Drain::Until(_) => {
+                    expired = true;
+                    break;
+                }
+                Drain::Unbounded => None,
+            };
             if !driver.turn().map_err(Failure::Driver)?.more() && driver.busy() {
-                match left {
-                    Some(left) => driver.wait_for(left),
+                match until {
+                    Some(until) => driver.wait_until(until),
                     None => driver.wait(),
                 }
                 .map_err(Failure::Driver)?;
@@ -159,6 +160,18 @@ impl RingOwner {
         }
         Ok(output)
     }
+}
+
+/// How long the operations of a worker can end by themselves after its tasks ended, before its
+/// teardown cancels them ([`RingOwner::serve`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Drain {
+    /// No time: the teardown comes at once.
+    Now,
+    /// Until the deadline.
+    Until(Until),
+    /// Until each operation ended.
+    Unbounded,
 }
 
 /// What the end of a worker did ([`RingOwner::serve`]).
@@ -227,7 +240,7 @@ impl Park for Drive {
         // The turn of `drive` can wake a task of another home after its own flush.
         flush(local, driver);
         match until {
-            Some(until) => driver.wait_for(until.remaining()),
+            Some(until) => driver.wait_until(until),
             None => driver.wait(),
         }
         .map_err(Failure::Driver)

@@ -84,15 +84,15 @@ impl Queue {
         }
     }
 
-    /// Submits as [`Queue::submit`] does, and waits at most for `timeout`. The end of the time is
+    /// Submits as [`Queue::submit`] does, and waits at most until `until`. The end of the time is
     /// no error.
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn submit_timeout(&mut self, wait: u32, timeout: core::time::Duration) -> io::Result<u32> {
+    pub(crate) fn submit_until(&mut self, wait: u32, until: crate::clock::Until) -> io::Result<u32> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Ring(ring) => ring.submit_timeout(wait, timeout),
+            Self::Ring(ring) => ring.submit_timeout(wait, until.remaining()),
             #[cfg(unix)]
-            Self::Poller(poller) => poller.submit_timeout(wait, timeout),
+            Self::Poller(poller) => poller.submit_until(wait, until),
         }
     }
 

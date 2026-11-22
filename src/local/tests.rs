@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::assert_matches;
@@ -86,6 +87,33 @@ fn bytes_cross_local_tcp_streams_and_their_halves() {
             server.close().unwrap().await.unwrap();
             client.close().unwrap().await.unwrap();
             listener.close().unwrap().await.unwrap();
+        })
+        .unwrap();
+}
+
+/// A receive that the root submits and polls, and that a task then awaits, wakes that task at its
+/// completion: the wake goes to the latest waker, not to the task that submitted. A wake of the
+/// root only would leave the task pending, and the join would never end.
+#[test]
+fn a_receive_that_another_task_awaits_wakes_that_task() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let (_listener, server, mut client) = pair().await;
+            // The task needs a `'static` future, so the stream outlives `block_on`, whose end
+            // closes it.
+            let server = Box::leak(Box::new(server));
+            let mut receive = server.recv(buffer()).unwrap();
+            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut receive).poll(cx).is_pending())).await;
+            assert!(polled, "no byte came before the send");
+            let waiter = task::spawn_local(receive).unwrap();
+            yield_once().await;
+            let (sent, _lease) = client.send(Lease::from(b"x".to_vec())).unwrap().await.unwrap();
+            assert_eq!(sent.unwrap(), 1);
+            let task::Outcome::Completed(Ok((received, bytes))) = waiter.join().await else {
+                panic!("the task that awaits the receive completes");
+            };
+            assert_eq!((received.unwrap(), bytes.bytes()), (1, &b"x"[..]));
         })
         .unwrap();
 }

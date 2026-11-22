@@ -36,7 +36,6 @@ use core::ptr::NonNull;
 use core::task::{Context, Waker};
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, RawFd};
-use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use epoll::{Event, Selector, decode};
@@ -374,32 +373,27 @@ impl Poller {
     ///
     /// An error of the wait of the selector, such as `Interrupted`.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
-        self.enter(wait, None)
+        self.enter(wait, || None)
     }
 
-    /// Submits as [`submit`](Self::submit) does, and waits at most for `timeout`. The end of the
+    /// Submits as [`submit`](Self::submit) does, and waits at most until `until`. The end of the
     /// time is no error.
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn submit_timeout(&mut self, wait: u32, timeout: core::time::Duration) -> io::Result<u32> {
-        self.enter(wait, Some(Instant::now() + timeout))
+    pub(crate) fn submit_until(&mut self, wait: u32, until: crate::clock::Until) -> io::Result<u32> {
+        self.enter(wait, || Some(until.remaining()))
     }
 
-    /// The submit of [`submit`](Self::submit), with no limit or until `deadline`.
-    fn enter(&mut self, wait: u32, deadline: Option<Instant>) -> io::Result<u32> {
+    /// The submit of [`submit`](Self::submit). Before each wait, `left` gives the time left, or
+    /// `None` for no limit. No time left ends the submit.
+    fn enter(&mut self, wait: u32, mut left: impl FnMut() -> Option<core::time::Duration>) -> io::Result<u32> {
         let taken = self.take();
         self.poll_jobs();
         let mut woke = self.poll(Some(core::time::Duration::ZERO))?;
         while wait > 0 && !woke && self.completions.len() < wait as usize {
-            let timeout = match deadline {
-                None => None,
-                Some(deadline) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        break;
-                    }
-                    Some(left)
-                }
-            };
+            let timeout = left();
+            if timeout.is_some_and(|left| left.is_zero()) {
+                break;
+            }
             woke = self.poll(timeout)?;
             self.poll_jobs();
         }

@@ -100,25 +100,33 @@ Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both 
 
 ## The runtime on Linux
 
-The [runtime](runtime.md), `rsasync::runtime`, is on Linux only. On 2026-11-20, `cargo xtask test`
-passed with glibc on two AWS EC2 hosts:
+The [runtime](runtime.md), `rsasync::runtime`, is on Linux only. Its local workers run on io_uring
+on these four hosts, with glibc. Each host was an AWS EC2 instance:
 
 | Distribution | Architecture | Kernel | Instance |
 | --- | --- | --- | --- |
 | Debian 12 | x86_64 | `6.1.0-56-cloud-amd64` | c8i.4xlarge, 8 cores with SMT |
+| Debian 12 | aarch64 | `6.1.0-56-cloud-arm64` | c8g.4xlarge, 16 cores |
+| Ubuntu 26.04 | x86_64 | `7.0.0-1018-aws` | c8i.4xlarge, 8 cores with SMT |
 | Ubuntu 26.04 | aarch64 | `7.0.0-1018-aws` | c8g.4xlarge, 16 cores |
 
-Each run passed 467 tests and the doctests. The runtime tests check a start that fails at one
-worker of four at the descriptor limit, the factory spawn and its refusals, a cancel of a factory
-spawn before and after its worker places it, `Dedicated` placement on one CPU of each physical core,
-an `Exact` CPU outside the CPU set, the release of the operations of `block_on` before it returns,
-a waker that the teardown calls, a kept waker that holds no descriptor, a kept cancel handle that
-keeps its charge, a root that starts no driver, a wake after the first operation, and the
-generators of each owner. They run on io_uring, and the factory spawn, the release, and the wake
-also run on epoll. `cargo xtask explore -p rsasync` passed its 53 exploration tests on the x86_64
-host, where the wakes of a task go through the cell of the ring of its home. No host
-with two NUMA nodes or two cache domains ran them, so the spread of `Domain` and `Dedicated` over
-nodes and domains has only the test of the plan on the facts of such a host.
+On 2026-11-22, `cargo xtask check` and `cargo xtask test` passed on each host. Each run passed 528
+tests and the doctests. Thirteen tests need root, `CAP_SYS_TIME`, or a second OS user, so they did
+not run. The three examples of [Run the examples](runtime.md#run-the-examples) printed their
+documented output. The runtime tests check a start that fails at one worker of four at the
+descriptor limit, the factory spawn and its refusals, `Dedicated` placement on one CPU of each
+physical core, the release of the operations of `block_on` before it returns, a wake from another
+thread, a task that yields at its poll budget, a receive that one task submits and another task
+awaits, the shutdown with its grace period and its report, and the generators of each owner. They
+also check the TCP, UDP, IPC stream, file, pipe, child, and signal types of a task. The factory
+spawn, the release, and the wake also run on epoll. No host with two NUMA nodes or two cache
+domains ran them, so the spread of `Domain` and `Dedicated` over nodes and domains has only the
+test of the plan on the facts of such a host.
+
+On the same day, an exploration campaign on the aarch64 Debian 12 host checked the 14 loom models
+of wake publication, waker replacement, cancellation, close, and slot reuse. Each model passed
+with at most 4, 5, and 6 forced thread switches, and with no limit, which checks each thread order
+of the model.
 
 ## macOS
 

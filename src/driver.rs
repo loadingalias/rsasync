@@ -99,7 +99,6 @@ use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, ready};
-use core::time::Duration;
 #[cfg(unix)]
 use std::fs;
 use std::io;
@@ -1856,18 +1855,18 @@ impl Driver {
     /// A failure of the kernel entry other than an interrupt or a full queue, which leave work for
     /// the next turn.
     pub fn wait(&mut self) -> io::Result<()> {
-        self.wait_in(None)
+        self.wait_in(|queue| queue.submit(1))
     }
 
-    /// Blocks as [`wait`](Self::wait) does, but at most for `timeout`.
+    /// Blocks as [`wait`](Self::wait) does, but at most until `until`.
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn wait_for(&mut self, timeout: Duration) -> io::Result<()> {
-        self.wait_in(Some(timeout))
+    pub(crate) fn wait_until(&mut self, until: crate::clock::Until) -> io::Result<()> {
+        self.wait_in(|queue| queue.submit_until(1, until))
     }
 
-    /// The wait of [`wait`](Self::wait), with no limit or at most for `timeout`. On IOCP, a
-    /// request or a wake of another thread posts a packet to the port, which ends the wait.
-    fn wait_in(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+    /// The wait of [`wait`](Self::wait), in `enter`, with no limit or with one. On IOCP, a request
+    /// or a wake of another thread posts a packet to the port, which ends the wait.
+    fn wait_in(&mut self, enter: impl FnOnce(&mut Queue) -> io::Result<u32>) -> io::Result<()> {
         // A completion that the control keeps for the next turn is ready.
         if self.control.as_ref().is_some_and(control::Controlled::due) {
             return Ok(());
@@ -1888,14 +1887,10 @@ impl Driver {
                 Err(error) => return Err(error),
             }
         }
-        let entered = match timeout {
-            #[cfg(all(feature = "local", target_os = "linux"))]
-            Some(timeout) => self.queue.submit_timeout(1, timeout),
-            _ => self.queue.submit(1),
-        };
+        let entered = enter(&mut self.queue);
         // A handled signal ends the wait with `Interrupted`, also under `SA_RESTART`. The wait
-        // then returns: a second entry with the same `timeout` would wait the whole time again,
-        // so signals that come faster than `timeout` would keep it past its end.
+        // then returns: a second entry with the same time left would wait the whole time again,
+        // so signals that come faster than that time would keep it past `until`.
         match entered {
             Err(error) if !retryable(&error) => Err(error),
             _ => Ok(()),

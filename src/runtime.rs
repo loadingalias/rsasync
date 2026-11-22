@@ -77,7 +77,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::io;
 use std::thread::JoinHandle as Thread;
-use std::time::Instant;
 
 pub use group::{Group, GroupError};
 pub use placement::{CpuSet, Fallback, MAX_CPUS, Placed, Placement, PlanError, Request, Selection};
@@ -87,11 +86,12 @@ pub use topology::{Host, Quota};
 use crate::blocking::{self, Service, Submitter};
 use crate::capacity::Budget;
 use crate::channel::{self, TrySendError, mpsc};
-use crate::clock;
+use crate::clock::{self, NativeClock, Until};
 use crate::driver::{self, Config};
 use crate::memory::room;
 use crate::sync::{Arc, try_arc};
-use crate::task::{self, Ended, JoinHandle, Placer, RingOwner, SpawnRefused};
+use crate::task::{self, Drain, Ended, JoinHandle, Placer, RingOwner, SpawnRefused};
+use crate::time::Suspend;
 use crate::timer;
 use worker::Message;
 
@@ -275,6 +275,8 @@ impl Builder {
             None => Budget::try_new(NonZeroU64::new(DEFAULT_BUDGET).expect("the default is not zero"))
                 .map_err(|_| fail(Cause::Allocation))?,
         };
+        // The clock of the grace period of the shutdown.
+        let clock = NativeClock::new(Suspend::Pauses).map_err(|error| fail(Cause::Clock(error)))?;
         let host = topology::discover().map_err(|_| fail(Cause::Allocation))?;
         let plans = placement::resolve(&self.placement, self.selection, self.local_workers, &host).map_err(fail)?;
         let generator = match self.generator {
@@ -326,6 +328,7 @@ impl Builder {
             },
             blocking: service,
             grace: self.grace,
+            clock,
             budget,
             slots: self.task_slots,
             driver: self.driver,
@@ -420,7 +423,7 @@ impl Started {
     /// Stops each worker that started, and joins it. Gives the outcome of each, with room for the
     /// outcome of the worker that failed.
     fn stop(&mut self) -> Vec<Cleanup> {
-        stop(&mut self.routes, Some(Instant::now()));
+        stop(&mut self.routes, Drain::Now);
         let mut cleanup = core::mem::take(&mut self.cleanup);
         for (index, thread) in (0..).zip(self.workers.drain(..)) {
             cleanup.push(join(index, thread));
@@ -429,12 +432,12 @@ impl Started {
     }
 }
 
-/// Sends the stop with `deadline` to each worker: the operations of the worker can end by
-/// themselves until it, and with no deadline until each one ended. Its inbox has a place for it.
-fn stop(routes: &mut [Route], deadline: Option<Instant>) {
+/// Sends the stop with `drain` to each worker: the operations of the worker can end by themselves
+/// until the end of the drain. Its inbox has a place for it.
+fn stop(routes: &mut [Route], drain: Drain) {
     for route in routes {
         // A worker whose driver failed ended, and its inbox is closed.
-        let sent = route.sender.try_send(Message::Stop(deadline));
+        let sent = route.sender.try_send(Message::Stop(drain));
         assert!(
             !matches!(sent, Err(TrySendError::Full(_))),
             "the inbox of a worker has a place for the stop"
@@ -482,6 +485,8 @@ pub struct Runtime {
     blocking: Option<Service>,
     /// The grace period of [`Runtime::shutdown`].
     grace: Duration,
+    /// The clock that measures the grace period.
+    clock: NativeClock,
 }
 
 impl Runtime {
@@ -572,9 +577,14 @@ impl Runtime {
     pub fn shutdown(mut self) -> Shutdown {
         // One deadline for each worker, which no step restarts. A grace period too long for the
         // clock has no deadline.
-        let deadline = Instant::now().checked_add(self.grace);
-        self.handle.closed.store(true, Ordering::Release);
-        stop(&mut self.handle.routes, deadline);
+        let drain = self
+            .clock
+            .now()
+            .checked_add(self.grace)
+            .map_or(Drain::Unbounded, |deadline| {
+                Drain::Until(Until::new(deadline, self.clock))
+            });
+        self.handle.close(drain);
         let workers = core::mem::take(&mut self.workers)
             .into_iter()
             .zip(0..)
@@ -594,9 +604,8 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.handle.closed.store(true, Ordering::Release);
         // A backstop: the teardown of each worker comes at once.
-        stop(&mut self.handle.routes, Some(Instant::now()));
+        self.handle.close(Drain::Now);
         for (index, thread) in (0..).zip(core::mem::take(&mut self.workers)) {
             // The drop is a backstop: the shutdown of R305 reports these outcomes.
             let _outcome = join(index, thread);
@@ -652,6 +661,12 @@ struct Route {
 }
 
 impl Handle {
+    /// The stop of the runtime: each spawn refuses from now, and each worker stops with `drain`.
+    fn close(&mut self, drain: Drain) {
+        self.closed.store(true, Ordering::Release);
+        stop(&mut self.routes, drain);
+    }
+
     /// The local workers of the runtime.
     #[must_use]
     pub fn workers(&self) -> u32 {
@@ -857,6 +872,9 @@ pub enum Cause {
     },
     /// The blocking service did not start ([`Builder::blocking`]). No worker started.
     Blocking(blocking::Error),
+    /// The system has no native clock that pauses while it is suspended, which measures the grace
+    /// period. No worker started.
+    Clock(clock::Unsupported),
 }
 
 impl fmt::Display for Cause {
@@ -867,6 +885,7 @@ impl fmt::Display for Cause {
             Self::Allocation => f.write_str("the allocator did not give the tables of the start"),
             Self::Worker { index, error } => write!(f, "worker {index} did not start: {error}"),
             Self::Blocking(error) => write!(f, "the blocking service did not start: {error}"),
+            Self::Clock(error) => write!(f, "no native clock: {error}"),
         }
     }
 }
@@ -879,6 +898,7 @@ impl core::error::Error for Cause {
             Self::Allocation => None,
             Self::Worker { error, .. } => Some(error),
             Self::Blocking(error) => Some(error),
+            Self::Clock(error) => Some(error),
         }
     }
 }

@@ -52,10 +52,10 @@ use core::time::Duration;
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::fd::AsRawFd as _;
-// A physical measurement of the kernel at startup. A deterministic run does not replace it.
-use std::time::Instant;
 
 use super::sys;
+use crate::clock::NativeClock;
+use crate::time::{Instant, Suspend};
 use crate::uring::{Ring, Sqe};
 
 /// The time for the first deferred signal. Each kernel gives it, but with `cd305ee3633a` only after
@@ -86,8 +86,11 @@ pub(super) fn signal_stops_after_first(ring: &mut Ring, wake: &File) -> io::Resu
 
 /// Makes two deferred signals on the registration of `wake`, and gives `false` only when both
 /// come in time. It waits `first` for the first one.
+///
+/// The probe measures the kernel, so it reads the native clock in each run.
 #[expect(unsafe_code, reason = "a poll names no memory")]
 pub(super) fn probe(ring: &mut Ring, wake: &File, first: Duration) -> io::Result<bool> {
+    let clock = NativeClock::new(Suspend::Pauses).map_err(|_| io::Error::from(io::ErrorKind::Unsupported))?;
     let (mut reader, mut writer) = io::pipe()?;
     let mut limit = first;
     for _ in 0..2 {
@@ -96,10 +99,10 @@ pub(super) fn probe(ring: &mut Ring, wake: &File, first: Duration) -> io::Result
         unsafe { ring.push(&poll) }.map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         // The poll waits in the kernel before the write wakes it.
         ring.submit(0)?;
-        let start = Instant::now();
+        let start = clock.now();
         writer.write_all(&[0])?;
-        let signaled = readable(wake, limit)?;
-        let delay = start.elapsed();
+        let signaled = readable(wake, limit, clock)?;
+        let delay = since(clock, start);
         // Run the deferred work, which posts the completion of the poll, and take it.
         while !ring.ready() {
             match ring.submit(1) {
@@ -120,10 +123,15 @@ pub(super) fn probe(ring: &mut Ring, wake: &File, first: Duration) -> io::Result
     Ok(false)
 }
 
-/// Waits until `fd` is readable, for at most `limit` in total.
+/// The time on `clock` since `start`, which `clock` gave.
+fn since(clock: NativeClock, start: Instant) -> Duration {
+    clock.now().duration_since(start).unwrap_or(Duration::ZERO)
+}
+
+/// Waits until `fd` is readable, for at most `limit` in total on `clock`.
 #[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
-fn readable(fd: &File, limit: Duration) -> io::Result<bool> {
-    let start = Instant::now();
+fn readable(fd: &File, limit: Duration, clock: NativeClock) -> io::Result<bool> {
+    let start = clock.now();
     let mut pollfd = sys::PollFd {
         fd: fd.as_raw_fd(),
         events: sys::POLLIN,
@@ -132,7 +140,7 @@ fn readable(fd: &File, limit: Duration) -> io::Result<bool> {
     loop {
         // After an interrupt, the wait continues only for the rest of the limit. A full limit for
         // each wait never ends while a periodic signal, for example of a profiler, comes sooner.
-        let rest = limit.saturating_sub(start.elapsed());
+        let rest = limit.saturating_sub(since(clock, start));
         // The limit is at most one second, so its milliseconds fit an `int`.
         let timeout = i32::try_from(rest.as_millis()).unwrap_or(i32::MAX);
         // SAFETY: `pollfd` is one valid `pollfd` during the call.

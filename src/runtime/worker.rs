@@ -4,7 +4,6 @@
 use core::num::NonZeroU32;
 use core::time::Duration;
 use std::io;
-use std::time::Instant;
 
 use rscrypto::ChaCha20Rng;
 
@@ -15,7 +14,7 @@ use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
 use crate::driver::{Config, Driver};
-use crate::task::{Ended, Failure, Job, Placer, RingOwner, with_driver};
+use crate::task::{Drain, Ended, Failure, Job, Placer, RingOwner, with_driver};
 use crate::time::Suspend;
 use crate::timer::Timers;
 
@@ -24,8 +23,9 @@ pub(super) enum Message {
     /// A factory spawn on the worker.
     Job(Job),
     /// The end of the worker: the inbox closes, and each job in it ends with `Cancelled`. The
-    /// operations of the worker can end by themselves until the deadline ([`RingOwner::serve`]).
-    Stop(Option<Instant>),
+    /// operations of the worker can end by themselves until the end of the drain
+    /// ([`RingOwner::serve`]).
+    Stop(Drain),
 }
 
 impl Message {
@@ -132,15 +132,15 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport), WorkerError> {
 
 /// The root of a worker: it runs each job of the inbox until the stop. Then it closes the inbox,
 /// and each job that waits there drops, so its task ends with `Cancelled`.
-/// Gives the deadline of the stop, and the count of `Driver::dropped_sent` at the stop, so the end
+/// Gives the drain of the stop, and the count of `Driver::dropped_sent` at the stop, so the end
 /// counts only what the stop ended.
-async fn serve(mut inbox: mpsc::Receiver<Message>) -> (Option<Instant>, u64) {
-    let deadline = loop {
+async fn serve(mut inbox: mpsc::Receiver<Message>) -> (Drain, u64) {
+    let drain = loop {
         match inbox.recv().await {
             Ok(Message::Job(job)) => job.run(),
-            Ok(Message::Stop(deadline)) => break deadline,
+            Ok(Message::Stop(drain)) => break drain,
             // No stop reaches a closed inbox, so the teardown comes at once.
-            Err(_) => break Some(Instant::now()),
+            Err(_) => break Drain::Now,
         }
     };
     inbox.close();
@@ -148,5 +148,5 @@ async fn serve(mut inbox: mpsc::Receiver<Message>) -> (Option<Instant>, u64) {
         drop(message);
     }
     let sent = with_driver((), |driver, ()| driver.dropped_sent()).unwrap_or(0);
-    (deadline, sent)
+    (drain, sent)
 }
