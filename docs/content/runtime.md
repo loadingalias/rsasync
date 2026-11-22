@@ -359,8 +359,8 @@ charges the service, and `runtime.report()` does not list it.
 
 ## Run the examples
 
-Two examples use the runtime with the types of `rsasync::local`, on Linux. Each one runs one task on
-worker 0, prints one line for each outcome, and ends with a shutdown that has no live debt.
+Three examples use the runtime with the types of `rsasync::local`, on Linux. Each one runs one task
+on worker 0, prints one line for each outcome, and ends with a shutdown that has no live debt.
 
 - `cargo run -p local_only` keeps the state of its task in an `Rc` across each wait, and it does
   file, TCP, UDP, and IPC stream I/O. It shows partial progress, the reuse of a buffer after a
@@ -369,6 +369,17 @@ worker 0, prints one line for each outcome, and ends with a shutdown that has no
   `core::future::join!`, `poll_fn`, and a small select. Its join borrows data on the stack of the
   task, and its select abandons a receive. It shows partial progress, and the reuse of a lease
   after a failure.
+- `cargo run -p process_supervision` supervises two children with piped standard streams. It
+  needs `sh`, `tee`, `sleep`, and `kill` on the host. The steps are:
+  1. Register a stream of `SIGINT` with `Escalation::At(2)`, so a second interrupt ends a stuck
+     process.
+  2. Spawn each child with `ChildOptions::new().tree(true).end(End::Kill)`. The child leads its own
+     process group, so a Ctrl-C at the terminal reaches only the supervisor.
+  3. Write 256 KiB to each child while both of its outputs drain, in one join. That is 4 times the
+     capacity of a Linux pipe, so a write before the reads would wait forever.
+  4. Send `SIGINT` to the example itself with `kill -s INT`, as Ctrl-C does.
+  5. On the interrupt, send `SIGTERM` to the tree of each child. Kill the tree of a child that
+     still runs after 1 s. One child obeys `SIGTERM`, and one child ignores it.
 
 The expected output of `local_only`:
 
@@ -404,6 +415,23 @@ failure: a send after the half-close gave BrokenPipe and its lease back
 failure: the same lease then sent "again" on a new stream
 shutdown: 0 tasks cancelled, 0 operations of debt, grace period expired: false
 ```
+
+The expected output of `process_supervision`:
+
+<!-- The same text as `EXPECTED` of `examples/process_supervision/src/main.rs`. Edit both. -->
+```text
+interrupt: the stream of SIGINT is ready, and a second SIGINT ends the process
+io: the child that obeys SIGTERM took 262144 bytes while its stdout and stderr drained
+io: its stdout gave 262144 bytes and its stderr gave 262144 bytes, each the same as the input: true
+io: the child that ignores SIGTERM took 262144 bytes while its stdout and stderr drained
+io: its stdout gave 262144 bytes and its stderr gave 262144 bytes, each the same as the input: true
+interrupt: kill -s INT sent SIGINT to this process, and the stream reported it
+stop: the child that obeys SIGTERM ended by signal 15 before the deadline of 1s
+stop: the child that ignores SIGTERM ran on to the deadline of 1s, and the kill ended it by signal 9
+shutdown: 0 tasks cancelled, 0 operations of debt, 0 children run on, grace period expired: false
+```
+
+In its shutdown line, "children run on" is `worker.kept()`.
 
 ## Stop a runtime
 

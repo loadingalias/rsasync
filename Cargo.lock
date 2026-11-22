@@ -149,6 +149,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "process_supervision"
+version = "0.0.0"
+dependencies = [
+ "rsasync",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

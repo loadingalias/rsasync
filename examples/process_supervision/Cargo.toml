@@ -1,0 +1,14 @@
+[package]
+name = "process_supervision"
+version = "0.0.0"
+description = "The process-supervision example of rsasync: a task that feeds two children, drains their outputs, and on an interrupt stops each one with a signal and then a kill at a deadline."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The local workers of the runtime need Linux on x86_64 or aarch64.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../.." }
+
+[lints]
+workspace = true

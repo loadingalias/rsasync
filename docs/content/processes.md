@@ -208,3 +208,7 @@ of the piped standard streams. A `Child` is not `Send`. A signal or a kill on a 
 driver, or on another owner, gives `SignalChildError::OtherDriver`. The end policy applies at
 `close`, at the drop of the `Child`, and at the end of its home: a child with `End::Kill` dies, and
 the driver reaps it. A `wait` can run on any thread.
+
+The `process_supervision` example ([Run the examples](runtime.md#run-the-examples)) writes the
+input of two children while their outputs drain. Then it stops each one with `SIGTERM`, and with a
+kill at a deadline when the child ignores `SIGTERM`.

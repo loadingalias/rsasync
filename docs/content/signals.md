@@ -117,3 +117,6 @@ It registers a stream, as `Driver::signal` does, whose home is the driver of the
 thread, and it gives the same `SignalStream`. A turn of that driver wakes the stream, so the
 stream can move to another thread. On a thread with no driver, the call gives
 `SignalError::NoDriver`.
+
+The `process_supervision` example ([Run the examples](runtime.md#run-the-examples)) stops its
+children when a stream of a task reports `SIGINT`.
