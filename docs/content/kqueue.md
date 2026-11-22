@@ -29,7 +29,7 @@ kqueue reports its socket ready.
 
 | Operations | On kqueue |
 | --- | --- |
-| TCP, [IPC streams](ipc-streams.md), and [pipes](pipes.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket or the pipe end is ready. A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
+| TCP, [IPC streams](ipc-streams.md), and [pipes](pipes.md): accept, connect, receive, send, vectored send, half-close, close | One nonblocking call when the socket or the pipe end is ready. A send on a TCP or IPC stream is several calls ([Stream sends](#stream-sends)). A local bind and a local connect are system calls, ready at once. A receive into a selected buffer ([`Driver::provide`](driver-only.md)) takes its buffer only when its data comes. A send to a closed peer gives `EPIPE` and raises no `SIGPIPE` (`MSG_NOSIGNAL`) |
 | UDP: one datagram, with its metadata and truncation | One nonblocking `sendmsg` or `recvmsg`, with the control messages of [datagram I/O](datagram-io.md) |
 | UDP batches: `send_batch` and `recv_batch` | One `sendmsg` or `recvmsg` for each datagram, in order. A batch stops at the first datagram that the kernel does not take, and its report counts the datagrams before it |
 | Bind and listen (`Call::Bind`, `Call::BindUdp`, and `Driver::bind_ipc`) | System calls on the thread of the driver (`Route::SystemCall`) |
@@ -48,6 +48,23 @@ event of a file operation is the return of its job. After that return, the kerne
 reference to the buffer. A cancel finds no socket operation running: the operation waits for its
 socket, and it ends at once with `ECANCELED`, or it already ended. A file job cannot be cancelled,
 so its operation ends when the job returns.
+
+## Stream sends
+
+A send and a vectored send on a TCP stream or an IPC stream run in calls of at most 16 KiB. At the
+first send, the driver sets the send low-water mark of the socket (`SO_SNDLOWAT`) to 16 KiB, or to
+the send buffer when it is smaller. macOS then takes each call whole or not at all.
+
+- The send ends with the bytes of the calls that the socket took. It ends at the first call that
+  does not fit, after 8 MiB, or at its last byte, so its count is exact.
+- When macOS refuses network memory (`ENOBUFS`, or `ENOMEM` of its memory accounting) before a byte
+  went, the send waits. It runs again at the next write event of the socket, or after 1 ms. The wait
+  doubles up to 10 ms while macOS refuses. So a stream send on kqueue never gives `ENOBUFS`.
+- A cancel or a close ends a waiting send, as for each operation.
+
+The calls exist because macOS can refuse network memory after it took a part of a larger call, and
+it then gives no count. A call of at most 16 KiB also keeps the send buffer full enough for macOS
+to make the buffer of a TCP stream larger, as one large call does.
 
 ## UDP has no segmentation offload
 
@@ -154,7 +171,7 @@ byte.
 The driver registers each socket and pipe end in its kqueue when it takes the descriptor: one
 edge-triggered registration (`EV_CLEAR`) for reads (`EVFILT_READ`) and one for writes
 (`EVFILT_WRITE`). It removes both before the close. A pipe end gets `O_NONBLOCK` at the
-registration. The exit of a child and the timer after it have one-shot registrations. A file has no registration. When kqueue refuses a registration, for
+registration. The exit of a child and the timer after it have one-shot registrations, and so does the one timer of the driver for refused stream sends. A file has no registration. When kqueue refuses a registration, for
 example with no kernel memory, the operation gives `OutOfMemory`, as with no free resource slot, and
 an accepted connection stays with its listener for the next accept.
 

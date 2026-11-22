@@ -25,6 +25,8 @@
 mod epoll;
 #[cfg(target_os = "macos")]
 mod kqueue;
+#[cfg(target_os = "macos")]
+mod pieces;
 pub(super) mod sys;
 
 use alloc::collections::VecDeque;
@@ -56,6 +58,24 @@ const WAKE: u64 = u64::MAX;
 
 /// The bit of the data of a one-shot registration, with the index of its slot in the low bits.
 const ONE_SHOT: u64 = 1 << 63;
+
+/// The data of the timer of the retry of the stream sends that macOS refused for its memory. It
+/// has the bit of a one-shot registration, so the poller reads it first.
+#[cfg(target_os = "macos")]
+const RETRY: u64 = u64::MAX - 1;
+
+/// The identifier of that timer: no process ID of macOS (at most 99999), so no timer of the exit
+/// of a process has it.
+#[cfg(target_os = "macos")]
+const RETRY_TIMER: RawFd = RawFd::MAX;
+
+/// The first and the longest wait before a refused stream send runs again, in microseconds. The
+/// wait doubles at each refusal while no stream send makes progress. No event of the socket tells
+/// when the kernel has memory again.
+#[cfg(target_os = "macos")]
+const RETRY_US_FIRST: u64 = 1_000;
+#[cfg(target_os = "macos")]
+const RETRY_US_MAX: u64 = 10_000;
 
 /// The `poll` bits of the events that a selector reports (`include/uapi/asm-generic/poll.h` of
 /// Linux, and `sys/poll.h` of the macOS SDK, which has no `POLLRDHUP`). They are the event bits of
@@ -164,6 +184,22 @@ struct Readiness {
     /// The first and the last entry that wait in each direction.
     head: [Option<u32>; 2],
     tail: [Option<u32>; 2],
+    /// How a send of the resource runs, from the probe at its first send.
+    #[cfg(target_os = "macos")]
+    sends: pieces::Sends,
+    /// A send of the resource waits for the retry after macOS refused its memory.
+    #[cfg(target_os = "macos")]
+    refused: bool,
+}
+
+/// The retry of the stream sends that macOS refused for its memory.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct Retry {
+    /// The timer of the retry runs.
+    armed: bool,
+    /// The wait of the next retry, in microseconds.
+    delay_us: u64,
 }
 
 /// What one call of an entry did.
@@ -198,6 +234,9 @@ pub(crate) struct Poller {
     events: Vec<Event>,
     /// The last wait filled the event array, so events can remain.
     full: bool,
+    /// The retry of the stream sends that macOS refused for its memory.
+    #[cfg(target_os = "macos")]
+    retry: Retry,
 }
 
 impl Poller {
@@ -246,6 +285,11 @@ impl Poller {
             waker: None,
             events: filled(EVENTS, Event::default).map_err(out_of_memory)?,
             full: false,
+            #[cfg(target_os = "macos")]
+            retry: Retry {
+                armed: false,
+                delay_us: RETRY_US_FIRST,
+            },
         })
     }
 
@@ -622,6 +666,11 @@ impl Poller {
         let mut woke = false;
         for event in 0..count {
             let (data, events) = decode(self.events[event]);
+            #[cfg(target_os = "macos")]
+            if data == RETRY {
+                self.retried();
+                continue;
+            }
             if data == WAKE {
                 woke = true;
             } else if data & ONE_SHOT != 0 {
@@ -710,6 +759,20 @@ impl Poller {
         if slot.sqe.opcode == ring::IORING_OP_CONNECT {
             return self.connect(index, slot);
         }
+        #[cfg(target_os = "macos")]
+        if matches!(slot.sqe.opcode, ring::IORING_OP_SEND | ring::IORING_OP_SENDMSG)
+            && let Some(readiness) = slot.token.and_then(|token| self.readiness_of(token))
+        {
+            if self.readiness[readiness].sends == pieces::Sends::Unknown {
+                match pieces::probe(slot.sqe.fd) {
+                    Ok(sends) => self.readiness[readiness].sends = sends,
+                    Err(errno) => return Step::Done(-errno, 0),
+                }
+            }
+            if let pieces::Sends::Pieces(piece) = self.readiness[readiness].sends {
+                return self.send_stream(index, &slot, readiness, piece);
+            }
+        }
         let selected = slot.sqe.flags & ring::IOSQE_BUFFER_SELECT != 0;
         let buffer = if selected {
             match self.group.as_ref().and_then(|group| group.peek(0)) {
@@ -734,6 +797,65 @@ impl Poller {
                 }
                 None => Step::Done(result, 0),
             },
+        }
+    }
+
+    /// A stream send on macOS, in calls of at most `piece` bytes, each of which sends all of its
+    /// bytes or none ([`pieces`]). It ends with the count of the calls that sent, at the first call
+    /// that the socket does not take whole, after [`pieces::STEP_BYTES`], or at its last byte.
+    /// With no byte sent, it waits for its next edge, and a refusal of memory (`ENOBUFS` or
+    /// `ENOMEM`) also waits for the retry.
+    #[cfg(target_os = "macos")]
+    fn send_stream(&mut self, index: u32, slot: &Slot, readiness: usize, piece: core::num::NonZeroUsize) -> Step {
+        // SAFETY: the driver keeps the memory that the entry names until its completion, and
+        // nothing writes it meanwhile.
+        #[expect(unsafe_code, reason = "the entry names the regions of the send")]
+        let mut send = unsafe { pieces::Pieces::new(&slot.sqe) };
+        let mut sent = 0_usize;
+        while sent < pieces::STEP_BYTES {
+            match send.call(piece) {
+                Ok((len, taken)) => {
+                    sent += taken;
+                    if taken < len || send.rest() == 0 {
+                        break;
+                    }
+                }
+                // The next send gives the error of the socket, after the count of this one.
+                Err(_) if sent > 0 => break,
+                Err(sys::EAGAIN) => return Step::Wait(index),
+                Err(sys::ENOBUFS | sys::ENOMEM) => return self.refuse(index, readiness),
+                Err(errno) => return Step::Done(-errno, 0),
+            }
+        }
+        self.retry.delay_us = RETRY_US_FIRST;
+        Step::Done(i32::try_from(sent).unwrap_or(i32::MAX), 0)
+    }
+
+    /// The stream send of `index` sent no byte, because macOS refused its memory: it waits for its
+    /// next edge or the retry. The send ends with that refusal, which sent no byte, when the timer
+    /// of the retry does not start.
+    #[cfg(target_os = "macos")]
+    fn refuse(&mut self, index: u32, readiness: usize) -> Step {
+        if !self.retry.armed {
+            if let Err(error) = self.selector.delay(RETRY_TIMER, self.retry.delay_us, RETRY) {
+                return Step::Done(-error.raw_os_error().unwrap_or(sys::ENOBUFS), 0);
+            }
+            self.retry.armed = true;
+            self.retry.delay_us = (self.retry.delay_us * 2).min(RETRY_US_MAX);
+        }
+        self.readiness[readiness].refused = true;
+        Step::Wait(index)
+    }
+
+    /// The timer of the retry ended: each refused stream send runs again, as at an edge.
+    #[cfg(target_os = "macos")]
+    fn retried(&mut self) {
+        self.retry.armed = false;
+        for readiness in 0..self.readiness.len() {
+            if core::mem::take(&mut self.readiness[readiness].refused) {
+                self.readiness[readiness].ready[WRITE] = true;
+                self.run(readiness, WRITE);
+            }
         }
     }
 

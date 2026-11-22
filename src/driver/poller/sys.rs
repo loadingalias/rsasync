@@ -270,6 +270,10 @@ pub(super) const EBADFD: i32 = 77;
 pub(super) const ENOBUFS: i32 = 105;
 #[cfg(target_os = "macos")]
 pub(super) const ENOBUFS: i32 = 55;
+/// A refusal of the memory accounting of macOS (`sosendcheck`), which a stream send treats as
+/// `ENOBUFS`.
+#[cfg(target_os = "macos")]
+pub(super) const ENOMEM: i32 = 12;
 #[cfg(target_os = "linux")]
 pub(super) const EINPROGRESS: i32 = 115;
 #[cfg(target_os = "macos")]

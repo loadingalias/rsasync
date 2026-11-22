@@ -95,10 +95,26 @@ async fn bind(address: &str) -> UdpSocket {
     UdpSocket::bind(address).await.unwrap()
 }
 
-/// A dual-stack IPv6 socket on the wildcard address.
+/// A dual-stack IPv6 socket on the wildcard address. macOS gives a dual-stack socket an ephemeral
+/// port that an IPv4 socket can hold already, and an IPv4 datagram to the port then goes to that
+/// IPv4 socket. A bind to a stated port checks the IPv4 sockets too. So the socket binds the port of
+/// an IPv4 socket that just closed, and it takes another port when a socket took that one first.
 #[cfg(not(windows))]
 async fn dual_stack() -> UdpSocket {
-    bind("[::]:0").await
+    const ATTEMPTS: usize = 16;
+    for _ in 0..ATTEMPTS {
+        let port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        match UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await {
+            Ok(socket) => return socket,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!("the dual-stack bind failed: {error}"),
+        }
+    }
+    panic!("another socket took each of {ATTEMPTS} free IPv4 ports before the dual-stack bind");
 }
 
 /// A dual-stack IPv6 socket on the wildcard address. A Windows IPv6 socket takes no IPv4 traffic
@@ -421,6 +437,43 @@ fn a_connected_socket_sends_to_its_peer_with_its_ecn_codepoint() {
     });
 }
 
+/// Waits until the receive buffer of `socket` holds `count` datagrams, for at most 2 s. macOS
+/// delivers a loopback datagram after its send returns, so the socket can be readable before the
+/// last datagram of a batch arrived, and one receive then gives only those that are ready.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the kernel writes one `int` option into owned storage")]
+fn wait_for_datagrams(socket: Borrowed<'_>, count: core::ffi::c_int) {
+    use std::os::fd::AsRawFd as _;
+
+    /// `SO_NUMRCVPKT` of `sys/socket.h` of the macOS SDK: the datagrams in the receive buffer.
+    const SO_NUMRCVPKT: core::ffi::c_int = 0x1112;
+    let start = std::time::Instant::now();
+    loop {
+        let mut queued: core::ffi::c_int = 0;
+        let mut len = u32::try_from(size_of::<core::ffi::c_int>()).unwrap();
+        // SAFETY: the option and its length live during the call, and the kernel writes at most
+        // `len` bytes.
+        let result = unsafe {
+            crate::sys::getsockopt(
+                socket.as_raw_fd(),
+                crate::sys::SOL_SOCKET,
+                SO_NUMRCVPKT,
+                (&raw mut queued).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        if queued >= count {
+            return;
+        }
+        assert!(
+            start.elapsed() < core::time::Duration::from_secs(2),
+            "{queued} of {count} datagrams arrived"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// One batch send and one batch receive keep each datagram, its size, its ECN codepoint, its peer, and
 /// its local address, and report the truncation of a datagram that does not fit its buffer.
 #[test]
@@ -444,6 +497,8 @@ fn a_batch_keeps_each_datagram_and_its_metadata() {
             .await
             .unwrap();
         assert_eq!(sent, 3);
+        #[cfg(target_os = "macos")]
+        wait_for_datagrams(receiver.handle(), 3);
 
         // The third buffer holds 100 bytes of the third datagram.
         let mut storage = [[0; 4096]; 4];

@@ -607,7 +607,9 @@ fn the_owner_parks_at_most_until_the_deadline_and_the_coarsening_of_the_next_tim
     let Ok(_lateness) = local.block_on(wake_for_timers(clock, resolution, waiting), &mut home);
     enter.ended = true;
     drop(enter);
-    assert!(home.parks.len() >= OFFSETS.len(), "{:?}", home.parks);
+    // A timer that is due at the turn of the owner fires with no park, for example after a late
+    // wake on a loaded host, so the timers can give fewer parks than timers.
+    assert!(!home.parks.is_empty(), "the owner never parked");
     for (until, deadline) in home.parks {
         let latest = deadline.checked_add(coarsening).unwrap();
         assert!(
