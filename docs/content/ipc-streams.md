@@ -35,7 +35,8 @@ fails at once. The future of `bind_ipc` and `connect_ipc` gives these errors:
 
 | Error kind | Cause |
 | --- | --- |
-| `InvalidInput` | The path is empty, holds a NUL byte, or has more than 107 bytes on Linux or 103 bytes on macOS. The driver makes no socket. An abstract name, which has no file, is not available |
+| `InvalidFilename` | The path has more than 107 bytes on Linux or 103 bytes on macOS, so it does not fit a socket address. The system error is `ENAMETOOLONG`. The driver makes no socket. Use a shorter path, for example a short directory in the temporary directory |
+| `InvalidInput` | The path is empty or holds a NUL byte. The driver makes no socket. An abstract name, which has no file, is not available |
 | `AddrInUse` | A bind found a file at the path, or a listener holds the lock of the path. See [Bind at a path](#bind-at-a-path) |
 | `PermissionDenied` | A connect to a socket file that the user of the process cannot write, for example one of another user. A bind with a lock file of another user, or with `Stale::Replace` on a socket file of another user |
 | `NotFound` | A connect to a path with no file |
@@ -178,9 +179,9 @@ listener of another program on macOS, and the named pipes of Windows.
 ## Windows
 
 On Windows, an IPC stream is a byte-mode named pipe. The path of `bind_ipc` and `connect_ipc`
-is a pipe name, `\\.\pipe\<name>`, with at most 256 units in all. Each other path gives
-`InvalidInput`. A pipe name has no file, and the name ends when the last instance of the pipe
-closes.
+is a pipe name, `\\.\pipe\<name>`, with at most 256 units in all. A longer pipe name gives
+`InvalidFilename` (`ERROR_FILENAME_EXCED_RANGE`), and each other path gives `InvalidInput`. A
+pipe name has no file, and the name ends when the last instance of the pipe closes.
 
 The bind makes the first instance of the pipe:
 

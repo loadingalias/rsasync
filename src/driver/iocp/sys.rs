@@ -485,6 +485,8 @@ pub(crate) const ERROR_HANDLE_EOF: c_int = 38;
 pub(crate) const ERROR_INVALID_FUNCTION: c_int = 1;
 /// `ERROR_INVALID_PARAMETER`.
 pub(crate) const ERROR_INVALID_PARAMETER: c_int = 87;
+/// `ERROR_FILENAME_EXCED_RANGE`, which `std::io` reads as `InvalidFilename`.
+pub(crate) const ERROR_FILENAME_EXCED_RANGE: c_int = 206;
 /// `ERROR_NOT_SUPPORTED`.
 pub(crate) const ERROR_NOT_SUPPORTED: c_int = 50;
 /// `ERROR_NOT_ENOUGH_MEMORY`, which reads as `OutOfMemory`.

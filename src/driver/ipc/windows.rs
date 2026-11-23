@@ -161,8 +161,9 @@ impl Drop for Descriptor {
 }
 
 /// The name of the pipe at `path` as a NUL-terminated UTF-16 string: `\\.\pipe\` and a name of at
-/// least one unit, at most 256 units in all. `None` for each other path.
-pub(crate) fn name(path: &Path) -> Option<Vec<u16>> {
+/// least one unit, at most 256 units in all. The negative `ERROR_FILENAME_EXCED_RANGE` for a
+/// longer pipe name, and the negative `ERROR_INVALID_PARAMETER` for each other path.
+pub(crate) fn name(path: &Path) -> Result<Vec<u16>, i32> {
     let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
     let prefix: Vec<u16> = PREFIX.encode_utf16().collect();
     let starts = name.get(..prefix.len()).is_some_and(|start| {
@@ -171,11 +172,14 @@ pub(crate) fn name(path: &Path) -> Option<Vec<u16>> {
             .zip(&prefix)
             .all(|(&unit, &expected)| lower(unit) == expected)
     });
-    if !starts || name.len() <= prefix.len() || name.len() > NAME_MAX || name.contains(&0) {
-        return None;
+    if !starts || name.len() <= prefix.len() || name.contains(&0) {
+        return Err(sys::ERROR_INVALID_PARAMETER.saturating_neg());
+    }
+    if name.len() > NAME_MAX {
+        return Err(sys::ERROR_FILENAME_EXCED_RANGE.saturating_neg());
     }
     name.push(0);
-    Some(name)
+    Ok(name)
 }
 
 /// `unit` in lower case, for an ASCII letter.

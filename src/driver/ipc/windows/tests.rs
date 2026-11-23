@@ -330,22 +330,24 @@ pub(in crate::driver) fn a_waiting_accept_ends_at_the_close_of_its_listener_and_
     drive(&mut driver, close).unwrap();
 }
 
-/// A path that is not a pipe name gives `InvalidInput` and makes no pipe: a file path, the prefix
-/// with no name, a name of more than 256 units, and a name with a NUL unit. A name of 256 units
-/// binds.
-pub(in crate::driver) fn a_path_that_is_not_a_pipe_name_gives_invalid_input(backend: Backend) {
+/// A path that is not a pipe name makes no pipe. A file path, the prefix with no name, and a name
+/// with a NUL unit give `InvalidInput`. A name of more than 256 units gives `InvalidFilename`, the
+/// kind of a name above its limit. A name of 256 units binds.
+pub(in crate::driver) fn a_path_that_is_not_a_pipe_name_gives_invalid_input_and_a_long_name_invalid_filename(
+    backend: Backend,
+) {
     let mut driver = suite::driver(Config::new(), backend);
     let long = alloc::format!(r"\\.\pipe\{}", "n".repeat(256 - 9));
-    for path in [
-        r"C:\rsasync.sock",
-        r"\\.\pipe\",
-        &alloc::format!("{long}n"),
-        "\\\\.\\pipe\\a\0b",
+    for (path, kind) in [
+        (r"C:\rsasync.sock", io::ErrorKind::InvalidInput),
+        (r"\\.\pipe\", io::ErrorKind::InvalidInput),
+        (&alloc::format!("{long}n"), io::ErrorKind::InvalidFilename),
+        ("\\\\.\\pipe\\a\0b", io::ErrorKind::InvalidInput),
     ] {
         let error = bind(&mut driver, Path::new(path), Stale::Refuse).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}: {error}");
+        assert_eq!(error.kind(), kind, "{path:?}: {error}");
         let error = connect(&mut driver, Path::new(path)).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}: {error}");
+        assert_eq!(error.kind(), kind, "{path:?}: {error}");
     }
     let listener = bind(&mut driver, Path::new(&long), Stale::Refuse).unwrap();
     let close = driver.close_ipc_listener(listener).unwrap();

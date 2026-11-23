@@ -54,6 +54,11 @@ pub(super) const ECONNREFUSED: i32 = 61;
 /// `ENOTCONN`.
 #[cfg(target_os = "macos")]
 pub(super) const ENOTCONN: i32 = 57;
+/// `ENAMETOOLONG`, which `std::io` reads as `InvalidFilename`.
+#[cfg(target_os = "linux")]
+pub(super) const ENAMETOOLONG: i32 = 36;
+#[cfg(target_os = "macos")]
+pub(super) const ENAMETOOLONG: i32 = 63;
 
 /// `struct sockaddr_un`: the family, and a path of at most 107 bytes and its NUL byte.
 #[cfg(target_os = "linux")]

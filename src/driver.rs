@@ -2099,11 +2099,26 @@ impl Driver {
             return;
         };
         let mut sqe = None;
-        slot.update(id, |held| sqe = held.as_mut().map(entry));
+        // The socket that the operation made and holds, as a connect holds its new socket.
+        #[cfg(unix)]
+        let mut made = None;
+        slot.update(id, |held| {
+            if let Some(held) = held {
+                #[cfg(unix)]
+                {
+                    made = held.accepted;
+                }
+                sqe = Some(entry(held));
+            }
+        });
         if let Some(sqe) = sqe {
             let resource = self.table.resources(id).and_then(|tag| tag.resource);
+            // An entry waits on the readiness of the resource of its tag, or else of the socket
+            // that its operation made. That socket has the registration of a resource, and a
+            // one-shot registration of its descriptor would replace it, so that no later receive
+            // or send of the socket could wait.
             #[cfg(unix)]
-            let token = resource.map(|resource| poller::Token {
+            let token = resource.or(made).map(|resource| poller::Token {
                 index: resource.index,
                 generation: resource.generation,
             });

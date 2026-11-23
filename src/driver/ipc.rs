@@ -31,7 +31,7 @@ use rsnetwork_udp::SockAddrStorage;
 #[cfg(unix)]
 use rsnetwork_udp::sys::SOCK_STREAM;
 #[cfg(unix)]
-use sys::{EADDRINUSE, EAGAIN, EBUSY, ECONNREFUSED, EINVAL, ENOENT, ENOMEM, EPERM};
+use sys::{EADDRINUSE, EAGAIN, EBUSY, ECONNREFUSED, EINVAL, ENAMETOOLONG, ENOENT, ENOMEM, EPERM};
 
 #[cfg(unix)]
 use super::Medium;
@@ -274,9 +274,10 @@ impl Driver {
     ///
     /// # Errors
     ///
-    /// A refusal when the driver has no room for the operation. The future gives `InvalidInput`
-    /// for a path that is empty, holds a NUL byte, or has more than 107 bytes on Linux or 103 on
-    /// macOS, or on Windows for a path that is not a pipe name of at most 256 units, `AddrInUse`
+    /// A refusal when the driver has no room for the operation. The future gives `InvalidFilename`
+    /// for a path of more than 107 bytes on Linux or 103 on macOS, or on Windows for a pipe name of
+    /// more than 256 units, `InvalidInput` for a path that is empty or holds a NUL byte, or on
+    /// Windows for a path that is not a pipe name, `AddrInUse`
     /// for a path that exists or whose lock a listener holds, as [`Stale`] tells, and on Windows
     /// for a pipe name with an instance, `PermissionDenied` for a lock file of another user,
     /// another error of the system, or `OutOfMemory` when each resource slot of the driver is in
@@ -289,18 +290,14 @@ impl Driver {
         let id = self.begin_now(Kind::Bind)?;
         #[cfg(unix)]
         {
-            let listening = unix_address(path)
-                .ok_or(EINVAL)
-                .and_then(|address| listen(path, address, stale));
+            let listening = unix_address(path).and_then(|address| listen(path, address, stale));
             self.end_now(id, listening);
         }
         // No pipe name is stale, so `stale` changes nothing.
         #[cfg(target_os = "windows")]
         {
             let _ = stale;
-            let listening = windows::name(path)
-                .ok_or(super::iocp::sys::ERROR_INVALID_PARAMETER.saturating_neg())
-                .and_then(windows::listen);
+            let listening = windows::name(path).and_then(windows::listen);
             self.end_pipe(id, listening.map(|(instance, listening)| (instance, Some(listening))));
         }
         Ok(Operation::new(
@@ -316,8 +313,8 @@ impl Driver {
     ///
     /// # Errors
     ///
-    /// A refusal when the driver has no room for the operation. The future gives `InvalidInput`
-    /// for a path as for [`Driver::bind_ipc`], `NotFound` for a path with no file,
+    /// A refusal when the driver has no room for the operation. The future gives `InvalidFilename`
+    /// and `InvalidInput` for a path as for [`Driver::bind_ipc`], `NotFound` for a path with no file,
     /// `ConnectionRefused` for a socket file with no listener, `ResourceBusy` for a live listener
     /// whose queue of connections that wait for an accept is full, so that a later connect can
     /// succeed, `PermissionDenied` for a socket file that the user of the process cannot write,
@@ -333,7 +330,7 @@ impl Driver {
         let id = self.begin_now(Kind::Connect)?;
         #[cfg(unix)]
         {
-            let connected = unix_address(path).ok_or(EINVAL).and_then(|address| {
+            let connected = unix_address(path).and_then(|address| {
                 connect(address).map_err(|errno| match errno {
                     // A live listener with a full queue: Linux gives `EAGAIN`, and macOS gives
                     // `ECONNREFUSED`, as for a socket file with no listener. On macOS, the lock of
@@ -348,9 +345,7 @@ impl Driver {
         }
         #[cfg(target_os = "windows")]
         {
-            let connected = windows::name(path)
-                .ok_or(super::iocp::sys::ERROR_INVALID_PARAMETER.saturating_neg())
-                .and_then(|name| windows::connect(&name));
+            let connected = windows::name(path).and_then(|name| windows::connect(&name));
             self.end_pipe(id, connected.map(|client| (client, None)));
         }
         Ok(Operation::new(
@@ -660,15 +655,16 @@ fn peer(fd: BorrowedFd<'_>) -> io::Result<Peer> {
 }
 
 /// The `struct sockaddr_un` of `path` in socket address storage, and its length with the NUL
-/// byte. `None` for a path that is empty, holds a NUL byte, or has no room in the path array of
-/// the address with its NUL byte: more than 107 bytes on Linux, or 103 on macOS. On Linux, an
-/// empty path asks the kernel for an abstract name, which has no file and no permission.
+/// byte. `EINVAL` for a path that is empty or holds a NUL byte, and `ENAMETOOLONG` for a path
+/// with no room in the path array of the address with its NUL byte: more than 107 bytes on Linux,
+/// or 103 on macOS. On Linux, an empty path asks the kernel for an abstract name, which has no
+/// file and no permission.
 #[expect(unsafe_code, reason = "the storage has room and alignment for the address")]
 #[cfg(unix)]
-fn unix_address(path: &Path) -> Option<(SockAddrStorage, u32)> {
+fn unix_address(path: &Path) -> Result<(SockAddrStorage, u32), i32> {
     let bytes = path.as_os_str().as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
-        return None;
+        return Err(EINVAL);
     }
     let mut address = sys::SockAddrUn {
         #[cfg(target_os = "macos")]
@@ -681,19 +677,20 @@ fn unix_address(path: &Path) -> Option<(SockAddrStorage, u32)> {
     address
         .sun_path
         .get_mut(..bytes.len())
-        .filter(|path| path.len() < room)?
+        .filter(|path| path.len() < room)
+        .ok_or(ENAMETOOLONG)?
         .copy_from_slice(bytes);
     let len = core::mem::offset_of!(sys::SockAddrUn, sun_path) + bytes.len() + 1;
     #[cfg(target_os = "macos")]
     {
-        address.sun_len = u8::try_from(len).ok()?;
+        address.sun_len = u8::try_from(len).map_err(|_| ENAMETOOLONG)?;
     }
     let mut storage = SockAddrStorage::EMPTY;
     // SAFETY: the storage is 128 bytes with the alignment of a pointer, and the address is at most
     // 110 bytes with the alignment of its family. Each field of the storage is an integer, so each
     // byte of the address is a valid value of it.
     unsafe { ptr::write((&raw mut storage).cast::<sys::SockAddrUn>(), address) };
-    Some((storage, u32::try_from(len).ok()?))
+    Ok((storage, u32::try_from(len).map_err(|_| ENAMETOOLONG)?))
 }
 
 /// The error number of `error`.

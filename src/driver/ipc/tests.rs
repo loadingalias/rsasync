@@ -304,11 +304,12 @@ pub(in crate::driver) fn a_bind_does_not_replace_the_socket_file_of_a_busy_liste
     assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
 }
 
-/// A path that the kernel would change gives `InvalidInput` and makes no socket: an empty path,
-/// which would bind an abstract name with no file and no permission on Linux, a path with a NUL
-/// byte, and a path that fills the path array of `struct sockaddr_un`, which then has no room for
-/// the NUL byte. A path one byte shorter binds.
-pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid_input(backend: Backend) {
+/// A path that the kernel would change makes no socket. An empty path, which would bind an
+/// abstract name with no file and no permission on Linux, and a path with a NUL byte give
+/// `InvalidInput`. A path that fills the path array of `struct sockaddr_un`, which then has no
+/// room for the NUL byte, gives `InvalidFilename`, the kind of a name above its limit. A path one
+/// byte shorter binds.
+pub(in crate::driver) fn a_path_with_no_room_in_a_socket_address_gives_invalid_filename(backend: Backend) {
     /// The size of `sun_path`: `include/uapi/linux/un.h` of Linux, and `sys/un.h` of macOS.
     #[cfg(target_os = "linux")]
     const SUN_PATH: usize = 108;
@@ -322,16 +323,19 @@ pub(in crate::driver) fn a_path_that_does_not_fit_a_socket_address_gives_invalid
         path.resize(len, b'p');
         PathBuf::from(OsStr::from_bytes(&path))
     };
-    for path in [
-        PathBuf::new(),
-        PathBuf::from(OsStr::from_bytes(b"/tmp/a\0b")),
-        long(SUN_PATH),
+    for (path, kind) in [
+        (PathBuf::new(), io::ErrorKind::InvalidInput),
+        (
+            PathBuf::from(OsStr::from_bytes(b"/tmp/a\0b")),
+            io::ErrorKind::InvalidInput,
+        ),
+        (long(SUN_PATH), io::ErrorKind::InvalidFilename),
     ] {
         let error = bind(&mut driver, &path, Stale::Refuse).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
+        assert_eq!(error.kind(), kind, "{path:?}");
         let connect = driver.connect_ipc(&path).unwrap();
         let error = drive(&mut driver, connect).unwrap().unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{path:?}");
+        assert_eq!(error.kind(), kind, "{path:?}");
     }
     let path = long(SUN_PATH - 1);
     let _listener = bind(&mut driver, &path, Stale::Refuse).unwrap();
@@ -397,7 +401,7 @@ pub(in crate::driver) fn an_accepted_stream_of_a_closed_peer_reports_its_user_an
 /// of the start.
 #[expect(unsafe_code, reason = "the hook of the new process makes only system calls")]
 fn connect_as_nobody(path: &Path) -> io::Result<Connected> {
-    let (address, len) = super::unix_address(path).ok_or(io::ErrorKind::InvalidInput)?;
+    let (address, len) = super::unix_address(path).map_err(io::Error::from_raw_os_error)?;
     let mut command = Command::new("/bin/sleep");
     command.arg("60").uid(NOBODY).gid(NOBODY);
     // SAFETY: the hook allocates nothing and takes no lock: it makes a socket and connects it with

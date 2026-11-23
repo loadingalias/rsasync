@@ -1459,6 +1459,49 @@ pub(in crate::driver) fn a_connect_to_a_port_with_no_listener_is_refused(backend
     }
 }
 
+/// A stream that the driver connected waits for bytes that come after its receive, and for room to
+/// send while its peer does not read, and each wait ends. On epoll and kqueue, the wait of the
+/// connect does not replace the registration of the socket, which each later wait needs.
+pub(in crate::driver) fn a_connected_stream_waits_for_late_bytes_and_for_room_to_send(backend: Backend) {
+    const TOTAL: usize = 16 << 20;
+    let mut driver = suite::driver(Config::new(), backend);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let connect = driver
+        .connect(listener.local_addr().unwrap(), TcpOptions::default())
+        .unwrap();
+    let mut stream = drive(&mut driver, connect).unwrap().unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+
+    // The receive starts before the peer sends, so it waits.
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(64))).unwrap();
+    for _ in 0..3 {
+        driver.turn().unwrap();
+    }
+    peer.write_all(b"late").unwrap();
+    let (count, bytes) = drive(&mut driver, receive).unwrap();
+    assert_eq!((count.unwrap(), bytes.bytes()), (4, &b"late"[..]));
+
+    // The peer reads only after the sends fill the buffers of the socket, so a send waits.
+    let reader = thread::spawn(move || {
+        thread::sleep(core::time::Duration::from_millis(200));
+        let mut received = Vec::new();
+        peer.read_to_end(&mut received).unwrap();
+        received
+    });
+    let lease = Lease::from(numbered(0, TOTAL));
+    let mut sent = 0;
+    while sent < TOTAL {
+        let send = driver.send(&mut stream, lease.view(sent..).unwrap()).unwrap();
+        sent += drive(&mut driver, send).unwrap().0.unwrap();
+    }
+    let close = driver.close(stream).unwrap();
+    drive(&mut driver, close).unwrap();
+    assert!(
+        reader.join().unwrap() == numbered(0, TOTAL),
+        "the peer did not read the sent bytes"
+    );
+}
+
 /// A connect whose future drops after the kernel connected leaves no descriptor open after its
 /// terminal event: the driver closes the connection, and the peer reads the end of the stream.
 #[cfg(unix)]

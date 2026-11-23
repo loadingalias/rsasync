@@ -124,7 +124,7 @@
 //!   - Bind with mode 0600: `the_socket_file_of_an_ipc_listener_has_mode_0600_when_its_bind_ends`.
 //!   - Bind on an existing path:
 //!     `a_bind_refuses_a_live_listener_path_and_replaces_only_a_stale_socket_file` and
-//!     `a_path_that_does_not_fit_a_socket_address_gives_invalid_input`.
+//!     `a_path_with_no_room_in_a_socket_address_gives_invalid_filename`.
 //!   - Accept, connect, receive, send, vectored send, half-close, and close (`law`):
 //!     `a_numbered_stream_crosses_an_ipc_stream_with_no_gap_through_the_abandoned_operations`.
 //!   - The identity of the peer:
@@ -504,6 +504,7 @@ mod operation {
         }
         // TCP.
         tests => each_socket_option_reads_back_the_value_that_was_set,
+        tests => a_connected_stream_waits_for_late_bytes_and_for_room_to_send,
         tests => a_selected_buffer_is_decrypted_in_place_and_returns_to_its_ring_when_its_last_view_drops_elsewhere,
         tests => idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer,
         tests => a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on,
@@ -518,7 +519,7 @@ mod operation {
         #[cfg(target_os = "windows")]
         ipc::windows::tests => a_waiting_accept_ends_at_the_close_of_its_listener_and_the_name_binds_again,
         #[cfg(target_os = "windows")]
-        ipc::windows::tests => a_path_that_is_not_a_pipe_name_gives_invalid_input,
+        ipc::windows::tests => a_path_that_is_not_a_pipe_name_gives_invalid_input_and_a_long_name_invalid_filename,
         #[cfg(target_os = "windows")]
         ipc::windows::tests => a_burst_of_backlog_clients_connects_and_each_one_is_accepted,
         #[cfg(target_os = "windows")]
@@ -540,7 +541,7 @@ mod operation {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         ipc::tests => a_bind_does_not_replace_the_socket_file_of_a_busy_listener_that_holds_the_lock,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        ipc::tests => a_path_that_does_not_fit_a_socket_address_gives_invalid_input,
+        ipc::tests => a_path_with_no_room_in_a_socket_address_gives_invalid_filename,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         ipc::tests => an_accepted_stream_reports_the_user_group_and_process_of_this_process,
         #[cfg(any(target_os = "linux", target_os = "macos"))]
