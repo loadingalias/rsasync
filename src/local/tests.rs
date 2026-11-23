@@ -587,13 +587,25 @@ fn a_group_that_worker_1_refuses_fails_only_after_the_listener_of_worker_0_close
     );
 }
 
-/// A directory of a test beside its binary, which its drop removes.
+/// A directory of a test, which its drop removes.
 struct Scratch(PathBuf);
 
 impl Scratch {
+    /// A directory beside the test binary, so on the file system of the build and not on a
+    /// `tmpfs`.
     fn new(name: &str) -> Self {
         let mut path = std::env::current_exe().unwrap();
         path.pop();
+        Self::within(path, name)
+    }
+
+    /// A directory in the temporary directory, for a socket file. A socket path has at most 107
+    /// bytes, and a socket beside the test binary had a path of 111 bytes on CI.
+    fn short(name: &str) -> Self {
+        Self::within(std::env::temp_dir(), name)
+    }
+
+    fn within(mut path: PathBuf, name: &str) -> Self {
         path.push(alloc::format!("rsasync-local-{name}-{}", std::process::id()));
         drop(fs::remove_dir_all(&path));
         fs::create_dir_all(&path).unwrap();
@@ -674,7 +686,7 @@ fn the_close_of_a_file_returns_after_its_dropped_write_ends() {
 #[test]
 #[expect(clippy::mem_forget, reason = "the test forgets a future, as a caller can")]
 fn an_ipc_stream_carries_bytes_and_its_close_cancels_a_waiting_receive() {
-    let scratch = Scratch::new("ipc");
+    let scratch = Scratch::short("ipc");
     let runtime = Runtime::builder().build().unwrap();
     runtime
         .block_on(async {
