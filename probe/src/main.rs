@@ -6,7 +6,7 @@
 //! The same client measures each server, so a ratio of two servers comes from one method.
 //!
 //! ```sh
-//! probe server --workers 4 --port 7000
+//! probe server --workers 4 --port 7000 --completions 64
 //! probe client --target 10.0.0.2:7000 --connections 1000 --rate 200000 --workers 15 \
 //!     --warmup 10 --window 60 --seed 1
 //! ```
@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
         Some((command, rest)) if command == "server" => server::run(&server::Plan::parse(rest)?),
         Some((command, rest)) if command == "client" => client::run(client::Plan::parse(rest)?),
         _ => Err(
-            "usage: probe server --workers N --port P | probe client --target ADDRESS \
+            "usage: probe server --workers N --port P --completions N | probe client --target ADDRESS \
                   --connections N --rate PER_SECOND --workers N --warmup SECONDS --window SECONDS \
                   --seed N"
                 .to_owned(),

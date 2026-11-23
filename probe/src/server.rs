@@ -27,14 +27,17 @@ const CONNECTIONS: u32 = 4096;
 pub(crate) struct Plan {
     workers: u32,
     port: u16,
+    /// The completions that each turn of a driver takes (`Config::completions_per_turn`).
+    completions: u32,
 }
 
 impl Plan {
-    /// The plan of `--workers` and `--port`.
+    /// The plan of `--workers`, `--port`, and `--completions`.
     pub(crate) fn parse(arguments: &[String]) -> Result<Self, String> {
         Ok(Self {
             workers: value(arguments, "workers")?,
             port: value(arguments, "port")?,
+            completions: value(arguments, "completions")?,
         })
     }
 }
@@ -46,7 +49,13 @@ pub(crate) fn run(plan: &Plan) -> Result<(), String> {
         .local_workers(plan.workers)
         .placement(Placement::Dedicated, Selection::Permissive)
         .task_slots(slots)
-        .driver(Config::new().resources(slots).operations(2 * slots).submissions(1024))
+        .driver(
+            Config::new()
+                .resources(slots)
+                .operations(2 * slots)
+                .submissions(1024)
+                .completions_per_turn(plan.completions),
+        )
         .build()
         .map_err(|failure| format!("start: {failure:?}"))?;
     let mut output = std::io::stdout().lock();

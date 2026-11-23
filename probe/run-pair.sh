@@ -12,20 +12,26 @@
 #     ~/dev-machines/dev-machine run rsasync aws-pair-arm64 --ephemeral --execute --local \
 #     bash probe/run-pair.sh
 #
-# For each case, a server and a count of connections, it finds the saturation: the first offered
-# rate whose achieved rate is below 0.95 of it, from `PROBE_START_RATE` up by half each step. Then
-# it runs 3 windows of 60 s, after 10 s of warm-up, at 70% of the saturation. Each client run
-# prints one JSON line; this script adds the CPU time of the server process in the window, and its
-# system calls when perf can count them. `PROBE_CASES` selects the cases, for example
-# `PROBE_CASES="tokio:1000 tokio:10000"`.
+# Each case is a server, a count of connections, and for rsasync the completions of each turn of a
+# driver, for example `PROBE_CASES="rsasync:10000:64 tokio:10000"`. Each server runs each offered
+# rate of `PROBE_RATES`, so two servers compare at one rate below the CPU limit of each one, and
+# the knee of each curve shows. Each rate has a window of 20 s after 5 s of warm-up. Each client
+# run prints one JSON line; this script adds the CPU time of the server process in the window, and
+# its system calls when perf can count them.
+#
+# With `PROBE_PROFILE=1`, the server builds with frame pointers and line tables, and each window
+# of 60 s has four profiles of the server, one after the other: hardware counters, system calls by
+# kind, io_uring events, and `perf record` stacks by thread.
 set -euo pipefail
 
 target="${PROBE_TARGET:-aws-pair-arm64}"
 port=7000
 server_cpus=0-3
 client_workers=15
-cases="${PROBE_CASES:-rsasync:1000 rsasync:10000 tokio:1000 tokio:10000}"
-start_rate="${PROBE_START_RATE:-100000}"
+cases="${PROBE_CASES:-rsasync:1000:64 rsasync:10000:64 tokio:1000 tokio:10000}"
+rates="${PROBE_RATES:-200000 337500 450000 675000 900000}"
+build_env=""
+[ -z "${PROBE_PROFILE:-}" ] || build_env='CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"'
 
 hosts="$(~/dev-machines/dev-machine nodes rsasync "$target" --live | sed -n 's/^[0-9][0-9]*=//p')"
 server="$(sed -n 1p <<<"$hosts")"
@@ -46,9 +52,8 @@ echo "server address: $address"
 on "$client" 'sudo sysctl -q -w net.ipv4.tcp_tw_reuse=1 net.ipv4.ip_local_port_range="1024 65535"'
 
 echo "== build"
-for host in "$server" "$client"; do
-    on "$host" 'cd ~/rsasync && cargo build --quiet --release --locked -p probe'
-done
+on "$server" "cd ~/rsasync && $build_env cargo build --quiet --release --locked -p probe"
+on "$client" 'cd ~/rsasync && cargo build --quiet --release --locked -p probe'
 on "$server" 'cd ~/rsasync && cargo test --quiet --release --locked -p probe 2>&1 | tail -3'
 on "$server" 'mkdir -p ~/tokio-echo/src && cp ~/rsasync/rust-toolchain.toml ~/tokio-echo/ && cat > ~/tokio-echo/Cargo.toml' <<'EOF'
 [package]
@@ -113,15 +118,16 @@ fn main() {
     }
 }
 EOF
-on "$server" 'cd ~/tokio-echo && cargo build --quiet --release && grep -A1 "^name = \"tokio\"" Cargo.lock'
+on "$server" "cd ~/tokio-echo && $build_env cargo build --quiet --release && grep -A1 '^name = \"tokio\"' Cargo.lock"
 perf_ok="$(on "$server" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y linux-tools-aws > /dev/null 2>&1; sudo perf stat -e raw_syscalls:sys_enter -- true > /dev/null 2>&1 && echo yes || echo no')"
 echo "perf counts system calls: $perf_ok"
 
-# Starts server `$1` on node 1 and prints its process ID.
+# Starts server `$1` on node 1, with `$2` completions for each turn for rsasync, and prints its
+# process ID.
 start_server() {
     local command
     case "$1" in
-        rsasync) command="rsasync/target/release/probe server --workers 4 --port $port" ;;
+        rsasync) command="rsasync/target/release/probe server --workers 4 --port $port --completions $2" ;;
         tokio) command="tokio-echo/target/release/tokio-echo 4 $port" ;;
     esac
     on "$server" "ulimit -n 65536; cd ~; setsid nohup taskset -c $server_cpus $command > ~/$1.log 2>&1 < /dev/null & echo \$!"
@@ -149,30 +155,44 @@ measure() {
     echo "${result%\}},\"server_cpu_s\":$(awk -v t="$ticks" -v h="$hz" 'BEGIN { printf "%.2f", t / h }'),\"server_syscalls\":${calls:-null}}"
 }
 
+# Profiles the server process `$4`, of server `$1`, with `$2` connections at `$3` requests/s.
+profile() {
+    local kind="$1" connections="$2" rate="$3" pid="$4" record
+    on "$client" "ulimit -n 65536; ~/rsasync/target/release/probe client --target $address:$port \
+        --connections $connections --rate $rate --workers $client_workers --warmup 5 --window 60 --seed 1" \
+        > /tmp/probe-client.$$ &
+    # The schedule starts 3 s after the client starts, and its window after 5 s more.
+    sleep 9
+    echo "-- counters"
+    on "$server" "sudo perf stat -e task-clock,context-switches,cpu-migrations,page-faults,cycles,instructions -p $pid -- sleep 10 2>&1 | grep -E '[0-9]'"
+    echo "-- system calls"
+    # One descriptor for each event and each thread: more than the default limit.
+    on "$server" "sudo sh -c 'ulimit -n 1048576; exec perf stat -x, -e \"syscalls:sys_enter_*\" -p $pid -- sleep 10' 2>&1 | awk -F, '\$1 + 0 > 0 { print \$1, \$3 }' | sort -rn | head -16"
+    echo "-- io_uring events"
+    on "$server" "sudo sh -c 'ulimit -n 1048576; exec perf stat -x, -e \"io_uring:*\" -p $pid -- sleep 10' 2>&1 | awk -F, '\$1 + 0 > 0 { print \$1, \$3 }' | sort -rn | head -16"
+    echo "-- stacks"
+    record="sudo perf record -q -F 499 -g -p $pid -o /tmp/perf.data -- sleep 10 > /dev/null 2>&1"
+    on "$server" "$record; sudo perf report -i /tmp/perf.data --stdio --sort comm 2>/dev/null | grep -E '^ +[0-9]' | head -12"
+    on "$server" "sudo perf report -i /tmp/perf.data --stdio --no-children --sort dso,symbol --percent-limit 0.4 -g none 2>/dev/null | grep -E '^ +[0-9]' | head -60"
+    on "$server" "sudo perf report -i /tmp/perf.data --stdio --children --sort symbol --percent-limit 3 -g none 2>/dev/null | grep -E '^ +[0-9]' | head -40"
+    wait
+    cat /tmp/probe-client.$$
+    rm -f /tmp/probe-client.$$
+}
+
 for case in $cases; do
-    kind="${case%:*}"
-    connections="${case#*:}"
-    pid="$(start_server "$kind")"
+    IFS=: read -r kind connections completions <<<"$case"
+    completions="${completions:-64}"
+    pid="$(start_server "$kind" "$completions")"
     sleep 2
     on "$server" "head -8 ~/$kind.log"
-    echo "== $kind, $connections connections: saturation"
-    rate="$start_rate"
-    saturation=0
-    while [ "$rate" -le 4000000 ]; do
-        line="$(measure "$connections" "$rate" 3 5 "$pid")"
-        echo "$line"
-        achieved="$(sed -E 's/.*"achieved":([0-9]+).*/\1/' <<<"$line")"
-        # The saturation is the highest achieved rate of the search.
-        [ "$achieved" -le "$saturation" ] || saturation="$achieved"
-        if [ "$((achieved * 100))" -lt "$((rate * 95))" ]; then
-            break
+    for rate in $rates; do
+        echo "== $kind, $connections connections, $completions completions for each turn, $rate requests/s"
+        if [ -n "${PROBE_PROFILE:-}" ]; then
+            profile "$kind" "$connections" "$rate" "$pid"
+        else
+            measure "$connections" "$rate" 5 20 "$pid"
         fi
-        rate=$((rate * 3 / 2))
-    done
-    point=$((saturation * 7 / 10))
-    echo "== $kind, $connections connections: saturation $saturation, 3 runs at $point"
-    for _ in 1 2 3; do
-        measure "$connections" "$point" 10 60 "$pid"
     done
     on "$server" "kill $pid"
     sleep 2
