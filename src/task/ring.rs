@@ -299,7 +299,7 @@ impl Local {
             let Some((config, blocking)) = self.lazy.take() else {
                 return Err(value);
             };
-            match Driver::new(config) {
+            match Driver::new(config.owned()) {
                 Ok(mut driver) => {
                     if let Some(submitter) = blocking {
                         driver.use_blocking(submitter);

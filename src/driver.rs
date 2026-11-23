@@ -176,6 +176,8 @@ pub struct Config {
     required: Features,
     backend: Option<Backend>,
     delivery: Delivery,
+    #[cfg(target_os = "linux")]
+    wake: WakeDescriptor,
 }
 
 impl Config {
@@ -193,6 +195,20 @@ impl Config {
             required: Features::NONE,
             backend: None,
             delivery: Delivery::Native,
+            #[cfg(target_os = "linux")]
+            wake: WakeDescriptor::Signaled,
+        }
+    }
+
+    /// A driver that only its owner waits on, in [`Driver::wait`]: a runtime worker, or the owner of
+    /// `block_on`. On io_uring, no host reactor polls its wake descriptor, so the kernel does not
+    /// signal it at each completion, and no turn reads it.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[must_use]
+    pub(crate) const fn owned(self) -> Self {
+        Self {
+            wake: WakeDescriptor::Unused,
+            ..self
         }
     }
 
@@ -1213,6 +1229,19 @@ impl Selected {
     }
 }
 
+/// Whether a wake from another thread signals the wake descriptor of a driver on Linux, which
+/// `AsFd` gives.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeDescriptor {
+    /// A host reactor or the poller waits on it, and the kernel signals it at each completion of
+    /// a ring.
+    Signaled,
+    /// Only the owner of the driver waits, in its ring, and each wake signals the interrupt
+    /// descriptor only.
+    Unused,
+}
+
 /// The state that the futures and the wake handles share with the home.
 struct Shared {
     /// The driver of the operations: their identity names it ([`Operation::id`]).
@@ -1236,6 +1265,9 @@ struct Shared {
     /// the kernel would also complete that poll, so the wait does not poll `wake`.
     #[cfg(target_os = "linux")]
     interrupt: fs::File,
+    /// Whether a wake also signals `wake`, and a turn clears it.
+    #[cfg(target_os = "linux")]
+    wake_descriptor: WakeDescriptor,
     /// The wake of the port: a packet that another thread posts, which ends a wait.
     #[cfg(target_os = "windows")]
     wake: iocp::Wake,
@@ -1244,10 +1276,11 @@ struct Shared {
 impl Shared {
     #[cfg(target_os = "linux")]
     fn wake(&self) {
-        for fd in [&self.wake, &self.interrupt] {
-            // A full counter is a pending wake already, and nothing else can fail here.
-            drop((&*fd).write(&1_u64.to_ne_bytes()));
+        // A full counter is a pending wake already, and nothing else can fail here.
+        if self.wake_descriptor == WakeDescriptor::Signaled {
+            drop((&self.wake).write(&1_u64.to_ne_bytes()));
         }
+        drop((&self.interrupt).write(&1_u64.to_ne_bytes()));
     }
 
     #[cfg(target_os = "macos")]
@@ -1274,13 +1307,20 @@ impl Shared {
         [std::os::fd::AsRawFd::as_raw_fd(&self.wake)]
     }
 
-    /// Clears the wake descriptors. Gives `true` when the wake descriptor had a wake.
+    /// Clears the wake descriptor, if something reads it. Gives `true` when it had a wake.
     #[cfg(target_os = "linux")]
     fn clear(&self) -> bool {
         let mut count = [0; 8];
         // A descriptor with no wake gives `WouldBlock`, which is the clear state.
+        self.wake_descriptor == WakeDescriptor::Signaled && (&self.wake).read(&mut count).is_ok()
+    }
+
+    /// Clears the interrupt descriptor, when the poll of it completed. A wake that comes after the
+    /// read completes the next poll at once.
+    #[cfg(target_os = "linux")]
+    fn clear_interrupt(&self) {
+        let mut count = [0; 8];
         drop((&self.interrupt).read(&mut count));
-        (&self.wake).read(&mut count).is_ok()
     }
 
     /// Clears the wake pipe. One read takes at most 64 wakes of 8 bytes, and bytes that remain
@@ -1592,8 +1632,13 @@ impl Driver {
                 if !missing.is_empty() {
                     return Err(Error::Unsupported(missing));
                 }
-                ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
-                let rearm_wake = probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?;
+                let rearm_wake = match config.wake {
+                    WakeDescriptor::Signaled => {
+                        ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
+                        probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?
+                    }
+                    WakeDescriptor::Unused => false,
+                };
                 (Queue::Ring(ring), probed, rearm_wake)
             }
             None => {
@@ -1620,6 +1665,11 @@ impl Driver {
             Queue::Poller(poller) => Some(poller.registrar()),
             Queue::Ring(_) => None,
         };
+        // The poller waits on the wake descriptor, so each wake signals it there.
+        let wake_descriptor = match &queue {
+            Queue::Ring(_) => config.wake,
+            Queue::Poller(_) => WakeDescriptor::Signaled,
+        };
         let table = Table::new(config.operations).map_err(refused)?;
         let driver = DriverId::next()?;
         let shared = try_arc(Shared {
@@ -1630,6 +1680,7 @@ impl Driver {
             closes: home::Closes::new(config.resources).map_err(refused)?,
             wake,
             interrupt: fs::File::from(interrupt),
+            wake_descriptor,
         })
         .map_err(refused)?;
         let job_waker = file::job_waker(&shared).map_err(refused)?;
@@ -2321,6 +2372,7 @@ impl Driver {
                 #[cfg(target_os = "linux")]
                 (Outcome::Control(WAKE), _) => {
                     *waking = false;
+                    shared.clear_interrupt();
                     continue;
                 }
                 // The timer of the children ended: the poll of each child whose time came follows.

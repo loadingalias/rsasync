@@ -30,7 +30,7 @@ println!("{report:#?}");
 | Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing. On epoll, kqueue, IOCP, and IoRing, no feature probe runs, and the set is empty |
 | Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring` (an entry of io_uring, or of the I/O ring on `Backend::IoRing`), `Route::SystemCall`, `Route::BlockingService`, `Route::Poll`, or on Windows `Route::Port` and `Route::Unsupported` |
 | Applied | `helper_threads()` | The threads that the driver starts: 0. A call on `Route::BlockingService` runs on a thread of your service |
-| Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws`. It also does so when a deferred signal came late during the probe of the kernel |
+| Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws`. It also does so when a deferred signal came late during the probe of the kernel. The driver of a runtime worker, and of the owner of `block_on`, has no host reactor, so it registers no wake descriptor and gives `false` |
 
 The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `Bind` and `Listen`
 (6.11), `IncrementalBufferRings` (6.12), `RinglessMessages` (6.13), and `ZeroCopyReceive` (6.15).
