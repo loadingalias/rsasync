@@ -256,10 +256,11 @@ impl Repo {
         step("clippy tests without std", &mut tests)
     }
 
-    /// Lints the driver-only example alone, on the host. Its build of rsasync has `std` and not
-    /// `local`, so a driver that needs the scheduler, or code that only the scheduler uses, fails
-    /// it. In a build of the workspace, the features of the other packages hide both. It runs only
-    /// when `scope` is the whole workspace, and it takes no argument of the caller.
+    /// Lints the driver-only example alone, on the host or on the `--target` of the caller. Its
+    /// build of rsasync has `std` and not `local`, so a driver that needs the scheduler, or code
+    /// that only the scheduler uses, fails it. In a build of the workspace, the features of the
+    /// other packages hide both. It runs only when `scope` is the whole workspace, and it takes no
+    /// other argument of the caller: a feature argument applies to the other steps.
     fn clippy_driver_only(&self, scope: &[&str]) -> Result<(), Failure> {
         if !scope.contains(&"--workspace") {
             eprintln!("── clippy driver only\n   not run: the arguments select packages; run with no -p or --package");
@@ -267,14 +268,15 @@ impl Repo {
         }
         step(
             "clippy driver only",
-            &mut self.cargo(&[
+            self.cargo(&[
                 "clippy",
                 "--locked",
                 "--quiet",
                 "--all-targets",
                 "--package",
                 "driver_only",
-            ]),
+            ])
+            .args(target(scope)),
         )
     }
 
@@ -966,6 +968,21 @@ fn scope<'a>(args: &'a [String], default: &[&'a str]) -> Vec<&'a str> {
     default.iter().copied().chain(args.iter().map(String::as_str)).collect()
 }
 
+/// The target arguments of `args`: `--target <tuple>` or `--target=<tuple>`.
+fn target<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    let mut rest = args.iter().copied();
+    while let Some(arg) = rest.next() {
+        if arg == "--target" {
+            found.push(arg);
+            found.extend(rest.next());
+        } else if arg.starts_with("--target=") {
+            found.push(arg);
+        }
+    }
+    found
+}
+
 /// Runs `command` as the step `name`. A failure keeps the exit code of the command.
 fn step(name: &str, command: &mut Command) -> Result<(), Failure> {
     eprintln!("── {name}");
@@ -1012,7 +1029,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::{Report, WORKSPACE, profiles, scope};
+    use super::{Report, WORKSPACE, profiles, scope, target};
 
     fn report(apalache: bool, lines: &[&str]) -> Report {
         let mut report = Report::default();
@@ -1159,5 +1176,29 @@ mod tests {
         ] {
             assert_eq!(joined(args), args.join(" "));
         }
+    }
+
+    /// The driver-only lint takes the target of the caller and no other argument, so a check for
+    /// Linux on another host lints the Linux build of the driver-only example.
+    #[test]
+    fn the_driver_only_lint_takes_only_the_target_of_the_caller() {
+        let args = [
+            "--workspace",
+            "--all-features",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "--target-dir",
+            "elsewhere",
+            "--target=aarch64-unknown-linux-musl",
+        ];
+        assert_eq!(
+            target(&args),
+            [
+                "--target",
+                "x86_64-unknown-linux-musl",
+                "--target=aarch64-unknown-linux-musl"
+            ]
+        );
+        assert!(target(&["--workspace", "--all-features"]).is_empty());
     }
 }

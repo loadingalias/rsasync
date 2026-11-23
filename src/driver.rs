@@ -1238,7 +1238,8 @@ enum WakeDescriptor {
     /// a ring.
     Signaled,
     /// Only the owner of the driver waits, in its ring, and each wake signals the interrupt
-    /// descriptor only.
+    /// descriptor only: a runtime worker, or the owner of `block_on`.
+    #[cfg(feature = "local")]
     Unused,
 }
 
@@ -1632,12 +1633,10 @@ impl Driver {
                 if !missing.is_empty() {
                     return Err(Error::Unsupported(missing));
                 }
-                let rearm_wake = match config.wake {
-                    WakeDescriptor::Signaled => {
-                        ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
-                        probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?
-                    }
-                    WakeDescriptor::Unused => false,
+                // A descriptor that nothing reads gets no registration, so the kernel does not signal it.
+                let rearm_wake = config.wake == WakeDescriptor::Signaled && {
+                    ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
+                    probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?
                 };
                 (Queue::Ring(ring), probed, rearm_wake)
             }
