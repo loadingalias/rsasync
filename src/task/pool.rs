@@ -22,10 +22,10 @@
 //! # Steals
 //!
 //! A worker with no task searches. It steals from the workers of its cache domain first, and then
-//! from the others, each time from a start of its generator. From a victim it takes the older half
-//! of the run queue, or else its whole list. It polls the oldest task that it took and pushes the
-//! others to its own queue, in their order: a list gives its tasks in the order of their pushes,
-//! as a queue does. The task-lifecycle model checks this steal (`Steal`). At most half of
+//! from the others, each time from a start of its generator. It takes the older half of a victim's
+//! run queue or up to half a queue of its oldest remote-ready tasks. It polls the first task and
+//! puts the others in its own queue in order. The victim keeps the rest available to other thieves.
+//! The task-lifecycle model checks this steal (`Steal`). At most half of
 //! the workers search at one time.
 //!
 //! # Parks and balance
@@ -68,6 +68,8 @@ use crate::sync::{Arc, arc_size, thread_local, try_arc};
 
 /// The link that ends a list of slots.
 const END: u32 = u32::MAX;
+/// A worker holds the links of a lane's oldest remote-ready tasks. Slot indices and `END` fit in `u32`.
+const TAKING: u64 = u64::MAX;
 /// In the admission word: the pool closed, and it admits no task.
 const CLOSED: u64 = 1 << 63;
 /// The tasks that one turn of a worker polls at most, before its driver turns: one full run queue.
@@ -165,8 +167,10 @@ mod cells {
 /// One worker of the pool.
 struct Lane {
     queue: Deque,
-    /// The first slot of the remote-ready list, or `END`.
+    /// The newest push since the last reversal, or `END`.
     remote: AtomicU32,
+    /// The oldest slot of the reversed list, `END`, or `TAKING`.
+    oldest: AtomicU64,
     /// The shared part of the owner of the worker: a wake of its root future ends its park. The
     /// worker sets it before it runs, and detaches it at its end.
     owner: Late<Home>,
@@ -306,30 +310,44 @@ impl Shared {
         }
     }
 
-    /// Takes the whole remote-ready list of `lane`, and gives its oldest slot. The caller then owns
-    /// each link of the list, which this take reverses, so the list gives its slots in the order
-    /// of their pushes, as the steal of the task-lifecycle model takes them.
-    fn take_list(&self, lane: u32) -> Option<u32> {
-        // Ordering: `AcqRel`. `Acquire` reads the release of each push. `Release` orders this take
-        // before each later push, which reads it.
-        let mut head = self.lanes[lane as usize].remote.swap(END, Ordering::AcqRel);
-        let mut oldest = END;
-        while head != END {
-            // Ordering: `Relaxed`: the swap read the release of the push of each link, and this
-            // thread owns the links now.
-            let next = self.next[head as usize].load(Ordering::Relaxed);
-            self.next[head as usize].store(oldest, Ordering::Relaxed);
-            oldest = head;
-            head = next;
+    /// Takes the oldest slot. A thief can also take a bounded prefix into its own queue.
+    fn take_list(&self, lane: u32, into: Option<&Deque>) -> Option<u32> {
+        let lane = &self.lanes[lane as usize];
+        // Ordering: these loads only skip an empty or claimed list. The swap claims the links.
+        let observed = lane.oldest.load(Ordering::Relaxed);
+        if observed == TAKING || (observed == u64::from(END) && lane.remote.load(Ordering::Relaxed) == END) {
+            return None;
         }
-        (oldest != END).then_some(oldest)
-    }
-
-    /// The slot after `slot` in a list that the caller took.
-    fn after(&self, slot: u32) -> Option<u32> {
-        // Ordering: `Relaxed`: the take of the list wrote this link on this thread.
-        let next = self.next[slot as usize].load(Ordering::Relaxed);
-        (next != END).then_some(next)
+        // Acquire reads the previous taker's release. Another taker skips this lane while it is claimed.
+        let mut first = u32::try_from(lane.oldest.swap(TAKING, Ordering::AcqRel)).ok()?;
+        if first == END {
+            // Acquire reads the published links. Producers can push the next group during this reversal.
+            let mut head = lane.remote.swap(END, Ordering::AcqRel);
+            while head != END {
+                let next = self.next[head as usize].load(Ordering::Relaxed);
+                self.next[head as usize].store(first, Ordering::Relaxed);
+                first = head;
+                head = next;
+            }
+        }
+        let first = (first != END).then_some(first);
+        let mut rest = first.map_or(END, |slot| self.next[slot as usize].load(Ordering::Relaxed));
+        if let Some(queue) = into {
+            for _ in 1..deque::CAPACITY / 2 {
+                if rest == END {
+                    break;
+                }
+                // A thief of this queue can run the slot as soon as the push publishes it.
+                let next = self.next[rest as usize].load(Ordering::Relaxed);
+                if queue.push(rest).is_err() {
+                    break;
+                }
+                rest = next;
+            }
+        }
+        // Release publishes the suffix before this worker polls a task. Each link is reversed only once.
+        lane.oldest.store(u64::from(rest), Ordering::Release);
+        first
     }
 
     /// Wakes one parked worker when no worker searches, after a push: work spreads.
@@ -377,9 +395,11 @@ impl Shared {
     /// Whether a queue or a list of a worker holds a task: the last look of a worker that parks.
     fn has_work(&self) -> bool {
         // Ordering: `Relaxed`: the fence before this look orders it, as in `balance`.
-        self.lanes
-            .iter()
-            .any(|lane| lane.queue.len() > 0 || lane.remote.load(Ordering::Relaxed) != END)
+        self.lanes.iter().any(|lane| {
+            lane.queue.len() > 0
+                || lane.remote.load(Ordering::Relaxed) != END
+                || lane.oldest.load(Ordering::Relaxed) != u64::from(END)
+        })
     }
 }
 
@@ -469,6 +489,7 @@ impl Pool {
             built.push(Lane {
                 queue: Deque::new().map_err(refused)?,
                 remote: AtomicU32::new(END),
+                oldest: AtomicU64::new(u64::from(END)),
                 owner: Late::new(None),
                 parked: AtomicBool::new(false),
                 group: group(lane),
@@ -750,8 +771,7 @@ impl Pool {
         // The oldest entry of the own list runs first in each turn, so a queue that never empties
         // does not starve the list: a spawn or a wake from another thread, or a cancel.
         let mut polls = 0;
-        if let Some(first) = shared.take_list(lane) {
-            self.queue_rest(lane, first);
+        if let Some(first) = shared.take_list(lane, None) {
             self.run(lane, first);
             if WOKE.with(|woke| woke.replace(false)) {
                 return Turn::Busy;
@@ -790,20 +810,7 @@ impl Pool {
         if let Some(slot) = shared.lanes[lane as usize].queue.pop() {
             return Some(slot);
         }
-        let first = shared.take_list(lane)?;
-        self.queue_rest(lane, first);
-        Some(first)
-    }
-
-    /// Pushes each slot after `first` of a list that this worker took to its own queue.
-    fn queue_rest(&self, lane: u32, first: u32) {
-        let shared = &*self.shared;
-        let mut slot = shared.after(first);
-        while let Some(current) = slot {
-            // The push can change the link, so it comes after the read of the next one.
-            slot = shared.after(current);
-            shared.queue(lane, current);
-        }
+        shared.take_list(lane, None)
     }
 
     /// Steals a task for `lane`, if fewer than half of the workers search.
@@ -838,7 +845,7 @@ impl Pool {
             .find_map(|victim| self.steal_from(lane, victim))
     }
 
-    /// Takes the older half of the queue of `victim`, or else its whole list.
+    /// Takes the older half of the queue of `victim`, or a batch from its remote-ready list.
     fn steal_from(&self, lane: u32, victim: u32) -> Option<u32> {
         let shared = &*self.shared;
         if let Some(slot) = shared.lanes[victim as usize]
@@ -847,9 +854,7 @@ impl Pool {
         {
             return Some(slot);
         }
-        let first = shared.take_list(victim)?;
-        self.queue_rest(lane, first);
-        Some(first)
+        shared.take_list(victim, Some(&shared.lanes[lane as usize].queue))
     }
 
     /// Polls the task in `slot`, or drops it at this poll boundary if a cancel was requested.

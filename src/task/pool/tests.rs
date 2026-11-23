@@ -4,13 +4,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::assert_matches;
 use core::future::{pending, poll_fn};
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Poll;
 use core::time::Duration;
+use std::io::Write as _;
 use std::sync::{Mutex, mpsc};
 use std::time::Instant;
 
-use super::{Pool, Target};
+use super::{Pool, Target, Turn};
+use crate::capacity::Budget;
 use crate::runtime::{Outcome as WorkerOutcome, Runtime};
 use crate::task::{JoinHandle, Outcome, POOL, Reason, spawn_movable};
 
@@ -196,4 +199,72 @@ fn a_spawn_from_another_thread_runs_while_the_queue_of_its_worker_never_empties(
     assert_matches!(busy.join_blocking(), Outcome::Completed(()));
     drop(handle);
     drop(runtime.shutdown());
+}
+
+/// Drives this worker until it has no work. Each task in these bursts needs one poll.
+fn drain(pool: &Pool, lane: u32) -> Option<Turn> {
+    (0..=pool.slots)
+        .map(|_| pool.turn(lane, 0))
+        .find(|turn| *turn != Turn::Busy)
+}
+
+/// A close from another thread publishes every idle task while the one worker is between turns.
+/// Each cancellation must remain in publication order across the capacity of the run queue.
+#[test]
+fn a_worker_drains_a_full_remote_list_in_publication_order_at_close() {
+    struct Waiting {
+        slot: u32,
+        dropped: Arc<Mutex<Vec<u32>>>,
+    }
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            self.dropped.lock().unwrap().push(self.slot);
+        }
+    }
+
+    let mut ordered = true;
+    for slots in [1 << 14, 1 << 15, 1 << 16] {
+        let budget = Budget::new(NonZeroU64::new(256 << 20).unwrap());
+        let pool = Pool::new(&budget, slots, &[None], crate::task::DEFAULT_POLL_BUDGET.get()).unwrap();
+        let dropped = Arc::new(Mutex::new(Vec::with_capacity(slots as usize)));
+        for slot in 0..slots {
+            let waiting = Waiting {
+                slot,
+                dropped: Arc::clone(&dropped),
+            };
+            drop(
+                pool.spawn(async move {
+                    pending::<()>().await;
+                    drop(waiting);
+                })
+                .unwrap(),
+            );
+        }
+        assert_eq!(drain(&pool, 0), Some(Turn::Idle));
+        let start = Instant::now();
+        std::thread::scope(|scope| scope.spawn(|| pool.close()).join().unwrap());
+        assert_eq!(drain(&pool, 0), Some(Turn::Ended));
+        let elapsed = start.elapsed();
+        assert_eq!(pool.cancelled(), slots);
+        ordered &= dropped.lock().unwrap().iter().copied().eq(0..slots);
+        writeln!(std::io::stdout().lock(), "{slots} idle tasks closed in {elapsed:?}").unwrap();
+    }
+    assert!(ordered, "the worker took a later cancellation before an earlier one");
+}
+
+#[test]
+fn a_thief_can_finish_a_remote_burst_after_its_owner_stops_polling() {
+    let slots = 2 * super::TURN_TASKS + 1;
+    let budget = Budget::new(NonZeroU64::new(1 << 20).unwrap());
+    let pool = Pool::new(&budget, slots, &[None, None], crate::task::DEFAULT_POLL_BUDGET.get()).unwrap();
+    assert_eq!(pool.turn(0, 0), Turn::Idle);
+    for _ in 0..slots {
+        drop(pool.spawn(pending::<()>()).unwrap());
+    }
+    assert_eq!(drain(&pool, 0), Some(Turn::Idle));
+    std::thread::scope(|scope| scope.spawn(|| pool.close()).join().unwrap());
+    assert_eq!(pool.turn(0, 0), Turn::Busy);
+    let stolen = std::thread::scope(|scope| scope.spawn(|| drain(&pool, 1)).join().unwrap());
+    assert_eq!(stolen, Some(Turn::Ended));
+    assert_eq!(pool.cancelled(), slots);
 }

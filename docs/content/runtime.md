@@ -215,10 +215,10 @@ has. Together they poll the tasks of one pool:
   movable worker in turn.
 - A wake on a movable worker queues the task on that worker. A wake on another thread queues it on
   the worker that polled it last, its location, and wakes that worker if it waits.
-- A movable worker with no task steals: from the workers of its cache domain first, and then from
-  the others. It takes the older half of the queue of another worker, or else the tasks that other
-  threads woke on that worker. It polls the oldest of these tasks, and it queues the others. Only
-  one worker polls a task at one time.
+- An idle movable worker searches its cache domain first, then the other domains. It takes the older half of another worker's run queue.
+  If it finds no task there, it can take up to 128 tasks from that worker's remote-ready list.
+  It polls the oldest task and queues the others in order. Other workers can take the rest of the list.
+  Only one worker polls a task at one time.
 
 The spawn reserves a slot of the pool and the charge of the task before it accepts the future, and
 the pool has `task_slots` slots for each movable worker. The task then needs no more capacity. A
