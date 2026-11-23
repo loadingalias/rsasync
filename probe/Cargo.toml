@@ -1,0 +1,14 @@
+[package]
+name = "probe"
+version = "0.0.0"
+description = "The early probe of rsasync: a thread-per-core TCP echo server and an owned open-loop client."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The local workers of the runtime need Linux on x86_64 or aarch64.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = ".." }
+
+[lints]
+workspace = true
