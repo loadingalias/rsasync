@@ -136,6 +136,11 @@ use crate::sync::thread_local;
 use crate::time::{Deadline, TimeError};
 use crate::timer::{self, Timer, Timers};
 
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+mod deque;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod factory;
 #[cfg(any(
@@ -144,6 +149,11 @@ mod factory;
 ))]
 mod late;
 mod owner;
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+mod pool;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod ring;
 mod slot;
@@ -153,6 +163,8 @@ mod waiting;
 pub(crate) use factory::{Job, Placer};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use owner::MAX_SLOTS;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) use pool::{Pool, serve as serve_pool};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use ring::{Drain, Ended, Failure, RingOwner};
 
@@ -181,6 +193,46 @@ thread_local! {
         )
     )]
     static HOME: Cell<*const slot::Shared> = Cell::new(ptr::null());
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+std::thread_local! {
+    /// The movable pool of the runtime of this thread, for [`spawn_movable`]: on each worker of a
+    /// runtime with movable workers, and on the caller of its `block_on` during the call.
+    static POOL: RefCell<Option<crate::sync::Arc<pool::Pool>>> = const { RefCell::new(None) };
+}
+
+/// Makes `pool` the pool of this thread, and gives the pool before.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn use_pool(pool: Option<crate::sync::Arc<pool::Pool>>) -> Option<crate::sync::Arc<pool::Pool>> {
+    POOL.try_with(|current| current.replace(pool)).ok().flatten()
+}
+
+/// Spawns `future` in the movable pool of the runtime of this thread. Any worker of the pool polls
+/// it, and an idle worker can steal it, so the future and its output are `Send`. On a worker of
+/// the pool, the task starts on that worker; on another thread, on the next worker in turn.
+///
+/// The spawn reserves a slot of the pool and the charge of the task before it accepts the future.
+///
+/// # Errors
+///
+/// [`SpawnRefused`] with the future and the [`Reason`]: `NoSlot` (each slot of the pool is in
+/// use), `Budget`, `Allocation`, `Closed` (the runtime stops), or `NoPool` (this thread runs no
+/// runtime with movable workers). A refusal keeps no charge and no reservation.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn spawn_movable<F>(future: F) -> Result<JoinHandle<F::Output>, SpawnRefused<F>>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let pool = POOL.try_with(|current| current.borrow().clone()).ok().flatten();
+    match pool {
+        Some(pool) => pool.spawn(future),
+        None => Err(SpawnRefused {
+            future,
+            reason: Reason::NoPool,
+        }),
+    }
 }
 
 /// A refusal to make an owner. A refusal keeps no charge and no memory.
@@ -457,6 +509,8 @@ pub enum Reason {
     NoOwner,
     /// The runtime has no worker with this index.
     NoWorker,
+    /// This thread runs no runtime with movable workers.
+    NoPool,
 }
 
 impl fmt::Display for Reason {
@@ -468,6 +522,7 @@ impl fmt::Display for Reason {
             Self::Closed => f.write_str("the owner is at the end of its block_on, or it failed"),
             Self::NoOwner => f.write_str("this thread has no local owner"),
             Self::NoWorker => f.write_str("the runtime has no worker with this index"),
+            Self::NoPool => f.write_str("this thread runs no runtime with movable workers"),
         }
     }
 }
@@ -515,7 +570,12 @@ impl<F> core::error::Error for SpawnRefused<F> {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match &self.reason {
             Reason::Budget(exhausted) => Some(exhausted),
-            Reason::NoSlot | Reason::Allocation | Reason::Closed | Reason::NoOwner | Reason::NoWorker => None,
+            Reason::NoSlot
+            | Reason::Allocation
+            | Reason::Closed
+            | Reason::NoOwner
+            | Reason::NoWorker
+            | Reason::NoPool => None,
         }
     }
 }
@@ -717,6 +777,12 @@ enum Target {
     /// A task that a factory spawn from another thread makes on its owner.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     Remote(alloc::sync::Arc<factory::Remote>),
+    /// A task of the movable pool.
+    #[cfg(any(
+        all(test, loom),
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    Movable(alloc::sync::Arc<pool::MovableRef>),
 }
 
 impl CancelHandle {
@@ -726,6 +792,11 @@ impl CancelHandle {
             Target::Local(task) => task.shared.wake(task.slot, task.generation, true),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
             Target::Remote(remote) => remote.cancel(),
+            #[cfg(any(
+                all(test, loom),
+                all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+            ))]
+            Target::Movable(task) => task.cancel(),
         }
     }
 }

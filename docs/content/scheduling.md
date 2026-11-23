@@ -27,6 +27,18 @@ work, and then the next turn starts:
 A turn does not wait for more work to fill a batch. A short burst of data, or a close of the peer,
 completes its operation in the turn that takes its completion.
 
+## The turn of a movable worker
+
+A movable worker of a [runtime](runtime.md#spawn-movable-work) is a local owner whose root future
+runs the movable pool. In each poll of that root, the worker polls at most 256 movable tasks, one
+full queue. It polls first the oldest task that another thread spawned or woke on it, so a busy
+queue cannot hold those tasks back. Then it polls the tasks of its own queue, the other tasks
+that other threads woke on it, and then the tasks that it steals. Each task poll has the same poll
+budget as a local task. When the worker polled 256 tasks, its owner runs steps 2 to 5 above, and
+the pool runs again. A poll that wakes an idle worker also ends the turn early, so that worker
+gets its wake at once and can steal. When the worker found no task, it waits as step 6 says, until
+a wake, a spawn, or another worker ends the wait.
+
 ## Poll budget
 
 Each poll of a task, and of the root future, has a budget of runtime leaves. A runtime leaf is a

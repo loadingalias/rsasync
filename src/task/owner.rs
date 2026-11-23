@@ -42,13 +42,13 @@ pub(crate) const MAX_SLOTS: u32 = 1 << 16;
 const TIMERS_PER_TURN: u32 = 64;
 
 /// Why a task ends with no output.
-enum End {
+pub(super) enum End {
     Cancelled,
     Panicked(Box<dyn Any + Send>),
 }
 
 /// A spawned future and the sender of its outcome, behind one pointer.
-trait Task {
+pub(super) trait Task {
     /// Polls the future. When it gives its output, drops the future, sends the output, and gives
     /// `Ready`.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
@@ -57,11 +57,11 @@ trait Task {
     fn end(self: Pin<&mut Self>, end: End);
 }
 
-struct TaskCell<F: Future> {
+pub(super) struct TaskCell<F: Future> {
     /// The future, pinned in the cell. It drops in place, at the end of the task.
-    future: Option<F>,
-    sender: Option<oneshot::Sender<Outcome<F::Output>>>,
-    _charge: Permit,
+    pub(super) future: Option<F>,
+    pub(super) sender: Option<oneshot::Sender<Outcome<F::Output>>>,
+    pub(super) _charge: Permit,
 }
 
 impl<F: Future> TaskCell<F> {
@@ -220,7 +220,7 @@ unsafe impl<F: Future> Send for TaskMemory<F> {}
 
 /// Writes `value` into `memory`, a new `Arc` with one count.
 #[expect(unsafe_code, reason = "the write initializes the value of the new `Arc`")]
-fn init<T>(mut memory: alloc::sync::Arc<MaybeUninit<T>>, value: T) -> alloc::sync::Arc<T> {
+pub(super) fn init<T>(mut memory: alloc::sync::Arc<MaybeUninit<T>>, value: T) -> alloc::sync::Arc<T> {
     alloc::sync::Arc::get_mut(&mut memory)
         .expect("the memory of a task is a new `Arc`, with one count")
         .write(value);

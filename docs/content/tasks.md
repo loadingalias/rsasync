@@ -8,7 +8,24 @@ the `std` feature.
 A `LocalOwner` runs tasks with no driver and no other thread. On Linux, the
 [runtime](runtime.md) gives each of its workers, and each call of its `block_on`, an owner with a
 driver, timers, and a generator. `task::generator` gives a task a generator of its own, and
-`Handle::spawn_on` spawns on a worker from any thread.
+`Handle::spawn_on` spawns on a worker from any thread. A runtime with movable workers also runs
+movable tasks: `spawn_movable` gives a `Send` future to a pool of workers, and an idle worker of the
+pool can steal it.
+
+## Where a task runs
+
+Where a task runs and whether its future is `Send` are two separate facts. A local task stays on
+its worker, also when its future is `Send`. Only a movable task moves between workers.
+
+| Spawn | Where the task runs | The future | The output |
+| --- | --- | --- | --- |
+| `spawn_local(future)` | The owner of this thread, for the life of the task | Any, also `!Send` | Any |
+| `handle.spawn_on(worker, factory)` | Local worker `worker`, for the life of the task. The `Send` factory makes the future there | Any, also `!Send` | `Send` |
+| `spawn_movable(future)`, `handle.spawn_movable(future)` | Each movable worker can poll it, one at a time. An idle worker can steal it | `Send` | `Send` |
+
+Each spawn gives a `JoinHandle` with the same [outcomes](#join-and-cancel), and each refusal gives
+the future back. [Spawn movable work](runtime.md#spawn-movable-work) gives the movable spawn, its
+refusals, and how the pool runs its tasks.
 
 ## Run tasks on a local owner
 

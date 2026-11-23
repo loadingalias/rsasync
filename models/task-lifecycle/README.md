@@ -215,6 +215,16 @@ all of them, each known-bad variant still fails its own property (see the eviden
     same states. Known-bad: `ParkWithFlag_bad`, `NoDeadline_bad`, and `NoFlush_bad` still fail
     under weak fairness.
 
+16. A batch steal (R401) takes the oldest movable task of the victim's queue and polls it, and it
+    moves the next movable task, if one is there, to the thief's run queue. The code moves each
+    other task of the older half of the run queue, or of the whole remote-ready list, in queue
+    order. Each moved task stays scheduled, with one queue entry, and the thief polls it in queue
+    order, as the model does with its one moved task. Each further moved task repeats that step.
+    The steal polls the oldest task: in the first form of this action, a steal could poll a newer
+    task and move an older one, and two workers then moved one task back and forth with no poll,
+    which violated `OwedWakeDelivered` (2026-11-22). So the remote-ready list of the code gives
+    its tasks in the order of their pushes.
+
 The declared bounds are argued, not proven: two workers, two slots, and two generations. Each one
 has a raise-by-one profile.
 
@@ -227,7 +237,7 @@ atomicity:
 | Step | Assumption |
 | --- | --- |
 | `Wake`, `WakeEffect`, `Doom` | The slot word holds the generation and the scheduling bits (scheduled, running, notified, cancelled). A wake or a cancel is one compare-exchange on it (acquire-release), so the generation check and the state change are one step (`Shared::wake`). The push of a task that was idle follows (reduction 1) |
-| `Take` (in `PollStart`, `Steal`) | The poll start is one read-modify-write from scheduled to running (acquire), and it also reads the cancel bit (`Shared::poll_start`). So the poller sees the task state that the last poll wrote. A steal (R401) removes one entry from the victim's queue with one read-modify-write |
+| `Take` (in `PollStart`, `Steal`) | The poll start is one read-modify-write from scheduled to running (acquire), and it also reads the cancel bit (`slot::poll_start`). So the poller sees the task state that the last poll wrote. A steal (R401) claims the older half of the victim's run queue with one compare-exchange of its head (`Deque::steal_into`), or takes its whole remote-ready list with one swap (`Shared::take_list` in `task/pool.rs`) |
 | `EndPending` | The poll end is one compare-exchange (release) that reads the notified and cancel bits in the same change to idle or scheduled (`Shared::poll_end`) |
 | `Push` | The remote-ready push is one compare-exchange on the list head (release) that also tells whether the list was empty, then the signal (`Shared::push`, `Shared::signal`). The harvest is one swap of the head (acquire, `Shared::harvest`) |
 | `Flush` | The outbox belongs to the owner's thread: only that thread puts a home in it (`ring::post`) and drains it (`ring::flush`). Each message is one `IORING_OP_MSG_RING` entry, which the next submit of the sender's driver sends |
@@ -252,7 +262,7 @@ it. A change to either side reopens the check. All paths are in `src/`.
 | `TimerArm`, `TimerFire` | Time, Hardware, and Backends: a timer never fires before its deadline; a deadline in the past fires on the next drive turn | One poll step; one step of a turn | R312: `task::timer` (`task.rs`) and `Timer::poll` (`timer.rs`, through `Waiter::poll_wait`); `Local::fire_timers` (`task/owner.rs`) through `Timers::turn` (`timer.rs`) |
 | `Wake`, `WakeEffect` | Future and Wake Contract: every waker is `Send + Sync`; a wake from another thread publishes the task to its home's remote-ready list; a wake after the task ended or its slot was reused has no effect | One compare-exchange of the slot word, then the push (reduction 1) | `Shared::wake` and `Shared::push` (`task/slot.rs`), through the waker of `TaskRef` and `CancelHandle` |
 | `PollStart`, `Take`, `EndPending` | Local and Movable Work: cancellation drops the future at a poll boundary, never during a poll. Future and Wake Contract: coalescing avoids duplicate scheduling without losing progress | One step at the owner | `Local::turn` (`task/owner.rs`: `Shared::harvest`, then the polls of the turn) and `Local::poll_slot`, with `Shared::poll_start` and `Shared::poll_end`. A cancelled task ends in `Local::finish` |
-| `Steal` | Local and Movable Work: movable work moves; a local task stays on its home | One step at the idle worker | R401, not built |
+| `Steal` | Local and Movable Work: movable work moves; a local task stays on its home | One step at the idle worker | `Pool::steal` and `Pool::steal_from` (`task/pool.rs`), with `Deque::steal_into` (`task/deque.rs`); `Pool::run` starts the poll and records the location |
 | `Push`, `Flush` | Future and Wake Contract: one unpark of the home for each batch, through its native signal. A thread that owns a ring sends a cross-ring message. A thread that owns no ring writes an event descriptor | One step each (reduction 14) | `Shared::push` and `Shared::signal` (`task/slot.rs`). `ring::post` (`task/ring.rs`) puts the home in the outbox, and `ring::flush` sends it in `Drive::drive` and `Drive::park` with `Driver::message` (`driver/home.rs`). `Enter::drop` (`task/owner.rs`) writes the interrupt descriptor of each home that is still in the outbox |
 | `Park`, `Unpark` | Future and Wake Contract: the home parks until its native signal; Time, Hardware, and Backends: the owner parks at most until its next timer | One step each | The park condition in `Local::block_on` (`task/owner.rs`, with `Shared::has_remote` and `Shared::root_woken`), the deadline from `Local::until`, and `Park::park`: `Thread::park` (`task/owner.rs`) and `Drive::park` (`task/ring.rs`) |
 | `SigRaise`, `SigHandle` | Future and Wake Contract: a thread that owns no ring writes an event descriptor that the home watches | One step each | R220: the handler `handle` (`driver/signal.rs`), and `signal::wake` in `Driver::turn` (`driver.rs`) |
@@ -401,6 +411,28 @@ The model does not cover these items. Each one is outside the task, or a later t
   remote-ready list, and the correspondence table maps each action to its code.
 
 ## Evidence record
+
+All 31 profiles pass for the R401 change of `Steal`
+(`sha256:52cff6cf0c1d8930755ad24a1e3e255feae931810939108cc5428d4d29f03924`, 32 files). On a Mac (10
+cores, 16 GiB, 2026-11-22), 30 profiles pass in 10 minutes 35 seconds: the declared profile
+(425,220 distinct states), `Gens3` (1,017,966), `Workers3` (2,212,365), each known-bad variant, and
+each witness. On that Mac, `Slots3` searched each state, and then TLC ran out of its default heap
+of 4 GiB in the check of the progress properties.
+
+`Slots3` passes on one EC2 m8g.4xlarge (16 vCPUs, 64 GiB, so a default heap of 16.5 GB) of the
+target `aws-linux-arm64-ubuntu2604-memory`: image `ami-098ede342a5440ac0`, Ubuntu 26.04, Linux
+7.0.0-1018-aws, aarch64, dev-machines run `20261123T022711Z-36121` (2026-11-23), from a plain clone
+of `9066dc1` with a clean tree. The search found 47,785,001 distinct states at depth 40, with 0
+states left on the queue and no error, in 4904.02 seconds. Its check of the progress properties
+took 37 minutes 43 seconds. The checkers were Temurin JRE 21.0.13+9 (the Linux aarch64 build,
+which matched its published SHA-256), TLC 1.8.0+bc1b506bdcad, and Apalache 0.63.0. The archive of
+the run directory, with no TLC state cache, has the SHA-256
+`8ef8875dcb993df984d3613d766cdbc5263d869d7a33bcc267ec375898ae5e88`. After the run,
+`dev-machine status rsasync aws-linux-arm64-ubuntu2604-memory` reports no AWS instance or EBS
+volume. This profile takes more than the one hour of [Large
+profiles](../../docs/content/design-models.md#large-profiles).
+
+The record of the model before R401 follows.
 
 All 31 profiles pass for
 `sha256:e566767773d31c00515732bb7bffcf6ca755f1a86888833db91b744e3ead2434` (32 files). The checks

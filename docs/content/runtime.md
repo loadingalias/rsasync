@@ -41,8 +41,9 @@ Each setting has a default:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `local_workers(n)` | 0 | The local workers, at most `MAX_WORKERS` (4096). With 0, the runtime gives only `block_on` |
-| `task_slots(n)` | 1024 | The task slots of each owner: each worker, and each call of `block_on`. From 1 to 2^16 |
+| `local_workers(n)` | 0 | The local workers. With no worker, the runtime gives only `block_on` |
+| `movable_workers(n)` | 0 | The movable workers, which poll the tasks of one pool. See [Spawn movable work](#spawn-movable-work). The local and the movable workers together are at most `MAX_WORKERS` (4096) |
+| `task_slots(n)` | 1024 | The task slots of each owner: each worker, and each call of `block_on`. From 1 to 2^16. The pool has this number of slots for each movable worker |
 | `budget(budget)` | 256 MiB | The [budget](capacity.md) that each owner charges its tables, its timers, and each task to |
 | `driver(config)` | `Config::new()` | The limits and the requirements of the driver of each owner |
 | `timers(capacity, resolution)` | 1024 timers, 1 ms | The [timers](timers.md) of each owner, on the native clock that pauses while the system is suspended |
@@ -111,6 +112,7 @@ match Runtime::builder().local_workers(4).build() {
 | `Plan(PlanError)` | A setting is invalid, or a strict placement falls back. No worker started | Correct the setting. See [Placement](#placement) |
 | `Seed(io::Error)` | The kernel gave no seed. No worker started | Give a seed with `seed`, or start again |
 | `Allocation` | The allocator did not give the memory of the start: the default budget, the facts of the host, the plans, or the tables of the workers. No worker started | Start fewer workers, or start again when memory is free |
+| `Pool(Refused)` | The budget (`Refused::Budget`) or the allocator (`Refused::Allocation`) refused the tables of the movable pool. No worker started | Give a larger budget, or fewer movable workers or task slots |
 | `Clock(clock::Unsupported)` | The target has no native clock that pauses while the system is suspended, which measures the grace period. No worker started | Use a target of [Native clock of each target](clocks.md#native-clock-of-each-target) |
 | `Worker { index, error }` | Worker `index` did not start | See `WorkerError` below |
 
@@ -200,6 +202,39 @@ A `Handle` can move to another thread, also to a task of a worker. Each handle h
 inbox of each worker, so `handles` bounds them: `runtime.handle()` and `handle.try_clone()` refuse
 with `HandleRefused::TooMany` at the limit, and with `HandleRefused::Allocation` when the allocator
 does not give the memory of the handle.
+
+## Spawn movable work
+
+`movable_workers(n)` starts `n` movable workers after the local workers, so their `WorkerId`s follow
+those of the local workers. Each one has its own driver, timers, and generator, as a local worker
+has. Together they poll the tasks of one pool:
+
+- In a task on a worker, or in the root of `block_on`, call `task::spawn_movable(future)`. From any
+  thread, call `handle.spawn_movable(future)`. The future and its output are `Send`.
+- A spawn on a movable worker starts on that worker. A spawn on another thread starts on the next
+  movable worker in turn.
+- A wake on a movable worker queues the task on that worker. A wake on another thread queues it on
+  the worker that polled it last, its location, and wakes that worker if it waits.
+- A movable worker with no task steals: from the workers of its cache domain first, and then from
+  the others. It takes the older half of the queue of another worker, or else the tasks that other
+  threads woke on that worker. It polls the oldest of these tasks, and it queues the others. Only
+  one worker polls a task at one time.
+
+The spawn reserves a slot of the pool and the charge of the task before it accepts the future, and
+the pool has `task_slots` slots for each movable worker. The task then needs no more capacity. A
+refusal keeps no reservation, and `SpawnRefused::into_future` gives the future back:
+
+| `Reason` | Cause | What to do |
+| --- | --- | --- |
+| `NoPool` | This thread runs no runtime with movable workers, or the runtime of the handle has none | Build the runtime with `movable_workers(n)`, and spawn on its threads or with its handle |
+| `NoSlot` | Each slot of the pool is reserved | Join or cancel a movable task, or give more `task_slots` |
+| `Budget(Exhausted)` | The budget has fewer free units than the task | Free units, or spawn a smaller future |
+| `Allocation` | The allocator did not give the memory of the task | Spawn again when memory is free |
+| `Closed` | The runtime stops | Spawn before `shutdown()` or the drop of the runtime |
+
+A movable task has the same `JoinHandle`, `CancelHandle`, and outcomes as a local task (see
+[Tasks](tasks.md#join-and-cancel)). A cancel from any thread drops the future at a poll boundary.
+`spawn_local` in a movable task spawns a local task on the worker that polls the movable task.
 
 ## Bind one socket on each worker
 
@@ -458,9 +493,10 @@ channel, before you call `shutdown()`. The 5 s default fits inside the 10 s stop
 | Report | Meaning |
 | --- | --- |
 | `report.expired()` | The grace period ended while an operation of a worker still ran |
+| `report.movable_cancelled()` | The movable tasks that the shutdown cancelled |
 | `report.blocking()` | What the teardown of the blocking service did, or `None` with no service |
 | `worker.outcome()` | How the thread of the worker ended: `Joined`, `Failed`, or `Panicked` |
-| `worker.cancelled()` | The tasks that the shutdown cancelled |
+| `worker.cancelled()` | The local tasks of the worker that the shutdown cancelled |
 | `worker.debt()` | The operations that still ran at the end of the grace period. Each one ended before the shutdown returned |
 | `worker.sent()` | The bytes that dropped sends had sent when the shutdown closed their resources |
 | `worker.kept()` | The children with `End::Keep` that run on. Nothing reaps them now |

@@ -14,7 +14,8 @@ use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
 use crate::driver::{Config, Driver};
-use crate::task::{Drain, Ended, Failure, Job, Placer, RingOwner, with_driver};
+use crate::sync::Arc;
+use crate::task::{self, Drain, Ended, Failure, Job, Placer, Pool, RingOwner, with_driver};
 use crate::time::Suspend;
 use crate::timer::Timers;
 
@@ -38,8 +39,20 @@ impl Message {
     }
 }
 
+/// What a worker runs.
+pub(super) enum Role {
+    /// Its own tasks, and the factory spawns of its inbox.
+    Local,
+    /// The turns of `lane` of the movable pool.
+    Movable(u32),
+}
+
 /// What a worker needs to start.
 pub(super) struct Start {
+    pub(super) role: Role,
+    /// The movable pool of the runtime, if it has one: the pool of `task::spawn_movable` on this
+    /// thread.
+    pub(super) pool: Option<Arc<Pool>>,
     pub(super) index: u32,
     pub(super) plan: Placed,
     pub(super) selection: Selection,
@@ -70,14 +83,34 @@ pub(super) fn timers(
 /// failure of the teardown of its driver, or `Ok` with nothing if it did not start.
 pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::Sender<Ready>) -> io::Result<Ended> {
     let budget = start.budget.clone();
+    let role = match start.role {
+        Role::Local => None,
+        Role::Movable(lane) => Some(lane),
+    };
+    let pool = start.pool.clone();
     match prepare(start) {
-        Ok((owner, report)) => {
+        Ok((owner, report, steal)) => {
+            if let (Some(lane), Some(pool)) = (role, &pool) {
+                owner.attach(pool, lane);
+            }
+            let _none = task::use_pool(pool.clone());
             let placer = owner.placer(&budget);
             // The start waits for the report, so only a start that ended can refuse it.
             if ready.send(Ok((report, placer))).is_err() {
                 return Ok(Ended::default());
             }
-            owner.serve(serve(inbox)).map_err(|failure| match failure {
+            let served = match (role, pool) {
+                (Some(lane), Some(pool)) => {
+                    let served = owner.serve(serve_movable(Arc::clone(&pool), lane, inbox, steal));
+                    // The tasks of this worker wait in its queue and its list for a thief.
+                    if served.is_err() {
+                        pool.worker_failed();
+                    }
+                    served
+                }
+                _ => owner.serve(serve(inbox)),
+            };
+            served.map_err(|failure| match failure {
                 Failure::Driver(error) => error,
                 // A worker has its driver from its start, so no first use starts one.
                 Failure::Start(error) => io::Error::other(error),
@@ -91,9 +124,12 @@ pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::
 }
 
 /// Applies the placement of the worker, and makes its driver, its tables, and its timers on this
-/// thread, so that their memory is local to its node.
-fn prepare(start: Start) -> Result<(RingOwner, WorkerReport), WorkerError> {
+/// thread, so that their memory is local to its node. Gives the owner, the report, and the
+/// generator of the steals of a movable worker.
+fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), WorkerError> {
     let Start {
+        role: _,
+        pool: _,
         index: _,
         mut plan,
         selection,
@@ -122,12 +158,37 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport), WorkerError> {
     owner
         .use_timers(timers, clock)
         .expect("the timers are on the domain of their own clock");
+    let steal = generator.child(b"steal\0\0\0", 0);
     owner.use_generator(generator);
     let report = WorkerReport {
         placement: plan,
         driver: report,
     };
-    Ok((owner, report))
+    Ok((owner, report, steal))
+}
+
+/// The root of a movable worker: it runs the turns of `lane` of `pool` until the pool closed and
+/// its last task ended. Each steal starts at a value of `steal`. Then it takes the stop, which the
+/// close sends, and gives its drain, and the count of `Driver::dropped_sent` at that time.
+async fn serve_movable(
+    pool: Arc<Pool>,
+    lane: u32,
+    mut inbox: mpsc::Receiver<Message>,
+    mut steal: ChaCha20Rng,
+) -> (Drain, u64) {
+    task::serve_pool(&pool, lane, || steal.next_u32()).await;
+    pool.detach(lane);
+    // A movable worker gets no factory spawn, only its stop.
+    let drain = loop {
+        match inbox.recv().await {
+            Ok(Message::Stop(drain)) => break drain,
+            Ok(Message::Job(job)) => drop(job),
+            Err(_) => break Drain::Now,
+        }
+    };
+    inbox.close();
+    let sent = with_driver((), |driver, ()| driver.dropped_sent()).unwrap_or(0);
+    (drain, sent)
 }
 
 /// The root of a worker: it runs each job of the inbox until the stop. Then it closes the inbox,

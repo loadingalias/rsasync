@@ -306,13 +306,29 @@ PollStart(o) ==
   /\ rr' = IF o = SH THEN <<>> ELSE rr
   /\ UNCHANGED <<ing, bo, wk, pk, sig, sf, ob>>
 
-\* An idle worker w takes a movable task from the run queue of worker v.
-Steal(w, v, i) ==
-  /\ Running(w) /\ cur[w] = NoSlot /\ Q(w) = <<>>
-  /\ kind[rq[v][i]] = "movable" \/ Bug = "stealLocal"
-  /\ Take(w, rq[v][i])
-  /\ rq' = [rq EXCEPT ![v] = RemoveAt(@, i)]
-  /\ UNCHANGED <<ing, bo, wk, pk, sig, sf, ob, rr>>
+\* q without the slots of S.
+Drop(q, S) == SelectSeq(q, LAMBDA x : x \notin S)
+
+\* The movable entries of q, in queue order.
+Movables(q) == SelectSeq(q, LAMBDA x : kind[x] = "movable")
+
+\* An idle worker w steals from worker v: one batch steal (R401). The queue
+\* of v is its run queue and, for the signal home, its remote-ready list. w
+\* takes the oldest movable task of that queue and polls it. With t, it
+\* also moves the next movable task to its own run queue, where it stays
+\* scheduled; its location changes at its next poll. The "stealLocal"
+\* variant takes the head of the queue of any kind, with no batch.
+Steal(w, v, t) ==
+  LET m == Movables(Q(v))
+      s == IF Bug = "stealLocal" THEN Head(Q(v)) ELSE Head(m)
+  IN /\ Running(w) /\ cur[w] = NoSlot /\ Q(w) = <<>>
+     /\ IF Bug = "stealLocal" THEN Q(v) # <<>> ELSE m # <<>>
+     /\ t = NoSlot \/ (Bug # "stealLocal" /\ Len(m) >= 2 /\ t = m[2])
+     /\ Take(w, s)
+     /\ rq' = [rq EXCEPT ![v] = Drop(@, {s, t}),
+                         ![w] = IF t = NoSlot THEN @ ELSE Append(@, t)]
+     /\ rr' = IF v = SH THEN Drop(rr, {s, t}) ELSE rr
+     /\ UNCHANGED <<ing, bo, wk, pk, sig, sf, ob>>
 
 \* The poll returns Pending. A wake during the poll, the self-wake of a
 \* spent poll budget (y), or a cancel request schedules the task again.
@@ -514,7 +530,7 @@ Next ==
        \/ \E w \in Workers, p \in Senders : Admit(s, w, p)
        \/ \E g \in Gens, c \in BOOLEAN : Wake(s, g, c)
   \/ \E o \in Owners : PollStart(o) \/ PollStep(o)
-  \/ \E w, v \in Workers : w # v /\ \E i \in 1..Len(rq[v]) : Steal(w, v, i)
+  \/ \E w, v \in Workers : w # v /\ \E t \in Slots \cup {NoSlot} : Steal(w, v, t)
   \/ Park \/ Unpark \/ \E w \in Workers : Exit(w) \/ Flush(w)
   \/ SigRaise \/ SigHandle
   \/ Shutdown

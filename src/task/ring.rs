@@ -80,6 +80,12 @@ impl RingOwner {
         self.local.generator.replace(Some((generator, 0)));
     }
 
+    /// Makes this owner worker `lane` of `pool`: a push to the list of the worker wakes the root
+    /// future of this owner.
+    pub(crate) fn attach(&self, pool: &super::Pool, lane: u32) {
+        pool.attach(lane, Arc::clone(self.local.shared()));
+    }
+
     /// The side of this owner that another thread uses to spawn on it.
     pub(crate) fn placer(&self, budget: &Budget) -> super::factory::Placer {
         super::factory::Placer::new(self.local.shared(), budget)

@@ -84,6 +84,19 @@ const RUNNING: u64 = 1 << 1;
 const NOTIFIED: u64 = 1 << 2;
 /// In a slot word: a cancel of the task was requested.
 const CANCEL: u64 = 1 << 3;
+/// In a slot word of the movable pool: a task holds the slot. The close of the pool cancels each
+/// such task, whatever its generation.
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const LIVE: u64 = 1 << 4;
+/// In a slot word of the movable pool: the close of the pool requested the cancel.
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+const CLOSING: u64 = 1 << 5;
 /// The generation is above these bits.
 const GENERATION_SHIFT: u32 = 8;
 
@@ -190,45 +203,18 @@ impl Shared {
     /// The generation of the task in `slot`, or of its next task if the slot is free. Only the
     /// owner calls it.
     pub(super) fn generation(&self, slot: u32) -> u64 {
-        // Ordering: `Relaxed`: only the owner changes the generation.
-        self.words[slot as usize].load(Ordering::Relaxed) >> GENERATION_SHIFT
+        generation(&self.words[slot as usize])
     }
 
     /// Starts a new task in the free `slot`. The owner pushes its first entry to the local queue.
     pub(super) fn start(&self, slot: u32) {
-        // Ordering: `Relaxed`: the owner gives the waker of the new task, with its generation, to
-        // other threads only after this change, through its own synchronization. The change is a
-        // read-modify-write, so it keeps the order of the word with each stale wake.
-        self.words[slot as usize].fetch_or(SCHEDULED, Ordering::Relaxed);
+        start(&self.words[slot as usize]);
     }
 
     /// Wakes the task of `generation` in `slot`, and requests its cancel if `cancel` is true. A
     /// task of another generation does not change.
     pub(super) fn wake(&self, slot: u32, generation: u64, cancel: bool) {
-        let word = &self.words[slot as usize];
-        let flag = if cancel { CANCEL } else { 0 };
-        // Ordering: `Relaxed` for the first load: the compare-exchange below reads the latest word.
-        let mut current = word.load(Ordering::Relaxed);
-        loop {
-            if current >> GENERATION_SHIFT != generation {
-                return;
-            }
-            let next = if current & RUNNING != 0 {
-                current | NOTIFIED | flag
-            } else {
-                current | SCHEDULED | flag
-            };
-            if next == current {
-                return;
-            }
-            // Ordering: `AcqRel`: the change orders the event of the wake before the next poll,
-            // which starts with `Acquire`, and it reads the end of the last poll.
-            match word.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
-        if current & (RUNNING | SCHEDULED) == 0 {
+        if wake(&self.words[slot as usize], generation, cancel) {
             self.push(slot);
         }
     }
@@ -300,49 +286,20 @@ impl Shared {
     /// Starts a poll of the scheduled task in `slot`. Gives `true` if a cancel was requested: the
     /// owner then drops the future, and does not poll it.
     pub(super) fn poll_start(&self, slot: u32) -> bool {
-        // Ordering: `Acquire` reads the release of the end of the last poll and of each wake. The
-        // task is scheduled and not running, so the change clears one bit and sets the other.
-        let old = self.words[slot as usize].fetch_xor(SCHEDULED | RUNNING, Ordering::Acquire);
-        old & CANCEL != 0
+        poll_start(&self.words[slot as usize])
     }
 
     /// Ends a poll of the task in `slot` that gave `Pending`. Gives `true` if a wake or a cancel
     /// came during the poll: the task is then scheduled again, and the owner pushes its entry to
     /// the local queue.
     pub(super) fn poll_end(&self, slot: u32) -> bool {
-        let word = &self.words[slot as usize];
-        // Ordering: `Relaxed` for the first load, as in `wake`.
-        let mut current = word.load(Ordering::Relaxed);
-        loop {
-            let again = current & (NOTIFIED | CANCEL) != 0;
-            let mut next = current & !(RUNNING | NOTIFIED);
-            if again {
-                next |= SCHEDULED;
-            }
-            // Ordering: `Release` orders the poll before the next wake, which reads this change.
-            match word.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => return again,
-                Err(actual) => current = actual,
-            }
-        }
+        poll_end(&self.words[slot as usize])
     }
 
     /// Ends the task in `slot`: the slot is free, with the next generation. Each waker of the
     /// ended task then changes nothing.
     pub(super) fn end(&self, slot: u32) {
-        let word = &self.words[slot as usize];
-        // Ordering: `Relaxed` for the first load, as in `wake`.
-        let mut current = word.load(Ordering::Relaxed);
-        loop {
-            let next = ((current >> GENERATION_SHIFT) + 1) << GENERATION_SHIFT;
-            // Ordering: `Release` orders the end of the task before a later read of the word. The
-            // change is a read-modify-write: a wake between a load and a store would be lost in
-            // the order of the word, and it could then change the next task.
-            match word.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
+        end(&self.words[slot as usize]);
     }
 
     /// Wakes the root future of `block_on`. Only the wake that sets the flag signals the home.
@@ -366,6 +323,146 @@ impl Shared {
     pub(super) fn root_woken(&self) -> bool {
         // Ordering: `Relaxed`: the owner takes the flag with `Acquire` before it polls the root.
         self.root.load(Ordering::Relaxed)
+    }
+}
+
+/// The generation of the task of a slot word, or of its next task if the slot is free. Only the
+/// thread that ends the tasks of the slot calls it.
+pub(super) fn generation(word: &AtomicU64) -> u64 {
+    // Ordering: `Relaxed`: only the caller changes the generation.
+    word.load(Ordering::Relaxed) >> GENERATION_SHIFT
+}
+
+/// Starts a new task in a free slot word: it is scheduled, and its spawn pushes its first entry.
+pub(super) fn start(word: &AtomicU64) {
+    // Ordering: `Relaxed`: the spawn gives the waker of the new task, with its generation, to
+    // other threads only after this change, through its own synchronization. The change is a
+    // read-modify-write, so it keeps the order of the word with each stale wake.
+    word.fetch_or(SCHEDULED, Ordering::Relaxed);
+}
+
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+/// Starts a new task in a free slot word of the movable pool, as `start` does, and marks the slot
+/// live.
+pub(super) fn start_live(word: &AtomicU64) {
+    // Ordering: `Relaxed`, as in `start`. The spawn then orders this change before its second
+    // read-modify-write of the admission of the pool, which the close reads (`pool`).
+    word.fetch_or(SCHEDULED | LIVE, Ordering::Relaxed);
+}
+
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+/// Requests the cancel of the live task of a slot word of the movable pool, whatever its
+/// generation, as `wake` does with a cancel. Gives `None` if the slot is free or the cancel was
+/// requested before, and else whether the task was idle: the caller then pushes its entry.
+pub(super) fn cancel_live(word: &AtomicU64) -> Option<bool> {
+    // Ordering: `Relaxed` for the first load, as in `wake`. The close reads the start of each task
+    // that it must see through the admission of the pool, which orders that start before this load.
+    let mut current = word.load(Ordering::Relaxed);
+    loop {
+        if current & LIVE == 0 || current & CANCEL != 0 {
+            return None;
+        }
+        let next = if current & RUNNING != 0 {
+            current | NOTIFIED | CANCEL | CLOSING
+        } else {
+            current | SCHEDULED | CANCEL | CLOSING
+        };
+        // Ordering: `AcqRel`, as in `wake`.
+        match word.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return Some(current & (RUNNING | SCHEDULED) == 0),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Whether the close of the pool requested the cancel of the task of a slot word. Only the poller
+/// calls it, after its poll start found the cancel.
+#[cfg(any(
+    all(test, loom),
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+pub(super) fn closing(word: &AtomicU64) -> bool {
+    // Ordering: `Relaxed`: the poll start read the change that set the bit, which no change clears
+    // before the end of the task.
+    word.load(Ordering::Relaxed) & CLOSING != 0
+}
+
+/// The word change of a wake of the task of `generation`, with a cancel request if `cancel` is
+/// true. Gives `true` if the task was idle: the caller then pushes its one entry to a queue. A task
+/// of another generation does not change.
+pub(super) fn wake(word: &AtomicU64, generation: u64, cancel: bool) -> bool {
+    let flag = if cancel { CANCEL } else { 0 };
+    // Ordering: `Relaxed` for the first load: the compare-exchange below reads the latest word.
+    let mut current = word.load(Ordering::Relaxed);
+    loop {
+        if current >> GENERATION_SHIFT != generation {
+            return false;
+        }
+        let next = if current & RUNNING != 0 {
+            current | NOTIFIED | flag
+        } else {
+            current | SCHEDULED | flag
+        };
+        if next == current {
+            return false;
+        }
+        // Ordering: `AcqRel`: the change orders the event of the wake before the next poll, which
+        // starts with `Acquire`, and it reads the end of the last poll.
+        match word.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return current & (RUNNING | SCHEDULED) == 0,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Starts a poll of the scheduled task of a slot word. Gives `true` if a cancel was requested: the
+/// poller then drops the future, and does not poll it.
+pub(super) fn poll_start(word: &AtomicU64) -> bool {
+    // Ordering: `Acquire` reads the release of the end of the last poll and of each wake. The task
+    // is scheduled and not running, so the change clears one bit and sets the other.
+    let old = word.fetch_xor(SCHEDULED | RUNNING, Ordering::Acquire);
+    old & CANCEL != 0
+}
+
+/// Ends a poll that gave `Pending`. Gives `true` if a wake or a cancel came during the poll: the
+/// task is then scheduled again, and the poller pushes its entry to a queue.
+pub(super) fn poll_end(word: &AtomicU64) -> bool {
+    // Ordering: `Relaxed` for the first load, as in `wake`.
+    let mut current = word.load(Ordering::Relaxed);
+    loop {
+        let again = current & (NOTIFIED | CANCEL) != 0;
+        let mut next = current & !(RUNNING | NOTIFIED);
+        if again {
+            next |= SCHEDULED;
+        }
+        // Ordering: `Release` orders the poll before the next wake, which reads this change.
+        match word.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return again,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Ends the task of a slot word: the slot is free, with the next generation. Each waker of the
+/// ended task then changes nothing.
+pub(super) fn end(word: &AtomicU64) {
+    // Ordering: `Relaxed` for the first load, as in `wake`.
+    let mut current = word.load(Ordering::Relaxed);
+    loop {
+        let next = ((current >> GENERATION_SHIFT) + 1) << GENERATION_SHIFT;
+        // Ordering: `Release` orders the end of the task before a later read of the word. The
+        // change is a read-modify-write: a wake between a load and a store would be lost in the
+        // order of the word, and it could then change the next task.
+        match word.compare_exchange_weak(current, next, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
     }
 }
 
