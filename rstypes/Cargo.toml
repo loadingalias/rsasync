@@ -7,6 +7,7 @@ description = "The types that rsasync shares with networking and applications: o
 repository = "https://github.com/loadingalias/rsasync"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["std"]

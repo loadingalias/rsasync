@@ -5,6 +5,7 @@ description = "A dual async runtime (in development): thread-per-core and work-s
 repository = "https://github.com/loadingalias/rsasync"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 # The crate is at the workspace root: the package holds only its sources, its license, and its
 # README.
 include = ["/src", "/LICENSE", "/README.md"]
@@ -47,11 +48,13 @@ workspace = true
 resolver = "3"
 members = [".", "examples/driver_only", "examples/local_only", "examples/process_supervision", "examples/standard_futures", "probe", "rsnetwork-udp", "rstypes", "xtask"]
 
-# No `rust-version`: development requires the nightly pinned in
-# rust-toolchain.toml, which a release number cannot express.
+# `rust-version` is the release number of the nightly that rust-toolchain.toml pins. Cargo then
+# refuses an older toolchain with one message. A crate that turns on an unstable feature also needs
+# that nightly. Set it again when the pin moves.
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
+rust-version = "1.101"
 
 [workspace.dependencies]
 # Features off: the exploration tests use only the models of the `sync`

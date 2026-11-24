@@ -5,6 +5,7 @@ description = "Datagram I/O on any socket that the caller owns, with segmentatio
 repository = "https://github.com/loadingalias/rsasync"
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["std"]
