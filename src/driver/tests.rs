@@ -69,16 +69,25 @@ mod sys {
 
 /// Blocks until the wake descriptor of `driver` is readable, as the reactor of a host waits for
 /// it.
-#[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
 #[cfg(unix)]
 fn wait_readable(driver: &Driver) {
+    assert!(readable_within(driver, -1));
+}
+
+/// Whether the wake descriptor of `driver` becomes readable in at most `millis` milliseconds, or
+/// with no limit for -1.
+#[expect(unsafe_code, reason = "poll reads and writes one pollfd")]
+#[cfg(unix)]
+fn readable_within(driver: &Driver, millis: core::ffi::c_int) -> bool {
     let mut fd = sys::PollFd {
         fd: driver.as_fd().as_raw_fd(),
         events: sys::POLLIN,
         revents: 0,
     };
     // SAFETY: `fd` is one valid `pollfd` during the call.
-    assert_eq!(unsafe { sys::poll(&raw mut fd, 1, -1) }, 1);
+    let ready = unsafe { sys::poll(&raw mut fd, 1, millis) };
+    assert!(ready >= 0, "poll failed");
+    ready == 1
 }
 
 /// A nonblocking pipe that closes at an exec: its read end and its write end, from
@@ -97,13 +106,14 @@ pub(crate) fn pipe() -> (OwnedFd, File) {
     (read, File::from(write))
 }
 
-/// A descriptor of the interrupt descriptor of `driver`, which shares its count, so a read takes
-/// the writes of the other threads since the last read.
+/// A descriptor of the wake descriptor of `driver`, which shares its count, so a read takes the
+/// writes of the other threads since the last read. The kernel signals the descriptor only after
+/// a host used it, which these tests do not do.
 #[cfg(all(feature = "local", target_os = "linux"))]
 pub(crate) fn interrupts(driver: &Driver) -> File {
     driver
         .shared
-        .interrupt
+        .wake
         .try_clone()
         .expect("the test process has a free descriptor")
 }
@@ -398,8 +408,8 @@ fn a_wake_from_another_thread_ends_a_wait() {
 }
 
 /// A completion during a wait adds no other completion. The poll that a wait keeps in the ring
-/// watches a descriptor that only the other threads signal, not the wake descriptor, which the
-/// kernel signals at each completion.
+/// watches the wake descriptor, which only the other threads signal while no host uses it: the
+/// ring registers it with the kernel only at its first use by a host.
 #[test]
 #[cfg(target_os = "linux")]
 fn a_completion_during_a_wait_adds_no_other_completion() {
@@ -829,6 +839,60 @@ fn the_wake_descriptor_is_readable_at_its_first_use_for_the_work_that_came_befor
     wait_readable(&driver);
     let (count, bytes) = drive_from_reactor(&mut driver, receive).unwrap();
     assert_eq!((count.unwrap(), bytes.bytes()), (5, &b"early"[..]));
+}
+
+/// R531: each wake of another thread writes the wake descriptor itself, so it reaches the reactor
+/// of a host at once, with no flag, also after a turn took a wake before it. A second descriptor
+/// that only the ring polls does not do this: the kernel defers the signal of the wake descriptor
+/// for that poll, and on Linux 7.0.14 it gave the first wake 11 ms late and the second one never.
+#[test]
+#[cfg(target_os = "linux")]
+fn each_wake_of_another_thread_makes_the_wake_descriptor_of_a_ring_readable() {
+    let mut driver = suite::driver(Config::new(), Backend::Kernel);
+    let wake = driver.wake_handle();
+    // The first use makes the descriptor readable one time, and the turns of the host take that
+    // signal.
+    let _host = driver.as_fd();
+    while driver.turn().unwrap().more() {}
+    for _ in 0..3 {
+        assert!(
+            !readable_within(&driver, 0),
+            "the turns left the wake descriptor readable"
+        );
+        let wake = wake.clone();
+        thread::spawn(move || wake.wake()).join().unwrap();
+        assert!(
+            readable_within(&driver, 5_000),
+            "the wake did not reach the wake descriptor"
+        );
+        // The host turns while the driver reports more work, and then it waits again.
+        while driver.turn().unwrap().more() {}
+    }
+}
+
+/// R531: a host that uses the wake descriptor can also wait in the driver. The kernel then
+/// signals the descriptor that the wait polls, so a wait can end one time more for a completion.
+/// The waits do not spin: after a completion, a loop waits a few times in 100 ms with no work. A
+/// wake descriptor that no turn clears ends thousands of waits in that time.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_waits_of_a_ring_whose_host_uses_the_wake_descriptor_do_not_spin() {
+    let mut driver = suite::driver(Config::new(), Backend::Kernel);
+    let _host = driver.as_fd();
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
+    peer.write_all(b"x").unwrap();
+    // The receive completes in a wait of the driver, and the kernel signals the wake descriptor.
+    assert_matches!(drive(&mut driver, receive), Ok((Ok(1), _)));
+    let clock = deadline_clock();
+    let deadline = deadline_after(clock, core::time::Duration::from_millis(100));
+    let mut waits = 0;
+    while !deadline.is_reached(clock.now()).unwrap() {
+        while driver.turn().unwrap().more() {}
+        driver.wait_until(deadline, clock).unwrap();
+        waits += 1;
+    }
+    assert!(waits <= 8, "the wait returned {waits} times in 100 ms");
 }
 
 /// The bytes of a numbered stream from `start`: each byte is its position modulo 251, so a lost

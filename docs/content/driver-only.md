@@ -152,6 +152,11 @@ A loop that only waits in the driver pays nothing for the wake descriptor. On io
 registers that descriptor only when you ask for it with `as_fd()`. Without it, the kernel signals
 no descriptor at a completion, and no turn reads one.
 
+A wake of another thread, and a handled signal, write that one descriptor. So a wake reaches a
+host reactor at once, and it ends a wait. Select one way to wait for a driver. A loop that uses
+`as_fd()` and also calls `wait()` still works, but the kernel then signals the descriptor at each
+completion, so a wait can end one time more with no new work.
+
 ### Wait until a deadline
 
 A loop with timers waits for its I/O and for its next timer in one call. `Driver::wait_until` ends

@@ -7,12 +7,12 @@
 //!   of its thread, because a turn of the driver calls wakers. So the waker puts the home in the
 //!   outbox of its owner, and the owner sends the messages before its next turn or wait, with its
 //!   other entries.
-//! - Each other thread, such as a thread of the blocking service, writes the interrupt descriptor
+//! - Each other thread, such as a thread of the blocking service, writes the wake descriptor
 //!   of the home. The wait polls it in the ring.
 //!
 //! The outbox has a fixed room, and so does the table of messages of the driver. A home that gets
-//! no room gets a write of its interrupt descriptor, so no wake waits for room. On epoll, a message
-//! fails with `EBADFD`, and the driver writes the interrupt descriptor of its home instead.
+//! no room gets a write of its wake descriptor, so no wake waits for room. On epoll, a message
+//! fails with `EBADFD`, and the driver writes the wake descriptor of its home instead.
 //!
 //! The driver is in the owner, so a task reaches it with `with_driver`. A worker has its driver
 //! from its start. The owner of `block_on` makes its driver at the first operation that needs a
@@ -264,7 +264,7 @@ fn flush(local: &Local, driver: &mut Driver) {
 }
 
 /// Puts `home` in the outbox of the owner of this thread. Gives `false` if the owner has no driver
-/// or its outbox has no room: the caller then writes the interrupt descriptor of `home`.
+/// or its outbox has no room: the caller then writes the wake descriptor of `home`.
 pub(super) fn post(home: &Arc<driver::Home>) -> bool {
     super::CURRENT.with(|current| {
         let Ok(current) = current.try_borrow() else {

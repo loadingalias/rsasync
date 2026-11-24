@@ -41,9 +41,12 @@
 //! 7.0.14, except 6.12.114 and later and 6.18.49 and later, which have `cd305ee3633a`.
 //!
 //! The probe does not test that path, because the only ring poll of an eventfd is the poll of the
-//! interrupt descriptor in `Driver::wait`. Each writer that must wake a host reactor also writes
-//! the wake descriptor directly. A ring operation that polls a caller's descriptor or another
-//! eventfd makes this path matter, and the probe must then test it.
+//! wake descriptor in `Driver::wait`, and no signal of the kernel has to reach a host through it:
+//! each writer that wakes a host reactor writes the wake descriptor itself. R531 measured the
+//! path on Linux 7.0.14 with a second `eventfd` that only the ring polled: the first wake reached
+//! the wake descriptor 11 ms late, and the second one never. A ring operation that polls a
+//! caller's descriptor or another eventfd makes this path matter, and the probe must then test
+//! it.
 //!
 //! The defect is a fact of the kernel, not of a ring, so only the first use of a wake descriptor
 //! in a process probes, on a ring of its own. Each later use reads that result. A driver whose

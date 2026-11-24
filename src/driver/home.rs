@@ -5,7 +5,7 @@
 use alloc::boxed::Box;
 use core::alloc::AllocError;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::io::{self, Write as _};
+use std::io::{self};
 use std::os::fd::{AsRawFd as _, OwnedFd};
 
 use super::queue::Queue;
@@ -104,11 +104,10 @@ pub(crate) struct Home {
 }
 
 impl Home {
-    /// Ends a wait of the home from a thread with no ring: it writes the interrupt descriptor,
-    /// which the wait polls in the ring.
+    /// Ends a wait of the home from a thread with no ring: it writes the wake descriptor, which
+    /// the wait polls in the ring.
     pub(crate) fn interrupt(&self) {
-        // A full counter is a pending wake already, and nothing else can fail here.
-        drop((&self.shared.interrupt).write(&1_u64.to_ne_bytes()));
+        self.shared.wake();
     }
 }
 
@@ -141,7 +140,7 @@ impl Wakes {
     }
 
     /// Ends the wake message of `data`, whose completion has `result`. If it failed, it did not
-    /// reach its home, and the interrupt descriptor wakes the home instead.
+    /// reach its home, and the wake descriptor wakes the home instead.
     pub(super) fn complete(&mut self, data: u64, result: i32) {
         let index = usize::try_from(data & MESSAGE_INDEX).ok();
         if let Some(home) = index.and_then(|index| self.sent.get_mut(index)?.take())
@@ -193,7 +192,7 @@ impl Driver {
 
     /// Sends a wake message from this ring to `home`: the next submit sends it, and its completion
     /// at `home` ends a wait there. The driver keeps `home` until the completion of the message at
-    /// this ring, and a failed message writes the interrupt descriptor of `home` instead. Gives
+    /// this ring, and a failed message writes the wake descriptor of `home` instead. Gives
     /// `home` back when no entry or no room in the queue is free.
     #[expect(unsafe_code, reason = "a message names no memory")]
     pub(crate) fn message(&mut self, home: Arc<Home>) -> Result<(), Arc<Home>> {
@@ -211,7 +210,7 @@ impl Driver {
         Ok(())
     }
 
-    /// Writes the interrupt descriptor of the home of each message whose completion this driver
+    /// Writes the wake descriptor of the home of each message whose completion this driver
     /// has not taken, before a time with no turn: such a message can still be in the queue, or it
     /// can fail with no turn that sees it. A message that arrives then wakes its home one more time.
     /// Each entry stays until the completion of its message, so a later message never takes the

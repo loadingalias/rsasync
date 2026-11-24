@@ -197,7 +197,7 @@ impl Queue {
     }
 
     /// A new descriptor of the backend, the target of the wake messages of local tasks. A message
-    /// to the descriptor of a poller fails, and the home is then woken by its interrupt descriptor.
+    /// to the descriptor of a poller fails, and the home is then woken by its wake descriptor.
     #[cfg(all(feature = "local", target_os = "linux"))]
     pub(crate) fn duplicate(&self) -> io::Result<OwnedFd> {
         match self {

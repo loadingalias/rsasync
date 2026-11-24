@@ -2,7 +2,7 @@
 //!
 //! The first stream of a signal installs a handler for it, and the last stream that closes
 //! restores the earlier disposition. The handler does only async-signal-safe work: it counts the
-//! delivery, writes the wake descriptors of the home of each stream of the signal, and, at a stated
+//! delivery, writes the wake descriptor of the home of each stream of the signal, and, at a stated
 //! delivery, restores the default action and raises the signal again. The home driver compares
 //! the count at each turn and wakes each stream whose signal arrived.
 //!
@@ -20,13 +20,13 @@
 //! none, and it cannot deliver signals either. The bookkeeping of the registrations, which only
 //! threads change, has one lock, which the handler never takes.
 //!
-//! A slot names the wake descriptors of one stream's home: those that a wake from another thread
-//! writes, the wake and the interrupt `eventfd` on Linux, and the write end of the wake pipe of the
-//! kqueue on macOS. The handler writes 8 bytes to each, which a pipe takes whole or not at all. A close stores 0 in the signal of the
+//! A slot names the wake descriptor of one stream's home, which a wake from another thread also
+//! writes: the wake `eventfd` on Linux, and the write end of the wake pipe of the kqueue on macOS.
+//! The handler writes 8 bytes to it, which a pipe takes whole or not at all. A close stores 0 in the signal of the
 //! slot, and then waits until no handler is in the slot. A handler announces itself in the slot
 //! and then reads the signal again. Each of the four accesses is `SeqCst`, so the close sees the
 //! handler, or the handler sees the close. Thus no handler writes a descriptor after its stream
-//! closed, and the stream keeps the descriptors open until then.
+//! closed, and the stream keeps the descriptor open until then.
 
 use core::ffi::c_int;
 use core::fmt;
@@ -62,11 +62,12 @@ const _: () = assert!(
     "the handler needs lock-free 64-bit atomics"
 );
 
-/// The wake descriptors of the home of one stream.
+/// The wake descriptor of the home of one stream.
 struct Slot {
     /// The signal of the stream, or 0 for a free slot.
     signal: AtomicI32,
-    wakes: [AtomicI32; WAKES],
+    /// The descriptor that a wake of another thread writes at the home (`Shared::wake_fd`).
+    wake: AtomicI32,
     /// The handlers that are in the slot now.
     active: AtomicU32,
 }
@@ -75,14 +76,11 @@ impl Slot {
     const fn new() -> Self {
         Self {
             signal: AtomicI32::new(0),
-            wakes: [const { AtomicI32::new(-1) }; WAKES],
+            wake: AtomicI32::new(-1),
             active: AtomicU32::new(0),
         }
     }
 }
-
-/// The wake descriptors of one home ([`Shared::wakes`]).
-pub(super) const WAKES: usize = if cfg!(target_os = "linux") { 2 } else { 1 };
 
 /// The bookkeeping that registrations change, under [`REGISTRY`].
 struct Registry {
@@ -289,10 +287,8 @@ pub(super) fn register(
         Escalation::At(at) => count.saturating_add(u64::from(at.get())),
     };
     let entry = &SLOTS[slot];
-    for (wake, fd) in entry.wakes.iter().zip(shared.wakes()) {
-        wake.store(fd, Ordering::Relaxed);
-    }
-    // Ordering: the handler reads the descriptors after it reads the signal.
+    entry.wake.store(shared.wake_fd(), Ordering::Relaxed);
+    // Ordering: the handler reads the descriptor after it reads the signal.
     entry.signal.store(number, Ordering::SeqCst);
     registry.escalate(number);
     // Ordering: `Relaxed`: only this thread has the home until the return.
@@ -346,7 +342,7 @@ pub struct SignalStream {
     slot: usize,
     /// The count at the last report.
     reported: u64,
-    /// Keeps the wake descriptors open while the slot names them.
+    /// Keeps the wake descriptor open while the slot names it.
     _shared: Arc<Shared>,
 }
 
@@ -440,9 +436,7 @@ extern "C" fn handle(signal: c_int) {
         // Ordering: see the module documentation.
         slot.active.fetch_add(1, Ordering::SeqCst);
         if slot.signal.load(Ordering::SeqCst) == signal {
-            for wake in &slot.wakes {
-                sys::wake(wake.load(Ordering::Relaxed));
-            }
+            sys::wake(slot.wake.load(Ordering::Relaxed));
         }
         slot.active.fetch_sub(1, Ordering::SeqCst);
     }

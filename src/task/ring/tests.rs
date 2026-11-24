@@ -40,7 +40,7 @@ fn driver(owner: &RingOwner) -> core::cell::RefMut<'_, Driver> {
     })
 }
 
-/// Takes the writes of the interrupt descriptor since the last take, from a descriptor that shares
+/// Takes the writes of the wake descriptor since the last take, from a descriptor that shares
 /// its count ([`interrupts`]). A descriptor with no write gives `WouldBlock`.
 fn take(interrupts: &File) -> u64 {
     let mut count = [0; 8];
@@ -61,7 +61,7 @@ fn pend_once(wakers: mpsc::Sender<Waker>) -> impl Future<Output = ()> {
 }
 
 /// Only the wake that finds the remote-ready list empty signals the home, so a burst of wakes
-/// from many threads with no ring writes the interrupt descriptor one time for each batch. No wake
+/// from many threads with no ring writes the wake descriptor one time for each batch. No wake
 /// allocates.
 #[test]
 fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
@@ -105,7 +105,7 @@ fn a_burst_of_wakes_from_threads_with_no_ring_signals_once_for_each_batch() {
 }
 
 /// A wake from a thread whose owner has a ring sends a message from that ring, and the message
-/// alone ends the wait of the home in its ring: the interrupt descriptor of the home gets no
+/// alone ends the wait of the home in its ring: the wake descriptor of the home gets no
 /// write. The wakes, the message, and its submit allocate nothing.
 #[test]
 fn a_wake_from_a_thread_with_a_ring_ends_the_wait_of_its_home_by_a_message() {

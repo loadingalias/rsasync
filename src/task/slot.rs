@@ -42,7 +42,7 @@
 //! - A home with no ring parks its thread, and the signal unparks it.
 //! - A home with a ring waits in its ring. A thread whose owner has a ring puts the home in the
 //!   outbox of that owner, which sends a message from its own ring after the poll (`ring`). Each
-//!   other thread writes the interrupt descriptor of the home, which the wait polls in its ring.
+//!   other thread writes the wake descriptor of the home, which the wait polls in its ring.
 //!
 //! The owner of `block_on` gets its ring at its first operation that needs one, while a wake from
 //! another thread can run. A wake that reads no ring unparks the thread, which then does not park

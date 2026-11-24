@@ -72,24 +72,24 @@ closes, the disposition that the first stream replaced returns, for example the 
 handler of another library. While a stream lives, its handler replaces the earlier one and does not
 call it. rsasync changes the disposition of no other signal.
 
-The handler does only async-signal-safe work: it counts the signal, writes the wake descriptors of
-the homes of its streams, and at a stated escalation restores the default action and raises the
-signal again. It takes no lock, allocates nothing, and keeps `errno` of the code that it interrupts.
+The handler does only async-signal-safe work: it counts the signal, writes the wake descriptor of
+the home of each of its streams, and at a stated escalation restores the default action and raises
+the signal again. It takes no lock, allocates nothing, and keeps `errno` of the code that it interrupts.
 The handler uses `SA_RESTART`, so a system call that it interrupts restarts where the kernel allows
 it. The write of the handler ends a `Driver::wait()` of the home, as [Backends](#backends) tells.
 
 ## Backends
 
-The handler writes the descriptors that a `WakeHandle` writes, with `write`, which POSIX lists as
-async-signal-safe:
+The handler writes the one descriptor that a `WakeHandle` writes, with `write`, which POSIX lists
+as async-signal-safe:
 
-| Backend | The wake descriptors of a home |
+| Backend | The wake descriptor of a home |
 | --- | --- |
-| io_uring | The wake `eventfd` and the interrupt `eventfd`, which the ring polls during a wait |
-| [epoll](epoll.md) | The wake `eventfd`, which epoll watches, and the interrupt `eventfd` |
+| io_uring | The wake `eventfd`, which the ring polls during a wait and which a host reactor reads |
+| [epoll](epoll.md) | The wake `eventfd`, which epoll watches |
 | [kqueue](kqueue.md), on macOS | The write end of the wake pipe, whose read end kqueue watches. A pipe, because `kevent` is not async-signal-safe |
 
-Each turn of the home compares the count of each signal after it clears its wake descriptors. So a
+Each turn of the home compares the count of each signal after it clears its wake descriptor. So a
 signal that comes during a turn gives its report at that turn or wakes the next wait.
 
 ## Refusals
