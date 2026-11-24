@@ -1,5 +1,4 @@
-# The CI gate on each push to main: `cargo xtask check`, then the tests on
-# glibc and on x86_64 musl.
+# CI checks the workspace on Linux and for Intel macOS. It runs the tests on glibc and x86_64 musl.
 #
 # Each version comes from a file that `machine update all` writes:
 # rust-toolchain.toml, .config/nextest.toml, and Cargo.lock. A pin change
@@ -113,6 +112,9 @@ jobs:
       - name: cargo xtask check
         shell: bash
         run: cargo xtask check
+
+      - name: Check the Intel macOS build
+        run: cargo xtask check --target x86_64-apple-darwin
 
       - name: cargo xtask test
         shell: bash

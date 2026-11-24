@@ -38,7 +38,7 @@ pub mod channel;
     all(
         any(
             all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
             all(target_os = "windows", target_arch = "x86_64")
         ),
         feature = "std"
@@ -48,7 +48,7 @@ pub mod channel;
     not(all(
         any(
             all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
             all(target_os = "windows", target_arch = "x86_64")
         ),
         feature = "std"
@@ -64,7 +64,7 @@ mod sync;
     not(all(
         any(
             all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
             all(target_os = "windows", target_arch = "x86_64")
         ),
         feature = "std"
@@ -99,7 +99,7 @@ pub mod timer;
 #[cfg(all(
     any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
         all(target_os = "windows", target_arch = "x86_64")
     ),
     feature = "std"
@@ -113,7 +113,7 @@ pub mod driver;
 #[cfg(all(
     any(
         all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
         all(target_os = "windows", target_arch = "x86_64")
     ),
     feature = "std"

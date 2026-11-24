@@ -130,6 +130,14 @@ of the model.
 
 ## macOS
 
+The Intel macOS target (`x86_64-apple-darwin`) compiles and links with the macOS 27.2 SDK.
+The linked test binaries include the kqueue driver and datagram operations. These binaries have no Intel Mac run evidence.
+CI checks this target on each push to `main`. Use this command on a Mac to link its tests.
+
+```sh
+cargo test --locked --workspace --no-run --target x86_64-apple-darwin
+```
+
 The driver runs TCP, UDP, IPC streams, [pipes](pipes.md), [child processes](processes.md),
 [signal streams](signals.md), and files on macOS on aarch64 (`aarch64-apple-darwin`), on
 [kqueue](kqueue.md), in driver-only use. The files run on your blocking service, with the macOS
