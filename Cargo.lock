@@ -200,8 +200,9 @@ dependencies = [
 
 [[package]]
 name = "rscrypto"
-version = "0.12.0"
-source = "git+https://github.com/loadingalias/rscrypto?branch=main#4b1899d17821da07a2866510036fe57e3a820e89"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e104be3abddebfbeb6b789e869de2cfa8c9129ded62b076f3b9bfc7f0e8314bd"
 
 [[package]]
 name = "rsnetwork-udp"

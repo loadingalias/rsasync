@@ -27,7 +27,7 @@ rsnetwork-udp = { path = "rsnetwork-udp", version = "=0.1.0-alpha.2", optional =
 # The seeded generator of the runtime: the family's only source of random values. This feature
 # alone has no dependency. The runtime reads the seed from the system itself.
 [target.'cfg(target_os = "linux")'.dependencies]
-rscrypto = { git = "https://github.com/loadingalias/rscrypto", branch = "main", default-features = false, features = ["chacha20-rng"], optional = true }
+rscrypto = { workspace = true, features = ["chacha20-rng"], optional = true }
 
 # The exploration tests (`cargo xtask explore`) use loom. A build without
 # `--cfg loom` compiles none of it.
@@ -57,6 +57,7 @@ license = "Apache-2.0"
 # Features off: the exploration tests use only the models of the `sync`
 # modules and `loom::model`.
 loom = { version = "0.7.2", default-features = false }
+rscrypto = { version = "0.13.0", default-features = false }
 
 [workspace.lints.cargo]
 unknown_lints = "deny"
