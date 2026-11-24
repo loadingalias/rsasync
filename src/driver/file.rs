@@ -882,13 +882,13 @@ fn done(result: i32, held: &Held) -> io::Result<()> {
 
 /// The resource and the alignment of a file that an open gave.
 /// The output of the open of a file.
-pub(crate) fn file_opened(result: i32, held: Held) -> Option<io::Result<File>> {
-    Some(opened(result, &held).map(|(resource, alignment)| File { resource, alignment }))
+pub(crate) fn file_opened(result: i32, held: &mut Held) -> Option<io::Result<File>> {
+    Some(opened(result, held).map(|(resource, alignment)| File { resource, alignment }))
 }
 
 /// The output of the open of a directory.
-pub(crate) fn directory_opened(result: i32, held: Held) -> Option<io::Result<Directory>> {
-    Some(opened(result, &held).map(|(resource, _)| Directory { resource }))
+pub(crate) fn directory_opened(result: i32, held: &mut Held) -> Option<io::Result<Directory>> {
+    Some(opened(result, held).map(|(resource, _)| Directory { resource }))
 }
 
 fn opened(result: i32, held: &Held) -> io::Result<(Resource, Option<Alignment>)> {
@@ -1067,7 +1067,7 @@ impl Driver {
     ) -> Result<Operation<'a, (io::Result<usize>, Backing)>, Refused<Backing>> {
         let completion = self.begin_read(file, buffer, offset)?;
         Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.loan?.into_inner()))
+            Some((count(result), held.loan.take()?.into_inner()))
         }))
     }
 
@@ -1088,7 +1088,7 @@ impl Driver {
     ) -> Result<Operation<'a, (io::Result<()>, Backing)>, Refused<Backing>> {
         let completion = self.begin_read(file, buffer, offset)?;
         Ok(Operation::new(completion, |result, held| {
-            let loan = held.loan?;
+            let loan = held.loan.take()?;
             let wanted = submitted(loan.capacity()) as usize;
             let read = match count(result) {
                 Ok(read) if read == wanted => Ok(()),
@@ -1132,7 +1132,7 @@ impl Driver {
         };
         let completion = self.begin_file(Some(file.resource), Op::ReadVectored, buffers, held, entry, true)?;
         Ok(Operation::new(completion, |result, held| {
-            let Payload::Buffers(buffers) = held.payload else {
+            let Payload::Buffers(buffers) = core::mem::take(&mut held.payload) else {
                 return None;
             };
             Some((count(result), buffers))
@@ -1176,10 +1176,7 @@ impl Driver {
         };
         let completion = self.begin_file(Some(file.resource), Op::Write(mode), lease, held, entry, false)?;
         Ok(Operation::new(completion, |result, held| {
-            let Payload::Lease(lease) = held.payload else {
-                return None;
-            };
-            Some((count(result), lease))
+            Some((count(result), held.payload.take_lease()?))
         }))
     }
 
@@ -1221,7 +1218,7 @@ impl Driver {
         };
         let completion = self.begin_file(Some(file.resource), Op::Write(mode), regions, held, entry, false)?;
         Ok(Operation::new(completion, |result, held| {
-            let Payload::Regions(regions) = held.payload else {
+            let Payload::Regions(regions) = core::mem::take(&mut held.payload) else {
                 return None;
             };
             Some((count(result), regions))
@@ -1260,10 +1257,10 @@ impl Driver {
         };
         let completion = self.begin_file(Some(file.resource), Op::Plain, (), held, entry, true)?;
         Ok(Operation::new(completion, |result, held| {
-            let Payload::Stat(stat) = held.payload else {
+            let Payload::Stat(stat) = &held.payload else {
                 return None;
             };
-            Some(count(result).and_then(|_| length(&stat)))
+            Some(count(result).and_then(|_| length(stat)))
         }))
     }
 
@@ -1291,7 +1288,7 @@ impl Driver {
             };
             self.begin_job(file.resource, job)?
         };
-        Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
+        Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 
     /// Reserves blocks for `len` bytes from `offset` of `file` (`IORING_OP_FALLOCATE`), so that a
@@ -1400,7 +1397,7 @@ impl Driver {
         self.own(directory.resource, ())?;
         if self.report.route(Call::SyncDirectory) == Route::Unsupported {
             let completion = self.fail_now(UNSUPPORTED)?;
-            return Ok(Operation::new(completion, |result, held| Some(done(result, &held))));
+            return Ok(Operation::new(completion, |result, held| Some(done(result, held))));
         }
         self.fsync(directory.resource, false)
     }
@@ -1438,7 +1435,7 @@ impl Driver {
             }
             _ => self.fail_now(EINVAL)?,
         };
-        Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
+        Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 
     /// Removes the file at `path` (`IORING_OP_UNLINKAT`). A sync of the parent directory makes the
@@ -1466,7 +1463,7 @@ impl Driver {
             }
             None => self.fail_now(EINVAL)?,
         };
-        Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
+        Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 
     /// Closes `file`. The close waits until each operation of the file ends, also each operation
@@ -1510,7 +1507,7 @@ impl Driver {
         };
         let completion = self.begin_job(file.resource, job)?;
         Ok(Operation::new(completion, |result, held| {
-            let path = done(result, &held).map(|()| match result {
+            let path = done(result, held).map(|()| match result {
                 1 => NvmePath::Native,
                 _ => NvmePath::Other,
             });
@@ -1633,14 +1630,14 @@ impl Driver {
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let entry = move |fd, _: &mut Held| Sqe::fallocate(fd, mode, offset, len);
         let completion = self.begin_file(Some(file.resource), op, (), |()| Held::default(), entry, false)?;
-        Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
+        Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 
     /// Starts a sync of `resource`: `fdatasync` when `data` holds, else `fsync`.
     fn fsync<'a>(&mut self, resource: Resource, data: bool) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let entry = move |fd, _: &mut Held| Sqe::fsync(fd, data);
         let completion = self.begin_file(Some(resource), Op::Sync, (), |()| Held::default(), entry, false)?;
-        Ok(Operation::new(completion, |result, held| Some(done(result, &held))))
+        Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 
     /// Starts an operation that ends at once with the error `errno`, with no submission.

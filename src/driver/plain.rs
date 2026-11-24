@@ -34,8 +34,8 @@
 //! earlier operation in its chain, and its consumer takes that one over.
 
 use alloc::boxed::Box;
+use core::mem;
 use core::net::SocketAddr;
-use core::pin::Pin;
 use core::task::{Context, Poll, ready};
 use std::io;
 use std::os::fd::{AsRawFd as _, OwnedFd};
@@ -102,7 +102,11 @@ impl Chain {
     fn settle(&mut self, cx: &Context<'_>, cancel: bool) -> bool {
         for place in &mut self.before {
             while let Some(tail) = place {
-                let Poll::Ready(taken) = tail.completion.take(cx) else {
+                // The abandoned rule keeps the resources, so they leave the slot whole.
+                let taken = tail
+                    .completion
+                    .take_with(cx, |result, held, _| (result, mem::take(held)));
+                let Poll::Ready(taken) = taken else {
                     break;
                 };
                 let kind = tail.kind;
@@ -288,26 +292,33 @@ impl Direction {
         }
     }
 
-    /// Polls the operation of the direction for the future that borrows it: gives its result and
-    /// its resources, and keeps the state that it leaves. An operation that ended before its start
-    /// gives back the earlier operation, which the direction keeps again. A direction with no
-    /// operation gives [`Gone`].
-    pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<(i32, Held), Gone>> {
+    /// Polls the operation of the direction for the future that borrows it: makes its output with
+    /// `output` from its result and its resources, and keeps the state that it leaves. An operation
+    /// that ended before its start gives back the earlier operation, which the direction keeps
+    /// again. A direction with no operation gives [`Gone`].
+    pub(crate) fn poll<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        output: fn(i32, &mut Held) -> Option<T>,
+    ) -> Poll<Result<Option<T>, Gone>> {
         let Some(tail) = &mut self.tail else {
             return Poll::Ready(Err(Gone));
         };
-        let taken = ready!(Pin::new(&mut tail.completion).poll(cx));
         let kind = tail.kind;
+        let taken = ready!(tail.completion.poll_with(cx, |result, held, _| {
+            let chain = held.plain.as_mut().and_then(|plain| plain.chain.take());
+            (chain, output(result, held))
+        }));
         self.tail = None;
-        Poll::Ready(taken.map(|(result, mut held)| {
-            if let Some(mut chain) = held.plain.as_mut().and_then(|plain| plain.chain.take()) {
+        Poll::Ready(taken.map(|(chain, output)| {
+            if let Some(mut chain) = chain {
                 self.tail = chain.before[0].take();
                 chain.flow.taken(kind);
                 if !chain.flow.is_clear() {
                     self.chain = Some(chain);
                 }
             }
-            (result, held)
+            output
         }))
     }
 
@@ -346,17 +357,18 @@ fn socket_held(peer: SockAddrStorage, len: u32) -> Held {
 /// The output of a plain accept, connect, or bind: the socket that the operation made, which no
 /// driver owns, and the address that its resources hold. That is the peer of an accept, the target
 /// of a connect, or the local address of a bind.
-pub(crate) fn socket(result: i32, held: Held) -> Option<io::Result<(PlainSocket, SocketAddr)>> {
+pub(crate) fn socket(result: i32, held: &mut Held) -> Option<io::Result<(PlainSocket, SocketAddr)>> {
     Some(tcp::count(result).and_then(|_| {
         let Payload::Socket {
             peer,
             peer_len,
-            connection: Some(socket),
-        } = held.payload
+            connection,
+        } = &mut held.payload
         else {
             return Err(io::ErrorKind::InvalidData.into());
         };
-        let address = peer.to_socket_addr(peer_len).ok_or(io::ErrorKind::InvalidData)?;
+        let socket = connection.take().ok_or(io::ErrorKind::InvalidData)?;
+        let address = peer.to_socket_addr(*peer_len).ok_or(io::ErrorKind::InvalidData)?;
         Ok((PlainSocket::try_new(socket).map_err(out_of_memory)?, address))
     }))
 }

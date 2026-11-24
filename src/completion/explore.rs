@@ -25,7 +25,7 @@ fn take(entry: &Entry<u8>, id: OpId) -> Result<(i32, u8), Gone> {
     let waker = Waker::from(alloc::sync::Arc::new(Unpark(thread::current())));
     let cx = Context::from_waker(&waker);
     loop {
-        if let Poll::Ready(taken) = entry.poll_take(&cx, id) {
+        if let Poll::Ready(taken) = entry.poll_take(&cx, id, |result, held| (result, *held)) {
             return taken;
         }
         thread::park();

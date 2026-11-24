@@ -104,7 +104,7 @@ use core::pin::Pin;
 #[cfg(target_os = "linux")]
 use core::sync::atomic::{AtomicBool, fence};
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::task::{Context, Poll, ready};
+use core::task::{Context, Poll};
 #[cfg(unix)]
 use std::fs;
 use std::io;
@@ -503,6 +503,14 @@ pub(crate) enum Payload {
 }
 
 impl Payload {
+    /// Takes only the lease. An empty static slice needs no allocation or release.
+    fn take_lease(&mut self) -> Option<Lease> {
+        match self {
+            Self::Lease(lease) => Some(mem::replace(lease, Lease::from(&[][..]))),
+            _ => None,
+        }
+    }
+
     /// The address of a connect or a bind, the local address that a bind gives, or the peer
     /// address that an accept writes, with its length.
     pub(crate) fn peer(&mut self) -> Option<(&mut SockAddrStorage, &mut u32)> {
@@ -756,18 +764,18 @@ pub struct Operation<'a, T> {
 /// How an operation makes its output from its result and its resources.
 enum Output<T> {
     /// The output of a call of the driver.
-    Driver(fn(i32, Held) -> Option<T>),
+    Driver(fn(i32, &mut Held) -> Option<T>),
     /// The output of a call of a local type, which also gets the operation: each resource that it
     /// makes keeps the home of its close ([`Completion::cleanup`]).
     #[cfg(all(feature = "local", target_os = "linux"))]
-    Local(fn(i32, Held, &Completion) -> Option<T>),
+    Local(fn(i32, &mut Held, &Completion) -> Option<T>),
 }
 
 // The future never pins its output, which exists only at the end of a poll.
 impl<T> Unpin for Operation<'_, T> {}
 
 impl<'a, T> Operation<'a, T> {
-    fn new(completion: Completion, output: fn(i32, Held) -> Option<T>) -> Self {
+    fn new(completion: Completion, output: fn(i32, &mut Held) -> Option<T>) -> Self {
         Self {
             completion,
             output: Output::Driver(output),
@@ -778,7 +786,7 @@ impl<'a, T> Operation<'a, T> {
     /// The same operation, with `output` in place of its output: the local I/O types give their own
     /// resources.
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn with_output<U>(self, output: fn(i32, Held, &Completion) -> Option<U>) -> Operation<'a, U> {
+    pub(crate) fn with_output<U>(self, output: fn(i32, &mut Held, &Completion) -> Option<U>) -> Operation<'a, U> {
         Operation {
             completion: self.completion,
             output: Output::Local(output),
@@ -804,14 +812,15 @@ impl<'a, T> Operation<'a, T> {
 impl<T> Future for Operation<'_, T> {
     type Output = Result<T, Ended>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let taken = ready!(Pin::new(&mut self.completion).poll(cx));
-        let output = taken.ok().and_then(|(result, held)| match self.output {
-            Output::Driver(output) => output(result, held),
-            #[cfg(all(feature = "local", target_os = "linux"))]
-            Output::Local(output) => output(result, held, &self.completion),
-        });
-        Poll::Ready(output.ok_or(Ended))
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.completion
+            .poll_with(cx, |result, held, _operation| match this.output {
+                Output::Driver(output) => output(result, held),
+                #[cfg(all(feature = "local", target_os = "linux"))]
+                Output::Local(output) => output(result, held, _operation),
+            })
+            .map(|output| output.ok().flatten().ok_or(Ended))
     }
 }
 

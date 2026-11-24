@@ -1101,24 +1101,21 @@ pub(super) fn after(resources: &mut Resources, pending: &mut Vec<Resource>, tag:
 }
 
 /// The output of a receive: the count of received bytes, and the buffer.
-pub(crate) fn received(result: i32, held: Held) -> Option<(io::Result<usize>, Backing)> {
-    Some((count(result), held.loan?.into_inner()))
+pub(crate) fn received(result: i32, held: &mut Held) -> Option<(io::Result<usize>, Backing)> {
+    Some((count(result), held.loan.take()?.into_inner()))
 }
 
 /// The output of a send: the count of sent bytes, or the failure of the write direction, and the
 /// lease.
-pub(crate) fn sent(result: i32, held: Held) -> Option<(io::Result<usize>, Lease)> {
+pub(crate) fn sent(result: i32, held: &mut Held) -> Option<(io::Result<usize>, Lease)> {
     let sent = held
         .failed
         .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
-    let Payload::Lease(lease) = held.payload else {
-        return None;
-    };
-    Some((sent, lease))
+    Some((sent, held.payload.take_lease()?))
 }
 
 /// The output of a bind: the listener and its local address.
-pub(crate) fn bound(result: i32, mut held: Held) -> Option<io::Result<TcpListener>> {
+pub(crate) fn bound(result: i32, held: &mut Held) -> Option<io::Result<TcpListener>> {
     Some(count(result).and_then(|_| {
         let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
         let local = held
@@ -1131,12 +1128,12 @@ pub(crate) fn bound(result: i32, mut held: Held) -> Option<io::Result<TcpListene
 }
 
 /// The output of a connect: the stream.
-pub(crate) fn connected(result: i32, held: Held) -> Option<io::Result<TcpStream>> {
+pub(crate) fn connected(result: i32, held: &mut Held) -> Option<io::Result<TcpStream>> {
     Some(count(result).and_then(|_| Ok(TcpStream::new(held.accepted.ok_or(io::ErrorKind::OutOfMemory)?))))
 }
 
 /// The output of an accept: the stream and the address of its peer.
-pub(crate) fn accepted(result: i32, mut held: Held) -> Option<io::Result<(TcpStream, SocketAddr)>> {
+pub(crate) fn accepted(result: i32, held: &mut Held) -> Option<io::Result<(TcpStream, SocketAddr)>> {
     Some(count(result).and_then(|_| {
         let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
         let peer = held
@@ -1349,7 +1346,7 @@ impl Driver {
             let sent = held
                 .failed
                 .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
-            let Payload::Regions(regions) = held.payload else {
+            let Payload::Regions(regions) = core::mem::take(&mut held.payload) else {
                 return None;
             };
             Some((sent, regions))
@@ -1527,6 +1524,7 @@ impl Driver {
             // and an empty `Vec` allocates nothing.
             Some(count(result).map(|_| {
                 held.loan
+                    .take()
                     .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner)
             }))
         }))

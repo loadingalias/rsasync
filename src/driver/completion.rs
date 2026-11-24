@@ -1,7 +1,5 @@
 //! The future of one driver operation.
 
-use core::future::Future;
-use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::completion::{Entry, Gone};
@@ -49,15 +47,20 @@ impl Completion {
         }
     }
 
-    /// Takes the result and the resources when they are ready, and otherwise registers the waker
-    /// of `cx`, with no poll budget. The driver of a later operation of the direction takes the
-    /// result of an operation with it, outside the poll of a task.
-    pub(super) fn take(&mut self, cx: &Context<'_>) -> Poll<Result<(i32, Held), Gone>> {
+    /// Makes the output from the result and the resources in their slot when they are ready, before
+    /// the home can use the slot again, and otherwise registers the waker of `cx`. It has no poll
+    /// budget: the driver of a later operation of the direction takes the result of an operation
+    /// with it, outside the poll of a task.
+    pub(super) fn take_with<T>(
+        &mut self,
+        cx: &Context<'_>,
+        take: impl FnOnce(i32, &mut Held, &Self) -> T,
+    ) -> Poll<Result<T, Gone>> {
         let id = self.id;
         let Some(entry) = self.entry() else {
             return Poll::Ready(Err(Gone));
         };
-        let output = entry.poll_take(cx, id);
+        let output = entry.poll_take(cx, id, |result, held| take(result, held, self));
         if output.is_ready() {
             self.done = true;
             // The home frees the slot at its next turn, and it needs no wake for that.
@@ -69,20 +72,22 @@ impl Completion {
     fn entry(&self) -> Option<&Entry<Held>> {
         self.shared.entries.get(self.id.index() as usize)
     }
-}
 
-impl Future for Completion {
-    type Output = Result<(i32, Held), Gone>;
-
+    /// The poll of the future of the operation: [`take_with`](Self::take_with), with the poll
+    /// budget of the task.
     #[expect(
         clippy::panic,
         reason = "a poll after `Ready` breaks the contract of `Future`, and the caller has no recovery path"
     )]
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    pub(super) fn poll_with<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        take: impl FnOnce(i32, &mut Held, &Self) -> T,
+    ) -> Poll<Result<T, Gone>> {
         if self.done {
             panic!("an `Operation` was polled after it gave `Ready`");
         }
-        crate::coop::poll(cx, |cx| self.take(cx))
+        crate::coop::poll(cx, |cx| self.take_with(cx, take))
     }
 }
 

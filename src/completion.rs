@@ -24,8 +24,8 @@
 #[cfg(all(test, loom))]
 mod explore;
 
-use core::mem::ManuallyDrop;
-use core::task::{Context, Poll};
+use core::mem::{DropGuard, ManuallyDrop};
+use core::task::{Context, Poll, ready};
 
 use crate::sync::UnsafeCell;
 use crate::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -124,10 +124,25 @@ impl<T> Entry<T> {
         self.waiter.wake();
     }
 
-    /// The consumer of `id` takes the result and the resources when they are ready, and otherwise
-    /// registers the waker of `cx`.
-    pub(crate) fn poll_take(&self, cx: &Context<'_>, id: OpId) -> Poll<Result<(i32, T), Gone>> {
-        self.waiter.poll_wait(cx, || self.try_take(id))
+    /// Claims the ready slot, makes the output in place, and drops the remaining resources.
+    /// The home can reuse the slot after the consumer ends its interest.
+    #[expect(
+        unsafe_code,
+        reason = "the successful claim gives this consumer exclusive access until it ends interest"
+    )]
+    pub(crate) fn poll_take<R>(
+        &self,
+        cx: &Context<'_>,
+        id: OpId,
+        take: impl FnOnce(i32, &mut T) -> R,
+    ) -> Poll<Result<R, Gone>> {
+        let result = ready!(self.waiter.poll_wait(cx, || self.claim(id)))?;
+        Poll::Ready(self.held.with_mut(|cell| {
+            // SAFETY: the consumer claimed READY and still holds its interest.
+            let held = unsafe { &mut *cell };
+            let mut held = DropGuard::new(held, |held| *held = None);
+            held.as_mut().map(|held| take(result, held)).ok_or(Gone)
+        }))
     }
 
     /// The consumer of `id` ends its wait: no later wake reaches its waker.
@@ -135,7 +150,7 @@ impl<T> Entry<T> {
         self.waiter.cancel();
     }
 
-    fn try_take(&self, id: OpId) -> Option<Result<(i32, T), Gone>> {
+    fn claim(&self, id: OpId) -> Option<Result<i32, Gone>> {
         let state = self.state.load(Ordering::Acquire);
         let ready = word(id, READY);
         if state == ready
@@ -144,8 +159,7 @@ impl<T> Entry<T> {
                 .compare_exchange(ready, word(id, TAKEN), Ordering::Acquire, Ordering::Acquire)
                 .is_ok()
         {
-            let result = self.result.load(Ordering::Relaxed);
-            return Some(self.take().map(|held| (result, held)).ok_or(Gone));
+            return Some(Ok(self.result.load(Ordering::Relaxed)));
         }
         (state != word(id, RUNNING)).then_some(Err(Gone))
     }

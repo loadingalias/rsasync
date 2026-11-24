@@ -673,7 +673,7 @@ pub(super) fn batch_completion(held: &mut Held, result: i32, buffer: Option<Back
 }
 
 /// The output of a UDP bind: the socket and its local address.
-pub(crate) fn bound(result: i32, mut held: Held) -> Option<io::Result<UdpSocket>> {
+pub(crate) fn bound(result: i32, held: &mut Held) -> Option<io::Result<UdpSocket>> {
     Some(super::tcp::count(result).and_then(|_| {
         let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
         let local = held
@@ -729,7 +729,7 @@ impl Driver {
         };
         let completion = self.begin(writer.as_mut().resource, Kind::SendTo, datagram, held)?;
         Ok(Operation::new(completion, |result, held| {
-            let Payload::SendTo { datagram, .. } = held.payload else {
+            let Payload::SendTo { datagram, .. } = core::mem::take(&mut held.payload) else {
                 return None;
             };
             let sent = super::tcp::count(result)
@@ -772,7 +772,7 @@ impl Driver {
             let Payload::Batch {
                 batch: Batch::Send(datagrams),
                 ..
-            } = held.payload
+            } = core::mem::take(&mut held.payload)
             else {
                 return None;
             };
@@ -811,7 +811,7 @@ impl Driver {
             let Payload::Receive { received: facts, .. } = held.payload else {
                 return None;
             };
-            Some((received(result, facts), held.loan?.into_inner()))
+            Some((received(result, facts), held.loan.take()?.into_inner()))
         }))
     }
 
@@ -848,6 +848,7 @@ impl Driver {
             };
             let buffer = held
                 .loan
+                .take()
                 .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner);
             Some(received(result, facts).map(|received| (received, buffer)))
         }))
@@ -896,7 +897,7 @@ impl Driver {
             let Payload::Batch {
                 batch: Batch::Receive(arrivals),
                 ..
-            } = held.payload
+            } = core::mem::take(&mut held.payload)
             else {
                 return None;
             };

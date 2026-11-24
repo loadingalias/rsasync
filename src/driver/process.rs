@@ -299,22 +299,18 @@ impl Future for Wait<'_> {
         let status = match child.status {
             Some(status) => status,
             None => {
-                let Poll::Ready(taken) = Pin::new(&mut child.exit).poll(cx) else {
+                let Poll::Ready(taken) = child
+                    .exit
+                    .poll_with(cx, |result, held, _| match (result, &held.payload) {
+                        (0, Payload::Exit(info)) => Ok(Ok(status(info))),
+                        // Only teardown cancels an exit operation, and the driver then ends first.
+                        (result, _) if result == -ECANCELED => Err(Ended),
+                        (result, _) => Ok(Err(result.min(-1).saturating_neg())),
+                    })
+                else {
                     return Poll::Pending;
                 };
-                let status = match taken {
-                    Ok((
-                        0,
-                        Held {
-                            payload: Payload::Exit(info),
-                            ..
-                        },
-                    )) => Ok(Ok(status(&info))),
-                    // Only teardown cancels an exit operation, and the driver then ends first.
-                    Ok((result, _)) if result == -ECANCELED => Err(Ended),
-                    Ok((result, _)) => Ok(Err(result.min(-1).saturating_neg())),
-                    Err(_) => Err(Ended),
-                };
+                let status = taken.unwrap_or(Err(Ended));
                 *child.status.insert(status)
             }
         };
@@ -827,13 +823,16 @@ fn again_poll(slot: &Slot) -> Option<Sqe> {
 }
 
 /// The output of a spawn: the child, or the error of the spawn.
-pub(crate) fn spawned_child(result: i32, held: Held) -> Option<io::Result<Child>> {
-    Some(match held.payload {
-        Payload::Spawn { child: Some(child), .. } if result >= 0 => Ok(child),
-        _ => Err(io::Error::from_raw_os_error(
-            result.checked_neg().filter(|errno| *errno > 0).unwrap_or(EIO),
-        )),
-    })
+pub(crate) fn spawned_child(result: i32, held: &mut Held) -> Option<io::Result<Child>> {
+    if result >= 0
+        && let Payload::Spawn { child, .. } = &mut held.payload
+        && let Some(child) = child.take()
+    {
+        return Some(Ok(child));
+    }
+    Some(Err(io::Error::from_raw_os_error(
+        result.checked_neg().filter(|errno| *errno > 0).unwrap_or(EIO),
+    )))
 }
 
 impl Driver {

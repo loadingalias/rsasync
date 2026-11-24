@@ -123,7 +123,7 @@ pub struct IpcStream {
 }
 
 /// The output of a bind of an IPC listener.
-pub(crate) fn ipc_bound(result: i32, held: Held) -> Option<io::Result<IpcListener>> {
+pub(crate) fn ipc_bound(result: i32, held: &mut Held) -> Option<io::Result<IpcListener>> {
     Some(tcp::count(result).and_then(|_| {
         let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
         Ok(IpcListener { resource })
@@ -131,7 +131,7 @@ pub(crate) fn ipc_bound(result: i32, held: Held) -> Option<io::Result<IpcListene
 }
 
 /// The output of a connect or an accept of an IPC stream.
-pub(crate) fn ipc_connected(result: i32, held: Held) -> Option<io::Result<IpcStream>> {
+pub(crate) fn ipc_connected(result: i32, held: &mut Held) -> Option<io::Result<IpcStream>> {
     Some(tcp::count(result).and_then(|_| {
         let resource = held.accepted.ok_or(io::ErrorKind::OutOfMemory)?;
         Ok(IpcStream::new(resource))

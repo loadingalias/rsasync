@@ -258,12 +258,12 @@ enum Place<'a> {
 /// A poll after the future gave `Ready` panics, as for the futures of the standard library.
 pub struct Operation<'a, T> {
     place: Place<'a>,
-    output: fn(i32, Held) -> Option<T>,
+    output: fn(i32, &mut Held) -> Option<T>,
     done: bool,
 }
 
 impl<'a, T> Operation<'a, T> {
-    const fn borrowed(direction: &'a mut Direction, output: fn(i32, Held) -> Option<T>) -> Self {
+    const fn borrowed(direction: &'a mut Direction, output: fn(i32, &mut Held) -> Option<T>) -> Self {
         Self {
             place: Place::Borrowed(direction),
             output,
@@ -288,7 +288,7 @@ impl<'a, T> Operation<'a, T> {
 }
 
 impl<T> Operation<'static, T> {
-    const fn owned(place: Direction, output: fn(i32, Held) -> Option<T>) -> Self {
+    const fn owned(place: Direction, output: fn(i32, &mut Held) -> Option<T>) -> Self {
         Self {
             place: Place::Owned(place),
             output,
@@ -308,14 +308,14 @@ impl<T> Future for Operation<'_, T> {
         if self.done {
             panic!("an `Operation` was polled after it gave `Ready`");
         }
+        let output = self.output;
         let direction = match &mut self.place {
             Place::Borrowed(direction) => &mut **direction,
             Place::Owned(direction) => direction,
         };
-        let taken = ready!(direction.poll(cx));
+        let taken = ready!(direction.poll(cx, output));
         self.done = true;
-        let output = taken.ok().and_then(|(result, held)| (self.output)(result, held));
-        Poll::Ready(output.ok_or(Ended))
+        Poll::Ready(taken.ok().flatten().ok_or(Ended))
     }
 }
 
