@@ -89,7 +89,7 @@ pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::
     };
     let pool = start.pool.clone();
     match prepare(start) {
-        Ok((owner, report, steal)) => {
+        Ok((mut owner, report, steal)) => {
             if let (Some(lane), Some(pool)) = (role, &pool) {
                 owner.attach(pool, lane);
             }

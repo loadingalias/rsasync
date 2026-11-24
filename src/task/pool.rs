@@ -30,10 +30,13 @@
 //!
 //! # Parks and balance
 //!
-//! A worker that finds no task parks: its root future gives `Pending`, and its home waits for a
-//! signal. It counts itself parked before a last look at each queue. A worker with more than one
-//! task in its queue, and each push to a list, wakes one parked worker when no worker searches.
-//! That wake only balances the work: the no-loss rule above does not need it.
+//! A worker that finds no task gives `Pending` from its root future. Its home then runs its local
+//! tasks and its driver, and it parks when they have no work. At that park, and not before, the
+//! worker counts itself parked, and then it looks one last time at each queue (`Pool::park`). So
+//! a worker that runs a local task is not parked. A worker with more than one task in its queue,
+//! and each push to a list, wakes one parked worker when no worker searches: that worker waits in
+//! its home, so it takes the work at once. That wake only balances the work: the no-loss rule
+//! above does not need it.
 //!
 //! # Admission and close
 //!
@@ -175,7 +178,7 @@ struct Lane {
     /// The shared part of the owner of the worker: a wake of its root future ends its park. The
     /// worker sets it before it runs, and detaches it at its end.
     owner: Late<Home>,
-    /// The worker counts itself parked.
+    /// The worker counts itself parked: its home waits ([`Pool::park`]).
     parked: AtomicBool,
     /// The cache domain of the worker: its first place in `Shared::order`, and its length.
     group: (u32, u32),
@@ -398,6 +401,7 @@ impl Shared {
     }
 
     /// Whether a queue or a list of a worker holds a task: the last look of a worker that parks.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn has_work(&self) -> bool {
         // Ordering: `Relaxed`: the fence before this look orders it, as in `balance`.
         self.lanes.iter().any(|lane| {
@@ -430,7 +434,7 @@ pub(crate) struct Pool {
 pub(crate) enum Turn {
     /// The turn polled its limit of tasks: the worker turns its driver and then runs again.
     Busy,
-    /// The worker found no task and counts itself parked.
+    /// The worker found no task. Its home can park, after [`Pool::park`].
     Idle,
     /// The pool closed and no task remains: the worker ends.
     Ended,
@@ -756,6 +760,35 @@ impl Pool {
         self.admission.load(Ordering::Acquire) == CLOSED
     }
 
+    /// Worker `lane` counts itself parked, at the park of its home, and then looks one last time at
+    /// each queue. Gives `false`, with the worker not parked, when a queue holds a task or the
+    /// pool ended: the worker then turns again and does not wait.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn park(&self, lane: u32) -> bool {
+        let shared = &*self.shared;
+        // Ordering: `Relaxed`: the counts are hints, and the fence orders them before the look.
+        shared.lanes[lane as usize].parked.store(true, Ordering::Relaxed);
+        shared.parked.fetch_add(1, Ordering::Relaxed);
+        // Ordering: see `balance`.
+        atomic::fence(Ordering::SeqCst);
+        let parked = !shared.has_work() && !self.ended();
+        if !parked {
+            self.unpark(lane);
+        }
+        parked
+    }
+
+    /// The park of worker `lane` ended, or did not start. A balance wake that selected the worker
+    /// took its mark already.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(crate) fn unpark(&self, lane: u32) {
+        let shared = &*self.shared;
+        // Ordering: `Relaxed`: the counts are hints.
+        if shared.lanes[lane as usize].parked.swap(false, Ordering::Relaxed) {
+            shared.parked.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     /// One turn of worker `lane` on this thread: it polls at most `TURN_TASKS` tasks of its queue,
     /// of its list, or of a steal. `start` is a random value for the order of the steal.
     pub(crate) fn turn(&self, lane: u32, start: u32) -> Turn {
@@ -768,11 +801,6 @@ impl Pool {
 
     fn run_turn(&self, lane: u32, start: u32) -> Turn {
         let shared = &*self.shared;
-        let mine = &shared.lanes[lane as usize];
-        // Ordering: `Relaxed`: the counts are hints.
-        if mine.parked.swap(false, Ordering::Relaxed) {
-            shared.parked.fetch_sub(1, Ordering::Relaxed);
-        }
         // The oldest entry of the own list runs first in each turn, so a queue that never empties
         // does not starve the list: a spawn or a wake from another thread, or a cancel.
         let mut polls = 0;
@@ -785,20 +813,7 @@ impl Pool {
         }
         for _ in polls..TURN_TASKS {
             let Some(slot) = self.next(lane).or_else(|| self.search(lane, start)) else {
-                if self.ended() {
-                    return Turn::Ended;
-                }
-                mine.parked.store(true, Ordering::Relaxed);
-                shared.parked.fetch_add(1, Ordering::Relaxed);
-                // Ordering: see `balance`.
-                atomic::fence(Ordering::SeqCst);
-                if shared.has_work() || self.ended() {
-                    if mine.parked.swap(false, Ordering::Relaxed) {
-                        shared.parked.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    return Turn::Busy;
-                }
-                return Turn::Idle;
+                return if self.ended() { Turn::Ended } else { Turn::Idle };
             };
             self.run(lane, slot);
             // A parked worker that this turn woke steals only after the flush of the wake.

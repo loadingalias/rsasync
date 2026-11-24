@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 use core::assert_matches;
-use core::future::{Future, pending, poll_fn};
+use core::future::{Future, poll_fn};
 use core::mem;
 use core::net::SocketAddr;
 use core::pin::Pin;
@@ -72,9 +72,8 @@ struct Blocked(#[expect(dead_code, reason = "the drop of the sender ends the blo
 /// The task spawns a local task, which stays on the worker of this poll. That worker polls it
 /// after its movable tasks: it starts a thread and then blocks the worker. The thread wakes the
 /// movable task. The wake comes from no worker, so it queues the task at its last worker, which is
-/// blocked, and it wakes one parked worker. That one can be the blocked worker, which counts
-/// itself parked. So the thread also cancels a second movable task: the second wake of the pool
-/// starts at the next worker, and the other worker then takes the task.
+/// blocked, and it wakes one parked worker. The blocked worker does not wait in its home, so it
+/// is not parked (R411), and the other worker takes the task.
 async fn leave() -> Blocked {
     let from = thread::current().id();
     let (release, blocked) = mpsc::channel::<()>();
@@ -85,12 +84,8 @@ async fn leave() -> Blocked {
         }
         if let Some(blocked) = blocked.take() {
             let waker = cx.waker().clone();
-            let second = task::spawn_movable(pending::<()>()).unwrap().cancel_handle();
             let blocker = task::spawn_local(async move {
-                thread::spawn(move || {
-                    waker.wake();
-                    second.cancel();
-                });
+                thread::spawn(move || waker.wake());
                 // The drop of the sender ends the wait, with an error.
                 assert!(blocked.recv().is_err());
             });
@@ -177,6 +172,29 @@ fn a_task_that_another_worker_takes_during_its_receive_gets_the_bytes_on_that_wo
     };
     assert_eq!((received, bytes.as_slice()), (4, b"ping".as_slice()));
     assert!(elsewhere, "the other worker took the result");
+}
+
+/// R411: a worker counts itself parked only while its home waits. So one wake from a thread that
+/// is no worker, for a task in the list of a worker that runs a local task, goes to the worker
+/// that waits, and that one takes the task. The task leaves its worker eight times, with one wake
+/// each time. A pool that counts a worker parked while it runs a local task gives a part of these
+/// wakes to the blocked worker, and the task then stays in its list.
+#[test]
+fn a_wake_from_no_worker_goes_to_the_worker_that_waits_and_not_to_one_that_runs_a_local_task() {
+    let runtime = runtime();
+    let task = runtime
+        .handle()
+        .unwrap()
+        .spawn_movable(async {
+            for _ in 0..8 {
+                let home = thread::current().id();
+                let blocked = leave().await;
+                assert_ne!(thread::current().id(), home, "the other worker took the task");
+                drop(blocked);
+            }
+        })
+        .unwrap();
+    assert_matches!(task.join_blocking(), Outcome::Completed(()));
 }
 
 /// R402: a cancel on another worker reaches the home of the operation, which ends it. The peer

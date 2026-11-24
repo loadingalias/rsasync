@@ -37,7 +37,9 @@ that other threads woke on it, and then the tasks that it steals. Each task poll
 budget as a local task. When the worker polled 256 tasks, its owner runs steps 2 to 5 above, and
 the pool runs again. A poll that wakes an idle worker also ends the turn early, so that worker
 gets its wake at once and can steal. When the worker found no task, it waits as step 6 says, until
-a wake, a spawn, or another worker ends the wait.
+a wake, a spawn, or another worker ends the wait. Only a worker that waits is idle. A worker that
+runs a local task is not idle, so a wake of the pool goes to a worker that waits, and that worker
+can steal the movable tasks of the busy one.
 
 A turn of the driver of the worker can make several movable tasks ready at one time, for example
 when the data of several streams came. The second task that it queues wakes an idle worker. The

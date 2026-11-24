@@ -35,6 +35,9 @@ use crate::timer::Timers;
 /// A local owner whose home waits in the ring of its driver.
 pub(crate) struct RingOwner {
     local: Rc<Local>,
+    /// The pool and the lane of a movable worker ([`RingOwner::attach`]): its home counts the
+    /// worker parked at each park.
+    pool: Option<(Arc<super::Pool>, u32)>,
 }
 
 impl RingOwner {
@@ -50,6 +53,7 @@ impl RingOwner {
         local.sends.set(true);
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
+            pool: None,
         })
     }
 
@@ -66,6 +70,7 @@ impl RingOwner {
         local.lazy.set(Some((config, blocking)));
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
+            pool: None,
         })
     }
 
@@ -81,9 +86,10 @@ impl RingOwner {
     }
 
     /// Makes this owner worker `lane` of `pool`: a push to the list of the worker wakes the root
-    /// future of this owner.
-    pub(crate) fn attach(&self, pool: &super::Pool, lane: u32) {
+    /// future of this owner, and each park of this owner counts the worker parked.
+    pub(crate) fn attach(&mut self, pool: &Arc<super::Pool>, lane: u32) {
         pool.attach(lane, Arc::clone(self.local.shared()));
+        self.pool = Some((Arc::clone(pool), lane));
     }
 
     /// The side of this owner that another thread uses to spawn on it.
@@ -101,7 +107,8 @@ impl RingOwner {
     /// As for [`RingOwner::block_on`].
     pub(crate) fn serve<F: Future<Output = (Drain, u64)>>(self, root: F) -> Result<Ended, Failure> {
         let mut enter = Enter::new(&self.local);
-        let output = self.local.block_on(root, &mut Drive);
+        let worker = self.pool.as_ref().map(|(pool, lane)| (&**pool, *lane));
+        let output = self.local.block_on(root, &mut Drive(worker));
         enter.ended = output.is_ok();
         let (drain, sent) = output?;
         let cancelled = self.local.cancelled.get();
@@ -153,7 +160,7 @@ impl RingOwner {
     /// `OwnerFailed`. If the teardown fails, the output of `root` drops.
     pub(crate) fn block_on<F: Future>(self, root: F) -> Result<F::Output, Failure> {
         let mut enter = Enter::new(&self.local);
-        let output = self.local.block_on(root, &mut Drive);
+        let output = self.local.block_on(root, &mut Drive(None));
         enter.ended = output.is_ok();
         let output = output?;
         // The slot stays borrowed through the teardown, and the owner makes no other driver: a
@@ -212,27 +219,12 @@ impl Drop for RingOwner {
 }
 
 /// The work and the wait of a home that can have a ring: the driver of the owner, while it has
-/// one, and else its thread.
-struct Drive;
+/// one, and else its thread. A worker of a pool has its pool and its lane.
+struct Drive<'a>(Option<(&'a super::Pool, u32)>);
 
-impl Park for Drive {
-    type Error = Failure;
-
-    fn drive(&mut self, local: &Local) -> Result<bool, Failure> {
-        self.check(local)?;
-        let mut driver = local.driver.borrow_mut();
-        let Some(driver) = driver.as_mut() else {
-            return Ok(false);
-        };
-        flush(local, driver);
-        Ok(driver.turn().map_err(Failure::Driver)?.more())
-    }
-
-    fn check(&mut self, local: &Local) -> Result<(), Failure> {
-        local.failure.take().map_or(Ok(()), |error| Err(Failure::Start(error)))
-    }
-
-    fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Failure> {
+impl Drive<'_> {
+    /// Waits in the driver of the owner, or parks its thread.
+    fn wait(local: &Local, until: Option<Until>) -> Result<(), Failure> {
         // The home got its ring in this turn. A wake that did not see the ring unparked the thread,
         // so the next turn takes the list and the root flag before a wait in the ring.
         if local.switched.take() {
@@ -250,6 +242,40 @@ impl Park for Drive {
             None => driver.wait(),
         }
         .map_err(Failure::Driver)
+    }
+}
+
+impl Park for Drive<'_> {
+    type Error = Failure;
+
+    fn drive(&mut self, local: &Local) -> Result<bool, Failure> {
+        self.check(local)?;
+        let mut driver = local.driver.borrow_mut();
+        let Some(driver) = driver.as_mut() else {
+            return Ok(false);
+        };
+        flush(local, driver);
+        Ok(driver.turn().map_err(Failure::Driver)?.more())
+    }
+
+    fn check(&mut self, local: &Local) -> Result<(), Failure> {
+        local.failure.take().map_or(Ok(()), |error| Err(Failure::Start(error)))
+    }
+
+    fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Failure> {
+        let Some((pool, lane)) = self.0 else {
+            return Self::wait(local, until);
+        };
+        // A worker of a pool counts itself parked only for this wait, so a balance wake of the
+        // pool goes to a worker that waits, not to one that runs a local task. A queue of the
+        // pool that holds a task ends the park before the wait, and the root future turns again.
+        if !pool.park(lane) {
+            local.shared().wake_root();
+            return Ok(());
+        }
+        let waited = Self::wait(local, until);
+        pool.unpark(lane);
+        waited
     }
 }
 
