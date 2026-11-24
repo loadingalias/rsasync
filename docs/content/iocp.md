@@ -11,7 +11,7 @@ not in a published release yet.
 
 ## Select the backend
 
-The driver has two backends on Windows x86_64 (`x86_64-pc-windows-msvc`):
+The driver has two backends on Windows x86_64 and ARM64.
 
 | `Config` | The system has IoRing version 3 or later | The system has no such ring |
 | --- | --- | --- |
@@ -181,7 +181,7 @@ The probed versions:
 | System | IoRing | Files |
 | --- | --- | --- |
 | Windows Server 2025, build 10.0.26100.33822 | Version 4 at most, with each operation of the probe | Reads, writes, and syncs on the ring; the rest as on IOCP |
-| Windows 11 | Not run | Not run |
+| Windows 11 Enterprise ARM64, build 10.0.26300.9974 | Version 4 at most. The driver opens version 3 | The native tests use the ring for file I/O |
 
 A close of the ring ends no operation: the kernel still writes the buffer of an operation after the
 close. So the drop of a driver closes its ring only when no operation of the ring runs, and else
@@ -264,6 +264,5 @@ inspection and change, preallocation, sync, rename, unlink, and the NVMe report.
 ## Limits
 
 - TCP, UDP, files, and IPC streams only. Pipes, processes, and signals have no Windows form yet.
-- Windows x86_64 only. Windows on aarch64 has no run evidence.
-- IoRing has run evidence only on Windows Server 2025. Windows 11 is not run.
+- The driver-only API has run evidence on Windows Server 2025 x86_64 and Windows 11 ARM64.
 - The ring registers no file handle and no buffer: each entry names its handle and its buffer.

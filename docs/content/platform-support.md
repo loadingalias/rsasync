@@ -175,13 +175,16 @@ cargo xtask test -p rsnetwork-udp --features macos-private-batch
 
 ## Windows
 
-The datagram calls of `rsnetwork-udp` also support Windows on x86_64 (`x86_64-pc-windows-msvc`): see
-[Datagram I/O on any socket](datagram-io.md#windows). The driver runs TCP, UDP, files, and IPC
-streams on Windows x86_64, on an [I/O completion port](iocp.md), in driver-only use. Where the
-system has an I/O ring of version 3, the reads, writes, and syncs of files run on the ring
-([IoRing files](iocp.md#ioring-files)). The files run on NTFS, with the other file calls on your
-blocking service ([Files](iocp.md#files)). Pipes, processes, and signals of the driver have no
-Windows form yet. CI does not run on Windows.
+The datagram API and the driver-only API run on Windows x86_64 and ARM64.
+The targets are `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
+The driver runs TCP, UDP, files, and IPC streams on an I/O completion port.
+[Datagram I/O](datagram-io.md#windows) and [I/O completion ports](iocp.md).
+
+On NTFS, the IoRing backend reads, writes, and syncs files on a version 3 ring.
+The route for each other file operation depends on the call.
+[IoRing files](iocp.md#ioring-files) and [IOCP files](iocp.md#files).
+
+The Windows driver has no API for pipes, processes, or signals yet. CI runs on other targets.
 
 On 2026-11-15, these runs passed on an AWS EC2 c8i.2xlarge instance with
 Windows Server 2025, OS build 10.0.26100.33822. The tests use Tokio sockets. Revision `285cc44` has
@@ -221,8 +224,14 @@ They include the 14 file cases of the driver suites on IoRing, and the same case
 `Backend::Iocp`. The permissive selection gave `Backend::IoRing`. In the same run, the header check
 matched 22 values, 22 layouts, and 15 signatures of the IoRing and loader declarations.
 
-The IOCP driver, IoRing file operations, and datagram API compile for
-`aarch64-pc-windows-msvc`. The Windows 11 ARM64 run is pending.
+On 2026-11-24 UTC, the native ARM64 suite passed on an Azure Cobalt 100 in West US 3.
+The `Standard_D8ps_v6` host ran Windows 11 Enterprise build `10.0.26300.9974` from image
+`MicrosoftWindowsDesktop:windows11preview-arm64:win11-26h2-ent:26300.9974.261109`.
+At revision `d85222f`, 319 tests and 43 doctests passed. Nextest skipped four tests.
+
+The run passed 54 IOCP cases, 15 IoRing file cases, and all 14 tests of `rsnetwork-udp`.
+The backend selection test also checked the route for each file call. The system reported
+IoRing version 4 as its maximum. The driver used version 3.
 
 ## WebAssembly
 
