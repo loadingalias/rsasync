@@ -179,7 +179,10 @@ With the feature, these limits also apply:
 On Windows, a send uses `WSASendMsg`, and a receive uses `WSARecvMsg`, which the crate gets one
 time from `WSAIoctl`. A segment size (USO) is the control message `UDP_SEND_MSG_SIZE`. After
 `set_uro(socket, true)`, a coalesced receive (URO) reports its segment size from
-`UDP_COALESCED_INFO`. The ECN codepoint is `IP_ECN` or `IPV6_ECN` on send and on receive, after
+`UDP_COALESCED_INFO`. Windows can still deliver each datagram separately. Its segment size is then
+`None`. [Winsock UDP socket options](https://learn.microsoft.com/en-us/windows/win32/winsock/ipproto-udp-socket-options)
+
+The ECN codepoint is `IP_ECN` or `IPV6_ECN` on send and on receive, after
 `configure`. A datagram larger than the buffer fills the buffer, and the receive reports
 `truncated`. A stack that refuses a segment size gives `Refused::NoSegmentation`. A batch is one
 `WSASendMsg` or `WSARecvMsg` for each datagram.

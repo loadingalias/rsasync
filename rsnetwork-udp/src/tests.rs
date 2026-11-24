@@ -232,8 +232,8 @@ fn one_segmented_send_arrives_as_one_datagram_for_each_segment() {
     });
 }
 
-/// With coalesced receive (GRO, URO), the same batch arrives as one coalesced receive with its
-/// segment size, and no other datagram follows it.
+/// Each receive preserves the datagram boundaries and the short final datagram.
+/// A receive that combines datagrams reports their segment size. No extra datagram follows.
 #[cfg(any(target_os = "linux", windows))]
 #[test]
 fn a_coalesced_receive_reports_its_segment_size() {
@@ -248,9 +248,21 @@ fn a_coalesced_receive_reports_its_segment_size() {
         send_on(&sender, &transmit).await.unwrap();
 
         let mut buffer = [0; 8192];
-        let received = recv_on(&receiver, &mut buffer).await;
-        assert_eq!((received.len, received.metadata.segment_size), (3500, Some(1000)));
-        assert_eq!(&buffer[..received.len], contents);
+        let mut expected = contents.chunks(1000);
+        for _ in 0..expected.len() {
+            let received = recv_on(&receiver, &mut buffer).await;
+            #[cfg(target_os = "linux")]
+            assert_eq!(received.len, contents.len(), "Linux loopback combines this send");
+            assert!(received.len > 0 && !received.truncated);
+            assert_eq!(received.metadata.segment_size, (received.len > 1000).then_some(1000));
+            for segment in buffer[..received.len].chunks(1000) {
+                assert_eq!(Some(segment), expected.next());
+            }
+            if expected.len() == 0 {
+                break;
+            }
+        }
+        assert_eq!(expected.len(), 0);
         let next = recv(receiver.handle(), &mut buffer).unwrap_err();
         assert_eq!(next.kind(), io::ErrorKind::WouldBlock);
     });

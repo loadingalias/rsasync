@@ -157,3 +157,17 @@ const _: () = {
     // information.
     assert!((CMSG_HEADER + 4).next_multiple_of(8) * 3 + (CMSG_HEADER + 20).next_multiple_of(8) <= Control::LEN);
 };
+
+#[test]
+fn a_winsock_coalesced_info_message_returns_its_segment_size() {
+    // Windows SDK layout on both 64-bit targets. The DWORD after the WSACMSGHDR holds 1200.
+    let message = [
+        20, 0, 0, 0, 0, 0, 0, 0, // cmsg_len
+        17, 0, 0, 0, // IPPROTO_UDP
+        3, 0, 0, 0, // UDP_COALESCED_INFO
+        0xb0, 0x04, 0, 0,
+    ];
+    let mut control = Control::new();
+    control.bytes[..message.len()].copy_from_slice(&message);
+    assert_eq!(control.decode(message.len()).segment_size, Some(1200));
+}

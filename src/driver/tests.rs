@@ -1818,9 +1818,8 @@ fn receive(driver: &mut Driver, socket: &mut UdpSocket, capacity: usize) -> (Rec
     (received.expect("the receive works"), buffer.bytes().to_vec())
 }
 
-/// One send with a segment size sends one datagram for each segment, all of them, and its report
-/// counts them. A receiver with no GRO gets each segment as a datagram; a receiver with GRO gets
-/// them in one receive, with their segment size. On IPv4 and IPv6.
+/// A segmented send reports the number of datagrams. Each datagram keeps its bytes on IPv4 and IPv6.
+/// A receive that combines datagrams reports their segment size.
 #[cfg(not(target_os = "macos"))]
 pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesced_receive_reports_its_segment_size(
     backend: Backend,
@@ -1850,9 +1849,23 @@ pub(in crate::driver) fn a_segmented_send_arrives_as_its_datagrams_and_a_coalesc
                 "the segments came out of order"
             );
         }
-        let (received, bytes) = receive(&mut driver, &mut coalescing, 8000);
-        assert_eq!((received.len, received.metadata.segment_size), (4000, Some(1000)));
-        assert!(bytes == numbered(0, 4000), "the coalesced bytes differ");
+        let contents = numbered(0, 4000);
+        let mut expected = contents.chunks(1000);
+        for _ in 0..expected.len() {
+            let (received, bytes) = receive(&mut driver, &mut coalescing, 8000);
+            #[cfg(target_os = "linux")]
+            assert_eq!(received.len, contents.len(), "Linux loopback combines this send");
+            assert_eq!(received.len, bytes.len());
+            assert!(!bytes.is_empty() && !received.truncated);
+            assert_eq!(received.metadata.segment_size, (received.len > 1000).then_some(1000));
+            for segment in bytes.chunks(1000) {
+                assert_eq!(Some(segment), expected.next());
+            }
+            if expected.len() == 0 {
+                break;
+            }
+        }
+        assert_eq!(expected.len(), 0);
     }
 }
 
