@@ -363,10 +363,17 @@ pub(in crate::driver) fn the_driver_never_reaps_a_child_that_the_test_starts_its
         "the test's own child ends"
     );
 
-    let adopted = sh("exit 4").spawn().expect("the test host runs sh");
+    // The child waits for the end of its input, which the test keeps until after the adoption. A
+    // child that ended before the adoption gets the refusal `Reason::Exited`.
+    let mut adopted = sh("read line; exit 4")
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("the test host runs sh");
+    let input = adopted.stdin.take();
     let mut adopted = driver
         .adopt_child(adopted, End::Keep)
         .expect("the test driver has room");
+    drop(input);
     let status = drive(&mut driver, adopted.wait()).expect("the driver runs");
     assert_eq!(status.expect("the wait works").code(), Some(4));
     let mut spawned = spawn(&mut driver, sh("exit 5"), ChildOptions::new());
