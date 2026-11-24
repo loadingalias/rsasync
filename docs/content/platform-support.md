@@ -221,7 +221,8 @@ They include the 14 file cases of the driver suites on IoRing, and the same case
 `Backend::Iocp`. The permissive selection gave `Backend::IoRing`. In the same run, the header check
 matched 22 values, 22 layouts, and 15 signatures of the IoRing and loader declarations.
 
-Windows 11 is not run, and Windows on aarch64 has no run evidence yet.
+The IOCP driver, IoRing file operations, and datagram API compile for
+`aarch64-pc-windows-msvc`. The Windows 11 ARM64 run is pending.
 
 ## WebAssembly
 

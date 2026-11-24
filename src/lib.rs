@@ -36,21 +36,15 @@ pub mod channel;
 #[cfg(any(
     all(test, loom),
     all(
-        any(
-            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-            all(target_os = "windows", target_arch = "x86_64")
-        ),
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(target_arch = "x86_64", target_arch = "aarch64"),
         feature = "std"
     )
 ))]
 #[cfg_attr(
     not(all(
-        any(
-            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-            all(target_os = "windows", target_arch = "x86_64")
-        ),
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(target_arch = "x86_64", target_arch = "aarch64"),
         feature = "std"
     )),
     expect(dead_code, reason = "with no driver, only the exploration tests use the entries")
@@ -62,11 +56,8 @@ mod memory;
 mod sync;
 #[cfg_attr(
     not(all(
-        any(
-            all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-            all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-            all(target_os = "windows", target_arch = "x86_64")
-        ),
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(target_arch = "x86_64", target_arch = "aarch64"),
         feature = "std"
     )),
     expect(dead_code, reason = "only the driver uses the table, and this target has no driver")
@@ -97,11 +88,8 @@ pub mod timer;
 /// Driver-only use of the driver: on io_uring or epoll on Linux, on kqueue on macOS, and on IOCP,
 /// with IoRing for files where the system has it, on Windows.
 #[cfg(all(
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-        all(target_os = "windows", target_arch = "x86_64")
-    ),
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     feature = "std"
 ))]
 pub mod driver;
@@ -111,11 +99,8 @@ pub mod driver;
 // kqueue and IOCP backends take the same submission entries and post the same completions, so they
 // use only those types of the module.
 #[cfg(all(
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-        all(target_os = "windows", target_arch = "x86_64")
-    ),
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     feature = "std"
 ))]
 #[cfg_attr(

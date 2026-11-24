@@ -30,7 +30,7 @@
 //!
 //! Each item agrees with the Linux 6.1 headers on x86_64 and aarch64, with the macOS 27.2 SDK on
 //! aarch64, and with the Windows 11 SDK on x86_64, as the `sys` module names them.
-//! The macOS declarations also compile and link for x86_64.
+//! The macOS declarations also compile and link for x86_64. The Windows declarations also compile for aarch64.
 //!
 //! With Tokio, each call runs in `UdpSocket::try_io`, which clears the readiness of the socket
 //! when the call gives `WouldBlock`:
@@ -96,82 +96,71 @@
 #[cfg(feature = "std")]
 extern crate std;
 
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod addr;
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod datagram;
 #[cfg(all(
     feature = "std",
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-        all(target_os = "windows", target_arch = "x86_64")
-    )
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod probe;
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod unix;
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod windows;
 
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use addr::{AF_INET, AF_INET6, SaFamily, SockAddrIn, SockAddrIn6, SockAddrStorage};
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-    all(target_os = "windows", target_arch = "x86_64")
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use datagram::{Ecn, Metadata, Transmit};
-#[cfg(any(
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-    all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use unix::{Control, sys};
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(target_os = "windows", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use windows::{Control, sys};
 
 #[cfg(all(
     feature = "std",
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-        all(target_os = "windows", target_arch = "x86_64")
-    )
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use datagram::{BATCH, Received, Refused};
 #[cfg(all(
     feature = "std",
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-        all(target_os = "windows", target_arch = "x86_64")
-    )
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use probe::{Probe, Reason, Verdict};
 #[cfg(all(
     feature = "std",
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64"))
-    )
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use unix::io::{configure, recv, recv_batch, send, send_batch, set_dont_fragment};
-#[cfg(all(feature = "std", target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(
+    feature = "std",
+    target_os = "windows",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub use windows::io::{configure, recv, recv_batch, send, send_batch, set_dont_fragment, set_uro};
 
 #[cfg(all(
@@ -185,10 +174,7 @@ pub use unix::io::set_gro;
 #[cfg(test)]
 #[cfg(all(
     feature = "std",
-    any(
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
-        all(target_os = "macos", any(target_arch = "aarch64", target_arch = "x86_64")),
-        all(target_os = "windows", target_arch = "x86_64")
-    )
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod tests;

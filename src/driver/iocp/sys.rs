@@ -1,5 +1,5 @@
 //! The declarations of the completion port, the overlapped socket calls, and the NT statuses that
-//! the IOCP backend uses, on Windows x86_64.
+//! the IOCP backend uses on 64-bit Windows.
 //!
 //! Each item agrees with the Windows 11 SDK that the Visual Studio Build Tools 18.11.1 install:
 //! `minwinbase.h` (`OVERLAPPED`, `OVERLAPPED_ENTRY`), `ioapiset.h` (`CreateIoCompletionPort`,
