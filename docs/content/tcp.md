@@ -259,3 +259,90 @@ The local types differ from the driver types in two points:
   the `block_on` of the resource does nothing, because that `block_on` closed the socket.
 
 For one listener on each worker, see [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker).
+
+## Use TCP from a movable task
+
+A [movable task](runtime.md#spawn-movable-work) uses `rsasync::movable::TcpListener` and
+`rsasync::movable::TcpStream` (Linux, on io_uring). They are `Send`, so the task keeps them on each
+worker that polls it. A movable resource has no home. It owns its socket, and only its operations
+have a home:
+
+- A call submits its operation to the driver of the worker that polls the task at that time. That
+  driver is the home of the operation until its terminal event.
+- When an idle worker steals the task, an operation that runs stays at its home, which stays
+  driven. Its future gives the result on the worker that polls the task then.
+- The next operation goes to the driver of that worker, with no message to another thread.
+- A cancel, a drop, or a close sends a request to the home of each operation that runs. Only that
+  home cancels the operation in its ring.
+
+| Movable call | Same meaning as |
+| --- | --- |
+| `TcpListener::bind(address, options)`, `listener.local_addr()` | `Driver::bind`, `TcpListener::local_addr` |
+| `listener.accept()` | `Driver::accept` |
+| `TcpStream::connect(address, options)` | `Driver::connect` |
+| `stream.recv(backing)`, `stream.send(lease)` | `Driver::recv`, `Driver::send` |
+| `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
+
+Each call gives a `rsasync::movable::Operation` future, with `cancel()` and the same outputs as
+on the driver. The halves of a stream, a vectored send, a half-close, the option calls, and the
+other kinds of resource are not movable calls yet.
+
+```rust
+use rsasync::buffer::{Backing, Buffer as _, Lease};
+use rsasync::driver::TcpOptions;
+use rsasync::movable::{TcpListener, TcpStream};
+use rsasync::runtime::Runtime;
+use rsasync::task::{self, Outcome};
+
+let runtime = Runtime::builder().movable_workers(2).build()?;
+runtime.block_on(async {
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse()?, TcpOptions::default())?.await??;
+    let address = listener.local_addr();
+    // The listener and its stream go with the task to each worker that polls it.
+    let server = task::spawn_movable(async move {
+        let (mut stream, _peer) = listener.accept().ok()?.await.ok()?.ok()?;
+        let (received, buffer) = stream.recv(Backing::from(Vec::with_capacity(64))).ok()?.await.ok()?;
+        let (sent, _lease) = stream.send(Lease::from(buffer)).ok()?.await.ok()?;
+        stream.close().ok()?.await.ok()?;
+        Some((received.ok()?, sent.ok()?))
+    });
+
+    let mut client = TcpStream::connect(address, TcpOptions::default())?.await??;
+    let (sent, _lease) = client.send(Lease::from(b"ping".to_vec()))?.await?;
+    assert_eq!(sent?, 4);
+    let (received, buffer) = client.recv(Backing::from(Vec::with_capacity(64)))?.await?;
+    assert_eq!(&buffer.bytes()[..received?], b"ping");
+    client.close()?.await?;
+
+    let Ok(server) = server else {
+        return Err("the runtime has no movable worker".into());
+    };
+    assert!(matches!(server.join().await, Outcome::Completed(Some((4, 4)))));
+    Ok::<(), Box<dyn std::error::Error>>(())
+})??;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The rules of this page apply, with these differences from the local types:
+
+- Each direction still runs one operation at a time, and a dropped receive leaves its bytes to
+  the next receive. The stream keeps a dropped operation, not a driver. An operation that starts
+  while a dropped one of its direction still runs gets its slot at once, at the driver of its own
+  worker. That driver waits for the end of the dropped operation, takes what it left, and then
+  starts the new one. So an accepted operation never refuses later, a dropped send that waits
+  still runs, and the bytes of the stream keep their order when the two operations have different
+  homes.
+- A cancel of an operation that still waits for a dropped one ends it at once, as on the driver.
+- A call never refuses with `Reason::Resource`, because no driver owns the resource. A call on a
+  thread with no driver refuses with `Reason::NoDriver`. A call when the allocator gives no
+  memory for the wait refuses with `Reason::Allocation`.
+- A call on a worker that runs on [epoll](epoll.md) refuses with `Reason::Unsupported`. Only
+  io_uring takes an operation for a descriptor that its driver does not own.
+- A drop of a listener or a stream cancels each of its operations, a dropped send too. It needs
+  no driver, so it also works after the task moved or on a thread with no driver. The socket
+  closes when each operation ended.
+- The memory of a movable resource has no charge to the budget of the runtime yet.
+
+A completion waits while the worker of its home is in a poll, also when other workers are idle:
+only the worker that owns a ring takes its completions. Keep each poll short, or give long work
+to the blocking service.

@@ -32,6 +32,10 @@ if report.backend() == Backend::Epoll {
 A feature of `Config::require` is a feature of io_uring, so an epoll driver with a required feature
 refuses with `Error::Unsupported`.
 
+The movable I/O types (`rsasync::movable`) do not run on epoll. Each of their calls on a worker
+that runs on epoll refuses with `Reason::Unsupported`, and no operation waits there: see
+[TCP from a movable task](tcp.md#use-tcp-from-a-movable-task).
+
 ## How each operation runs
 
 | Operations | On epoll |

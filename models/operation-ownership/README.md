@@ -280,6 +280,18 @@ entry ends it at once, which is `Process` and then `Complete`.
 | The abort (`CompleteTx` with `abort`) | `tcp::abandon` sets `Sent::Lost` for an abort that no future took. `WriteFailed::sent` and `Closed::sent` then give `SendCount::Unknown` | — |
 | `Submit` and `Complete` of an exit operation (R219) | — | `Poller::arm`: epoll has a one-shot registration of the process descriptor. kqueue has a one-shot `EVFILT_PROC` registration with `NOTE_EXIT`, and a registration that gives `ESRCH` (the child ended first) posts its completion at once: the immediate completion of an exit before the start. A poll with no status yet waits in a one-shot `EVFILT_TIMER` on kqueue (`again_poll` in `src/driver/process.rs`) and is no event of the table |
 
+The movable resources (R402, `src/driver/plain.rs`). A movable resource owns its descriptor and the
+state of its directions, and each of its operations has its home at the driver of the thread that
+starts it. The table above applies, with these transitions for the actions of a direction:
+
+| Action | R402 transition |
+| --- | --- |
+| `BeginRx`, `BeginTx`, `BeginAc` | `Direction::begin` gives the operation the state of the direction and the earlier operation whose result no future took, in a `Chain`. `Driver::begin_plain` records the operation at the home of the caller. `Chain::settle` takes the result of the earlier operation from its own home (`Completion::take`) and applies the abandoned rule (`Directions::abandon`). Then `Chain::result` gives the kept result (`Directions::resume`), or `Driver::advance` submits. This is the "next operation in the direction" of reduction 3. An operation whose earlier operation still runs waits in `Driver::following`, which is reduction 13 with two homes |
+| `Drop`, `Forget` | The direction keeps the `Completion`, so no interest ends. `Operation::drop` posts `Request::Cancel` for a receive, an accept, or a connect (`Direction::forgo`). The next operation posts it for a forgotten one |
+| `Cancel` | `Operation::cancel` posts `Request::Cancel`. An operation that waits ends at its home with `ECANCELED` (`Driver::unfollow`), and its consumer takes the earlier operation of its chain over |
+| `TakeOver`, `CloseDone` | `Direction::close` gives the close the operations of both directions, with a cancel for each. `Chain::settle` takes each result, and `step` reports `Closed::sent` and drops the descriptor |
+| `EndTask` | The drop of the resource drops each `Tail`: `Request::Cancel` and `Request::EndInterest` go to the home of each operation, which releases its resources and its hold of the descriptor at its terminal event |
+
 ## Properties
 
 | Property | Acceptance text | Kind |

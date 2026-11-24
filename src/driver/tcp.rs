@@ -762,6 +762,262 @@ impl Directions {
         self.kept = Some(Kept::Connection { fd, peer, peer_len });
     }
 
+    /// Takes the connection that the listener keeps, with the address of its peer.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn take_connection(&mut self) -> Option<(Handle, SockAddrStorage, u32)> {
+        match self.kept.take() {
+            Some(Kept::Connection { fd, peer, peer_len }) => Some((fd, peer, peer_len)),
+            kept => {
+                self.kept = kept;
+                None
+            }
+        }
+    }
+
+    /// Whether the directions hold nothing for a later operation: no kept result, and no failure
+    /// and no count of the write direction.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn is_clear(&self) -> bool {
+        self.kept.is_none() && self.sent == Sent::Ok && self.unreported == 0
+    }
+
+    /// Takes from `earlier` the state of the direction of an operation of `kind`: what its receives
+    /// or accepts keep, or the progress of its sends.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn inherit(&mut self, earlier: &mut Self, kind: Kind) {
+        if kind.writes() {
+            (self.sent, self.unreported) = (earlier.sent, earlier.unreported);
+        } else {
+            self.kept = earlier.kept.take();
+        }
+    }
+
+    /// The report of a close of the resource.
+    pub(super) const fn closed(&self) -> Closed {
+        Closed { sent: self.count() }
+    }
+
+    /// The consumer of an operation of `kind` took its result. A send result that a future took
+    /// reports each byte up to its end.
+    pub(super) fn taken(&mut self, kind: Kind) {
+        if matches!(kind, Kind::Send | Kind::Vectored) && self.sent == Sent::Ok {
+            self.unreported = 0;
+        }
+    }
+
+    /// The abandoned rule for the result of an operation of `kind` whose consumer ended its
+    /// interest, with its resources `held`. Received bytes, the error of a receive, and an accepted
+    /// connection stay for the next operation of the direction. A send that failed, sent only part
+    /// of its bytes, or was cancelled makes the write direction fail.
+    pub(super) fn abandon(&mut self, kind: Kind, result: i32, held: Held) {
+        match kind {
+            Kind::Recv | Kind::Selected => {
+                let buffer = held.loan.map(WriteLoan::into_inner);
+                if held.copied > 0
+                    && let Some(Kept::Bytes { start, .. }) = &mut self.kept
+                {
+                    // The receive copied its bytes from the kept buffer, which still holds them.
+                    *start -= held.copied;
+                } else if let (Ok(received), Some(buffer)) = (usize::try_from(result), buffer)
+                    && received > 0
+                {
+                    let start = buffer.initialized() - received;
+                    self.kept = Some(Kept::Bytes { buffer, start });
+                } else if result < 0 && result != -ECANCELED && result != -ENOBUFS {
+                    self.kept = Some(Kept::Error(result));
+                }
+            }
+            Kind::Send | Kind::Vectored | Kind::Shutdown => {
+                if let Some(failed) = held.failed {
+                    // The future did not take the failure: the next send gives it.
+                    match failed.sent {
+                        SendCount::Sent(sent) => {
+                            self.unreported = self.unreported.saturating_add(sent);
+                            self.sent = Sent::Owe;
+                        }
+                        #[cfg(target_os = "windows")]
+                        SendCount::Unknown => self.sent = Sent::Lost,
+                        _ => {}
+                    }
+                    return;
+                }
+                if kind == Kind::Shutdown {
+                    return;
+                }
+                let sent = usize::try_from(result).unwrap_or(0);
+                let len = match &held.payload {
+                    Payload::Lease(lease) => lease.initialized(),
+                    Payload::Regions(regions) => regions.total(),
+                    _ => 0,
+                };
+                self.unreported = self.unreported.saturating_add(sent);
+                #[cfg(target_os = "windows")]
+                if result == -sys::WSAECONNABORTED {
+                    self.sent = Sent::Lost;
+                    return;
+                }
+                if (result < 0 || sent < len || held.cancelled) && self.sent == Sent::Ok {
+                    self.sent = Sent::Owe;
+                }
+            }
+            Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.payload) {
+                (
+                    Some(loan),
+                    Payload::Receive {
+                        received: Some(received),
+                        ..
+                    },
+                ) if result >= 0 => {
+                    self.kept = Some(Kept::Datagram {
+                        buffer: loan.into_inner(),
+                        received,
+                    });
+                }
+                _ if result < 0 && result != -ECANCELED && result != -ENOBUFS => {
+                    self.kept = Some(Kept::Error(result));
+                }
+                _ => {}
+            },
+            Kind::RecvBatch => match held.payload {
+                Payload::Batch {
+                    batch: Batch::Receive(arrivals),
+                    ..
+                } if !arrivals.is_empty() => {
+                    self.kept = Some(Kept::Arrivals(arrivals));
+                }
+                _ if result < 0 && result != -ECANCELED && result != -ENOBUFS && result != -EAGAIN => {
+                    self.kept = Some(Kept::Error(result));
+                }
+                _ => {}
+            },
+            // The connection that the accept took stays for the next accept.
+            Kind::Accept => {
+                if let Payload::Socket {
+                    peer,
+                    peer_len,
+                    connection: Some(fd),
+                } = held.payload
+                {
+                    self.keep_connection(fd, peer, peer_len);
+                }
+            }
+            // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
+            Kind::File(_) => {}
+            #[cfg(unix)]
+            Kind::Spawn(_) | Kind::Exit(_) => {}
+        }
+    }
+
+    /// Gives an operation of `kind`, with its resources `held`, the result that the direction holds
+    /// for it, with no submission: the bytes, the datagrams, or the error that an abandoned receive
+    /// left, or the failure of the write direction. `interest` gives whether the consumer of the
+    /// operation has interest. Adds the bytes that it copies to `copied`. Gives `None` when the
+    /// operation needs a submission. An accept takes its kept connection at its caller.
+    pub(super) fn resume(
+        &mut self,
+        held: &mut Held,
+        kind: Kind,
+        interest: impl Fn() -> bool,
+        copied: &mut u64,
+    ) -> Option<i32> {
+        match (kind, self.kept.take()) {
+            (Kind::Recv, Some(Kept::Bytes { buffer, mut start })) => {
+                let count = held.loan.as_mut().map_or(0, |loan| {
+                    loan.fill_from(buffer.bytes().get(start..).unwrap_or_default())
+                });
+                held.copied = count;
+                start += count;
+                if start < buffer.initialized() {
+                    self.kept = Some(Kept::Bytes { buffer, start });
+                }
+                *copied = copied.saturating_add(count as u64);
+                // The kept bytes came from one kernel result, so their count fits an `i32`.
+                Some(i32::try_from(count).unwrap_or(i32::MAX))
+            }
+            (Kind::Selected, Some(Kept::Bytes { mut buffer, start })) => {
+                let len = buffer.initialized() - start;
+                if start > 0 {
+                    buffer.bytes_mut().copy_within(start.., 0);
+                    buffer.truncate(len);
+                    *copied = copied.saturating_add(len as u64);
+                }
+                held.copied = if start > 0 { len } else { 0 };
+                held.loan = Some(WriteLoan::new(buffer));
+                Some(i32::try_from(len).unwrap_or(i32::MAX))
+            }
+            (Kind::Recv | Kind::Selected, Some(Kept::Error(error))) => Some(error),
+            (Kind::RecvFrom, Some(Kept::Datagram { buffer, received })) => {
+                let (result, count) = deliver_copy(held, &buffer, received);
+                *copied = copied.saturating_add(count as u64);
+                Some(result)
+            }
+            (Kind::RecvFrom, Some(Kept::Arrivals(mut arrivals))) => {
+                let first = arrivals.take_first();
+                self.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
+                first.map(|(buffer, received)| {
+                    let (result, count) = deliver_copy(held, &buffer, received);
+                    *copied = copied.saturating_add(count as u64);
+                    result
+                })
+            }
+            (Kind::RecvSelectedFrom, Some(Kept::Datagram { buffer, received })) => {
+                Some(deliver(held, buffer, received))
+            }
+            (Kind::RecvSelectedFrom, Some(Kept::Arrivals(mut arrivals))) => {
+                let first = arrivals.take_first();
+                self.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
+                first.map(|(buffer, received)| deliver(held, buffer, received))
+            }
+            (Kind::RecvBatch, Some(Kept::Datagram { buffer, received })) => {
+                let mut taken = Some((buffer, received));
+                if let Some(Batch::Receive(arrivals)) = held.payload.batch()
+                    && let Some((buffer, received)) = taken.take()
+                {
+                    taken = arrivals.add(buffer, received);
+                }
+                self.kept = taken.map(|(buffer, received)| Kept::Datagram { buffer, received });
+                Some(1)
+            }
+            (Kind::RecvBatch, Some(Kept::Arrivals(mut kept))) => {
+                let mut count = 0;
+                if let Some(Batch::Receive(arrivals)) = held.payload.batch() {
+                    while arrivals.len() < arrivals.capacity() {
+                        let Some((buffer, received)) = kept.take_first() else {
+                            break;
+                        };
+                        if arrivals.add(buffer, received).is_none() {
+                            count += 1;
+                        }
+                    }
+                }
+                self.kept = udp::keep_arrivals(kept).map(Kept::Arrivals);
+                Some(count)
+            }
+            (Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch, Some(Kept::Error(error))) => Some(error),
+            (Kind::Send | Kind::Vectored | Kind::Shutdown, kept) => {
+                self.kept = kept;
+                match self.sent {
+                    Sent::Ok => None,
+                    // A dropped send that waited never ran, so it gives no report.
+                    Sent::Owe if !interest() => Some(-ECANCELED),
+                    #[cfg(target_os = "windows")]
+                    Sent::Lost if !interest() => Some(-ECANCELED),
+                    _ => {
+                        held.failed = Some(WriteFailed { sent: self.count() });
+                        self.sent = Sent::Reported;
+                        self.unreported = 0;
+                        Some(0)
+                    }
+                }
+            }
+            (_, kept) => {
+                self.kept = kept;
+                None
+            }
+        }
+    }
+
     /// Whether an operation of `kind` has its result here, with no submission.
     fn has_result(&self, kind: Kind) -> bool {
         match kind {
@@ -786,10 +1042,9 @@ pub(super) fn count(result: i32) -> io::Result<usize> {
 }
 
 /// The abandoned rule: the home applies it to the result of an operation of `tag` whose consumer
-/// ended its interest. Received bytes, the error of a receive, and an accepted connection stay
-/// for the next operation of the direction. A send that failed, sent only part of its bytes, or
-/// was cancelled makes the write direction fail.
-pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: Held) {
+/// ended its interest. It closes the socket or the file that the operation made, and the
+/// directions of the resource of `tag` take the rest ([`Directions::abandon`]).
+pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, mut held: Held) {
     #[cfg(unix)]
     let closes = matches!(tag.kind, Kind::Connect | Kind::Bind | Kind::File(_));
     #[cfg(target_os = "windows")]
@@ -805,123 +1060,25 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, held: He
     let Some(resource) = tag.resource else {
         return;
     };
-    if tag.kind == Kind::Accept {
-        // A stream that the home gave to a future that dropped before it took it goes back to a
-        // descriptor.
-        let Payload::Socket {
-            peer,
-            peer_len,
-            connection,
-        } = held.payload
-        else {
-            return;
-        };
-        let connection = connection.or_else(|| held.accepted.and_then(|stream| resources.release(stream)));
-        if let (Some(fd), Some(listener)) = (connection, resources.get(resource)) {
-            listener.directions.keep_connection(fd, peer, peer_len);
-        }
-        return;
+    // A stream that the home gave to a future that dropped before it took it goes back to a
+    // descriptor.
+    if tag.kind == Kind::Accept
+        && let Payload::Socket { connection, .. } = &mut held.payload
+        && connection.is_none()
+    {
+        *connection = held.accepted.take().and_then(|stream| resources.release(stream));
     }
-    let Some(owned) = resources.get(resource) else {
-        return;
-    };
-    let directions = &mut owned.directions;
-    match tag.kind {
-        Kind::Recv | Kind::Selected => {
-            let buffer = held.loan.map(WriteLoan::into_inner);
-            if held.copied > 0
-                && let Some(Kept::Bytes { start, .. }) = &mut directions.kept
-            {
-                // The receive copied its bytes from the kept buffer, which still holds them.
-                *start -= held.copied;
-            } else if let (Ok(received), Some(buffer)) = (usize::try_from(result), buffer)
-                && received > 0
-            {
-                let start = buffer.initialized() - received;
-                directions.kept = Some(Kept::Bytes { buffer, start });
-            } else if result < 0 && result != -ECANCELED && result != -ENOBUFS {
-                directions.kept = Some(Kept::Error(result));
-            }
-        }
-        Kind::Send | Kind::Vectored | Kind::Shutdown => {
-            if let Some(failed) = held.failed {
-                // The future did not take the failure: the next send gives it.
-                match failed.sent {
-                    SendCount::Sent(sent) => {
-                        directions.unreported = directions.unreported.saturating_add(sent);
-                        directions.sent = Sent::Owe;
-                    }
-                    #[cfg(target_os = "windows")]
-                    SendCount::Unknown => directions.sent = Sent::Lost,
-                    _ => {}
-                }
-                return;
-            }
-            if tag.kind == Kind::Shutdown {
-                return;
-            }
-            let sent = usize::try_from(result).unwrap_or(0);
-            let len = match &held.payload {
-                Payload::Lease(lease) => lease.initialized(),
-                Payload::Regions(regions) => regions.total(),
-                _ => 0,
-            };
-            directions.unreported = directions.unreported.saturating_add(sent);
-            #[cfg(target_os = "windows")]
-            if result == -sys::WSAECONNABORTED {
-                directions.sent = Sent::Lost;
-                return;
-            }
-            if (result < 0 || sent < len || held.cancelled) && directions.sent == Sent::Ok {
-                directions.sent = Sent::Owe;
-            }
-        }
-        Kind::RecvFrom | Kind::RecvSelectedFrom => match (held.loan, held.payload) {
-            (
-                Some(loan),
-                Payload::Receive {
-                    received: Some(received),
-                    ..
-                },
-            ) if result >= 0 => {
-                directions.kept = Some(Kept::Datagram {
-                    buffer: loan.into_inner(),
-                    received,
-                });
-            }
-            _ if result < 0 && result != -ECANCELED && result != -ENOBUFS => {
-                directions.kept = Some(Kept::Error(result));
-            }
-            _ => {}
-        },
-        Kind::RecvBatch => match held.payload {
-            Payload::Batch {
-                batch: Batch::Receive(arrivals),
-                ..
-            } if !arrivals.is_empty() => {
-                directions.kept = Some(Kept::Arrivals(arrivals));
-            }
-            _ if result < 0 && result != -ECANCELED && result != -ENOBUFS && result != -EAGAIN => {
-                directions.kept = Some(Kept::Error(result));
-            }
-            _ => {}
-        },
-        // A dropped datagram send fails no direction: its result is lost, as a datagram can be.
-        Kind::Accept | Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => {}
-        Kind::File(_) => {}
-        #[cfg(unix)]
-        Kind::Spawn(_) | Kind::Exit(_) => {}
+    if let Some(owned) = resources.get(resource) {
+        owned.directions.abandon(tag.kind, result, held);
     }
 }
 
-/// The consumer of an operation of `tag` took its result. A send result that a future took
-/// reports each byte up to its end.
+/// The consumer of an operation of `tag` took its result ([`Directions::taken`]).
 pub(super) fn taken(resources: &mut Resources, tag: Tag) {
     if matches!(tag.kind, Kind::Send | Kind::Vectored)
         && let Some(owned) = tag.resource.and_then(|resource| resources.get(resource))
-        && owned.directions.sent == Sent::Ok
     {
-        owned.directions.unreported = 0;
+        owned.directions.taken(tag.kind);
     }
 }
 
@@ -941,6 +1098,23 @@ pub(super) fn after(resources: &mut Resources, pending: &mut Vec<Resource>, tag:
         // At most one entry for each resource, so the capacity of the list holds it.
         pending.push(resource);
     }
+}
+
+/// The output of a receive: the count of received bytes, and the buffer.
+pub(crate) fn received(result: i32, held: Held) -> Option<(io::Result<usize>, Backing)> {
+    Some((count(result), held.loan?.into_inner()))
+}
+
+/// The output of a send: the count of sent bytes, or the failure of the write direction, and the
+/// lease.
+pub(crate) fn sent(result: i32, held: Held) -> Option<(io::Result<usize>, Lease)> {
+    let sent = held
+        .failed
+        .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
+    let Payload::Lease(lease) = held.payload else {
+        return None;
+    };
+    Some((sent, lease))
 }
 
 /// The output of a bind: the listener and its local address.
@@ -1322,9 +1496,7 @@ impl Driver {
             ..Held::default()
         };
         let completion = self.begin(reader.as_mut().resource, Kind::Recv, buffer, held)?;
-        Ok(Operation::new(completion, |result, held| {
-            Some((count(result), held.loan?.into_inner()))
-        }))
+        Ok(Operation::new(completion, received))
     }
 
     /// Receives into a buffer that the kernel selects from the buffers of [`Driver::provide`] when
@@ -1377,15 +1549,7 @@ impl Driver {
             ..Held::default()
         };
         let completion = self.begin(writer.as_mut().resource, Kind::Send, lease, held)?;
-        Ok(Operation::new(completion, |result, held| {
-            let sent = held
-                .failed
-                .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
-            let Payload::Lease(lease) = held.payload else {
-                return None;
-            };
-            Some((sent, lease))
-        }))
+        Ok(Operation::new(completion, sent))
     }
 
     /// Closes `stream`. The close cancels each operation that runs on the stream, a dropped send
@@ -1625,40 +1789,6 @@ impl Driver {
         };
         let directions = &mut owned.directions;
         let result = match (kind, directions.kept.take()) {
-            (Kind::Recv, Some(Kept::Bytes { buffer, mut start })) => {
-                let mut copied = 0;
-                slot.update(id, |held| {
-                    if let Some(held) = held
-                        && let Some(loan) = held.loan.as_mut()
-                    {
-                        copied = loan.fill_from(buffer.bytes().get(start..).unwrap_or_default());
-                        held.copied = copied;
-                    }
-                });
-                start += copied;
-                if start < buffer.initialized() {
-                    directions.kept = Some(Kept::Bytes { buffer, start });
-                }
-                self.copied = self.copied.saturating_add(copied as u64);
-                // The kept bytes came from one kernel result, so their count fits an `i32`.
-                Some(i32::try_from(copied).unwrap_or(i32::MAX))
-            }
-            (Kind::Selected, Some(Kept::Bytes { mut buffer, start })) => {
-                let len = buffer.initialized() - start;
-                if start > 0 {
-                    buffer.bytes_mut().copy_within(start.., 0);
-                    buffer.truncate(len);
-                    self.copied = self.copied.saturating_add(len as u64);
-                }
-                slot.update(id, |held| {
-                    if let Some(held) = held {
-                        held.copied = if start > 0 { len } else { 0 };
-                        held.loan = Some(WriteLoan::new(buffer));
-                    }
-                });
-                Some(i32::try_from(len).unwrap_or(i32::MAX))
-            }
-            (Kind::Recv | Kind::Selected, Some(Kept::Error(error))) => Some(error),
             (Kind::Accept, Some(Kept::Connection { fd, peer, peer_len })) => {
                 match self.resources.adopt(fd, Medium::Stream) {
                     Ok(stream) => slot.update(id, |held| {
@@ -1679,84 +1809,16 @@ impl Driver {
                 }
                 Some(0)
             }
-            (Kind::RecvFrom, Some(Kept::Datagram { buffer, received })) => {
-                let (result, copied) = deliver_copy(slot, id, &buffer, received);
-                self.copied = self.copied.saturating_add(copied as u64);
-                Some(result)
-            }
-            (Kind::RecvFrom, Some(Kept::Arrivals(mut arrivals))) => {
-                let first = arrivals.take_first();
-                directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
-                first.map(|(buffer, received)| {
-                    let (result, copied) = deliver_copy(slot, id, &buffer, received);
-                    self.copied = self.copied.saturating_add(copied as u64);
-                    result
-                })
-            }
-            (Kind::RecvSelectedFrom, Some(Kept::Datagram { buffer, received })) => {
-                Some(deliver(slot, id, buffer, received))
-            }
-            (Kind::RecvSelectedFrom, Some(Kept::Arrivals(mut arrivals))) => {
-                let first = arrivals.take_first();
-                directions.kept = udp::keep_arrivals(arrivals).map(Kept::Arrivals);
-                first.map(|(buffer, received)| deliver(slot, id, buffer, received))
-            }
-            (Kind::RecvBatch, Some(Kept::Datagram { buffer, received })) => {
-                let mut taken = Some((buffer, received));
+            (kind, kept) => {
+                directions.kept = kept;
+                let (table, copied) = (&self.table, &mut self.copied);
+                let mut result = None;
                 slot.update(id, |held| {
-                    if let Some(Batch::Receive(arrivals)) = held.as_mut().and_then(|held| held.payload.batch())
-                        && let Some((buffer, received)) = taken.take()
-                    {
-                        taken = arrivals.add(buffer, received);
+                    if let Some(held) = held {
+                        result = directions.resume(held, kind, || table.interest(id), copied);
                     }
                 });
-                directions.kept = taken.map(|(buffer, received)| Kept::Datagram { buffer, received });
-                Some(1)
-            }
-            (Kind::RecvBatch, Some(Kept::Arrivals(mut kept))) => {
-                let mut count = 0;
-                slot.update(id, |held| {
-                    if let Some(Batch::Receive(arrivals)) = held.as_mut().and_then(|held| held.payload.batch()) {
-                        while arrivals.len() < arrivals.capacity() {
-                            let Some((buffer, received)) = kept.take_first() else {
-                                break;
-                            };
-                            if arrivals.add(buffer, received).is_none() {
-                                count += 1;
-                            }
-                        }
-                    }
-                });
-                directions.kept = udp::keep_arrivals(kept).map(Kept::Arrivals);
-                Some(count)
-            }
-            (Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch, Some(Kept::Error(error))) => Some(error),
-            (Kind::Send | Kind::Vectored | Kind::Shutdown, kept) => {
-                directions.kept = kept;
-                match directions.sent {
-                    Sent::Ok => None,
-                    // A dropped send that waited never ran, so it gives no report.
-                    Sent::Owe if !self.table.interest(id) => Some(-ECANCELED),
-                    #[cfg(target_os = "windows")]
-                    Sent::Lost if !self.table.interest(id) => Some(-ECANCELED),
-                    _ => {
-                        let failed = WriteFailed {
-                            sent: directions.count(),
-                        };
-                        directions.sent = Sent::Reported;
-                        directions.unreported = 0;
-                        slot.update(id, |held| {
-                            if let Some(held) = held {
-                                held.failed = Some(failed);
-                            }
-                        });
-                        Some(0)
-                    }
-                }
-            }
-            (_, kept) => {
-                directions.kept = kept;
-                None
+                result
             }
         };
         if let Some(result) = result {
@@ -1784,63 +1846,13 @@ impl Driver {
         }
         let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
         let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
-        // A batch submits in `start_batch`, and each other kind always has its resources, so the
-        // last arm gives no entry that the kernel runs.
-        let entry = move |held: &mut Held| match (kind, &mut held.payload, held.loan.as_mut()) {
-            (Kind::Recv, _, Some(loan)) => {
-                let (buffer, len) = (loan.as_mut_ptr(), u32::try_from(loan.capacity()).unwrap_or(u32::MAX));
-                if pipe {
-                    Sqe::read(fd, buffer, len)
-                } else {
-                    Sqe::recv(fd, buffer, len)
-                }
-            }
-            (Kind::Selected, _, _) if pipe => Sqe::read_selected(fd, group),
-            (Kind::Selected, _, _) => Sqe::recv_selected(fd, group),
-            (Kind::Send, Payload::Lease(lease), _) => {
-                let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
-                if pipe {
-                    Sqe::write(fd, bytes, len)
-                } else {
-                    Sqe::send(fd, bytes, len)
-                }
-            }
-            (Kind::Vectored, Payload::Regions(regions), _) if pipe => {
-                let (vectors, count) = regions.vectors();
-                Sqe::writev(fd, vectors, count)
-            }
-            #[cfg(unix)]
-            (Kind::Vectored, Payload::Regions(regions), _) => Sqe::send_message(fd, regions.message()),
-            // The port sends the `WSABUF` array of a vectored write with one `WSASend`.
-            #[cfg(target_os = "windows")]
-            (Kind::Vectored, Payload::Regions(regions), _) => {
-                let (vectors, count) = regions.vectors();
-                Sqe::writev(fd, vectors, count)
-            }
-            #[cfg(unix)]
-            (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SHUT_WR),
-            #[cfg(target_os = "windows")]
-            (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SD_SEND),
-            (Kind::RecvFrom, Payload::Receive { message, .. }, Some(loan)) => {
-                let (region, len) = (loan.as_mut_ptr(), loan.capacity());
-                Sqe::recv_message(fd, message.receive(region, len), 0)
-            }
-            (Kind::RecvSelectedFrom, Payload::Receive { message, .. }, _) => {
-                Sqe::recv_message_selected(fd, message.receive(ptr::null_mut(), slot_len), 0, group)
-            }
-            (Kind::SendTo, Payload::SendTo { message, datagram }, _) => Sqe::send_message(fd, message.send(datagram)),
-            (Kind::Accept, Payload::Socket { peer, peer_len, .. }, _) => {
-                Sqe::accept(fd, (&raw mut *peer).cast(), &raw mut *peer_len)
-            }
-            _ => Sqe::nop(),
-        };
         // SAFETY: the entry names the loan, the lease, the regions, the message, or the peer
         // address in the resources of `id`, which the home keeps until its terminal event, and the
         // descriptor of `resource`, which stays open until its close, after each of its operations
         // ends. The queue has room.
         #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
         unsafe {
-            self.push(id, entry);
+            self.push(id, |held| submission(held, kind, fd, pipe, group, slot_len));
         }
         true
     }
@@ -2048,9 +2060,7 @@ impl Driver {
         if runs {
             return;
         }
-        let closed = Closed {
-            sent: directions.count(),
-        };
+        let closed = directions.closed();
         // The release drops the kept bytes and connections, and the descriptor.
         drop(self.resources.release(resource));
         match closing {
@@ -2075,36 +2085,83 @@ impl Driver {
     }
 }
 
-/// Gives the kept datagram of `buffer` with `received` to the receive `id`, copied into its
+/// The submission of an operation of `kind` on the descriptor `fd`, from its resources `held`:
+/// `pipe` selects the calls of a pipe end, and a selecting receive takes a buffer of `slot_len`
+/// bytes from the buffer group `group`. A batch submits in `start_batch`, and each other kind
+/// always has its resources, so the last arm gives no entry that the kernel runs.
+pub(super) fn submission(held: &mut Held, kind: Kind, fd: i32, pipe: bool, group: u16, slot_len: usize) -> Sqe {
+    match (kind, &mut held.payload, held.loan.as_mut()) {
+        (Kind::Recv, _, Some(loan)) => {
+            let (buffer, len) = (loan.as_mut_ptr(), u32::try_from(loan.capacity()).unwrap_or(u32::MAX));
+            if pipe {
+                Sqe::read(fd, buffer, len)
+            } else {
+                Sqe::recv(fd, buffer, len)
+            }
+        }
+        (Kind::Selected, _, _) if pipe => Sqe::read_selected(fd, group),
+        (Kind::Selected, _, _) => Sqe::recv_selected(fd, group),
+        (Kind::Send, Payload::Lease(lease), _) => {
+            let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
+            if pipe {
+                Sqe::write(fd, bytes, len)
+            } else {
+                Sqe::send(fd, bytes, len)
+            }
+        }
+        (Kind::Vectored, Payload::Regions(regions), _) if pipe => {
+            let (vectors, count) = regions.vectors();
+            Sqe::writev(fd, vectors, count)
+        }
+        #[cfg(unix)]
+        (Kind::Vectored, Payload::Regions(regions), _) => Sqe::send_message(fd, regions.message()),
+        // The port sends the `WSABUF` array of a vectored write with one `WSASend`.
+        #[cfg(target_os = "windows")]
+        (Kind::Vectored, Payload::Regions(regions), _) => {
+            let (vectors, count) = regions.vectors();
+            Sqe::writev(fd, vectors, count)
+        }
+        #[cfg(unix)]
+        (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SHUT_WR),
+        #[cfg(target_os = "windows")]
+        (Kind::Shutdown, _, _) => Sqe::shutdown(fd, sys::SD_SEND),
+        (Kind::RecvFrom, Payload::Receive { message, .. }, Some(loan)) => {
+            let (region, len) = (loan.as_mut_ptr(), loan.capacity());
+            Sqe::recv_message(fd, message.receive(region, len), 0)
+        }
+        (Kind::RecvSelectedFrom, Payload::Receive { message, .. }, _) => {
+            Sqe::recv_message_selected(fd, message.receive(ptr::null_mut(), slot_len), 0, group)
+        }
+        (Kind::SendTo, Payload::SendTo { message, datagram }, _) => Sqe::send_message(fd, message.send(datagram)),
+        (Kind::Accept, Payload::Socket { peer, peer_len, .. }, _) => {
+            Sqe::accept(fd, (&raw mut *peer).cast(), &raw mut *peer_len)
+        }
+        _ => Sqe::nop(),
+    }
+}
+
+/// Gives the kept datagram of `buffer` with `received` to the receive of `held`, copied into its
 /// buffer: one copy, which [`Driver::copied`] counts. Gives the result of the receive and the
 /// bytes that it copied.
-fn deliver_copy(slot: &crate::completion::Entry<Held>, id: OpId, buffer: &Backing, received: Received) -> (i32, usize) {
+fn deliver_copy(held: &mut Held, buffer: &Backing, received: Received) -> (i32, usize) {
     let mut copied = 0;
-    slot.update(id, |held| {
-        if let Some(held) = held
-            && let (Some(loan), Payload::Receive { received: kept, .. }) = (held.loan.as_mut(), &mut held.payload)
-        {
-            let (facts, count) = udp::copy_kept(buffer, received, loan);
-            *kept = Some(facts);
-            copied = count;
-        }
-    });
+    if let (Some(loan), Payload::Receive { received: kept, .. }) = (held.loan.as_mut(), &mut held.payload) {
+        let (facts, count) = udp::copy_kept(buffer, received, loan);
+        *kept = Some(facts);
+        copied = count;
+    }
     // The kept bytes came from one kernel result, so their count fits an `i32`.
     (i32::try_from(copied).unwrap_or(i32::MAX), copied)
 }
 
-/// Gives the kept datagram of `buffer` with `received` to the selecting receive `id`, with no
+/// Gives the kept datagram of `buffer` with `received` to the selecting receive of `held`, with no
 /// copy. Gives the result of the receive.
-fn deliver(slot: &crate::completion::Entry<Held>, id: OpId, buffer: Backing, received: Received) -> i32 {
+fn deliver(held: &mut Held, buffer: Backing, received: Received) -> i32 {
     let len = i32::try_from(received.len).unwrap_or(i32::MAX);
-    slot.update(id, |held| {
-        if let Some(held) = held
-            && let Payload::Receive { received: facts, .. } = &mut held.payload
-        {
-            held.loan = Some(WriteLoan::new(buffer));
-            *facts = Some(received);
-        }
-    });
+    if let Payload::Receive { received: facts, .. } = &mut held.payload {
+        held.loan = Some(WriteLoan::new(buffer));
+        *facts = Some(received);
+    }
     len
 }
 
@@ -2113,8 +2170,23 @@ const fn running(owned: &super::Owned) -> bool {
     owned.running > 0
 }
 
+/// A new nonblocking TCP socket that listens at the address `storage` of `len` bytes, with
+/// `options`, as [`Driver::bind`] makes it, and its local address. No driver owns the socket.
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(super) fn listening(
+    (storage, len): (SockAddrStorage, u32),
+    options: TcpOptions,
+) -> io::Result<(Handle, (SockAddrStorage, u32))> {
+    let socket = new_socket(storage.ss_family, sys::SOCK_STREAM)?;
+    set_int(borrow(&socket), sys::SOL_SOCKET, sys::SO_REUSEADDR, 1)?;
+    options.apply(borrow(&socket))?;
+    bind_now(borrow(&socket), &storage, len, true)?;
+    let local = local_address(borrow(&socket)).ok_or_else(io::Error::last_os_error)?;
+    Ok((socket, local))
+}
+
 /// The negative errno of `error`, as a kernel result gives it.
-fn errno(error: &io::Error) -> i32 {
+pub(super) fn errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or(EINVAL).saturating_neg()
 }
 

@@ -49,6 +49,23 @@ impl Completion {
         }
     }
 
+    /// Takes the result and the resources when they are ready, and otherwise registers the waker
+    /// of `cx`, with no poll budget. The driver of a later operation of the direction takes the
+    /// result of an operation with it, outside the poll of a task.
+    pub(super) fn take(&mut self, cx: &Context<'_>) -> Poll<Result<(i32, Held), Gone>> {
+        let id = self.id;
+        let Some(entry) = self.entry() else {
+            return Poll::Ready(Err(Gone));
+        };
+        let output = entry.poll_take(cx, id);
+        if output.is_ready() {
+            self.done = true;
+            // The home frees the slot at its next turn, and it needs no wake for that.
+            self.shared.requests.post(id, Request::EndInterest);
+        }
+        output
+    }
+
     fn entry(&self) -> Option<&Entry<Held>> {
         self.shared.entries.get(self.id.index() as usize)
     }
@@ -65,19 +82,7 @@ impl Future for Completion {
         if self.done {
             panic!("an `Operation` was polled after it gave `Ready`");
         }
-        crate::coop::poll(cx, |cx| {
-            let id = self.id;
-            let Some(entry) = self.entry() else {
-                return Poll::Ready(Err(Gone));
-            };
-            let output = entry.poll_take(cx, id);
-            if output.is_ready() {
-                self.done = true;
-                // The home frees the slot at its next turn, and it needs no wake for that.
-                self.shared.requests.post(id, Request::EndInterest);
-            }
-            output
-        })
+        crate::coop::poll(cx, |cx| self.take(cx))
     }
 }
 

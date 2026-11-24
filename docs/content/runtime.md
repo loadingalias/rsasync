@@ -236,6 +236,10 @@ A movable task has the same `JoinHandle`, `CancelHandle`, and outcomes as a loca
 [Tasks](tasks.md#join-and-cancel)). A cancel from any thread drops the future at a poll boundary.
 `spawn_local` in a movable task spawns a local task on the worker that polls the movable task.
 
+A movable task does its I/O with the types of `rsasync::movable`, which are `Send` and move with
+the task: see [TCP from a movable task](tcp.md#use-tcp-from-a-movable-task). The types of
+`rsasync::local` are not `Send`, so a movable task cannot keep one across an `await`.
+
 ## Bind one socket on each worker
 
 `handle.tcp_group(address, options, serve)` binds one TCP listener on each local worker, in one

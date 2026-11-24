@@ -128,6 +128,13 @@ of wake publication, waker replacement, cancellation, close, and slot reuse. Eac
 with at most 4, 5, and 6 forced thread switches, and with no limit, which checks each thread order
 of the model.
 
+The [movable TCP types](tcp.md#use-tcp-from-a-movable-task), `rsasync::movable`, run on io_uring
+only. On 2026-11-24, their tests passed on the x86_64 Debian 12 host (`6.1.0-56-cloud-amd64`) and
+on the aarch64 Ubuntu 26.04 host (`7.0.0-1018-aws`), each with two movable workers. The tests
+check a receive whose task goes to the other worker, a cancel and a close from the other worker,
+the bytes of a dropped receive, the order of two sends with different homes, and a shutdown. On
+epoll, each movable call refuses, and one test checks that refusal.
+
 ## macOS
 
 The Intel macOS target (`x86_64-apple-darwin`) compiles and links with the macOS 27.2 SDK.

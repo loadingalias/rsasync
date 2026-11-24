@@ -98,8 +98,9 @@ thread_local! {
     )]
     static TURNING: Cell<bool> = Cell::new(false);
 
-    /// A turn on this thread woke a parked worker. The wake waits in the outbox of the owner of
-    /// this thread until the root future returns, so the turn then ends.
+    /// The worker of this thread woke a parked worker. The wake waits in the outbox of the owner of
+    /// this thread until the root future returns, so the turn that runs, or the next one, ends
+    /// after its task.
     #[cfg_attr(
         not(all(test, loom)),
         expect(
@@ -266,15 +267,17 @@ impl Shared {
     }
 
     /// Pushes `slot` to the queue of `lane`, the worker of this thread. A wake outside a turn, such
-    /// as from its driver or from a local task, also wakes its root future.
+    /// as from its driver or from a local task, also wakes its root future. A second task in the
+    /// queue wakes a parked worker: the completions of one turn of the driver can make each task of
+    /// the worker ready at one time.
     fn push_local(&self, lane: u32, slot: u32) {
         self.queue(lane, slot);
-        if TURNING.with(Cell::get) {
-            if self.lanes[lane as usize].queue.len() > 1 {
-                self.balance();
-            }
-        } else {
-            let _ = self.lanes[lane as usize].owner.with(|home| home.wake_root());
+        let mine = &self.lanes[lane as usize];
+        if !TURNING.with(Cell::get) {
+            let _ = mine.owner.with(|home| home.wake_root());
+        }
+        if mine.queue.len() > 1 {
+            self.balance();
         }
     }
 
@@ -377,7 +380,9 @@ impl Shared {
             {
                 self.parked.fetch_sub(1, Ordering::Relaxed);
                 let _ = lane.owner.with(|home| home.wake_root());
-                if TURNING.with(Cell::get) {
+                // Also outside a turn, for a wake from the driver: the next turn then ends after
+                // its first task.
+                if self.lane_of_thread().is_some() {
                     WOKE.with(|woke| woke.set(true));
                 }
                 return;

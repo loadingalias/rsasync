@@ -39,6 +39,11 @@ the pool runs again. A poll that wakes an idle worker also ends the turn early, 
 gets its wake at once and can steal. When the worker found no task, it waits as step 6 says, until
 a wake, a spawn, or another worker ends the wait.
 
+A turn of the driver of the worker can make several movable tasks ready at one time, for example
+when the data of several streams came. The second task that it queues wakes an idle worker. The
+next turn of the pool then ends after its first task, so the idle worker gets its wake and takes a
+part of the tasks.
+
 ## Poll budget
 
 Each poll of a task, and of the root future, has a budget of runtime leaves. A runtime leaf is a

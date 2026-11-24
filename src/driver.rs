@@ -67,6 +67,8 @@ mod iocp;
 mod ipc;
 #[cfg(unix)]
 mod pipe;
+#[cfg(all(feature = "local", target_os = "linux"))]
+mod plain;
 #[cfg(unix)]
 mod poller;
 #[cfg(target_os = "linux")]
@@ -162,6 +164,11 @@ use crate::completion::Entry;
 pub(crate) use completion::Completion;
 #[cfg(all(feature = "local", target_os = "linux"))]
 pub(crate) use home::{Cleanup, Home, MESSAGES};
+// The operations of the movable I/O types, and their outputs.
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) use plain::{Direction, PlainSocket, socket as plain_socket};
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) use tcp::{received, sent};
 
 /// The limits of a driver, each of which bounds memory that the driver allocates when it starts,
 /// and the features that it requires.
@@ -440,6 +447,9 @@ pub(crate) struct Held {
     pub(crate) cancelled: bool,
     /// An error of the home that the future gives in place of the result of the kernel.
     pub(crate) error: Option<io::ErrorKind>,
+    /// The descriptor and the chain of an operation of a movable resource, which no driver owns.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) plain: Option<plain::Plain>,
 }
 
 // Each of the `Config::operations` slots holds one `Held`, so a kind with large inline resources
@@ -606,10 +616,11 @@ pub enum Reason {
     /// The descriptor or the child is not one that this driver owns: another driver made it, or it
     /// closed.
     Resource,
-    /// A call of `rsasync::local` has no driver on this thread that it can use: the thread runs no
-    /// owner of a `Runtime`, its owner is a `task::LocalOwner`, which has no driver, or the driver of
-    /// `Runtime::block_on` did not start, and `block_on` then gives its error. A turn of the driver
-    /// also uses it, so a call in a destructor that the turn runs gets this refusal.
+    /// A call of `rsasync::local` or `rsasync::movable` has no driver on this thread that it can
+    /// use: the thread runs no owner of a `Runtime`, its owner is a `task::LocalOwner`, which has no
+    /// driver, or the driver of `Runtime::block_on` did not start, and `block_on` then gives its
+    /// error. A turn of the driver also uses it, so a call in a destructor that the turn runs gets
+    /// this refusal.
     #[cfg(all(feature = "local", target_os = "linux"))]
     NoDriver,
     /// The driver has no provided buffers ([`Driver::provide`]).
@@ -623,7 +634,9 @@ pub enum Reason {
     /// write end for a reader.
     #[cfg(unix)]
     Direction,
-    /// The operation does not apply to this resource, for example a half-close of a pipe.
+    /// The operation does not apply to this resource, for example a half-close of a pipe. A call
+    /// of `rsasync::movable` also gives it when the driver of the thread runs on epoll: only
+    /// io_uring runs the operations of a movable resource.
     Unsupported,
     /// The buffer, the length, or the offset of a direct-I/O operation does not have the
     /// [`Alignment`] of its file.
@@ -1390,6 +1403,11 @@ pub struct Driver {
     /// The home of a local owner on this driver, and the wake messages that it sent.
     #[cfg(all(feature = "local", target_os = "linux"))]
     wakes: home::Wakes,
+    /// The operations of movable resources that wait here before their submission: for an earlier
+    /// operation of their direction, or for room in the queue. At most one entry for each
+    /// operation.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    following: Vec<OpId>,
     /// The state of [`Delivery::Controlled`].
     control: Option<control::Controlled>,
     /// The bytes that dropped sends had sent when the closes of their dropped resources ended
@@ -1711,6 +1729,8 @@ impl Driver {
             jobs: room(config.operations as usize).map_err(refused)?,
             #[cfg(all(feature = "local", target_os = "linux"))]
             wakes,
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            following: room(config.operations as usize).map_err(refused)?,
             control: None,
             #[cfg(all(feature = "local", target_os = "linux"))]
             dropped_sent: 0,
@@ -1854,6 +1874,8 @@ impl Driver {
         let completed = self.harvest(self.completions_per_turn);
         // Start the operations that waited for an operation that ended, and end the closes.
         self.attend();
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        self.follow();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.start_waiting();
         // Clear the wake descriptor, then look again: work that came after the harvest has woken
@@ -1964,6 +1986,9 @@ impl Driver {
         if let Some(control) = &mut self.control {
             control.deliver_all();
         }
+        // An operation that waits for an earlier one of its direction never ran, so it ends now.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        self.end_following();
         // A spawn cannot be cancelled, and its child starts at the end of its job, so teardown
         // applies the end of each child after each spawn ended.
         #[cfg(unix)]
@@ -2276,6 +2301,11 @@ impl Driver {
             self.complete_now(id, -ECANCELED);
             return;
         }
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if self.unfollow(id) {
+            self.complete_now(id, -ECANCELED);
+            return;
+        }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.unwait(id) {
             return;
@@ -2554,7 +2584,8 @@ fn finish(
                     // An accept always has its address, and the drop closes the descriptor.
                     return;
                 };
-                if abandoned {
+                // The connection of a listener that no driver owns stays a plain descriptor.
+                if abandoned || tag.resource.is_none() {
                     *connection = Some(fd);
                 } else {
                     match resources.adopt(fd, Medium::Stream) {
@@ -2600,7 +2631,11 @@ impl Drop for Driver {
     /// the operations first.
     fn drop(&mut self) {
         #[cfg(all(feature = "local", target_os = "linux"))]
-        self.settle_messages();
+        {
+            self.settle_messages();
+            // The kernel uses nothing of an operation that waits for its start, so it leaks nothing.
+            self.end_following();
+        }
         let busy = self.table.busy();
         for entry in &self.shared.entries {
             entry.close();

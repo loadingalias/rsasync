@@ -216,7 +216,7 @@ pub fn signal(
 
 /// Calls `f` with the driver of the owner of this thread and `value`. With no driver, it refuses
 /// with [`Reason::NoDriver`] and gives `value` back.
-fn submit<V, T>(value: V, f: impl FnOnce(&mut Driver, V) -> Result<T, Refused<V>>) -> Result<T, Refused<V>> {
+pub(crate) fn submit<V, T>(value: V, f: impl FnOnce(&mut Driver, V) -> Result<T, Refused<V>>) -> Result<T, Refused<V>> {
     with_driver(value, f).unwrap_or_else(|value| Err(Refused::new(Reason::NoDriver, value)))
 }
 
@@ -228,7 +228,7 @@ fn call<T>(f: impl FnOnce(&mut Driver) -> io::Result<T>) -> io::Result<T> {
 }
 
 /// Gives `refused` with `wrap` applied to its value.
-fn rewrap<T, U>(refused: Refused<T>, wrap: impl FnOnce(T) -> U) -> Refused<U> {
+pub(crate) fn rewrap<T, U>(refused: Refused<T>, wrap: impl FnOnce(T) -> U) -> Refused<U> {
     let reason = refused.reason();
     Refused::new(reason, wrap(refused.into_inner()))
 }

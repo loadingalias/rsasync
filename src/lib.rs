@@ -73,6 +73,13 @@ pub mod clock;
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub mod local;
+/// The I/O types of a movable task, on Linux, on io_uring workers.
+#[cfg(all(
+    feature = "local",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub mod movable;
 /// Local workers and `block_on` on one lifecycle, on Linux: macOS and Windows get them with their
 /// worker topologies.
 #[cfg(all(
