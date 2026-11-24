@@ -119,6 +119,12 @@
 //!   - Half-close: `a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on`
 //!     and `a_half_close_on_a_failed_write_direction_sends_no_end_of_stream`.
 //!   - Zero-copy send: no case before R611 adds the operation.
+//! - The timed wait of a loop that owns the driver:
+//!   `a_timed_wait_with_no_work_blocks_until_its_deadline`,
+//!   `a_timed_wait_whose_deadline_passed_does_not_block`,
+//!   `a_completion_ends_a_timed_wait_before_its_deadline`,
+//!   `a_wake_ends_a_timed_wait_before_its_deadline`, and, on Linux and macOS,
+//!   `signals_do_not_delay_the_deadline_of_a_timed_wait`.
 //!   - A listener group for each worker: no case before the local workers of R307.
 //! - IPC stream
 //!   - Bind with mode 0600: `the_socket_file_of_an_ipc_listener_has_mode_0600_when_its_bind_ends`.
@@ -509,6 +515,13 @@ mod operation {
         tests => idle_connections_with_a_waiting_selecting_receive_hold_no_receive_buffer,
         tests => a_half_close_ends_the_peer_receive_at_the_sent_count_and_local_receives_go_on,
         tests => a_half_close_on_a_failed_write_direction_sends_no_end_of_stream,
+        // The timed wait of a loop that owns the driver.
+        tests => a_timed_wait_with_no_work_blocks_until_its_deadline,
+        tests => a_timed_wait_whose_deadline_passed_does_not_block,
+        tests => a_completion_ends_a_timed_wait_before_its_deadline,
+        tests => a_wake_ends_a_timed_wait_before_its_deadline,
+        #[cfg(unix)]
+        tests => signals_do_not_delay_the_deadline_of_a_timed_wait,
         // IPC stream.
         #[cfg(target_os = "windows")]
         ipc::windows::tests => an_accepted_stream_reports_the_process_and_user_of_its_client,

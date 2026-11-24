@@ -28,7 +28,7 @@ use core::mem::size_of;
 use core::ptr::{self, NonNull};
 #[cfg(target_os = "linux")]
 use core::sync::atomic::{AtomicU32, Ordering};
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use core::time::Duration;
 use std::io;
 #[cfg(target_os = "macos")]
@@ -725,7 +725,6 @@ impl Ring {
 
     /// Submits as [`submit`](Self::submit) does, and waits for `wait` completions at most for
     /// `timeout` (`IORING_ENTER_EXT_ARG`). The end of the time is no error.
-    #[cfg(feature = "local")]
     pub(crate) fn submit_timeout(&mut self, wait: u32, timeout: Duration) -> io::Result<u32> {
         self.word(self.sq_tail).store(self.sq_pushed, Ordering::Release);
         let ts = sys::KernelTimespec {
@@ -999,7 +998,7 @@ fn enter(fd: RawFd, to_submit: u32, min_complete: u32, flags: u32) -> io::Result
 
 /// `io_uring_enter(fd, to_submit, min_complete, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG,
 /// &arg, sizeof(arg))`, with no signal mask and the relative timeout `ts`.
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[expect(
     unsafe_code,
     reason = "the kernel reads the published entries and the argument of the wait"

@@ -374,6 +374,9 @@ fn a_turn_enters_the_kernel_for_deferred_work_with_nothing_to_submit() {
     let mut driver = driver(Config::new());
     let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
     let future = driver.recv(&mut stream, Backing::from(Vec::with_capacity(16))).unwrap();
+    // The first use of the wake descriptor makes it readable one time, and the turn clears it. So
+    // the wait below ends only at the signal of the kernel.
+    let _first_use = driver.as_fd();
     driver.turn().unwrap();
     peer.write_all(b"x").unwrap();
     wait_readable(&driver);
@@ -758,23 +761,26 @@ fn a_host_reactor_wakes_for_two_selecting_receives_that_wait_for_data() {
     client.join().unwrap();
 }
 
-/// Only the first driver of a process probes the kernel: a second driver gets the same result and
-/// makes no probe. On a kernel with the defect, the probe waits for a deferred signal that does not
-/// come, so the start of the second driver is then far shorter than the start of the first.
+/// Only the first use of a wake descriptor in a process probes the kernel: a second driver gets
+/// the same result and makes no probe. On a kernel with the defect, the probe waits for a deferred
+/// signal that does not come, so the first use by the second driver is then far shorter than the
+/// first use by the first. Before that use, a driver has no registration, and its report says so.
 #[test]
 #[cfg(target_os = "linux")]
-fn only_the_first_driver_of_a_process_probes_the_kernel() {
+fn only_the_first_use_of_a_wake_descriptor_in_a_process_probes_the_kernel() {
+    let (first, second) = (driver(Config::new()), driver(Config::new()));
+    assert!(!first.report().rearms_wake());
     let start = Instant::now();
-    let first = driver(Config::new());
+    let _first_use = first.as_fd();
     let probed = start.elapsed();
     let start = Instant::now();
-    let second = driver(Config::new());
+    let _first_use = second.as_fd();
     let read = start.elapsed();
-    assert_eq!(second.rearm_wake, first.rearm_wake);
-    if first.rearm_wake {
+    assert_eq!(second.report().rearms_wake(), first.report().rearms_wake());
+    if first.report().rearms_wake() {
         assert!(
             read * 10 < probed,
-            "the second start took {read:?}, and the first {probed:?}"
+            "the second first use took {read:?}, and the first {probed:?}"
         );
     }
 }
@@ -783,19 +789,20 @@ fn only_the_first_driver_of_a_process_probes_the_kernel() {
 /// kernel `7.0.0-1016-aws` of Ubuntu 26.04 has `cd305ee3633a` and not `04fe9aeb4f3c`, and Linux
 /// 6.1 of Debian 12 has neither. On a kernel with the defect, it also finds the defect when the
 /// first deferred signal comes after the first wait, as after a slow grace period. On another
-/// kernel, only the start of the driver is checked.
+/// kernel, only the first use of the wake descriptor is checked.
 #[test]
 #[cfg(target_os = "linux")]
 fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
     let driver = driver(Config::new());
+    let _first_use = driver.as_fd();
     let expected = match release.trim() {
         "7.0.0-1016-aws" => Some(true),
         release if release.starts_with("6.1.") => Some(false),
         _ => None,
     };
     if let Some(expected) = expected {
-        assert_eq!(driver.rearm_wake, expected, "the kernel {release}");
+        assert_eq!(driver.report().rearms_wake(), expected, "the kernel {release}");
     }
     if expected == Some(true) {
         // A first wait of zero ends before the grace period of the first signal.
@@ -805,6 +812,23 @@ fn the_probe_finds_the_eventfd_defect_on_the_kernels_that_have_it() {
         let defect = probe::probe(&mut ring, &wake, core::time::Duration::ZERO).unwrap();
         assert!(defect, "a late first signal hid the defect of the kernel {release}");
     }
+}
+
+/// R530: a ring registers its wake descriptor at its first use, so the kernel signalled nothing
+/// for the work that came before. The descriptor is readable at that first use, and the turn of
+/// the reactor then takes that work. Here, the bytes of the receive come before the first use.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_wake_descriptor_is_readable_at_its_first_use_for_the_work_that_came_before_it() {
+    let mut driver = suite::driver(Config::new(), Backend::Kernel);
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
+    // The turn submits the receive, which waits for its bytes.
+    driver.turn().unwrap();
+    peer.write_all(b"early").unwrap();
+    wait_readable(&driver);
+    let (count, bytes) = drive_from_reactor(&mut driver, receive).unwrap();
+    assert_eq!((count.unwrap(), bytes.bytes()), (5, &b"early"[..]));
 }
 
 /// The bytes of a numbered stream from `start`: each byte is its position modulo 251, so a lost
@@ -2476,4 +2500,158 @@ fn a_driver_that_the_allocator_refuses_keeps_no_memory() {
         assert_eq!((held, refunded), (-bytes, units));
     }
     driver.teardown().unwrap();
+}
+
+/// The clock of the deadlines of a case. It pauses while the system is suspended, as the wait of
+/// the kernel does.
+fn deadline_clock() -> crate::clock::NativeClock {
+    crate::clock::NativeClock::new(crate::time::Suspend::Pauses).expect("the test host has a monotonic clock")
+}
+
+/// The deadline `time` after now on `clock`.
+fn deadline_after(clock: crate::clock::NativeClock, time: core::time::Duration) -> crate::time::Deadline {
+    crate::time::Deadline::at(clock.now().checked_add(time).expect("the deadline is in the domain"))
+}
+
+/// A deadline that no case reaches: a wait that ends there fails its test at the time limit.
+const NEVER: core::time::Duration = core::time::Duration::from_secs(600);
+
+/// R530: a loop that owns the driver waits in it until its next timer. With no work, no wake, and
+/// no signal, the wait blocks until the deadline: a wait that does not block returns thousands of
+/// times in that time.
+pub(in crate::driver) fn a_timed_wait_with_no_work_blocks_until_its_deadline(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let clock = deadline_clock();
+    let deadline = deadline_after(clock, core::time::Duration::from_millis(50));
+    let mut waits = 0;
+    while !deadline.is_reached(clock.now()).unwrap() {
+        driver.turn().unwrap();
+        driver.wait_until(deadline, clock).unwrap();
+        waits += 1;
+    }
+    assert!(waits <= 8, "the wait returned {waits} times in 50 ms");
+}
+
+/// R530: a deadline that passed gives no block, also with no work that could end a wait. A
+/// deadline of another clock refuses, and does not wait.
+pub(in crate::driver) fn a_timed_wait_whose_deadline_passed_does_not_block(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let clock = deadline_clock();
+    let passed = crate::time::Deadline::at(clock.now());
+    driver.turn().unwrap();
+    driver.wait_until(passed, clock).unwrap();
+
+    let other = crate::time::ClockDomain::new(clock.domain().id() ^ 1, crate::time::Suspend::Pauses);
+    let foreign = crate::time::Deadline::at(crate::time::Instant::new(other, u64::MAX));
+    let refused = driver.wait_until(foreign, clock).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::InvalidInput);
+}
+
+/// R530: a completion ends a timed wait before its deadline. The receive waits in the kernel
+/// when the peer sends.
+pub(in crate::driver) fn a_completion_ends_a_timed_wait_before_its_deadline(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let clock = deadline_clock();
+    let never = deadline_after(clock, NEVER);
+    let mut receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(8))).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    driver.turn().unwrap();
+    let sender = thread::spawn(move || {
+        peer.write_all(b"now").unwrap();
+        peer
+    });
+    let (count, bytes) = loop {
+        let more = driver.turn().unwrap().more();
+        if let Poll::Ready(output) = Pin::new(&mut receive).poll(&mut cx) {
+            break output.unwrap();
+        }
+        if !more {
+            driver.wait_until(never, clock).unwrap();
+        }
+    };
+    assert_eq!((count.unwrap(), bytes.bytes()), (3, &b"now"[..]));
+    assert!(!never.is_reached(clock.now()).unwrap());
+    drop(sender.join().unwrap());
+}
+
+/// R530: a wake from another thread ends a timed wait before its deadline, also when the wake
+/// comes before the wait.
+pub(in crate::driver) fn a_wake_ends_a_timed_wait_before_its_deadline(backend: Backend) {
+    let mut driver = suite::driver(Config::new(), backend);
+    let clock = deadline_clock();
+    let never = deadline_after(clock, NEVER);
+    let handle = driver.wake_handle();
+    driver.turn().unwrap();
+    // No turn takes the wake before the wait.
+    let waker = thread::spawn(move || handle.wake());
+    driver.wait_until(never, clock).unwrap();
+    assert!(!never.is_reached(clock.now()).unwrap());
+    waker.join().unwrap();
+}
+
+/// R530: handled signals that come faster than the time of a wait do not keep the loop past its
+/// deadline. Each signal ends the wait in the kernel, and the next wait takes only the time that
+/// is left. A wait that takes its whole time again at each signal ends only after the last signal.
+#[cfg(unix)]
+pub(in crate::driver) fn signals_do_not_delay_the_deadline_of_a_timed_wait(backend: Backend) {
+    use core::ffi::c_int;
+    use core::sync::atomic::AtomicU32;
+    use core::time::Duration;
+    use std::os::unix::thread::{JoinHandleExt as _, RawPthread};
+    use std::sync::mpsc;
+
+    /// `SIGUSR1` (`asm-generic/signal.h` of Linux, `sys/signal.h` of macOS).
+    #[cfg(target_os = "linux")]
+    const SIGUSR1: c_int = 10;
+    #[cfg(target_os = "macos")]
+    const SIGUSR1: c_int = 30;
+    /// The time from the first wait to the deadline: many intervals of the signals.
+    const TIMEOUT: Duration = Duration::from_millis(100);
+    const LATE: Duration = Duration::from_secs(1);
+    static HANDLED: AtomicU32 = AtomicU32::new(0);
+    extern "C" fn handle(_signal: c_int) {
+        HANDLED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[expect(unsafe_code, reason = "the C library of each Unix target gives these functions")]
+    unsafe extern "C" {
+        /// `sighandler_t signal(int sig, sighandler_t handler)`. `SIG_ERR` is `-1`.
+        fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> isize;
+        /// `int pthread_kill(pthread_t thread, int sig)`.
+        fn pthread_kill(thread: RawPthread, sig: c_int) -> c_int;
+    }
+
+    // SAFETY: the handler only adds to an atomic counter, which is async-signal-safe.
+    #[expect(unsafe_code, reason = "the handler is async-signal-safe")]
+    let installed = unsafe { signal(SIGUSR1, handle) };
+    assert_ne!(installed, -1);
+    let (ready, started) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let mut driver = suite::driver(Config::new(), backend);
+        let clock = deadline_clock();
+        let deadline = deadline_after(clock, TIMEOUT);
+        ready.send(()).unwrap();
+        while !deadline.is_reached(clock.now()).unwrap() {
+            driver.turn().unwrap();
+            driver.wait_until(deadline, clock).unwrap();
+        }
+        clock.now().duration_since(deadline.instant()).unwrap()
+    });
+    started.recv().unwrap();
+    let start = Instant::now();
+    while !waiter.is_finished() && start.elapsed() < TIMEOUT + 2 * LATE {
+        // SAFETY: the thread is not joined, so its handle is valid.
+        #[expect(unsafe_code, reason = "the handle names a thread that is not joined")]
+        unsafe {
+            pthread_kill(waiter.as_pthread_t(), SIGUSR1);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let late = waiter.join().unwrap();
+    assert_ne!(
+        HANDLED.load(core::sync::atomic::Ordering::Relaxed),
+        0,
+        "the signals reach the waiting thread"
+    );
+    assert!(late < LATE, "{late:?}");
 }

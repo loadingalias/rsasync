@@ -85,14 +85,16 @@ impl Queue {
     }
 
     /// Submits as [`Queue::submit`] does, and waits at most until `until`. The end of the time is
-    /// no error.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    /// no error. Each backend reads the time that is left at each entry of its wait, so a wait that
+    /// ends early and starts again does not start the time again.
     pub(crate) fn submit_until(&mut self, wait: u32, until: crate::clock::Until) -> io::Result<u32> {
         match self {
             #[cfg(target_os = "linux")]
             Self::Ring(ring) => ring.submit_timeout(wait, until.remaining()),
             #[cfg(unix)]
             Self::Poller(poller) => poller.submit_until(wait, until),
+            #[cfg(target_os = "windows")]
+            Self::Port(port) => port.submit_until(wait, until),
         }
     }
 
@@ -242,6 +244,15 @@ impl Queue {
                 buffers.free();
                 Ok(())
             }
+        }
+    }
+
+    /// The ring, for a call that changes none of its queues, such as a registration.
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn as_ring(&self) -> Option<&Ring> {
+        match self {
+            Self::Ring(ring) => Some(ring),
+            Self::Poller(_) => None,
         }
     }
 

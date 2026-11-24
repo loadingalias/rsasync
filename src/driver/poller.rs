@@ -378,7 +378,6 @@ impl Poller {
 
     /// Submits as [`submit`](Self::submit) does, and waits at most until `until`. The end of the
     /// time is no error.
-    #[cfg(all(feature = "local", target_os = "linux"))]
     pub(crate) fn submit_until(&mut self, wait: u32, until: crate::clock::Until) -> io::Result<u32> {
         self.enter(wait, || Some(until.remaining()))
     }

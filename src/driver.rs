@@ -93,12 +93,16 @@ mod udp;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::AllocError;
+#[cfg(target_os = "linux")]
+use core::cell::Cell;
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop};
 use core::num::NonZeroU64;
 use core::pin::Pin;
+#[cfg(target_os = "linux")]
+use core::sync::atomic::{AtomicBool, fence};
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll, ready};
 #[cfg(unix)]
@@ -183,8 +187,6 @@ pub struct Config {
     required: Features,
     backend: Option<Backend>,
     delivery: Delivery,
-    #[cfg(target_os = "linux")]
-    wake: WakeDescriptor,
 }
 
 impl Config {
@@ -202,20 +204,6 @@ impl Config {
             required: Features::NONE,
             backend: None,
             delivery: Delivery::Native,
-            #[cfg(target_os = "linux")]
-            wake: WakeDescriptor::Signaled,
-        }
-    }
-
-    /// A driver that only its owner waits on, in [`Driver::wait`]: a runtime worker, or the owner of
-    /// `block_on`. On io_uring, no host reactor polls its wake descriptor, so the kernel does not
-    /// signal it at each completion, and no turn reads it.
-    #[cfg(all(feature = "local", target_os = "linux"))]
-    #[must_use]
-    pub(crate) const fn owned(self) -> Self {
-        Self {
-            wake: WakeDescriptor::Unused,
-            ..self
         }
     }
 
@@ -1242,20 +1230,6 @@ impl Selected {
     }
 }
 
-/// Whether a wake from another thread signals the wake descriptor of a driver on Linux, which
-/// `AsFd` gives.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WakeDescriptor {
-    /// A host reactor or the poller waits on it, and the kernel signals it at each completion of
-    /// a ring.
-    Signaled,
-    /// Only the owner of the driver waits, in its ring, and each wake signals the interrupt
-    /// descriptor only: a runtime worker, or the owner of `block_on`.
-    #[cfg(feature = "local")]
-    Unused,
-}
-
 /// The state that the futures and the wake handles share with the home.
 struct Shared {
     /// The driver of the operations: their identity names it ([`Operation::id`]).
@@ -1279,9 +1253,12 @@ struct Shared {
     /// the kernel would also complete that poll, so the wait does not poll `wake`.
     #[cfg(target_os = "linux")]
     interrupt: fs::File,
-    /// Whether a wake also signals `wake`, and a turn clears it.
+    /// Whether something reads `wake`: the poller, from the start, or the reactor of a host, from
+    /// the first `AsFd` of a ring. A wake then also signals `wake`, and a turn clears it. A driver
+    /// that only its caller waits on, in [`Driver::wait`], never sets it: the kernel then signals
+    /// no descriptor at a completion, and no turn reads one.
     #[cfg(target_os = "linux")]
-    wake_descriptor: WakeDescriptor,
+    signaled: AtomicBool,
     /// The wake of the port: a packet that another thread posts, which ends a wait.
     #[cfg(target_os = "windows")]
     wake: iocp::Wake,
@@ -1291,10 +1268,15 @@ impl Shared {
     #[cfg(target_os = "linux")]
     fn wake(&self) {
         // A full counter is a pending wake already, and nothing else can fail here.
-        if self.wake_descriptor == WakeDescriptor::Signaled {
+        drop((&self.interrupt).write(&1_u64.to_ne_bytes()));
+        // Ordering: this `SeqCst` fence after the request or the work that the caller queued, and
+        // the one of the first use of the wake descriptor after its store (`Driver::use_wake`),
+        // order the two. This wake sees the flag, or the turn that follows that first use sees
+        // what the caller queued.
+        fence(Ordering::SeqCst);
+        if self.signaled.load(Ordering::Relaxed) {
             drop((&self.wake).write(&1_u64.to_ne_bytes()));
         }
-        drop((&self.interrupt).write(&1_u64.to_ne_bytes()));
     }
 
     #[cfg(target_os = "macos")]
@@ -1326,7 +1308,8 @@ impl Shared {
     fn clear(&self) -> bool {
         let mut count = [0; 8];
         // A descriptor with no wake gives `WouldBlock`, which is the clear state.
-        self.wake_descriptor == WakeDescriptor::Signaled && (&self.wake).read(&mut count).is_ok()
+        // Ordering: `Relaxed`: only the thread of the driver sets the flag.
+        self.signaled.load(Ordering::Relaxed) && (&self.wake).read(&mut count).is_ok()
     }
 
     /// Clears the interrupt descriptor, when the poll of it completed. A wake that comes after the
@@ -1380,9 +1363,13 @@ pub struct Driver {
     waking: bool,
     /// The kernel signals the wake descriptor for deferred work only one time in each
     /// registration, or a signal of the probe came late (`probe`). Each turn that takes a wake thus
-    /// registers it again.
+    /// registers it again. The first use of the descriptor sets it.
     #[cfg(target_os = "linux")]
-    rearm_wake: bool,
+    rearm_wake: Cell<bool>,
+    /// The failure of the registration of the wake descriptor at its first use, which the next
+    /// turn gives.
+    #[cfg(target_os = "linux")]
+    wake_failed: Cell<Option<io::Error>>,
     /// The signal streams whose home is this driver.
     #[cfg(unix)]
     signals: signal::Homes,
@@ -1425,7 +1412,7 @@ impl fmt::Debug for Driver {
             .field("selected", &self.selected)
             .field("completions_per_turn", &self.completions_per_turn);
         #[cfg(target_os = "linux")]
-        debug.field("rearm_wake", &self.rearm_wake);
+        debug.field("rearm_wake", &self.rearm_wake.get());
         debug.finish_non_exhaustive()
     }
 }
@@ -1642,7 +1629,7 @@ impl Driver {
                 Err(SetupError::Failed(error)) => return Err(Error::System(error)),
             },
         };
-        let (queue, probed, rearm_wake) = match ring {
+        let (queue, probed) = match ring {
             Some(mut ring) => {
                 // The probe needs a new ring, with no entry, completion, or buffer group.
                 let probed = Features::probed(ring.probe().map_err(Error::System)?);
@@ -1651,12 +1638,9 @@ impl Driver {
                 if !missing.is_empty() {
                     return Err(Error::Unsupported(missing));
                 }
-                // A descriptor that nothing reads gets no registration, so the kernel does not signal it.
-                let rearm_wake = config.wake == WakeDescriptor::Signaled && {
-                    ring.register_eventfd(wake.as_raw_fd()).map_err(Error::System)?;
-                    probe::signal_stops_after_first(&mut ring, &wake).map_err(Error::System)?
-                };
-                (Queue::Ring(ring), probed, rearm_wake)
+                // Nothing reads the wake descriptor yet, so it gets no registration, and the
+                // kernel does not signal it (`Driver::use_wake`).
+                (Queue::Ring(ring), probed)
             }
             None => {
                 selection.backend = Backend::Epoll;
@@ -1675,7 +1659,7 @@ impl Driver {
                     io::ErrorKind::InvalidInput => Error::Config,
                     _ => Error::System(error),
                 })?;
-                (Queue::Poller(poller), Features::NONE, false)
+                (Queue::Poller(poller), Features::NONE)
             }
         };
         let registrar = match &queue {
@@ -1683,10 +1667,7 @@ impl Driver {
             Queue::Ring(_) => None,
         };
         // The poller waits on the wake descriptor, so each wake signals it there.
-        let wake_descriptor = match &queue {
-            Queue::Ring(_) => config.wake,
-            Queue::Poller(_) => WakeDescriptor::Signaled,
-        };
+        let signaled = AtomicBool::new(matches!(queue, Queue::Poller(_)));
         let table = Table::new(config.operations).map_err(refused)?;
         let driver = DriverId::next()?;
         let shared = try_arc(Shared {
@@ -1697,7 +1678,7 @@ impl Driver {
             closes: home::Closes::new(config.resources).map_err(refused)?,
             wake,
             interrupt: fs::File::from(interrupt),
-            wake_descriptor,
+            signaled,
         })
         .map_err(refused)?;
         let job_waker = file::job_waker(&shared).map_err(refused)?;
@@ -1719,10 +1700,11 @@ impl Driver {
             pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
             selected: None,
-            report: Report::new(selection, config.required, probed, rearm_wake),
+            report: Report::new(selection, config.required, probed, false),
             completions_per_turn: config.completions_per_turn,
             waking: false,
-            rearm_wake,
+            rearm_wake: Cell::new(false),
+            wake_failed: Cell::new(None),
             signals: filled(signal::STREAMS, || None).map_err(refused)?.into_boxed_slice(),
             blocking: None,
             job_waker,
@@ -1737,9 +1719,13 @@ impl Driver {
         })
     }
 
-    /// What the driver found and applied when it started.
+    /// What the driver found and applied when it started. [`Report::rearms_wake`] gives what the
+    /// first use of the wake descriptor found, and `false` before it.
     #[must_use]
-    pub const fn report(&self) -> Report {
+    pub fn report(&self) -> Report {
+        #[cfg(target_os = "linux")]
+        return self.report.with_rearms_wake(self.rearm_wake.get());
+        #[cfg(not(target_os = "linux"))]
         self.report
     }
 
@@ -1856,6 +1842,10 @@ impl Driver {
     /// A failure of the kernel entry other than an interrupt or a full completion queue, which
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
+        #[cfg(target_os = "linux")]
+        if let Some(error) = self.wake_failed.take() {
+            return Err(error);
+        }
         self.take_requests();
         // A packet of the port wakes the next wait for a job that ends later, and no turn clears it.
         #[cfg(target_os = "windows")]
@@ -1882,7 +1872,7 @@ impl Driver {
         // the descriptor already, so this turn reports it, or a later wake comes.
         #[cfg(target_os = "linux")]
         if self.shared.clear()
-            && self.rearm_wake
+            && self.rearm_wake.get()
             && let Some(ring) = self.queue.ring()
         {
             // On a kernel with the defect of `probe`, the next deferred work signals only a new
@@ -1930,9 +1920,51 @@ impl Driver {
         self.wait_in(|queue| queue.submit(1))
     }
 
-    /// Blocks as [`wait`](Self::wait) does, but at most until `until`.
-    #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn wait_until(&mut self, until: crate::clock::Until) -> io::Result<()> {
+    /// Blocks as [`wait`](Self::wait) does, but at most until `deadline`, an instant of `clock`. A
+    /// loop that owns the driver waits with it for its I/O and for its next timer in one call: the
+    /// kernel ends the wait, and the driver starts no timer thread.
+    ///
+    /// A deadline that passed gives no block: the call takes the pushed entries and returns. The
+    /// wait can also end before the deadline with no work, for example at a handled signal. Call
+    /// it again with the same deadline then: the time does not start again, because the driver
+    /// reads the time that is left at each entry of the kernel.
+    ///
+    /// On epoll and IOCP, the kernel counts the wait in milliseconds, so the driver rounds the
+    /// time up. The kernel measures the wait on a clock that pauses while the system is suspended.
+    /// So with a clock of [`Suspend::Advances`](crate::time::Suspend::Advances), a suspend during
+    /// the wait can end the wait later than the deadline.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use core::time::Duration;
+    ///
+    /// use rsasync::clock::NativeClock;
+    /// use rsasync::driver::{Config, Driver};
+    /// use rsasync::time::{Deadline, Suspend};
+    ///
+    /// let clock = NativeClock::new(Suspend::Pauses)?;
+    /// let mut driver = Driver::new(Config::new())?;
+    /// loop {
+    ///     // Poll the futures of your operations here, and run each timer that is due.
+    ///     let next_timer = Deadline::at(clock.now().checked_add(Duration::from_millis(250))?);
+    ///     if !driver.turn()?.more() {
+    ///         driver.wait_until(next_timer, clock)?;
+    ///     }
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The kind `InvalidInput`, with no wait, when `deadline` is not an instant of the domain of
+    /// `clock`. A failure of the kernel entry, as for [`wait`](Self::wait).
+    pub fn wait_until(&mut self, deadline: crate::time::Deadline, clock: crate::clock::NativeClock) -> io::Result<()> {
+        let until = crate::clock::Until::checked(deadline.instant(), clock).ok_or(io::ErrorKind::InvalidInput)?;
+        self.wait_to(until)
+    }
+
+    /// The wait of [`wait_until`](Self::wait_until), until a deadline that has its clock.
+    pub(crate) fn wait_to(&mut self, until: crate::clock::Until) -> io::Result<()> {
         self.wait_in(|queue| queue.submit_until(1, until))
     }
 
@@ -2611,17 +2643,53 @@ impl AsFd for Driver {
     /// driver when it is readable. On epoll and kqueue, it is the epoll descriptor or the kqueue,
     /// which is readable when an event of a resource or a wake waits.
     ///
+    /// On io_uring, the first call registers the descriptor with the ring, and it is readable
+    /// then, so that the first turn takes the work that came before. A driver whose caller never
+    /// asks for the descriptor, and waits only in [`Driver::wait`] or [`Driver::wait_until`], has
+    /// no registration: the kernel signals no descriptor at a completion, and no turn reads one.
+    /// When the registration fails, the next [`Driver::turn`] gives its error.
+    ///
     /// A Linux kernel with the io_uring change `cd305ee3633a` and not `04fe9aeb4f3c` signals the
     /// descriptor for deferred work only one time in each registration, for example Ubuntu 26.04
-    /// with `7.0.0-1016-aws`. The first driver of a process finds such a kernel, and each driver
-    /// then registers the descriptor again in each turn that takes a wake, so the descriptor still
-    /// becomes readable for each completion and each deferred work. A kernel with no defect makes
-    /// no extra system call.
+    /// with `7.0.0-1016-aws`. The first use of a wake descriptor in a process finds such a kernel
+    /// with a probe, and each driver then registers the descriptor again in each turn that takes a
+    /// wake, so the descriptor still becomes readable for each completion and each deferred work.
+    /// A kernel with no defect makes no extra system call.
     fn as_fd(&self) -> BorrowedFd<'_> {
         #[cfg(target_os = "linux")]
-        return self.queue.readable(self.shared.wake.as_fd());
+        {
+            self.use_wake();
+            self.queue.readable(self.shared.wake.as_fd())
+        }
         #[cfg(target_os = "macos")]
         return self.queue.readable();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Driver {
+    /// The first use of the wake descriptor of a ring: the reactor of a host reads it from now on.
+    /// Registers it with the ring, so that the kernel signals it at each completion, and finds
+    /// whether the kernel has the defect of `probe`. Then each wake of another thread signals it
+    /// too, and each turn clears it.
+    fn use_wake(&self) {
+        // Ordering: `Relaxed`: only this thread sets the flag.
+        if self.shared.signaled.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(ring) = self.queue.as_ring() else {
+            return;
+        };
+        match ring.register_eventfd(self.shared.wake.as_raw_fd()) {
+            Ok(()) => self.rearm_wake.set(probe::defect()),
+            Err(error) => self.wake_failed.set(Some(error)),
+        }
+        self.shared.signaled.store(true, Ordering::Relaxed);
+        // Ordering: see `Shared::wake`.
+        fence(Ordering::SeqCst);
+        // A completion or a wake that came before the registration signalled nothing. The
+        // descriptor is readable now, so the host turns the driver one time and takes that work.
+        drop((&self.shared.wake).write(&1_u64.to_ne_bytes()));
     }
 }
 

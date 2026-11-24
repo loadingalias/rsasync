@@ -130,22 +130,38 @@ impl fmt::Debug for InjectedClock {
 }
 
 /// A deadline and the clock that reads it: the end of a timed wait of an owner or a driver.
-#[cfg(feature = "local")]
+#[cfg(any(
+    feature = "local",
+    all(
+        feature = "std",
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Until {
     pub(crate) instant: Instant,
     clock: NativeClock,
 }
 
-#[cfg(feature = "local")]
+#[cfg(any(
+    feature = "local",
+    all(
+        feature = "std",
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 impl Until {
     /// The deadline `instant`, which `clock` reads.
+    #[cfg(feature = "local")]
     pub(crate) fn new(instant: Instant, clock: NativeClock) -> Self {
-        assert!(
-            instant.domain() == clock.domain(),
-            "a deadline is on the domain of its clock"
-        );
-        Self { instant, clock }
+        Self::checked(instant, clock).expect("a deadline is on the domain of its clock")
+    }
+
+    /// The deadline `instant`, which `clock` reads, or `None` for an instant of another domain.
+    pub(crate) fn checked(instant: Instant, clock: NativeClock) -> Option<Self> {
+        (instant.domain() == clock.domain()).then_some(Self { instant, clock })
     }
 
     /// The time from now until the deadline, or zero when it passed.

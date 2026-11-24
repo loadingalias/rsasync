@@ -313,10 +313,17 @@ impl Report {
     /// Whether the driver registers its wake descriptor again in each turn that takes a wake. It
     /// does so on a kernel whose registered event descriptor signals deferred work one time. It
     /// also does so when a deferred signal came late during the probe of the kernel (see the
-    /// `AsFd` form of the driver on Linux).
+    /// `AsFd` form of the driver on Linux). Before the first use of the wake descriptor, the
+    /// driver has no registration, and this gives `false`.
     #[must_use]
     pub const fn rearms_wake(&self) -> bool {
         self.rearms_wake
+    }
+
+    /// The report with what the first use of the wake descriptor found.
+    #[cfg(target_os = "linux")]
+    pub(super) const fn with_rearms_wake(self, rearms_wake: bool) -> Self {
+        Self { rearms_wake, ..self }
     }
 }
 

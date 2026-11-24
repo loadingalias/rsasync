@@ -121,8 +121,9 @@ child gives `SignalChildError::OtherDriver`.
 | `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and takes up to `Config::completions_per_turn` completions from the ring. It gives the completion of each operation to its future. The bound and `Turn::completed()` also count the completions of the driver itself, such as cancel results |
 | `Turn::more()` | Work remains. Turn again before you wait |
 | `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. A handled signal also ends the wait, with no completion. The kernel runs its deferred work during the wait |
-| The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread. Some kernels signal deferred work only one time; see [Drive it from another reactor](#drive-it-from-another-reactor) |
-| `Driver::wake_handle()` | A `WakeHandle` that any thread can use to make the wake descriptor readable and to end a wait |
+| `Driver::wait_until(deadline, clock)` | Blocks as `wait()` does, but at most until `deadline`, an instant of the `NativeClock` `clock`. See [Wait until a deadline](#wait-until-a-deadline) |
+| The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread. On io_uring, the first `as_fd()` registers it. Some kernels signal deferred work only one time; see [Drive it from another reactor](#drive-it-from-another-reactor) |
+| `Driver::wake_handle()` | A `WakeHandle` that any thread can use to make the wake descriptor readable and to end a wait. A turn takes a wake that came before it |
 | `Driver::teardown()` | Cancels each running operation, drives until each terminal event, closes each resource, and reports the cancelled operations |
 
 ## Drive it from your own loop
@@ -147,6 +148,59 @@ loop {
 A turn stops at its bound. If more completions are ready, `Turn::more()` gives `true`, and the next
 turn gives them. So a turn always returns soon, and your loop can do other work between turns.
 
+A loop that only waits in the driver pays nothing for the wake descriptor. On io_uring, the driver
+registers that descriptor only when you ask for it with `as_fd()`. Without it, the kernel signals
+no descriptor at a completion, and no turn reads one.
+
+### Wait until a deadline
+
+A loop with timers waits for its I/O and for its next timer in one call. `Driver::wait_until` ends
+at a completion, at a request or a wake from another thread, at a handled signal, or when the
+deadline passed. The kernel ends the wait, so the driver starts no timer thread.
+
+```rust
+use core::time::Duration;
+
+use rsasync::clock::NativeClock;
+use rsasync::driver::{Config, Driver};
+use rsasync::time::{Deadline, Suspend};
+
+let clock = NativeClock::new(Suspend::Pauses)?;
+let mut driver = Driver::new(Config::new())?;
+loop {
+    let turn = driver.turn()?;
+    // 1. Poll the futures of your operations.
+    // 2. Take the work that other threads gave to this loop.
+    // 3. Run each timer that is due, and find the deadline of the next one.
+    let next_timer = Deadline::at(clock.now().checked_add(Duration::from_millis(250))?);
+    if !turn.more() {
+        driver.wait_until(next_timer, clock)?;
+    }
+    // Stop when your work is done.
+}
+```
+
+| Case | What `wait_until` does |
+| --- | --- |
+| No work before the deadline | It returns when the deadline passed |
+| The deadline passed before the call | It takes the pushed entries and returns, with no block |
+| A completion comes first | It returns then. The next turn gives the completion to its future |
+| Another thread calls `WakeHandle::wake` | It returns then, also when the wake came before the wait and after the last turn |
+| A handled signal comes | It returns then. Call it again with the same deadline: the time does not start again |
+| The deadline is not an instant of the domain of `clock` | It gives an error of the kind `InvalidInput`, and it does not wait |
+
+Rules for the loop:
+
+- Read the clock after each return. The wait can end before the deadline with no work for you.
+- Take the work of other threads after the turn and before the wait. A turn takes each wake that
+  came before it. A wake that comes after the turn ends the wait.
+- Use a clock of `Suspend::Pauses`. The kernel measures the wait on a clock that pauses while the
+  system is suspended. With a clock of `Suspend::Advances`, a suspend during the wait can end the
+  wait later than the deadline.
+- On epoll and IOCP, the kernel counts the wait in milliseconds, so the driver rounds the time up.
+
+The timed wait has the same form on io_uring, epoll, kqueue, and IOCP.
+
 ## Drive it from another reactor
 
 On Linux and macOS, register the wake descriptor (`driver.as_fd()`) for readability with the
@@ -154,15 +208,20 @@ reactor of your host, for example epoll, kqueue, or the reactor of another runti
 turn the driver, and turn it again while `Turn::more()` gives `true`. The turn clears the
 descriptor, so the reactor reports it again only for new work.
 
+On io_uring, the first `as_fd()` registers the descriptor with the ring. The descriptor is readable
+then, one time, so that your first turn takes the work that came before the registration. If the
+registration fails, the next `Driver::turn` gives its error. Ask for the descriptor only when a
+reactor waits for it: a loop that waits in `Driver::wait` or `Driver::wait_until` does not need it.
+
 The descriptor becomes readable for each completion and for each deferred work of the kernel, on
 each supported kernel, so a reactor that waits only for it misses no operation.
 
 One kernel defect needs a workaround in the driver. A Linux kernel with the io_uring change
 `cd305ee3633a` ("defer eventfd signaling when queued from a wakeup handler") and not
 `04fe9aeb4f3c` ("reset deferred signal state") signals the descriptor for deferred work only one
-time in each registration, for example Ubuntu 26.04 with `7.0.0-1016-aws`. The first `Driver::new`
-of a process finds such a kernel with a probe of two deferred signals, which takes up to about 2 s.
-Each later driver of the process uses that result and makes no probe. The workaround goes when the
+time in each registration, for example Ubuntu 26.04 with `7.0.0-1016-aws`. The first `as_fd()`
+of a process on io_uring finds such a kernel with a probe of two deferred signals, which takes up
+to about 2 s. Each later driver of the process uses that result and makes no probe. The workaround goes when the
 supported kernels have `04fe9aeb4f3c`.
 
 On such a kernel, the driver registers the descriptor again in each turn that takes a wake: two

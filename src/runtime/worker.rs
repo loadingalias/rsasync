@@ -148,7 +148,7 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), Worke
         }
     }
     // On Linux, the driver runs io_uring, or epoll, and the home of an owner runs on both.
-    let mut driver = Driver::new(driver.owned()).map_err(WorkerError::Driver)?;
+    let mut driver = Driver::new(driver).map_err(WorkerError::Driver)?;
     if let Some(submitter) = blocking {
         driver.use_blocking(submitter);
     }

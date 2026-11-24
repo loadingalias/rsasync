@@ -519,12 +519,33 @@ impl Port {
     ///
     /// An error of `GetQueuedCompletionStatusEx` other than the end of its time.
     pub(crate) fn submit(&mut self, wait: u32) -> io::Result<u32> {
+        self.enter(wait, || None)
+    }
+
+    /// Submits as [`submit`](Self::submit) does, and waits at most until `until`. The end of the
+    /// time is no error.
+    pub(crate) fn submit_until(&mut self, wait: u32, until: crate::clock::Until) -> io::Result<u32> {
+        self.enter(wait, || Some(until.remaining()))
+    }
+
+    /// The submit of [`submit`](Self::submit). Before each wait, `left` gives the time left, or
+    /// `None` for no limit. No time left ends the submit.
+    fn enter(&mut self, wait: u32, mut left: impl FnMut() -> Option<core::time::Duration>) -> io::Result<u32> {
         let taken = self.take();
         self.submit_ring()?;
         self.poll_jobs();
         let mut woke = self.poll(0)?;
         while wait > 0 && !woke && self.completions.len() < wait as usize {
-            woke = self.poll(sys::INFINITE)?;
+            let timeout = match left() {
+                None => sys::INFINITE,
+                Some(left) if left.is_zero() => break,
+                // Rounded up, so the wait does not end a millisecond before its time. The largest
+                // value is `INFINITE`, so a longer time waits in parts.
+                Some(left) => u32::try_from(left.as_nanos().div_ceil(1_000_000))
+                    .unwrap_or(u32::MAX)
+                    .min(sys::INFINITE - 1),
+            };
+            woke = self.poll(timeout)?;
             self.poll_jobs();
         }
         Ok(taken)

@@ -45,8 +45,9 @@
 //! the wake descriptor directly. A ring operation that polls a caller's descriptor or another
 //! eventfd makes this path matter, and the probe must then test it.
 //!
-//! The defect is a fact of the kernel, not of a ring, so only the first driver of a process
-//! probes. Each later driver reads that result.
+//! The defect is a fact of the kernel, not of a ring, so only the first use of a wake descriptor
+//! in a process probes, on a ring of its own. Each later use reads that result. A driver whose
+//! caller never asks for the descriptor makes no registration and no probe.
 
 use core::time::Duration;
 use std::fs::File;
@@ -56,7 +57,7 @@ use std::os::fd::AsRawFd as _;
 use super::sys;
 use crate::clock::NativeClock;
 use crate::time::{Instant, Suspend};
-use crate::uring::{Ring, Sqe};
+use crate::uring::{Ring, SetupError, Sqe};
 
 /// The time for the first deferred signal. Each kernel gives it, but with `cd305ee3633a` only after
 /// a grace period, which has no fixed bound.
@@ -69,19 +70,31 @@ const MOST: Duration = Duration::from_secs(1);
 /// time, and loom explores no part of the probe, so this is the cell of `std`.
 static DEFECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Gives `true` when the driver must register `wake` again in each turn: the kernel signals the
-/// registered `wake` for deferred work only one time in the life of a registration, or a signal
-/// of the probe came late. The first call of the process probes `ring`, and then registers
-/// `wake` again, because the probe used the registration. Call it on a new ring with no entry and
-/// no completion: a probe takes each completion that it makes.
-pub(super) fn signal_stops_after_first(ring: &mut Ring, wake: &File) -> io::Result<bool> {
+/// Gives `true` when a driver must register its wake descriptor again in each turn: the kernel
+/// signals a registered descriptor for deferred work only one time in the life of a registration,
+/// or a signal of the probe came late. The first call of the process probes the kernel, at the
+/// first use of a wake descriptor (`Driver::use_wake`). The ring of that driver can have entries
+/// and completions then, and a probe takes each completion that it makes, so the probe runs on a
+/// ring and a descriptor of its own. A probe that cannot run gives `true`: the registrations cost
+/// system calls, but they miss no wake on each kernel.
+pub(super) fn defect() -> bool {
     if let Some(defect) = DEFECT.get() {
-        return Ok(*defect);
+        return *defect;
     }
-    let defect = probe(ring, wake, FIRST)?;
-    super::rearm(ring, wake)?;
-    // Two first drivers on two threads can both probe; each gets one result.
-    Ok(*DEFECT.get_or_init(|| defect))
+    let probed = Ring::new(4, 8)
+        .map_err(|error| match error {
+            SetupError::Refused(error) | SetupError::Failed(error) => error,
+        })
+        .and_then(|mut ring| {
+            let wake = File::from(super::eventfd()?);
+            ring.register_eventfd(wake.as_raw_fd())?;
+            probe(&mut ring, &wake, FIRST)
+        });
+    match probed {
+        // Two first uses on two threads can both probe; each gets one result.
+        Ok(defect) => *DEFECT.get_or_init(|| defect),
+        Err(_) => true,
+    }
 }
 
 /// Makes two deferred signals on the registration of `wake`, and gives `false` only when both

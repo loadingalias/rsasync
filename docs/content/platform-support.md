@@ -135,6 +135,14 @@ check a receive whose task goes to the other worker, a cancel and a close from t
 the bytes of a dropped receive, the order of two sends with different homes, and a shutdown. On
 epoll, each movable call refuses, and one test checks that refusal.
 
+The timed wait of the driver, `Driver::wait_until`, runs on each backend. On 2026-11-24, its cases
+passed on io_uring and epoll on the x86_64 Debian 12 host (`6.1.0-56-cloud-amd64`) and the aarch64
+Ubuntu 26.04 host (`7.0.0-1018-aws`), on kqueue on macOS 27.2.1 (aarch64), and on IOCP on Windows
+Server 2025 x86_64 (build `10.0.26100.33822`) and Windows 11 aarch64 (build `10.0.26300.9974`).
+The cases check a wait with no work, a deadline that passed, an earlier completion, and a wake of
+another thread. On Linux and macOS, one more case checks signals that come faster than the time of
+the wait.
+
 ## macOS
 
 The Intel macOS target (`x86_64-apple-darwin`) compiles and links with the macOS 27.2 SDK.

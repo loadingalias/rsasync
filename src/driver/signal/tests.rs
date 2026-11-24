@@ -122,6 +122,9 @@ pub(in crate::driver) fn two_streams_of_one_signal_on_two_drivers_both_report(ba
     let mut streams = drivers.each_mut().map(|driver| stream(driver, Signal::TERMINATE));
     let cx = Context::from_waker(Waker::noop());
     for (driver, stream) in drivers.iter_mut().zip(&mut streams) {
+        // The first use of the wake descriptor of a ring makes it readable one time, and the turn
+        // clears it.
+        let _first_use = driver.as_fd();
         driver.turn().unwrap();
         assert!(!woken(driver));
         assert_eq!(stream.poll_recv(&cx), Poll::Pending);
