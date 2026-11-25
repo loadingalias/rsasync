@@ -1704,7 +1704,7 @@ impl Driver {
         let Some(owned) = resources.get(resource) else {
             return Err((value, held));
         };
-        let (Some(fd), pipe) = (owned.number(), owned.medium == Medium::Pipe) else {
+        let (Some(fd), pipe, place) = (owned.number(), owned.medium == Medium::Pipe, owned.place(resource)) else {
             return Err((value, held));
         };
         // The entry waits on the readiness of the resource, or names the facts of its packet.
@@ -1746,6 +1746,7 @@ impl Driver {
         let slot_len = selected.as_ref().map_or(0, |selected| selected.len as usize);
         slot.start(id, held(value), |held| {
             let sqe = submission(held, kind, fd, pipe, group, slot_len).with_user_data(id.user_data());
+            let sqe = place.map_or(sqe, |place| sqe.fixed_file(fd, place));
             // SAFETY: the entry names the loan, the lease, the regions, the message, or the peer
             // address in the resources of `id`, which the home keeps in their slot until its
             // terminal event, and the descriptor of `resource`, which stays open until its close,
@@ -1947,7 +1948,7 @@ impl Driver {
         let Some(fd) = owned.number() else {
             return true;
         };
-        let pipe = owned.medium == Medium::Pipe;
+        let (pipe, place) = (owned.medium == Medium::Pipe, owned.place(resource));
         let Some(slot) = self.shared.entries.get(id.index() as usize) else {
             return true;
         };
@@ -2005,7 +2006,7 @@ impl Driver {
             }
         }
         if kind.batch() {
-            return self.start_batch(id, fd);
+            return self.start_batch(id, fd, place);
         }
         if !self.room(1) {
             return false;
@@ -2018,7 +2019,10 @@ impl Driver {
         // ends. The queue has room.
         #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
         unsafe {
-            self.push(id, |held| submission(held, kind, fd, pipe, group, slot_len));
+            self.push(id, |held| {
+                let sqe = submission(held, kind, fd, pipe, group, slot_len);
+                place.map_or(sqe, |place| sqe.fixed_file(fd, place))
+            });
         }
         true
     }
@@ -2026,7 +2030,7 @@ impl Driver {
     /// Submits the batch `id` on the socket `fd`: one entry for each datagram, each linked to the
     /// next, in one kernel entry. A batch receive waits only in its first entry. Gives `false`, and
     /// changes nothing, when the queue has no room for each entry.
-    fn start_batch(&mut self, id: OpId, fd: i32) -> bool {
+    fn start_batch(&mut self, id: OpId, fd: i32, place: Option<u32>) -> bool {
         let mut entries = Ok(0);
         self.hold(id, |held| {
             entries = match held.payload.batch() {
@@ -2077,6 +2081,7 @@ impl Driver {
                     }
                     None => Sqe::nop(),
                 };
+                let sqe = place.map_or(sqe, |place| sqe.fixed_file(fd, place));
                 if last { sqe } else { sqe.linked() }
             };
             // SAFETY: each entry names a message of the batch in the resources of `id`, in the heap

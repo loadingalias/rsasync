@@ -134,7 +134,7 @@ use crate::uring::{BufferRing, Cqe, Sqe};
 use crate::uring::{Ring, SetupError};
 use queue::Queue;
 
-pub use capability::{Backend, Call, Feature, Features, Report, Route};
+pub use capability::{Backend, Call, Feature, Features, Files, Report, Route};
 pub use control::{Control, ControlError, Delivery, OperationId};
 #[cfg(target_os = "windows")]
 pub use file::NvmePath;
@@ -187,11 +187,13 @@ pub struct Config {
     required: Features,
     backend: Option<Backend>,
     delivery: Delivery,
+    files: Files,
 }
 
 impl Config {
     /// 64 submission entries, 256 operations, 256 resources, 64 children, 64 completions per turn,
-    /// no required feature, the permissive selection of the backend, and native delivery.
+    /// no required feature, the permissive selection of the backend, native delivery, and plain
+    /// descriptors.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -204,6 +206,7 @@ impl Config {
             required: Features::NONE,
             backend: None,
             delivery: Delivery::Native,
+            files: Files::Plain,
         }
     }
 
@@ -267,6 +270,13 @@ impl Config {
     #[must_use]
     pub const fn operations(self, operations: u32) -> Self {
         Self { operations, ..self }
+    }
+
+    /// The descriptors that the operations of the resources name: [`Files::Plain`], the default,
+    /// or [`Files::Registered`], a file table of the ring. [`Report::files`] gives the table in use.
+    #[must_use]
+    pub const fn files(self, files: Files) -> Self {
+        Self { files, ..self }
     }
 
     /// The resources, such as descriptors, that the driver can own at one time.
@@ -924,6 +934,9 @@ struct Owned {
     fd: Option<Handle>,
     /// The next free slot after this free slot, or `NO_SLOT`.
     next_free: u32,
+    /// The descriptor is in the place of this slot in the file table of the ring.
+    #[cfg(target_os = "linux")]
+    registered: bool,
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
     /// The operations of a file that run, which its close waits for.
@@ -969,6 +982,21 @@ enum Medium {
 }
 
 impl Owned {
+    /// The place of the descriptor in the file table of the ring, when it is there: the index of
+    /// the slot of `resource`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        expect(clippy::unused_self, reason = "only io_uring has a file table")
+    )]
+    const fn place(&self, resource: Resource) -> Option<u32> {
+        #[cfg(target_os = "linux")]
+        if self.registered {
+            return Some(resource.index);
+        }
+        let _ = resource;
+        None
+    }
+
     /// Whether the slot holds a resource.
     #[cfg(unix)]
     const fn used(&self) -> bool {
@@ -1008,6 +1036,9 @@ struct Resources {
     first_free: u32,
     /// The number of free slots.
     free: u32,
+    /// The descriptor of the ring whose file table has a place for each slot ([`Files::Registered`]).
+    #[cfg(target_os = "linux")]
+    files: Option<std::os::fd::RawFd>,
     /// The free slots that spawns keep for the pipe ends of their children.
     reserved: u32,
     /// The registrations in the poller, on the epoll and kqueue backends, or the associations with
@@ -1038,15 +1069,22 @@ impl Resources {
             })?,
             first_free: if count > 0 { 0 } else { NO_SLOT },
             free: count,
+            #[cfg(target_os = "linux")]
+            files: None,
             reserved: 0,
             registrar,
             fail_registration: false,
         })
     }
 
-    /// Whether the backend registers each socket and pipe: the poller and the port do.
+    /// Whether the backend registers each socket and pipe: the poller and the port do, and a ring
+    /// with a file table registers each resource.
     #[cfg(unix)]
     const fn registers(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if self.files.is_some() {
+            return true;
+        }
         self.registrar.is_some()
     }
 
@@ -1135,6 +1173,12 @@ impl Resources {
                 Ok(skips) => slot.skips = skips,
                 Err(()) => return Err((Reason::Register, fd)),
             }
+        }
+        // A failed update leaves the resource on its plain descriptor.
+        #[cfg(target_os = "linux")]
+        if let Some(ring) = self.files {
+            slot.registered = !mem::take(&mut self.fail_registration)
+                && crate::uring::update_file(ring, index, fd.as_raw_fd()).is_ok();
         }
         slot.fd = Some(fd);
         slot.medium = medium;
@@ -1236,6 +1280,14 @@ impl Resources {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             slot.lock = None;
+        }
+        // The table holds its own reference of the file, so the place empties before the close, and
+        // the close then closes the file. A failed update keeps the file open until the ring ends.
+        #[cfg(target_os = "linux")]
+        if mem::take(&mut slot.registered)
+            && let Some(ring) = self.files
+        {
+            drop(crate::uring::update_file(ring, resource.index, -1));
         }
         let fd = slot.fd.take()?;
         // A socket stays associated with its port until its close, and no system call ends the
@@ -1735,6 +1787,16 @@ impl Driver {
         let watched = Cell::new(matches!(queue, Queue::Poller(_)));
         let table = Table::new(config.operations).map_err(refused)?;
         let driver = DriverId::next()?;
+        let mut resources = Resources::new(driver, config.resources, registrar).map_err(refused)?;
+        // A ring that cannot register its table names the plain descriptors.
+        let mut files = Files::Plain;
+        if config.files == Files::Registered
+            && let Queue::Ring(ring) = &queue
+            && ring.register_files(config.resources).is_ok()
+        {
+            resources.files = Some(ring.fd());
+            files = Files::Registered;
+        }
         let shared = try_arc(Shared {
             driver,
             entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
@@ -1751,13 +1813,13 @@ impl Driver {
             queue,
             table,
             shared,
-            resources: Resources::new(driver, config.resources, registrar).map_err(refused)?,
+            resources,
             children: process::Children::new(config.children, driver).map_err(Error::System)?,
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
             selected: None,
-            report: Report::new(selection, config.required, probed, false),
+            report: Report::new(selection, config.required, probed, false).with_files(files),
             completions_per_turn: config.completions_per_turn,
             waking: false,
             watched,
@@ -2826,6 +2888,15 @@ impl Drop for Driver {
     /// kernel can still use them, and so do the provided buffers then; [`Driver::teardown`] ends
     /// the operations first.
     fn drop(&mut self) {
+        // The file table holds its own reference of each file in it. The kernel ends the table
+        // with the ring, after this drop, so the table ends here, and the close of each descriptor
+        // then closes its file at once, as a plain descriptor does.
+        #[cfg(target_os = "linux")]
+        if self.resources.files.take().is_some()
+            && let Some(ring) = self.queue.ring()
+        {
+            drop(ring.unregister_files());
+        }
         #[cfg(all(feature = "local", target_os = "linux"))]
         {
             self.settle_messages();

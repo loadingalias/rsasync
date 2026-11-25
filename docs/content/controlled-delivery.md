@@ -105,7 +105,7 @@ the operation and its driver, so the control of another driver refuses it.
 | `Control::fail(id, &error)` | The next completion of `id` that the driver gives has `error` in place of its result. The error needs a code of the system (`io::Error::raw_os_error`) |
 | `Control::cancel_finds_running(id)` | The result of the next cancel of `id` says that the operation runs (`EALREADY`, or `WSAEALREADY` on Windows). The operation ends only at its own completion. Hold the operation to make its completion come after the cancel |
 | `Control::repeat(id)` | Gives the last completion of `id` again at the next turn: a late completion. After a later operation took the slot of `id`, the driver finds the identity stale, and the completion changes nothing |
-| `Control::fail_next_registration()` | The registration of the next socket or pipe that the driver takes fails, as a refusal of epoll, kqueue, or the port would. Its adoption refuses with `Reason::Register` and gives the descriptor back, and an accept gives `OutOfMemory` and keeps its connection for the next accept |
+| `Control::fail_next_registration()` | The registration of the next socket or pipe that the driver takes fails, as a refusal of epoll, kqueue, or the port would. Its adoption refuses with `Reason::Register` and gives the descriptor back, and an accept gives `OutOfMemory` and keeps its connection for the next accept. On io_uring with `Files::Registered`, the next resource gets no place in the file table: it keeps its plain descriptor, and its operations run on it |
 
 A failed call changes nothing and gives a `ControlError`:
 
@@ -115,7 +115,7 @@ A failed call changes nothing and gives a `ControlError`:
 | `ControlError::NoCompletion` | `repeat` found no completion of the operation: none reached its future yet, or a later operation of its slot got a completion since | Repeat after the completion, and before the next operation of the slot ends |
 | `ControlError::Full` | `repeat` found the control at its completion room | Turn the driver, or deliver a held operation, then repeat |
 | `ControlError::NoCode` | `fail` got an error with no code of the system | Make the error with `io::Error::from_raw_os_error` |
-| `ControlError::NoRegistration` | `fail_next_registration` on io_uring, which registers no resource | Run the test on epoll (`Config::backend(Backend::Epoll)`), kqueue, or IOCP |
+| `ControlError::NoRegistration` | `fail_next_registration` on io_uring with plain descriptors, which registers no resource | Run the test on epoll (`Config::backend(Backend::Epoll)`), kqueue, IOCP, or io_uring with `Config::files(Files::Registered)` |
 
 ## Limits
 

@@ -38,7 +38,7 @@ use super::{
     SendCount, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed,
 };
 #[cfg(target_os = "linux")]
-use super::{Call, Error, Feature, Features, Route, eventfd, probe, sys};
+use super::{Call, Error, Feature, Features, Files, Route, eventfd, probe, sys};
 #[cfg(unix)]
 use super::{Ended, PipeReader};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
@@ -926,6 +926,37 @@ fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStr
     let close = driver.close_listener(listener).expect("the test driver has room");
     drive(driver, close).expect("the driver runs");
     (stream, peer)
+}
+
+/// A stream that gets no place in the file table of the ring, as at a refusal of the kernel,
+/// keeps its plain descriptor: its send and its receive run on it, and its close closes it.
+#[cfg(target_os = "linux")]
+pub(in crate::driver) fn a_stream_with_no_place_in_the_file_table_runs_on_its_plain_descriptor() {
+    let mut driver = driver(Config::new().files(Files::Registered).delivery(Delivery::Controlled));
+    assert_eq!(
+        driver.report().files(),
+        Files::Registered,
+        "the ring registers its table"
+    );
+    let mut listener = listen(&mut driver, "127.0.0.1:0");
+    let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+    driver.control().unwrap().fail_next_registration().unwrap();
+    let accept = driver.accept(&mut listener).unwrap();
+    let (mut stream, _) = drive(&mut driver, accept).unwrap().unwrap();
+
+    let send = driver.send(&mut stream, Lease::from(b"ping".to_vec())).unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 4);
+    let mut received = [0; 4];
+    peer.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"ping");
+    peer.write_all(b"pong").unwrap();
+    let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(4))).unwrap();
+    let (count, buffer) = drive(&mut driver, receive).unwrap();
+    assert_eq!((count.unwrap(), buffer.bytes()), (4, &b"pong"[..]));
+
+    let close = driver.close(stream).unwrap();
+    drive(&mut driver, close).unwrap();
+    assert_eq!(peer.read(&mut received).unwrap(), 0, "the close ends the stream");
 }
 
 /// On Windows, the socket of `stream` gets no send buffer (`SO_SNDBUF` 0), so a send larger than

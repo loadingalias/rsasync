@@ -45,8 +45,8 @@
 //! # Forms of a case
 //!
 //! The body of a case stays beside the code of its surface, and this index gives each body its
-//! tests: `<suite>::kernel::<case>`, `<suite>::controlled::<case>`, and `<suite>::epoll::<case>`
-//! on Linux, `<suite>::kqueue::<case>` and `<suite>::controlled::<case>` on macOS, and
+//! tests: `<suite>::kernel::<case>`, `<suite>::controlled::<case>`, `<suite>::epoll::<case>`, and
+//! `<suite>::registered::<case>`, io_uring with its file table, on Linux, `<suite>::kqueue::<case>` and `<suite>::controlled::<case>` on macOS, and
 //! `<suite>::iocp::<case>`, `<suite>::controlled::<case>`, and, for a file case,
 //! `<suite>::io_ring::<case>` on Windows. A case runs once, as `<suite>::once::<case>`, when the
 //! seam can change none of its inputs: a refusal makes no completion, and a signal reaches its
@@ -197,6 +197,10 @@ pub(super) enum Backend {
     /// service of the case.
     #[cfg(target_os = "linux")]
     Epoll,
+    /// The io_uring ring with its file table (`Files::Registered`): each operation of a socket or a
+    /// pipe names its place in the table.
+    #[cfg(target_os = "linux")]
+    Registered,
     /// The completion port, where each socket that passes the installed-provider check skips the
     /// packet of a call that ends at once: the return of that call is its terminal event. Each file
     /// operation with no overlapped form runs on a blocking service of the case.
@@ -244,8 +248,16 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
         Backend::Kernel => (super::Backend::IoUring, config),
         Backend::Controlled => (super::Backend::IoUring, config.delivery(Delivery::Controlled)),
         Backend::Epoll => (super::Backend::Epoll, config),
+        Backend::Registered => (super::Backend::IoUring, config.files(super::Files::Registered)),
     };
     let mut driver = super::tests::driver(config.backend(selected));
+    if backend == Backend::Registered {
+        assert_eq!(
+            driver.report().files(),
+            super::Files::Registered,
+            "the ring registers its table"
+        );
+    }
     if backend == Backend::Epoll {
         driver.use_blocking(service().submitter());
     }
@@ -261,7 +273,7 @@ fn service() -> &'static Service {
 }
 
 /// Gives each case a test on each backend of the target, and under controlled delivery: on Linux,
-/// the kernel and epoll; on macOS, kqueue; on Windows, the port. Each case of the `files` block also
+/// the kernel, the kernel with its file table, and epoll; on macOS, kqueue; on Windows, the port. Each case of the `files` block also
 /// has a test on IoRing on Windows, which differs from IOCP only in its files. A
 /// case with a `cfg` runs only where it holds, for example a case of pipes only on Linux.
 macro_rules! cases {
@@ -279,6 +291,7 @@ macro_rules! cases {
         cases!(@backend kernel, target_os = "linux", Kernel; $($files)* $($others)*);
         cases!(@backend controlled, all(), Controlled; $($files)* $($others)*);
         cases!(@backend epoll, target_os = "linux", Epoll; $($files)* $($others)*);
+        cases!(@backend registered, target_os = "linux", Registered; $($files)* $($others)*);
         cases!(@backend iocp, target_os = "windows", Iocp; $($files)* $($others)*);
         cases!(@backend io_ring, target_os = "windows", IoRing; $($files)*);
         cases!(@backend kqueue, target_os = "macos", Kqueue; $($files)* $($others)*);
@@ -621,6 +634,8 @@ mod operation {
     once! {
         #[cfg(unix)]
         pipe::tests => an_adoption_refuses_a_socket_a_wrong_direction_and_a_full_driver,
+        #[cfg(target_os = "linux")]
+        tests => a_stream_with_no_place_in_the_file_table_runs_on_its_plain_descriptor,
         #[cfg(unix)]
         signal::tests => a_close_restores_the_earlier_disposition_and_other_signals_keep_theirs,
         #[cfg(unix)]

@@ -384,6 +384,20 @@ impl Sqe {
         }
     }
 
+    /// The entry with the place `place` of the registered file table in place of the descriptor
+    /// `fd`, when it names `fd` (`IOSQE_FIXED_FILE`). The kernel then takes no reference of the file
+    /// for the operation.
+    pub(crate) fn fixed_file(self, fd: RawFd, place: u32) -> Self {
+        match i32::try_from(place) {
+            Ok(place) if self.fd == fd => Self {
+                fd: place,
+                flags: self.flags | sys::IOSQE_FIXED_FILE,
+                ..self
+            },
+            _ => self,
+        }
+    }
+
     /// The entry, linked to the next one: the next one starts only after this one succeeds, and
     /// it fails with `ECANCELED` when this one fails.
     pub(crate) fn linked(self) -> Self {
@@ -777,6 +791,30 @@ impl Ring {
         unsafe { register(self.fd(), sys::IORING_REGISTER_EVENTFD, (&raw mut fd).cast(), 1) }.map(drop)
     }
 
+    /// Registers a file table of `places` empty places (`IORING_REGISTER_FILES2` with
+    /// `IORING_RSRC_REGISTER_SPARSE`, Linux 5.19). [`update_file`] fills a place.
+    #[expect(unsafe_code, reason = "the kernel reads the structure of the registration")]
+    pub(crate) fn register_files(&self, places: u32) -> io::Result<()> {
+        let mut table = sys::RsrcRegister {
+            nr: places,
+            flags: sys::IORING_RSRC_REGISTER_SPARSE,
+            ..sys::RsrcRegister::default()
+        };
+        let size = u32::try_from(size_of::<sys::RsrcRegister>()).unwrap_or(u32::MAX);
+        // SAFETY: `table` is one `io_uring_rsrc_register`, valid for reads during the call, and the
+        // call takes its size as `nr_args`. A sparse table reads no array of descriptors.
+        unsafe { register(self.fd(), sys::IORING_REGISTER_FILES2, (&raw mut table).cast(), size) }.map(drop)
+    }
+
+    /// Ends the file table of `register_files` (`IORING_UNREGISTER_FILES`): the table drops its
+    /// references of the files, so a later close of a descriptor closes its file. An operation
+    /// that runs keeps its own reference until its completion.
+    #[expect(unsafe_code, reason = "the call reads no argument")]
+    pub(crate) fn unregister_files(&self) -> io::Result<()> {
+        // SAFETY: the operation reads no argument, and `nr_args` is 0.
+        unsafe { register(self.fd(), sys::IORING_UNREGISTER_FILES, core::ptr::null_mut(), 0) }.map(drop)
+    }
+
     /// Ends the registration of `register_eventfd` (`IORING_UNREGISTER_EVENTFD`). A new
     /// registration then starts with a new state in the kernel.
     #[expect(unsafe_code, reason = "the call reads no argument")]
@@ -1022,6 +1060,30 @@ fn enter_timeout(fd: RawFd, to_submit: u32, min_complete: u32, ts: &sys::KernelT
             size_of::<sys::GeteventsArg>(),
         )
     })
+}
+
+/// Puts the descriptor `fd` in the place `place` of the file table of the ring `ring`, or empties
+/// the place with `-1` (`IORING_REGISTER_FILES_UPDATE`). The table holds its own reference of the
+/// file, so a close of `fd` alone does not close the file while it is in the table.
+#[expect(
+    unsafe_code,
+    reason = "the kernel reads the update and the one descriptor that it names"
+)]
+#[cfg(target_os = "linux")]
+pub(crate) fn update_file(ring: RawFd, place: u32, fd: RawFd) -> io::Result<()> {
+    let mut fd = fd;
+    let mut update = sys::RsrcUpdate {
+        offset: place,
+        resv: 0,
+        data: (&raw mut fd) as u64,
+    };
+    // SAFETY: `update` is one `io_uring_rsrc_update`, and its `data` names one `int`, `fd`; both
+    // are valid for reads during the call, and `nr_args` is 1.
+    match unsafe { register(ring, sys::IORING_REGISTER_FILES_UPDATE, (&raw mut update).cast(), 1) } {
+        Ok(1) => Ok(()),
+        Ok(_) => Err(io::ErrorKind::Other.into()),
+        Err(error) => Err(error),
+    }
 }
 
 /// `io_uring_register(fd, opcode, arg, nr_args)`.

@@ -335,11 +335,13 @@ impl Control<'_> {
     /// The registration of the next socket or pipe that the driver takes fails, as a refusal of
     /// the poller or the port would: its adoption refuses with
     /// [`Reason::Register`](super::Reason::Register), and an accept keeps its connection for the
-    /// next accept.
+    /// next accept. On io_uring with a file table ([`Files::Registered`](super::Files::Registered)),
+    /// the next resource gets no place in the table, as a refusal of the kernel would: it keeps
+    /// its plain descriptor, and its operations run on it.
     ///
     /// # Errors
     ///
-    /// [`ControlError::NoRegistration`] on io_uring.
+    /// [`ControlError::NoRegistration`] on io_uring with no file table.
     pub fn fail_next_registration(&mut self) -> Result<(), ControlError> {
         if !self.resources.registers() {
             return Err(ControlError::NoRegistration);

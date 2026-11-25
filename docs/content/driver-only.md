@@ -353,8 +353,26 @@ operations that run on the socket, and its future is ready after the kernel ends
 | `children` | 64 | Child processes that the driver can own at one time. Each child also holds an operation slot until its status is taken or its handle drops. 0 refuses each spawn |
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
 | `delivery` | `Delivery::Native` | How the driver gives each completion to its operation. Under `Delivery::Controlled`, `Driver::control()` lets a test hold, fail, or repeat a completion: see [Test your code under controlled completions](controlled-delivery.md) |
+| `files` | `Files::Plain` | The descriptor that each operation of a resource names. See [Registered files](#registered-files) |
 
 A limit of 0, other than `children`, gives `Error::Config`.
+
+## Registered files
+
+With `Config::files(Files::Registered)`, an io_uring driver registers a file table at its start
+(Linux 5.19), with one place for each resource slot. Each socket and pipe that the driver adopts
+gets the place of its slot, and each receive, send, accept, and half-close names that place, so the
+kernel takes no reference of the file for the operation. The close empties the place before it
+closes the descriptor, so the socket closes as with a plain descriptor.
+
+- `Report::files()` gives the table in use. It is `Files::Plain` on epoll, and when the kernel
+  refuses the table.
+- A resource whose registration fails keeps its plain descriptor, and its operations run on it, with
+  no refusal. Under controlled delivery, `Control::fail_next_registration()` makes that failure.
+- The operations of a file, and the operations of a movable resource, name the plain descriptor.
+
+The default is `Files::Plain` until a measurement on the thread-per-core TCP cell selects the
+default.
 
 ## End the driver
 

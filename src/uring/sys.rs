@@ -65,6 +65,14 @@ pub(super) const IORING_ENTER_EXT_ARG: u32 = 1 << 3;
 pub(super) const IORING_OFF_SQ_RING: i64 = 0;
 pub(super) const IORING_OFF_SQES: i64 = 0x1000_0000;
 
+/// `IORING_UNREGISTER_FILES`: the end of the file table, which drops its references of the files.
+pub(super) const IORING_UNREGISTER_FILES: u32 = 3;
+/// `IORING_REGISTER_FILES_UPDATE` (Linux 5.5): new descriptors for places of the file table.
+pub(super) const IORING_REGISTER_FILES_UPDATE: u32 = 6;
+/// `IORING_REGISTER_FILES2` (Linux 5.13): a file table from an `io_uring_rsrc_register`.
+pub(super) const IORING_REGISTER_FILES2: u32 = 13;
+/// `IORING_RSRC_REGISTER_SPARSE` (Linux 5.19): each place of the table starts empty.
+pub(super) const IORING_RSRC_REGISTER_SPARSE: u32 = 1;
 pub(super) const IORING_REGISTER_EVENTFD: u32 = 4;
 pub(super) const IORING_UNREGISTER_EVENTFD: u32 = 5;
 pub(super) const IORING_REGISTER_PROBE: u32 = 8;
@@ -115,6 +123,8 @@ pub(super) const IORING_OP_RECV_ZC: u8 = 58;
 /// `IOSQE_IO_LINK`: the next entry starts after this one succeeds, and fails with `ECANCELED`
 /// when this one fails.
 pub(crate) const IOSQE_IO_LINK: u8 = 1 << 2;
+/// `IOSQE_FIXED_FILE`: the `fd` of the entry is a place of the registered file table.
+pub(crate) const IOSQE_FIXED_FILE: u8 = 1 << 0;
 pub(crate) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 /// `IOSQE_CQE_SKIP_SUCCESS` (Linux 5.17): the entry posts a completion only when it fails.
 pub(crate) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
@@ -215,6 +225,27 @@ pub(crate) struct Sqe {
     pub(crate) splice_fd_in: i32,
     pub(crate) addr3: u64,
     pub(crate) pad2: u64,
+}
+
+/// `struct io_uring_rsrc_register`, the argument of `IORING_REGISTER_FILES2`.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub(super) struct RsrcRegister {
+    pub(super) nr: u32,
+    pub(super) flags: u32,
+    pub(super) resv2: u64,
+    pub(super) data: u64,
+    pub(super) tags: u64,
+}
+
+/// `struct io_uring_rsrc_update`, the argument of `IORING_REGISTER_FILES_UPDATE`: the first place,
+/// and the address of the descriptors for it and the places after it.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub(super) struct RsrcUpdate {
+    pub(super) offset: u32,
+    pub(super) resv: u32,
+    pub(super) data: u64,
 }
 
 /// `struct io_uring_cqe`, 16 bytes: a ring without `IORING_SETUP_CQE32`.

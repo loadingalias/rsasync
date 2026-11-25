@@ -208,6 +208,20 @@ const CALLS: [Call; 9] = [
     Call::File,
 ];
 
+/// The descriptor that the operations of a resource name ([`Config::files`](super::Config::files)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Files {
+    /// The descriptor of the resource: the kernel takes a reference of the file for each
+    /// operation.
+    #[default]
+    Plain,
+    /// A place of a file table that the ring registers at its start (Linux 5.19), one for each
+    /// resource slot: the kernel takes no reference of the file for an operation. Only io_uring
+    /// has the table. A resource whose registration fails keeps its plain descriptor, and the
+    /// operations of a file and of a movable resource use the plain descriptor.
+    Registered,
+}
+
 /// What a driver found and applied when it started. The report does not change after
 /// [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each call and the
 /// helper threads.
@@ -219,6 +233,7 @@ pub struct Report {
     required: Features,
     probed: Features,
     rearms_wake: bool,
+    files: Files,
 }
 
 impl Report {
@@ -230,7 +245,21 @@ impl Report {
             required,
             probed,
             rearms_wake,
+            files: Files::Plain,
         }
+    }
+
+    /// The same report, with the file table `files` in use.
+    #[cfg(target_os = "linux")]
+    pub(super) const fn with_files(self, files: Files) -> Self {
+        Self { files, ..self }
+    }
+
+    /// The descriptors that the operations of the resources name: [`Files::Registered`] when the
+    /// caller asked for it and the ring registered its table, and else [`Files::Plain`].
+    #[must_use]
+    pub const fn files(&self) -> Files {
+        self.files
     }
 
     /// The backend that the caller required with [`Config::backend`](super::Config::backend), or
@@ -349,6 +378,7 @@ impl fmt::Debug for Report {
             .field("routes", &Routes(self))
             .field("helper_threads", &self.helper_threads())
             .field("rearms_wake", &self.rearms_wake)
+            .field("files", &self.files)
             .finish()
     }
 }
