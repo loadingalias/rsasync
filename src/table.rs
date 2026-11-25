@@ -396,6 +396,15 @@ impl<T> Table<T> {
         }
     }
 
+    /// The resources of the operation `id`, to change, while its slot holds them.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn resources_mut(&mut self, id: OpId) -> Option<&mut T> {
+        match &mut self.live(id)?.state {
+            State::Live { resources, .. } | State::Done { resources, .. } => Some(resources),
+            State::Free => None,
+        }
+    }
+
     /// Whether the operation `id` runs: its terminal event can still come.
     pub(crate) fn runs(&self, id: OpId) -> bool {
         self.slots

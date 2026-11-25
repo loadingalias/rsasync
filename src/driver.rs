@@ -62,6 +62,8 @@ mod control;
 mod file;
 #[cfg(all(feature = "local", target_os = "linux"))]
 mod home;
+#[cfg(all(feature = "local", target_os = "linux"))]
+pub(crate) use home::LocalTask;
 #[cfg(target_os = "windows")]
 mod iocp;
 mod ipc;
@@ -620,12 +622,36 @@ impl Kind {
     }
 }
 
-/// The facts of an operation that the operation table keeps for the home: its resource and its
-/// kind.
+/// The facts of an operation that the operation table keeps for the home: its resource, its
+/// kind, and who consumes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Tag {
     pub(crate) resource: Option<Resource>,
     pub(crate) kind: Kind,
+    pub(crate) consumer: Consumer,
+}
+
+impl Tag {
+    /// The tag of an operation of `kind` on `resource`, whose consumer can be on any thread.
+    pub(crate) const fn new(resource: Option<Resource>, kind: Kind) -> Self {
+        Self {
+            resource,
+            kind,
+            consumer: Consumer::Any,
+        }
+    }
+}
+
+/// Where the consumer of an operation polls it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consumer {
+    /// On any thread: the completion entry and its waiter give the result and the wake.
+    Any,
+    /// On the thread of the home, through its driver: the operation of a local type, whose future
+    /// is not `Send`. The home takes the result in place and wakes the waiter that the driver
+    /// keeps.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    Home,
 }
 
 /// Why the driver refused an operation. The caller keeps what it gave.
@@ -1444,6 +1470,9 @@ pub struct Driver {
     /// operation.
     #[cfg(all(feature = "local", target_os = "linux"))]
     following: Vec<OpId>,
+    /// The consumers of the home operations: the operations of local types.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    consumers: home::Consumers,
     /// The state of [`Delivery::Controlled`].
     control: Option<control::Controlled>,
     /// The bytes that dropped sends had sent when the closes of their dropped resources ended
@@ -1742,6 +1771,8 @@ impl Driver {
             wakes,
             #[cfg(all(feature = "local", target_os = "linux"))]
             following: room(config.operations as usize).map_err(refused)?,
+            #[cfg(feature = "local")]
+            consumers: home::Consumers::new(config.operations).map_err(refused)?,
             control: None,
             #[cfg(all(feature = "local", target_os = "linux"))]
             dropped_sent: 0,
@@ -2168,6 +2199,31 @@ impl Driver {
         self.queue.room() >= entries || (self.queue.submit(0).is_ok() && self.queue.room() >= entries)
     }
 
+    /// The future of the new operation `id`, which a drop cancels when `cancel_on_drop` is true.
+    /// During a call of a local type, its consumer is at the home ([`Consumer::Home`]), and its tag
+    /// says so.
+    pub(crate) fn completion(&mut self, id: OpId, cancel_on_drop: bool) -> Completion {
+        let completion = Completion::new(Arc::clone(&self.shared), id, cancel_on_drop);
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if self.consumers.calls
+            && let Some(tag) = self.table.resources_mut(id)
+        {
+            tag.consumer = Consumer::Home;
+            return completion.with_consumer(Consumer::Home);
+        }
+        completion
+    }
+
+    /// The consumer of an operation that starts now.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    const fn consumer(&self) -> Consumer {
+        if self.consumers.calls {
+            Consumer::Home
+        } else {
+            Consumer::Any
+        }
+    }
+
     /// Gives `value` back when this driver owns `resource`, and else refuses it with
     /// [`Reason::Resource`]. A call that can refuse for another reason checks this first, so a
     /// resource of another driver always gives this reason.
@@ -2317,6 +2373,16 @@ impl Driver {
             file::ended(&mut self.resources, &mut self.pending, tag);
         }
         match outcome {
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            Outcome::Ready
+                if self
+                    .table
+                    .resources(id)
+                    .is_some_and(|tag| tag.consumer == Consumer::Home) =>
+            {
+                slot.publish_home(id, result);
+                self.consumers.wake(id);
+            }
             Outcome::Ready => slot.publish(id, result),
             Outcome::Abandoned(Done { resources: tag, .. }) => {
                 if let Some(held) = slot.reclaim(id) {
@@ -2431,7 +2497,7 @@ impl Driver {
         #[cfg(target_os = "linux")]
         let (waking, watched) = (&mut self.waking, self.watched.get());
         #[cfg(all(feature = "local", target_os = "linux"))]
-        let wakes = &mut self.wakes;
+        let (wakes, consumers) = (&mut self.wakes, &mut self.consumers);
         #[cfg(unix)]
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
         for cqe in native.iter_mut().flatten().chain(kept.iter_mut().flatten()) {
@@ -2532,6 +2598,12 @@ impl Driver {
                 }
                 tcp::after(resources, pending, tag);
             } else {
+                #[cfg(all(feature = "local", target_os = "linux"))]
+                if tag.consumer == Consumer::Home {
+                    slot.publish_home(id, event.result);
+                    consumers.wake(id);
+                    continue;
+                }
                 slot.publish(id, event.result);
             }
         }
@@ -2764,6 +2836,8 @@ impl Drop for Driver {
         for entry in &self.shared.entries {
             entry.close();
         }
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        self.consumers.end();
         #[cfg(unix)]
         signal::end(&self.signals);
         if let Some(selected) = self.selected.take() {

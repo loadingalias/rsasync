@@ -271,7 +271,20 @@ pub(super) struct Local {
     /// The timer storage of the owner and the clock of its domain, from `use_timers`.
     pub(super) timers: RefCell<Option<(Timers, NativeClock)>>,
     pub(super) waiting: List,
+    /// The task that the owner polls, with the data and the vtable of its own waker.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    polling: Cell<Option<Polling>>,
     _charge: Permit,
+}
+
+/// The task that an owner polls: a home operation that the task's own waker polls wakes the task
+/// directly ([`crate::driver::LocalTask`]).
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[derive(Clone, Copy)]
+struct Polling {
+    task: crate::driver::LocalTask,
+    data: *const (),
+    vtable: *const core::task::RawWakerVTable,
 }
 
 impl Local {
@@ -346,6 +359,8 @@ impl Local {
             poll_budget: Cell::new(super::DEFAULT_POLL_BUDGET.get()),
             timers: RefCell::new(None),
             waiting: List::new(),
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            polling: Cell::new(None),
             _charge: charge,
         })
     }
@@ -460,6 +475,24 @@ impl Local {
         self.waiting.wake_first();
     }
 
+    /// The task that this owner polls, when `waker` is that task's own waker.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn polling_task(&self, waker: &Waker) -> Option<crate::driver::LocalTask> {
+        let polling = self.polling.get()?;
+        (core::ptr::eq(waker.data(), polling.data) && core::ptr::eq(waker.vtable(), polling.vtable))
+            .then_some(polling.task)
+    }
+
+    /// Wakes `task` of this owner on its thread: a task that was idle goes to the local ready
+    /// queue, with no remote-ready list. A task of another generation does not change.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn wake_local(&self, task: crate::driver::LocalTask) {
+        if self.shared.wake_idle(task.slot, task.generation) {
+            // The queue has room for each slot, and the word gives each slot one entry.
+            self.queue.borrow_mut().push_back(task.slot);
+        }
+    }
+
     /// The part of this owner that each thread can change.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn shared(&self) -> &Arc<Shared> {
@@ -482,11 +515,22 @@ impl Local {
             return self.finish(slot, entry);
         }
         let Entry { task, waker } = &mut entry;
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        self.polling.set(Some(Polling {
+            task: crate::driver::LocalTask {
+                slot,
+                generation: self.shared.generation(slot),
+            },
+            data: waker.data(),
+            vtable: waker.vtable(),
+        }));
         let polled = catch_unwind(AssertUnwindSafe(|| {
             coop::with_budget(self.poll_budget.get(), || {
                 task.as_mut().poll(&mut Context::from_waker(waker))
             })
         }));
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        self.polling.set(None);
         match polled {
             Ok(Poll::Pending) => {
                 self.entries[slot as usize].set(Some(entry));
@@ -657,6 +701,8 @@ pub(super) struct Enter {
     local: Rc<Local>,
     previous: Option<Rc<Local>>,
     previous_home: *const Shared,
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    previous_owner: *const Local,
     pub(super) ended: bool,
 }
 
@@ -664,10 +710,14 @@ impl Enter {
     pub(super) fn new(local: &Rc<Local>) -> Self {
         let previous = super::CURRENT.with(|current| current.replace(Some(Rc::clone(local))));
         let previous_home = super::HOME.with(|home| home.replace(Arc::as_ptr(&local.shared)));
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let previous_owner = super::OWNER.with(|owner| owner.replace(Rc::as_ptr(local)));
         Self {
             local: Rc::clone(local),
             previous,
             previous_home,
+            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            previous_owner,
             ended: false,
         }
     }
@@ -679,6 +729,8 @@ impl Drop for Enter {
             self.local.fail_all();
         }
         super::HOME.with(|home| home.set(self.previous_home));
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        super::OWNER.with(|owner| owner.set(self.previous_owner));
         let previous = self.previous.take();
         super::CURRENT.with(|current| current.replace(previous));
         // No later turn of this owner sends the messages of a wake that came after its last turn,

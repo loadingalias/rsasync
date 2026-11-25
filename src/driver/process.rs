@@ -42,7 +42,6 @@ use crate::blocking::{Failed, Job};
 use crate::clock::NativeClock;
 use crate::driver::out_of_memory;
 use crate::memory::{items, room};
-use crate::sync::Arc;
 use crate::table::OpId;
 #[cfg(target_os = "linux")]
 use crate::time::{Instant, Suspend};
@@ -887,10 +886,7 @@ impl Driver {
                 return refuse(reason, command);
             }
         };
-        let tag = Tag {
-            resource: None,
-            kind: Kind::Spawn(index),
-        };
+        let tag = Tag::new(None, Kind::Spawn(index));
         let job = SpawnJob {
             command,
             tree: options.tree,
@@ -910,7 +906,7 @@ impl Driver {
                 }
                 // At most one entry for each operation, so the capacity of the list holds it.
                 self.jobs.push(id);
-                let completion = Completion::new(Arc::clone(&self.shared), id, false);
+                let completion = self.completion(id, false);
                 Ok(Operation::new(completion, spawned_child))
             }
             Err((reason, job)) => {
@@ -1053,10 +1049,7 @@ impl Driver {
 
     /// Begins the exit operation of the child slot `index`, with room for `entries` entries.
     fn open_exit(&mut self, index: u32, entries: u32) -> Result<OpId, Reason> {
-        let tag = Tag {
-            resource: None,
-            kind: Kind::Exit(index),
-        };
+        let tag = Tag::new(None, Kind::Exit(index));
         let held = |()| Held {
             payload: Payload::Exit(sys::SigInfo::default()),
             ..Held::default()
@@ -1117,7 +1110,7 @@ impl Driver {
                 generation,
             },
             pid: spawned.pid,
-            exit: Completion::new(Arc::clone(&self.shared), exit, end == End::Kill),
+            exit: self.completion(exit, end == End::Kill),
             status: None,
         }
     }

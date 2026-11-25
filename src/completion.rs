@@ -99,6 +99,43 @@ impl<T> Entry<T> {
         self.waiter.wake();
     }
 
+    /// The home publishes the result of the terminal event of `id`, whose consumer polls on the
+    /// thread of the home through its driver ([`Entry::take_home`]): no waiter of the entry wakes.
+    /// The `Release` keeps the phase a valid order for each later reader, such as the close.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn publish_home(&self, id: OpId, result: i32) {
+        self.result.store(result, Ordering::Relaxed);
+        self.state.store(word(id, READY), Ordering::Release);
+    }
+
+    /// The consumer of `id` takes the result on the thread of the home, with exclusive access to
+    /// its driver: it makes the output in place and drops the remaining resources. Gives `None`
+    /// while the operation runs, and `Some(Err(Gone))` for another generation or an ended driver.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[expect(
+        unsafe_code,
+        reason = "the home owns the cell of a ready slot whose consumer is at the home"
+    )]
+    pub(crate) fn take_home<R>(&self, id: OpId, take: impl FnOnce(i32, &mut T) -> R) -> Option<Result<R, Gone>> {
+        // `Acquire` reads the release of the publication, which can come from `publish` too.
+        let state = self.state.load(Ordering::Acquire);
+        if state == word(id, RUNNING) {
+            return None;
+        }
+        if state != word(id, READY) {
+            return Some(Err(Gone));
+        }
+        self.state.store(word(id, TAKEN), Ordering::Relaxed);
+        let result = self.result.load(Ordering::Relaxed);
+        Some(self.held.with_mut(|cell| {
+            // SAFETY: the phase was `READY` and only this consumer takes the slot: its future is
+            // at the home, and the caller holds the driver, so no turn and no other take runs.
+            let held = unsafe { &mut *cell };
+            let mut held = DropGuard::new(held, |held| *held = None);
+            held.as_mut().map(|held| take(result, held)).ok_or(Gone)
+        }))
+    }
+
     /// After the terminal event of `id` and the end of interest of its consumer, the home takes
     /// back the resources, for the abandoned rule. A consumer that took them first keeps them, and
     /// then the home gets `None`.

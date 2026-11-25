@@ -219,6 +219,15 @@ impl Shared {
         }
     }
 
+    /// Wakes the task of `generation` in `slot` on the thread of the owner. Gives `true` if the task
+    /// was idle: the owner then pushes its one entry to its local queue.
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    pub(super) fn wake_idle(&self, slot: u32, generation: u64) -> bool {
+        self.words
+            .get(slot as usize)
+            .is_some_and(|word| wake(word, generation, false))
+    }
+
     /// Pushes `slot` to the remote-ready list, and signals the home if the list was empty.
     fn push(&self, slot: u32) {
         // Ordering: `Relaxed`: the compare-exchange below reads the latest head.

@@ -1642,15 +1642,12 @@ impl Driver {
 
     /// Starts an operation that ends at once with the error `errno`, with no submission.
     fn fail_now(&mut self, errno: i32) -> Result<Completion, Refused<()>> {
-        let tag = Tag {
-            resource: None,
-            kind: Kind::File(Op::Plain),
-        };
+        let tag = Tag::new(None, Kind::File(Op::Plain));
         let id = self
             .open(tag, 0, (), |()| Held::default())
             .map_err(|(reason, value)| Refused { reason, value })?;
         self.complete_now(id, -errno);
-        Ok(Completion::new(Arc::clone(&self.shared), id, false))
+        Ok(self.completion(id, false))
     }
 
     /// Starts the file operation `op` on `resource`, or on no resource for a path operation, with
@@ -1681,10 +1678,7 @@ impl Driver {
         }
         #[cfg(target_os = "windows")]
         let waits = resource.is_some_and(|resource| self.waits(resource, op));
-        let tag = Tag {
-            resource,
-            kind: Kind::File(op),
-        };
+        let tag = Tag::new(resource, Kind::File(op));
         let id = self
             .open(tag, 1, value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
@@ -1704,7 +1698,7 @@ impl Driver {
                 }),
                 None => self.complete_now(id, -EINVAL),
             }
-            return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
+            return Ok(self.completion(id, cancel_on_drop));
         }
         // SAFETY: the entry names only the loan, the lease, the regions, the buffers, the paths,
         // or the structure in the resources of `id`, which the home keeps until its terminal
@@ -1714,7 +1708,7 @@ impl Driver {
         unsafe {
             self.push(id, |held| entry(fd, held));
         }
-        Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
+        Ok(self.completion(id, cancel_on_drop))
     }
 
     /// The number of the descriptor of the file `resource` in an entry, while the driver owns it.
@@ -1799,10 +1793,7 @@ impl Driver {
         };
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let waits = resource.is_some_and(|resource| self.waits(resource, op));
-        let tag = Tag {
-            resource,
-            kind: Kind::File(op),
-        };
+        let tag = Tag::new(resource, Kind::File(op));
         let id = self
             .open(tag, 0, value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
@@ -1815,7 +1806,7 @@ impl Driver {
             }
             Err(error) => {
                 self.complete_now(id, -error.raw_os_error().unwrap_or(EIO));
-                return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
+                return Ok(self.completion(id, cancel_on_drop));
             }
         };
         let mut sqe = None;
@@ -1831,7 +1822,7 @@ impl Driver {
                 op,
                 start: Start::Job(reservation, FileJob { sqe, _fd: fd }),
             });
-            return Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop));
+            return Ok(self.completion(id, cancel_on_drop));
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.started(resource, op, id);
@@ -1847,7 +1838,7 @@ impl Driver {
             ),
             _ => self.complete_now(id, -EINVAL),
         }
-        Ok(Completion::new(Arc::clone(&self.shared), id, cancel_on_drop))
+        Ok(self.completion(id, cancel_on_drop))
     }
 
     /// Whether a new file operation `op` of `resource` waits on macOS and Windows: an earlier
@@ -1972,10 +1963,7 @@ impl Driver {
             Some(Err(error)) => return self.fail_now(error.raw_os_error().unwrap_or(EIO)),
             None => return refuse(Reason::Resource),
         };
-        let tag = Tag {
-            resource: Some(resource),
-            kind: Kind::File(Op::Plain),
-        };
+        let tag = Tag::new(Some(resource), Kind::File(Op::Plain));
         let held = move |()| match submitter.submit(move || job(fd)) {
             Ok(waiter) => Ok(Held {
                 payload: Payload::Job(waiter),
@@ -1990,7 +1978,7 @@ impl Driver {
         self.count_start(Some(resource));
         // At most one entry for each operation, so the capacity of the list holds it.
         self.jobs.push(id);
-        Ok(Completion::new(Arc::clone(&self.shared), id, false))
+        Ok(self.completion(id, false))
     }
 
     /// Counts a started operation of the file `resource`, which its terminal event uncounts.

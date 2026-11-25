@@ -11,8 +11,9 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 use super::queue::Queue;
 use super::{Completion, Driver, Resource, Shared};
 use crate::driver::out_of_memory;
-use crate::memory::items;
+use crate::memory::{items, room};
 use crate::sync::{Arc, try_arc};
+use crate::table::OpId;
 use crate::uring::Sqe;
 
 /// The mark of a word of [`Closes`] that holds a record, above the generation of its resource.
@@ -38,6 +39,92 @@ impl Closes {
     /// Whether a record waits for the driver.
     pub(super) fn posted(&self) -> bool {
         self.posted.load(Ordering::Relaxed)
+    }
+}
+
+/// A task of the local owner of a driver: its slot and its generation. The owner wakes it after a
+/// turn of the driver ([`Driver::take_woken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LocalTask {
+    pub(crate) slot: u32,
+    pub(crate) generation: u64,
+}
+
+/// The waiter of a home operation ([`Consumer::Home`](super::Consumer::Home)).
+#[derive(Debug, Default)]
+enum Waiter {
+    /// No consumer waits.
+    #[default]
+    None,
+    /// The task that the local owner polled, with its own waker.
+    Task(LocalTask),
+    /// Another waker, such as the waker of a child future of a task.
+    Waker(core::task::Waker),
+}
+
+/// The consumers of the home operations of a driver: a waiter for each operation slot, and the
+/// tasks that the completions of a turn woke, which the owner takes after the turn. The driver
+/// makes both at its start, so a wake needs no allocation: an operation wakes at most one task.
+pub(super) struct Consumers {
+    /// A local type calls the driver: each operation that starts has its consumer at the home.
+    pub(super) calls: bool,
+    waiters: Box<[Waiter]>,
+    woken: alloc::vec::Vec<LocalTask>,
+}
+
+impl Consumers {
+    /// No waiter, for `operations` slots.
+    pub(super) fn new(operations: u32) -> Result<Self, AllocError> {
+        Ok(Self {
+            calls: false,
+            waiters: items(operations, |_| Waiter::None)?,
+            woken: room(operations as usize)?,
+        })
+    }
+
+    /// Records the waiter of the home operation `id`: `task` when the waker of the poll is the
+    /// task's own waker, and else a clone of `waker`, unless the waiter wakes it already.
+    pub(super) fn wait(&mut self, id: OpId, task: Option<LocalTask>, waker: &core::task::Waker) {
+        let Some(waiter) = self.waiters.get_mut(id.index() as usize) else {
+            return;
+        };
+        match (task, &*waiter) {
+            (Some(task), _) => *waiter = Waiter::Task(task),
+            (None, Waiter::Waker(old)) if old.will_wake(waker) => {}
+            (None, _) => *waiter = Waiter::Waker(waker.clone()),
+        }
+    }
+
+    /// Wakes the waiter of the home operation `id`, which ended: a task goes to the list that the
+    /// owner takes, and another waker wakes now.
+    pub(super) fn wake(&mut self, id: OpId) {
+        match self.waiters.get_mut(id.index() as usize).map(core::mem::take) {
+            // The list has room for each operation slot, and each slot has one waiter.
+            Some(Waiter::Task(task)) if self.woken.len() < self.woken.capacity() => self.woken.push(task),
+            Some(Waiter::Waker(waker)) => waker.wake(),
+            _ => {}
+        }
+    }
+
+    /// Forgets the waiter of the operation `id`, whose consumer ended its interest.
+    pub(super) fn clear(&mut self, id: OpId) {
+        if let Some(waiter) = self.waiters.get_mut(id.index() as usize) {
+            *waiter = Waiter::None;
+        }
+    }
+
+    /// Gives each task that a completion woke since the last take, and empties the list.
+    pub(super) fn take(&mut self) -> alloc::vec::Drain<'_, LocalTask> {
+        self.woken.drain(..)
+    }
+
+    /// Wakes each waker that waits, at the end of the driver: its consumer then gets `Gone`.
+    pub(super) fn end(&mut self) {
+        for waiter in &mut self.waiters {
+            if let Waiter::Waker(waker) = core::mem::take(waiter) {
+                waker.wake();
+            }
+        }
     }
 }
 
@@ -191,6 +278,26 @@ impl Driver {
                 });
             }
         }
+    }
+
+    /// Calls `f` with this driver in the mode of a call of a local type: each operation that
+    /// starts has its consumer at the home ([`Consumer::Home`](super::Consumer::Home)).
+    pub(crate) fn home_call<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let before = core::mem::replace(&mut self.consumers.calls, true);
+        let output = f(self);
+        self.consumers.calls = before;
+        output
+    }
+
+    /// Gives each local task that the completions of home operations woke since the last call to
+    /// `wake`. Gives whether it gave one.
+    pub(crate) fn take_woken(&mut self, mut wake: impl FnMut(LocalTask)) -> bool {
+        let mut woke = false;
+        for task in self.consumers.take() {
+            woke = true;
+            wake(task);
+        }
+        woke
     }
 
     /// Sends a wake message from this ring to `home`: the next submit sends it, and its completion

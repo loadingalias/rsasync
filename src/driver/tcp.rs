@@ -1209,10 +1209,7 @@ impl Driver {
             (true, false) => 1,
             (true, true) => 2,
         };
-        let tag = Tag {
-            resource: None,
-            kind: Kind::Bind,
-        };
+        let tag = Tag::new(None, Kind::Bind);
         let held = |()| Held {
             payload: Payload::Socket {
                 peer: storage,
@@ -1224,7 +1221,7 @@ impl Driver {
         let id = self
             .open(tag, entries, (), held)
             .map_err(|(reason, value)| Refused { reason, value })?;
-        let completion = Completion::new(Arc::clone(&self.shared), id, true);
+        let completion = self.completion(id, true);
         let kind = if listen { sys::SOCK_STREAM } else { sys::SOCK_DGRAM };
         match self.socket(id, storage.ss_family, kind, setup) {
             Err(error) => self.complete_now(id, errno(&error)),
@@ -1302,10 +1299,7 @@ impl Driver {
         (storage, len): (SockAddrStorage, u32),
         setup: impl FnOnce(Borrowed<'_>) -> io::Result<()>,
     ) -> Result<Completion, Refused<()>> {
-        let tag = Tag {
-            resource: None,
-            kind: Kind::Connect,
-        };
+        let tag = Tag::new(None, Kind::Connect);
         let held = |()| Held {
             payload: Payload::Socket {
                 peer: storage,
@@ -1317,7 +1311,7 @@ impl Driver {
         let id = self
             .open(tag, 1, (), held)
             .map_err(|(reason, value)| Refused { reason, value })?;
-        let completion = Completion::new(Arc::clone(&self.shared), id, true);
+        let completion = self.completion(id, true);
         match self.socket(id, storage.ss_family, sys::SOCK_STREAM, setup) {
             Err(error) => self.complete_now(id, errno(&error)),
             Ok((_, fd)) => {
@@ -1663,10 +1657,7 @@ impl Driver {
         };
         direction.current = direction.current.filter(|&id| table.runs(id));
         let now = direction.current.is_none() && direction.first.is_none();
-        let tag = Tag {
-            resource: Some(resource),
-            kind,
-        };
+        let tag = Tag::new(Some(resource), kind);
         // An operation that waits, or that has its result here, pushes no entry now.
         let pushed = if now && !has_result { entries } else { 0 };
         let id = self
@@ -1684,7 +1675,7 @@ impl Driver {
         } else {
             self.enqueue(resource, kind, id);
         }
-        Ok(Completion::new(Arc::clone(&self.shared), id, !kind.writes()))
+        Ok(self.completion(id, !kind.writes()))
     }
 
     /// The usual start of an operation of one entry: its direction runs no operation, keeps
@@ -1698,6 +1689,8 @@ impl Driver {
         value: P,
         held: H,
     ) -> Result<Completion, (P, H)> {
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        let consumer = self.consumer();
         let Self {
             resources,
             table,
@@ -1734,10 +1727,13 @@ impl Driver {
         else {
             return Err((value, held));
         };
+        #[cfg(all(feature = "local", target_os = "linux"))]
         let tag = Tag {
-            resource: Some(resource),
-            kind,
+            consumer,
+            ..Tag::new(Some(resource), kind)
         };
+        #[cfg(not(all(feature = "local", target_os = "linux")))]
+        let tag = Tag::new(Some(resource), kind);
         let Ok(id) = table.begin(tag, Shape::Single) else {
             return Err((value, held));
         };
@@ -1758,7 +1754,10 @@ impl Driver {
             let pushed = unsafe { queue.push(&sqe, Some(token)) }.is_ok();
             assert!(pushed, "the queue has room for the entry");
         });
-        Ok(Completion::new(Arc::clone(shared), id, !kind.writes()))
+        let completion = Completion::new(Arc::clone(shared), id, !kind.writes());
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        let completion = completion.with_consumer(consumer);
+        Ok(completion)
     }
 
     /// The direction of `kind` of `resource`.
@@ -1874,12 +1873,52 @@ impl Driver {
         if !Arc::ptr_eq(shared, &self.shared) {
             return false;
         }
+        self.consumers.clear(id);
         match self.table.end_interest(id) {
             Some(ended) => self.claimed(id, ended),
             None if cancel => self.cancel(id),
             None => {}
         }
         true
+    }
+
+    /// The poll of the home operation `id`, an operation of this driver when `shared` is its own,
+    /// on the thread of the home: `take` makes the output from the result and the resources in
+    /// their slot, and the slot frees; or the operation runs, and the driver keeps the waiter,
+    /// `task` or `waker`. Gives `None`, and changes nothing, for an operation of another driver.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn poll_home<T>(
+        &mut self,
+        shared: &Arc<super::Shared>,
+        id: OpId,
+        task: Option<super::home::LocalTask>,
+        waker: &core::task::Waker,
+        take: impl FnOnce(i32, &mut Held) -> T,
+    ) -> Option<core::task::Poll<Result<T, crate::completion::Gone>>> {
+        use core::task::Poll;
+        if !Arc::ptr_eq(shared, &self.shared) {
+            return None;
+        }
+        let taken = self
+            .shared
+            .entries
+            .get(id.index() as usize)
+            .map(|slot| slot.take_home(id, take));
+        Some(match taken {
+            Some(None) => {
+                self.consumers.wait(id, task, waker);
+                Poll::Pending
+            }
+            Some(Some(Ok(output))) => {
+                // The table holds the result, so the slot frees here, as at the take of a request.
+                if let Some(ended) = self.table.end_interest(id) {
+                    self.claimed(id, ended);
+                }
+                Poll::Ready(Ok(output))
+            }
+            Some(Some(Err(gone))) => Poll::Ready(Err(gone)),
+            None => Poll::Ready(Err(crate::completion::Gone)),
+        })
     }
 
     /// The operation `id` has no future any more: the caller started the next operation in its
@@ -2118,15 +2157,12 @@ impl Driver {
                 value,
             });
         }
-        let tag = Tag {
-            resource: Some(resource),
-            kind: Kind::Close,
-        };
+        let tag = Tag::new(Some(resource), Kind::Close);
         let id = self
             .open(tag, 0, value, |_| Held::default())
             .map_err(|(reason, value)| Refused { reason, value })?;
         self.start_close(resource, Closing::Future(id));
-        Ok(Completion::new(Arc::clone(&self.shared), id, false))
+        Ok(self.completion(id, false))
     }
 
     /// Starts the close of `resource` that a drop of a local type recorded, as

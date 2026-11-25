@@ -7,9 +7,9 @@
 use core::net::SocketAddr;
 use std::io;
 
-use super::{Home, Homed, ReadHalf, WriteHalf, call, rewrap, submit};
+use super::{Home, Homed, Operation, ReadHalf, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
-use crate::driver::{self, Closed, Completion, Driver, Operation, Refused, Regions, TcpOptions};
+use crate::driver::{self, Closed, Completion, Driver, Refused, Regions, TcpOptions};
 
 /// A listening TCP socket whose home is the driver of the owner of this thread.
 ///
@@ -38,9 +38,9 @@ impl TcpListener {
     /// thread. The future gives an error of the system.
     pub fn bind(address: SocketAddr, options: TcpOptions) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let bind = submit((), |driver, ()| driver.bind(address, options))?;
-        Ok(bind.with_output(|result, held, bind| {
+        Ok(Operation::home(bind.with_output(|result, held, bind| {
             driver::tcp_bound(result, held).map(|bound| bound.map(|listener| Self::new(listener, bind)))
-        }))
+        })))
     }
 
     /// The local address of the listener.
@@ -59,10 +59,10 @@ impl TcpListener {
     pub fn accept(&mut self) -> Result<Operation<'_, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
         let listener = &mut self.inner.resource;
         let accept = submit((), |driver, ()| driver.accept(listener))?;
-        Ok(accept.with_output(|result, held, accept| {
+        Ok(Operation::home(accept.with_output(|result, held, accept| {
             driver::accepted(result, held)
                 .map(|accepted| accepted.map(|(stream, peer)| (TcpStream::new(stream, accept), peer)))
-        }))
+        })))
     }
 
     /// The options of the socket, with the values of the kernel.
@@ -130,9 +130,9 @@ impl TcpStream {
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let connect = submit((), |driver, ()| driver.connect(address, options))?;
-        Ok(connect.with_output(|result, held, connect| {
+        Ok(Operation::home(connect.with_output(|result, held, connect| {
             driver::connected(result, held).map(|stream| stream.map(|stream| Self::new(stream, connect)))
-        }))
+        })))
     }
 
     /// The read half and the write half, so that a receive and a send run at one time.
@@ -159,7 +159,7 @@ impl TcpStream {
     /// runs on this thread, or with `Reason::Resource` when the stream has another home.
     pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
         let stream = &mut self.inner.resource;
-        submit(buffer, |driver, buffer| driver.recv(stream, buffer))
+        submit(buffer, |driver, buffer| driver.recv(stream, buffer)).map(Operation::home)
     }
 
     /// Sends the bytes of `lease`, as [`Driver::send`](crate::driver::Driver::send) does.
@@ -169,7 +169,7 @@ impl TcpStream {
     /// As for [`TcpStream::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let stream = &mut self.inner.resource;
-        submit(lease, |driver, lease| driver.send(stream, lease))
+        submit(lease, |driver, lease| driver.send(stream, lease)).map(Operation::home)
     }
 
     /// Sends the bytes of `regions` in order, in one operation, as
@@ -183,7 +183,7 @@ impl TcpStream {
         regions: Regions,
     ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
         let stream = &mut self.inner.resource;
-        submit(regions, |driver, regions| driver.send_vectored(stream, regions))
+        submit(regions, |driver, regions| driver.send_vectored(stream, regions)).map(Operation::home)
     }
 
     /// Ends the write direction after the sent bytes, as
@@ -194,7 +194,7 @@ impl TcpStream {
     /// As for [`TcpStream::recv`].
     pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let stream = &mut self.inner.resource;
-        submit((), |driver, ()| driver.shutdown_write(stream))
+        submit((), |driver, ()| driver.shutdown_write(stream)).map(Operation::home)
     }
 
     /// The options of the socket, with the values of the kernel.

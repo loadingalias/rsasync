@@ -255,7 +255,10 @@ impl Park for Drive<'_> {
             return Ok(false);
         };
         flush(local, driver);
-        Ok(driver.turn().map_err(Failure::Driver)?.more())
+        let more = driver.turn().map_err(Failure::Driver)?.more();
+        // A task that a home operation woke is in the local queue, so the owner turns again.
+        let woke = driver.take_woken(|task| local.wake_local(task));
+        Ok(more || woke)
     }
 
     fn check(&mut self, local: &Local) -> Result<(), Failure> {

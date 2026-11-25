@@ -35,10 +35,8 @@ use sys::{EADDRINUSE, EAGAIN, EBUSY, ECONNREFUSED, EINVAL, ENAMETOOLONG, ENOENT,
 
 #[cfg(unix)]
 use super::Medium;
-use super::completion::Completion;
 use super::tcp::{self, Closed, ReadHalf, WriteHalf};
 use super::{Driver, Held, Kind, Operation, Refused, Resource, Tag};
-use crate::sync::Arc;
 use crate::table::OpId;
 
 #[cfg(unix)]
@@ -300,10 +298,7 @@ impl Driver {
             let listening = windows::name(path).and_then(windows::listen);
             self.end_pipe(id, listening.map(|(instance, listening)| (instance, Some(listening))));
         }
-        Ok(Operation::new(
-            Completion::new(Arc::clone(&self.shared), id, false),
-            ipc_bound,
-        ))
+        Ok(Operation::new(self.completion(id, false), ipc_bound))
     }
 
     /// Connects a new Unix-domain stream socket to the listener at `path`. The future gives the
@@ -348,10 +343,7 @@ impl Driver {
             let connected = windows::name(path).and_then(|name| windows::connect(&name));
             self.end_pipe(id, connected.map(|client| (client, None)));
         }
-        Ok(Operation::new(
-            Completion::new(Arc::clone(&self.shared), id, false),
-            ipc_connected,
-        ))
+        Ok(Operation::new(self.completion(id, false), ipc_connected))
     }
 
     /// Accepts a connection on `listener`. The future gives the stream; [`Driver::ipc_peer`]
@@ -463,7 +455,7 @@ impl Driver {
 
     /// Records an operation of `kind` that ends at once, with no submission.
     fn begin_now(&mut self, kind: Kind) -> Result<OpId, Refused<()>> {
-        let tag = Tag { resource: None, kind };
+        let tag = Tag::new(None, kind);
         self.open(tag, 0, (), |()| Held::default())
             .map_err(|(reason, value)| Refused { reason, value })
     }

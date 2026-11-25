@@ -245,8 +245,11 @@ runtime.block_on(async {
 
 The local types differ from the driver types in two points:
 
-- They are not `Send`, so a resource stays on the thread of its home. The future of a bind, a
-  connect, or an accept is not `Send` either, so the resource starts on that thread. A local call
+- They are not `Send`, so a resource stays on the thread of its home. The future of each call,
+  `rsasync::local::Operation`, is not `Send` either, so the resource starts on that thread and each
+  operation ends there. The driver takes the result in place and wakes the task that polls the
+  future. A poll outside the owner of the home gives `Ended`, and the drop of the future then ends
+  the operation as a drop does. A local call
   on another owner refuses with `Reason::Resource`, also after the `block_on` that made the
   resource ended. A local call on a thread with no driver, or in a destructor that a turn of the
   driver runs, refuses with `Reason::NoDriver`. Each refusal gives back what you gave, such as the

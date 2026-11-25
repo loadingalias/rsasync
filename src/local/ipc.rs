@@ -8,9 +8,9 @@
 use std::io;
 use std::path::Path;
 
-use super::{Home, Homed, ReadHalf, WriteHalf, call, rewrap, submit};
+use super::{Home, Homed, Operation, ReadHalf, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
-use crate::driver::{self, Closed, Completion, Driver, Operation, Peer, Refused, Regions, Stale};
+use crate::driver::{self, Closed, Completion, Driver, Peer, Refused, Regions, Stale};
 
 /// A listening IPC socket at a path, whose home is the driver of the owner of this thread.
 ///
@@ -30,7 +30,7 @@ impl IpcListener {
     /// thread. The future gives an error of the system.
     pub fn bind(path: &Path, stale: Stale) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let bind = submit((), |driver, ()| driver.bind_ipc(path, stale))?;
-        Ok(bind.with_output(|result, held, bind| {
+        Ok(Operation::home(bind.with_output(|result, held, bind| {
             driver::ipc_bound(result, held).map(|bound| {
                 bound.map(|listener| {
                     let cleanup = bind.cleanup(listener.resource());
@@ -39,7 +39,7 @@ impl IpcListener {
                     }
                 })
             })
-        }))
+        })))
     }
 
     /// Accepts a connection, as [`Driver::accept_ipc`] does. The future gives the stream, whose
@@ -52,9 +52,9 @@ impl IpcListener {
     pub fn accept(&mut self) -> Result<Operation<'_, io::Result<IpcStream>>, Refused<()>> {
         let listener = &mut self.inner.resource;
         let accept = submit((), |driver, ()| driver.accept_ipc(listener))?;
-        Ok(accept.with_output(|result, held, accept| {
+        Ok(Operation::home(accept.with_output(|result, held, accept| {
             driver::ipc_connected(result, held).map(|accepted| accepted.map(|stream| IpcStream::new(stream, accept)))
-        }))
+        })))
     }
 
     /// Closes the listener, as [`Driver::close_ipc_listener`] does.
@@ -94,9 +94,9 @@ impl IpcStream {
     /// As for [`IpcListener::bind`].
     pub fn connect(path: &Path) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let connect = submit((), |driver, ()| driver.connect_ipc(path))?;
-        Ok(connect.with_output(|result, held, connect| {
+        Ok(Operation::home(connect.with_output(|result, held, connect| {
             driver::ipc_connected(result, held).map(|connected| connected.map(|stream| Self::new(stream, connect)))
-        }))
+        })))
     }
 
     /// The read half and the write half, so that a receive and a send run at one time.
@@ -133,7 +133,7 @@ impl IpcStream {
     /// runs on this thread, or with `Reason::Resource` when the stream has another home.
     pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
         let stream = &mut self.inner.resource;
-        submit(buffer, |driver, buffer| driver.recv(stream, buffer))
+        submit(buffer, |driver, buffer| driver.recv(stream, buffer)).map(Operation::home)
     }
 
     /// Sends the bytes of `lease`, as [`Driver::send`] does.
@@ -143,7 +143,7 @@ impl IpcStream {
     /// As for [`IpcStream::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let stream = &mut self.inner.resource;
-        submit(lease, |driver, lease| driver.send(stream, lease))
+        submit(lease, |driver, lease| driver.send(stream, lease)).map(Operation::home)
     }
 
     /// Sends the bytes of `regions` in order, in one operation, as [`Driver::send_vectored`] does.
@@ -156,7 +156,7 @@ impl IpcStream {
         regions: Regions,
     ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
         let stream = &mut self.inner.resource;
-        submit(regions, |driver, regions| driver.send_vectored(stream, regions))
+        submit(regions, |driver, regions| driver.send_vectored(stream, regions)).map(Operation::home)
     }
 
     /// Ends the write direction after the sent bytes, as [`Driver::shutdown_write`] does.
@@ -166,7 +166,7 @@ impl IpcStream {
     /// As for [`IpcStream::recv`].
     pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let stream = &mut self.inner.resource;
-        submit((), |driver, ()| driver.shutdown_write(stream))
+        submit((), |driver, ()| driver.shutdown_write(stream)).map(Operation::home)
     }
 
     /// Closes the stream, as [`Driver::close_ipc`] does: it cancels each operation of the stream,

@@ -7,10 +7,10 @@
 use core::net::SocketAddr;
 use std::io;
 
-use super::{Home, Homed, rewrap, submit};
+use super::{Home, Homed, Operation, rewrap, submit};
 use crate::buffer::Backing;
 use crate::datagram::Received;
-use crate::driver::{self, Closed, Completion, Datagram, Datagrams, Driver, Operation, Refused, UdpOptions};
+use crate::driver::{self, Closed, Completion, Datagram, Datagrams, Driver, Refused, UdpOptions};
 
 /// A UDP socket whose home is the driver of the owner of this thread.
 ///
@@ -38,9 +38,9 @@ impl UdpSocket {
     /// thread. The future gives an error of the system.
     pub fn bind(address: SocketAddr, options: UdpOptions) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let bind = submit((), |driver, ()| driver.bind_udp(address, options))?;
-        Ok(bind.with_output(|result, held, bind| {
+        Ok(Operation::home(bind.with_output(|result, held, bind| {
             driver::udp_bound(result, held).map(|bound| bound.map(|socket| Self::new(socket, bind)))
-        }))
+        })))
     }
 
     /// The local address of the socket.
@@ -75,7 +75,7 @@ impl UdpSocket {
         datagram: Datagram,
     ) -> Result<Operation<'_, (io::Result<usize>, Datagram)>, Refused<Datagram>> {
         let socket = &mut self.inner.resource;
-        submit(datagram, |driver, datagram| driver.send_to(socket, datagram))
+        submit(datagram, |driver, datagram| driver.send_to(socket, datagram)).map(Operation::home)
     }
 
     /// Sends the datagrams of `datagrams` in one operation, as
@@ -89,7 +89,7 @@ impl UdpSocket {
         datagrams: Datagrams,
     ) -> Result<Operation<'_, (io::Result<usize>, Datagrams)>, Refused<Datagrams>> {
         let socket = &mut self.inner.resource;
-        submit(datagrams, |driver, datagrams| driver.send_batch(socket, datagrams))
+        submit(datagrams, |driver, datagrams| driver.send_batch(socket, datagrams)).map(Operation::home)
     }
 
     /// Receives one datagram into the capacity of `buffer` after its initialized bytes, as
@@ -103,7 +103,7 @@ impl UdpSocket {
         buffer: Backing,
     ) -> Result<Operation<'_, (io::Result<Received>, Backing)>, Refused<Backing>> {
         let socket = &mut self.inner.resource;
-        submit(buffer, |driver, buffer| driver.recv_from(socket, buffer))
+        submit(buffer, |driver, buffer| driver.recv_from(socket, buffer)).map(Operation::home)
     }
 
     /// Closes the socket, as [`Driver::close_udp`](crate::driver::Driver::close_udp) does.
@@ -137,7 +137,7 @@ impl ReadHalf<'_> {
         buffer: Backing,
     ) -> Result<Operation<'_, (io::Result<Received>, Backing)>, Refused<Backing>> {
         let read = &mut *self.read;
-        submit(buffer, |driver, buffer| driver.recv_from(read, buffer))
+        submit(buffer, |driver, buffer| driver.recv_from(read, buffer)).map(Operation::home)
     }
 }
 
@@ -159,7 +159,7 @@ impl WriteHalf<'_> {
         datagram: Datagram,
     ) -> Result<Operation<'_, (io::Result<usize>, Datagram)>, Refused<Datagram>> {
         let write = &mut *self.write;
-        submit(datagram, |driver, datagram| driver.send_to(write, datagram))
+        submit(datagram, |driver, datagram| driver.send_to(write, datagram)).map(Operation::home)
     }
 
     /// Sends the datagrams of `datagrams` in one operation, as [`UdpSocket::send_batch`] does.
@@ -172,6 +172,6 @@ impl WriteHalf<'_> {
         datagrams: Datagrams,
     ) -> Result<Operation<'_, (io::Result<usize>, Datagrams)>, Refused<Datagrams>> {
         let write = &mut *self.write;
-        submit(datagrams, |driver, datagrams| driver.send_batch(write, datagrams))
+        submit(datagrams, |driver, datagrams| driver.send_batch(write, datagrams)).map(Operation::home)
     }
 }

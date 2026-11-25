@@ -6,6 +6,8 @@ use crate::completion::{Entry, Gone};
 use crate::sync::Arc;
 use crate::table::{OpId, Request};
 
+#[cfg(all(feature = "local", target_os = "linux"))]
+use super::Consumer;
 use super::{Held, Shared};
 
 /// The future of one operation: it gives the result and the resources after the terminal event.
@@ -17,6 +19,9 @@ pub(crate) struct Completion {
     id: OpId,
     /// A drop asks the home to cancel the operation: a receive, not a send.
     cancel_on_drop: bool,
+    /// Where the consumer polls the operation.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    consumer: Consumer,
     done: bool,
 }
 
@@ -26,8 +31,17 @@ impl Completion {
             shared,
             id,
             cancel_on_drop,
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            consumer: Consumer::Any,
             done: false,
         }
+    }
+
+    /// The same future, with `consumer` as its consumer, which the tag of its operation names.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) const fn with_consumer(mut self, consumer: Consumer) -> Self {
+        self.consumer = consumer;
+        self
     }
 
     /// The identity of the operation and its driver.
@@ -97,7 +111,36 @@ impl Completion {
         if self.done {
             panic!("an `Operation` was polled after it gave `Ready`");
         }
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if self.consumer == Consumer::Home {
+            return crate::coop::poll(cx, |cx| self.poll_home(cx, take));
+        }
         crate::coop::poll(cx, |cx| self.take_with(cx, take))
+    }
+
+    /// The poll of a home operation: its driver takes the result in place, or keeps the waiter.
+    /// With no driver of the home on this thread, outside a turn, it gives [`Gone`]: the context
+    /// is refused, and the drop of the future ends the interest.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    fn poll_home<T>(
+        &mut self,
+        cx: &Context<'_>,
+        take: impl FnOnce(i32, &mut Held, &Self) -> T,
+    ) -> Poll<Result<T, Gone>> {
+        let this = &*self;
+        let polled = crate::task::with_driver_task(cx.waker(), take, |driver, task, take| {
+            driver.poll_home(&this.shared, this.id, task, cx.waker(), |result, held| {
+                take(result, held, this)
+            })
+        });
+        match polled {
+            Ok(Some(Poll::Ready(Ok(output)))) => {
+                self.done = true;
+                Poll::Ready(Ok(output))
+            }
+            Ok(Some(poll)) => poll,
+            Ok(None) | Err(_) => Poll::Ready(Err(Gone)),
+        }
     }
 }
 
@@ -106,7 +149,12 @@ impl Drop for Completion {
         if self.done {
             return;
         }
-        if let Some(entry) = self.entry() {
+        // The waiter of a home operation is at its driver, which the end of interest clears.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        let home = self.consumer == Consumer::Home;
+        #[cfg(not(all(feature = "local", target_os = "linux")))]
+        let home = false;
+        if !home && let Some(entry) = self.entry() {
             entry.cancel_wait();
         }
         // On the thread of the home, outside a turn, the driver ends the interest now, and the

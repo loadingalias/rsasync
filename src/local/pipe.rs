@@ -8,9 +8,9 @@
 use std::io;
 use std::os::fd::OwnedFd;
 
-use super::{Homed, rewrap, submit};
+use super::{Homed, Operation, rewrap, submit};
 use crate::buffer::{Backing, Lease};
-use crate::driver::{self, Cleanup, Closed, Driver, Operation, Refused, Regions};
+use crate::driver::{self, Cleanup, Closed, Driver, Refused, Regions};
 
 /// The read end of a pipe, whose home is the driver of the owner of this thread.
 ///
@@ -51,7 +51,7 @@ impl PipeReader {
     /// runs on this thread, or with `Reason::Resource` when the pipe end has another home.
     pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
         let reader = &mut self.inner.resource;
-        submit(buffer, |driver, buffer| driver.recv(reader, buffer))
+        submit(buffer, |driver, buffer| driver.recv(reader, buffer)).map(Operation::home)
     }
 
     /// Closes the read end, as [`Driver::close_reader`] does.
@@ -104,7 +104,7 @@ impl PipeWriter {
     /// As for [`PipeReader::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let writer = &mut self.inner.resource;
-        submit(lease, |driver, lease| driver.send(writer, lease))
+        submit(lease, |driver, lease| driver.send(writer, lease)).map(Operation::home)
     }
 
     /// Sends the bytes of `regions` in order, in one operation, as [`Driver::send_vectored`] does.
@@ -117,7 +117,7 @@ impl PipeWriter {
         regions: Regions,
     ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
         let writer = &mut self.inner.resource;
-        submit(regions, |driver, regions| driver.send_vectored(writer, regions))
+        submit(regions, |driver, regions| driver.send_vectored(writer, regions)).map(Operation::home)
     }
 
     /// Closes the write end, as [`Driver::close_writer`] does: the future gives the progress that

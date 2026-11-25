@@ -12,8 +12,8 @@ use std::io;
 use super::{Handle, WorkerId};
 use crate::capacity::Exhausted;
 use crate::channel::{self, oneshot};
-use crate::driver::{self, Operation, TcpOptions, UdpOptions};
-use crate::local::{TcpListener, UdpSocket};
+use crate::driver::{self, TcpOptions, UdpOptions};
+use crate::local::{Operation, TcpListener, UdpSocket};
 use crate::memory::room;
 use crate::task::{self, JoinHandle};
 

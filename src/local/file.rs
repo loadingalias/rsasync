@@ -7,10 +7,10 @@
 use std::io;
 use std::path::Path;
 
-use super::{Homed, rewrap, submit};
+use super::{Homed, Operation, rewrap, submit};
 use crate::buffer::{Backing, Lease};
 use crate::driver::{
-    self, Alignment, Buffers, Completion, Driver, Length, OpenOptions, Operation, Refused, Regions, SyncMode, WriteMode,
+    self, Alignment, Buffers, Completion, Driver, Length, OpenOptions, Refused, Regions, SyncMode, WriteMode,
 };
 
 /// A file whose home is the driver of the owner of this thread.
@@ -36,9 +36,9 @@ impl File {
     /// thread. The future gives an error of the system.
     pub fn open(path: &Path, options: OpenOptions) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let open = submit((), |driver, ()| driver.open_file(path, options))?;
-        Ok(open.with_output(|result, held, open| {
+        Ok(Operation::home(open.with_output(|result, held, open| {
             driver::file_opened(result, held).map(|opened| opened.map(|file| Self::new(file, open)))
-        }))
+        })))
     }
 
     /// The alignment of direct I/O, for a file that `Cache::Direct` opened.
@@ -61,7 +61,7 @@ impl File {
         offset: u64,
     ) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
         let file = &self.inner.resource;
-        submit(buffer, |driver, buffer| driver.read_at(file, buffer, offset))
+        submit(buffer, |driver, buffer| driver.read_at(file, buffer, offset)).map(Operation::home)
     }
 
     /// Reads until `buffer` is full, from `offset`, as [`Driver::read_exact_at`] does.
@@ -75,7 +75,7 @@ impl File {
         offset: u64,
     ) -> Result<Operation<'_, (io::Result<()>, Backing)>, Refused<Backing>> {
         let file = &self.inner.resource;
-        submit(buffer, |driver, buffer| driver.read_exact_at(file, buffer, offset))
+        submit(buffer, |driver, buffer| driver.read_exact_at(file, buffer, offset)).map(Operation::home)
     }
 
     /// Reads into `buffers` in order, from `offset`, as [`Driver::read_vectored_at`] does.
@@ -92,6 +92,7 @@ impl File {
         submit(buffers, |driver, buffers| {
             driver.read_vectored_at(file, buffers, offset)
         })
+        .map(Operation::home)
     }
 
     /// Writes the bytes of `lease` at `offset`, with `mode`, as [`Driver::write_at`] does.
@@ -106,7 +107,7 @@ impl File {
         mode: WriteMode,
     ) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let file = &self.inner.resource;
-        submit(lease, |driver, lease| driver.write_at(file, lease, offset, mode))
+        submit(lease, |driver, lease| driver.write_at(file, lease, offset, mode)).map(Operation::home)
     }
 
     /// Writes the bytes of `regions` in order at `offset`, as [`Driver::write_vectored_at`] does.
@@ -124,6 +125,7 @@ impl File {
         submit(regions, |driver, regions| {
             driver.write_vectored_at(file, regions, offset, mode)
         })
+        .map(Operation::home)
     }
 
     /// The length of the file, as [`Driver::file_len`] does.
@@ -133,7 +135,7 @@ impl File {
     /// As for [`File::read_at`].
     pub fn len(&self) -> Result<Operation<'_, io::Result<u64>>, Refused<()>> {
         let file = &self.inner.resource;
-        submit((), |driver, ()| driver.file_len(file))
+        submit((), |driver, ()| driver.file_len(file)).map(Operation::home)
     }
 
     /// Changes the length of the file to `len`, as [`Driver::set_file_len`] does.
@@ -143,7 +145,7 @@ impl File {
     /// As for [`File::read_at`].
     pub fn set_len(&self, len: u64) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let file = &self.inner.resource;
-        submit((), |driver, ()| driver.set_file_len(file, len))
+        submit((), |driver, ()| driver.set_file_len(file, len)).map(Operation::home)
     }
 
     /// Allocates the blocks of `len` bytes at `offset`, as [`Driver::allocate`] does.
@@ -158,7 +160,7 @@ impl File {
         length: Length,
     ) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let file = &self.inner.resource;
-        submit((), |driver, ()| driver.allocate(file, offset, len, length))
+        submit((), |driver, ()| driver.allocate(file, offset, len, length)).map(Operation::home)
     }
 
     /// Frees the blocks of `len` bytes at `offset`, as [`Driver::punch_hole`] does.
@@ -168,7 +170,7 @@ impl File {
     /// As for [`File::read_at`].
     pub fn punch_hole(&self, offset: u64, len: u64) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let file = &self.inner.resource;
-        submit((), |driver, ()| driver.punch_hole(file, offset, len))
+        submit((), |driver, ()| driver.punch_hole(file, offset, len)).map(Operation::home)
     }
 
     /// Makes the contents of the file durable by `mode`, as [`Driver::sync`] does.
@@ -178,7 +180,7 @@ impl File {
     /// As for [`File::read_at`].
     pub fn sync(&self, mode: SyncMode) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let file = &self.inner.resource;
-        submit((), |driver, ()| driver.sync(file, mode))
+        submit((), |driver, ()| driver.sync(file, mode)).map(Operation::home)
     }
 
     /// Closes the file, as [`Driver::close_file`] does: the future ends after each operation of the
@@ -209,7 +211,7 @@ impl Directory {
     /// As for [`File::open`].
     pub fn open(path: &Path) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
         let open = submit((), |driver, ()| driver.open_directory(path))?;
-        Ok(open.with_output(|result, held, open| {
+        Ok(Operation::home(open.with_output(|result, held, open| {
             driver::directory_opened(result, held).map(|opened| {
                 opened.map(|directory| {
                     let cleanup = open.cleanup(directory.resource());
@@ -218,7 +220,7 @@ impl Directory {
                     }
                 })
             })
-        }))
+        })))
     }
 
     /// Makes the names of the directory durable, as [`Driver::sync_directory`] does.
@@ -228,7 +230,7 @@ impl Directory {
     /// As for [`File::read_at`].
     pub fn sync(&self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
         let directory = &self.inner.resource;
-        submit((), |driver, ()| driver.sync_directory(directory))
+        submit((), |driver, ()| driver.sync_directory(directory)).map(Operation::home)
     }
 
     /// Closes the directory, as [`Driver::close_directory`] does.
@@ -250,7 +252,7 @@ impl Directory {
 /// A refusal when the driver has no room for the operation, or when no driver runs on this thread.
 /// The future gives an error of the system.
 pub fn rename(from: &Path, to: &Path) -> Result<Operation<'static, io::Result<()>>, Refused<()>> {
-    submit((), |driver, ()| driver.rename(from, to))
+    submit((), |driver, ()| driver.rename(from, to)).map(Operation::home)
 }
 
 /// Removes the name `path`, as [`Driver::unlink`] does, on the driver of this thread.
@@ -259,5 +261,5 @@ pub fn rename(from: &Path, to: &Path) -> Result<Operation<'static, io::Result<()
 ///
 /// As for [`rename`].
 pub fn unlink(path: &Path) -> Result<Operation<'static, io::Result<()>>, Refused<()>> {
-    submit((), |driver, ()| driver.unlink(path))
+    submit((), |driver, ()| driver.unlink(path)).map(Operation::home)
 }

@@ -75,7 +75,7 @@ use std::io;
 
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Closed, Direction, Ended, Held, PlainSocket, Refused, TcpOptions};
-use crate::local::{rewrap, submit};
+use crate::local::{rewrap, submit_any};
 
 /// A listening TCP socket that moves with its task.
 ///
@@ -99,7 +99,7 @@ impl TcpListener {
     /// thread. The future gives an error of the system, or `OutOfMemory` when the allocator does
     /// not give the memory of the listener.
     pub fn bind(address: SocketAddr, options: TcpOptions) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
-        let place = submit((), |driver, ()| driver.bind_plain(address, options))?;
+        let place = submit_any((), |driver, ()| driver.bind_plain(address, options))?;
         Ok(Operation::owned(place, |result, held| {
             driver::plain_socket(result, held).map(|made| {
                 made.map(|(socket, local)| Self {
@@ -127,7 +127,7 @@ impl TcpListener {
     /// not give the memory of the stream. The connection closes then.
     pub fn accept(&mut self) -> Result<Operation<'_, io::Result<(TcpStream, SocketAddr)>>, Refused<()>> {
         let Self { socket, accepts, .. } = self;
-        submit((), |driver, ()| accepts.accept(driver, socket))?;
+        submit_any((), |driver, ()| accepts.accept(driver, socket))?;
         Ok(Operation::borrowed(accepts, |result, held| {
             driver::plain_socket(result, held).map(|made| made.map(|(socket, peer)| (TcpStream::new(socket), peer)))
         }))
@@ -143,7 +143,7 @@ impl TcpListener {
     pub fn close(self) -> Result<Operation<'static, Closed>, Refused<Self>> {
         let Self { socket, local, accepts } = self;
         let parts = (socket, accepts, Direction::default());
-        match submit(parts, |driver, (socket, accepts, none)| {
+        match submit_any(parts, |driver, (socket, accepts, none)| {
             Direction::close(driver, socket, accepts, none)
         }) {
             Ok(place) => Ok(Operation::owned(place, |_, held| held.closed)),
@@ -187,7 +187,7 @@ impl TcpStream {
         address: SocketAddr,
         options: TcpOptions,
     ) -> Result<Operation<'static, io::Result<Self>>, Refused<()>> {
-        let place = submit((), |driver, ()| driver.connect_plain(address, options))?;
+        let place = submit_any((), |driver, ()| driver.connect_plain(address, options))?;
         Ok(Operation::owned(place, |result, held| {
             driver::plain_socket(result, held).map(|made| made.map(|(socket, _)| Self::new(socket)))
         }))
@@ -203,7 +203,7 @@ impl TcpStream {
     /// driver runs on this thread.
     pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
         let Self { socket, read, .. } = self;
-        submit(buffer, |driver, buffer| read.recv(driver, socket, buffer))?;
+        submit_any(buffer, |driver, buffer| read.recv(driver, socket, buffer))?;
         Ok(Operation::borrowed(read, driver::received))
     }
 
@@ -215,7 +215,7 @@ impl TcpStream {
     /// As for [`TcpStream::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
         let Self { socket, write, .. } = self;
-        submit(lease, |driver, lease| write.send(driver, socket, lease))?;
+        submit_any(lease, |driver, lease| write.send(driver, socket, lease))?;
         Ok(Operation::borrowed(write, driver::sent))
     }
 
@@ -229,7 +229,7 @@ impl TcpStream {
     /// runs on this thread.
     pub fn close(self) -> Result<Operation<'static, Closed>, Refused<Self>> {
         let Self { socket, read, write } = self;
-        match submit((socket, read, write), |driver, (socket, read, write)| {
+        match submit_any((socket, read, write), |driver, (socket, read, write)| {
             Direction::close(driver, socket, read, write)
         }) {
             Ok(place) => Ok(Operation::owned(place, |_, held| held.closed)),

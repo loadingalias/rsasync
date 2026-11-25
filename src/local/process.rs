@@ -7,10 +7,8 @@
 use std::io;
 use std::process::Command;
 
-use super::{Home, PipeReader, PipeWriter, rewrap, submit};
-use crate::driver::{
-    self, ChildOptions, Cleanup, Driver, End, Operation, Refused, Resource, Signal, SignalChildError, Wait,
-};
+use super::{Home, Operation, PipeReader, PipeWriter, rewrap, submit};
+use crate::driver::{self, ChildOptions, Cleanup, Driver, End, Refused, Resource, Signal, SignalChildError, Wait};
 use crate::task::with_driver;
 
 /// A child process whose home is the driver of the owner of this thread.
@@ -64,10 +62,10 @@ impl Child {
         options: ChildOptions,
     ) -> Result<Operation<'static, io::Result<Self>>, Refused<Command>> {
         let spawn = submit(command, |driver, command| driver.spawn(command, options))?;
-        Ok(spawn.with_output(|result, held, spawn| {
+        Ok(Operation::home(spawn.with_output(|result, held, spawn| {
             driver::spawned_child(result, held)
                 .map(|spawned| spawned.map(|child| Self::new(child, |resource| spawn.cleanup(resource))))
-        }))
+        })))
     }
 
     /// Takes `child`, which you started, with the end policy `end`, as [`Driver::adopt_child`] does.

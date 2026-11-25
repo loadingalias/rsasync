@@ -46,7 +46,6 @@ use super::tcp::{self, Directions, TcpOptions};
 use super::{Completion, Driver, ECANCELED, Held, Kind, Payload, Reason, Refused, Tag, borrow, out_of_memory};
 use crate::buffer::{Backing, Lease, WriteLoan};
 use crate::completion::Gone;
-use crate::sync::Arc;
 use crate::table::OpId;
 use crate::uring::Sqe;
 
@@ -433,7 +432,7 @@ impl Driver {
     /// driver is its home. Refuses with `value`, before `held` runs, when the driver has no room.
     fn begin_plain<P>(&mut self, kind: Kind, value: P, held: impl FnOnce(P) -> Held) -> Result<Completion, Refused<P>> {
         let value = self.ring_only(value)?;
-        let tag = Tag { resource: None, kind };
+        let tag = Tag::new(None, kind);
         let id = self
             .open(tag, u32::from(kind != Kind::Close), value, held)
             .map_err(|(reason, value)| Refused { reason, value })?;
@@ -441,7 +440,7 @@ impl Driver {
             // At most one entry for each operation, so the capacity of the list holds it.
             self.following.push(id);
         }
-        Ok(Completion::new(Arc::clone(&self.shared), id, false))
+        Ok(self.completion(id, false))
     }
 
     /// Moves the operation `id` forward: it takes the results of the earlier operations of its
@@ -519,10 +518,7 @@ impl Driver {
     pub(crate) fn bind_plain(&mut self, address: SocketAddr, options: TcpOptions) -> Result<Direction, Refused<()>> {
         self.ring_only(())?;
         let (storage, len) = SockAddrStorage::new(address);
-        let tag = Tag {
-            resource: None,
-            kind: Kind::Bind,
-        };
+        let tag = Tag::new(None, Kind::Bind);
         let id = self
             .open(tag, 0, (), |()| socket_held(storage, len))
             .map_err(|(reason, value)| Refused { reason, value })?;
@@ -539,10 +535,7 @@ impl Driver {
             }
             Err(error) => self.complete_now(id, tcp::errno(&error)),
         }
-        Ok(Direction::of(
-            Completion::new(Arc::clone(&self.shared), id, false),
-            Kind::Bind,
-        ))
+        Ok(Direction::of(self.completion(id, false), Kind::Bind))
     }
 
     /// Connects a new TCP socket that no driver owns, with `options`, to `address`, as
@@ -551,10 +544,7 @@ impl Driver {
     pub(crate) fn connect_plain(&mut self, address: SocketAddr, options: TcpOptions) -> Result<Direction, Refused<()>> {
         self.ring_only(())?;
         let (storage, len) = SockAddrStorage::new(address);
-        let tag = Tag {
-            resource: None,
-            kind: Kind::Connect,
-        };
+        let tag = Tag::new(None, Kind::Connect);
         let id = self
             .open(tag, 1, (), |()| socket_held(storage, len))
             .map_err(|(reason, value)| Refused { reason, value })?;
@@ -585,9 +575,6 @@ impl Driver {
                 }
             }
         }
-        Ok(Direction::of(
-            Completion::new(Arc::clone(&self.shared), id, false),
-            Kind::Connect,
-        ))
+        Ok(Direction::of(self.completion(id, false), Kind::Connect))
     }
 }

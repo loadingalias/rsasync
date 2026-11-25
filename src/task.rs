@@ -197,6 +197,14 @@ thread_local! {
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 std::thread_local! {
+    /// The owner in `CURRENT`, or null. A call of the driver reads it with no count of the `Rc`:
+    /// the `Enter` that set it holds an `Rc` of the owner until it restores the pointer before it
+    /// ([`with_owner`]).
+    static OWNER: Cell<*const Local> = const { Cell::new(ptr::null()) };
+}
+
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+std::thread_local! {
     /// The movable pool of the runtime of this thread, for [`spawn_movable`]: on each worker of a
     /// runtime with movable workers, and on the caller of its `block_on` during the call.
     static POOL: RefCell<Option<crate::sync::Arc<pool::Pool>>> = const { RefCell::new(None) };
@@ -451,10 +459,43 @@ impl core::error::Error for TimerRefused {
 /// that calls a waker or a destructor.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn with_driver<V, R>(value: V, f: impl FnOnce(&mut crate::driver::Driver, V) -> R) -> Result<R, V> {
-    match current() {
-        Some(local) => local.with_driver(value, f),
-        None => Err(value),
+    with_owner(value, |local, value| local.with_driver(value, f)).unwrap_or_else(Err)
+}
+
+/// Calls `f` with the owner of this thread and `value`, with no count of its `Rc`, or gives
+/// `value` back when the thread has no owner.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[expect(
+    unsafe_code,
+    reason = "the `Enter` that set the pointer keeps the owner alive while it is set"
+)]
+fn with_owner<V, R>(value: V, f: impl FnOnce(&Local, V) -> R) -> Result<R, V> {
+    // A destructor of another thread-local value can run after the end of this one at the exit of
+    // the thread, which then has no owner.
+    let owner = OWNER.try_with(Cell::get).unwrap_or(ptr::null());
+    if owner.is_null() {
+        return Err(value);
     }
+    // SAFETY: a pointer that is not null is the owner of the `Enter` of this thread that set it.
+    // That `Enter` holds an `Rc` of the owner until its drop restores the pointer before it, and it
+    // lives in a frame below this call, so the owner lives during `f`. An `Enter` in `f` restores
+    // this pointer before it ends.
+    Ok(f(unsafe { &*owner }, value))
+}
+
+/// [`with_driver`], which also gives `f` the task that the owner polls when `waker` is that task's
+/// own waker, so a home operation can wake the task with no clone of the waker.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn with_driver_task<V, R>(
+    waker: &core::task::Waker,
+    value: V,
+    f: impl FnOnce(&mut crate::driver::Driver, Option<crate::driver::LocalTask>, V) -> R,
+) -> Result<R, V> {
+    with_owner(value, |local, value| {
+        let task = local.polling_task(waker);
+        local.with_driver(value, |driver, value| f(driver, task, value))
+    })
+    .unwrap_or_else(Err)
 }
 
 /// Gives a new generator that the caller owns: a child of the generator of the owner of this

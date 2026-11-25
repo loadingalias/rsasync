@@ -255,6 +255,23 @@ fn a_stream_after_its_block_on_refuses_and_gives_its_buffer_back() {
         .unwrap();
 }
 
+/// A receive that a `block_on` started ends with `Ended` at a poll outside that owner, and does not
+/// wait: no turn of its driver comes there, so a wait would never end.
+#[test]
+fn a_receive_polled_outside_its_owner_ends_and_does_not_wait() {
+    let runtime = Runtime::builder().build().unwrap();
+    let (_listener, _client, mut receive) = runtime
+        .block_on(async {
+            let (listener, server, client) = pair().await;
+            // The receive needs a stream that outlives `block_on`.
+            let server = Box::leak(Box::new(server));
+            (listener, client, server.recv(buffer()).unwrap())
+        })
+        .unwrap();
+    let polled = Pin::new(&mut receive).poll(&mut core::task::Context::from_waker(core::task::Waker::noop()));
+    assert_matches!(polled, Poll::Ready(Err(_)));
+}
+
 /// A stream that drops while its owner runs closes, so its peer reads the end of the stream before
 /// `block_on` ends.
 #[test]
