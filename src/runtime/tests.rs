@@ -923,7 +923,9 @@ fn a_spawn_after_the_start_of_a_shutdown_refuses_with_closed() {
 
 /// A send of a cancelled task to a peer that never reads ends at the close of its stream, and the
 /// report gives the bytes that it had sent: the peer reads exactly that many before the end of the
-/// stream.
+/// stream. The task never polls the send, so the send is still its operation when the shutdown
+/// cancels the task: a send that fills the buffer of the socket ends with its partial count, and a
+/// task that took that count would end before the shutdown.
 #[test]
 fn the_report_gives_the_count_of_a_send_that_a_peer_never_read() {
     use std::io::Read as _;
@@ -940,7 +942,8 @@ fn the_report_gives_the_count_of_a_send_that_a_peer_never_read() {
                 .unwrap()
                 .unwrap();
             let lease = crate::buffer::Lease::from(alloc::vec![7; 64 << 20]);
-            let _sent = stream.send(lease).unwrap().await;
+            let _send = stream.send(lease).unwrap();
+            pending::<()>().await;
         })
         .unwrap();
     let mut peer = listener.accept().unwrap().0;
