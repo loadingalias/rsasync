@@ -1119,25 +1119,14 @@ fn waits<F: Future + Unpin>(driver: &mut Driver, future: &mut F) -> bool {
         .is_pending()
 }
 
-/// A send of 64 MiB, more than the socket buffers hold while the peer does not read, so the
-/// kernel sends only part of it. Gives the count that it sent, from the numbered stream.
-#[cfg(target_os = "linux")]
-fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
-    let send = driver
-        .send(stream, Lease::from(numbered(0, 64 << 20)))
-        .expect("the test driver has room");
-    let sent = drive(driver, send).expect("the driver runs").0.expect("the send works");
-    assert!(sent < 64 << 20, "the socket buffers held the whole send");
-    sent
-}
-
 /// Sends a numbered stream from 0 until the socket buffers hold no more bytes while the peer does
-/// not read, and gives the count that went. On macOS, the loopback delivers the segments of a send
-/// after its return, so the window of the peer fills after the send, and the send buffer has room
-/// again. Each next send of 4 MiB takes that room, until one send finds no room for 200 ms. Its
-/// cancel then ends it with no byte sent. The socket buffers of macOS hold at most 8 MiB
-/// (`kern.ipc.maxsockbuf`) on each side, so `SENDS_MAX` sends of 4 MiB are more than they hold.
-#[cfg(target_os = "macos")]
+/// not read, and gives the count that went. The loopback can deliver the segments of a send after
+/// its return: on macOS each time, and on Linux under load. The window of the peer then fills after
+/// the send, and the send buffer has room again. Each next send of 4 MiB takes that room, until one
+/// send finds no room for 200 ms. Its cancel then ends it with no byte sent. The socket buffers
+/// hold at most 8 MiB on each side (`kern.ipc.maxsockbuf` of macOS, and the `tcp_wmem` and
+/// `tcp_rmem` maxima of Linux), so `SENDS_MAX` sends of 4 MiB are more than they hold.
+#[cfg(unix)]
 fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
     const SENDS_MAX: usize = 64;
     let mut filled = 0;
