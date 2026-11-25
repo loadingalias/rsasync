@@ -215,6 +215,20 @@ pub(in crate::driver) fn an_adoption_refuses_a_socket_a_wrong_direction_and_a_fu
     assert_eq!(refused.reason(), Reason::Resources);
 }
 
+/// A driver with one resource slot takes a new resource after each close, and refuses a second
+/// one while the first is open: the close gives its slot back, and the slot holds one resource.
+pub(in crate::driver) fn a_driver_with_one_resource_slot_takes_a_new_resource_after_each_close(backend: Backend) {
+    let mut driver = suite::driver(Config::new().resources(1), backend);
+    for _ in 0..3 {
+        let (read, write) = io::pipe().unwrap();
+        let reader = driver.adopt_reader(OwnedFd::from(read)).unwrap();
+        let refused = driver.adopt_writer(OwnedFd::from(write)).unwrap_err();
+        assert_eq!(refused.reason(), Reason::Resources);
+        let close = driver.close_reader(reader).unwrap();
+        drive(&mut driver, close).unwrap();
+    }
+}
+
 /// A read end that was nonblocking waits for data after its adoption, and does not end at once.
 #[expect(unsafe_code, reason = "fcntl names no memory with these commands")]
 pub(in crate::driver) fn an_adopted_nonblocking_read_end_waits_for_data(backend: Backend) {

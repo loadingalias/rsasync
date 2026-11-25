@@ -896,6 +896,8 @@ pub(crate) struct Resource {
 struct Owned {
     generation: u32,
     fd: Option<Handle>,
+    /// The next free slot after this free slot, or `NO_SLOT`.
+    next_free: u32,
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
     /// The operations of a file that run, which its close waits for.
@@ -975,19 +977,47 @@ struct Resources {
     /// The driver of the resources.
     driver: DriverId,
     slots: Box<[Owned]>,
+    /// The first free slot, or `NO_SLOT`: a release puts its slot first, so a new resource gets
+    /// the slot that freed last, with no search.
+    first_free: u32,
+    /// The number of free slots.
+    free: u32,
     /// The free slots that spawns keep for the pipe ends of their children.
     reserved: u32,
-    /// The registrations in the poller, on the epoll and kqueue backends.
-    #[cfg(unix)]
-    registrar: Option<poller::Registrar>,
-    /// The associations with the port.
-    #[cfg(target_os = "windows")]
-    registrar: iocp::Registrar,
+    /// The registrations in the poller, on the epoll and kqueue backends, or the associations with
+    /// the port.
+    registrar: Registrar,
     /// The next registration fails ([`Control::fail_next_registration`]).
     fail_registration: bool,
 }
 
+/// No resource slot: the end of the free list.
+const NO_SLOT: u32 = u32::MAX;
+
+/// The registrations of the backend: the poller on epoll and kqueue, none on io_uring.
+#[cfg(unix)]
+type Registrar = Option<poller::Registrar>;
+/// The associations with the port.
+#[cfg(target_os = "windows")]
+type Registrar = iocp::Registrar;
+
 impl Resources {
+    /// The `count` resource slots of `driver`, each free. It allocates here, one time.
+    fn new(driver: DriverId, count: u32, registrar: Registrar) -> Result<Self, AllocError> {
+        Ok(Self {
+            driver,
+            slots: items(count, |index| Owned {
+                next_free: if index + 1 < count { index + 1 } else { NO_SLOT },
+                ..Owned::default()
+            })?,
+            first_free: if count > 0 { 0 } else { NO_SLOT },
+            free: count,
+            reserved: 0,
+            registrar,
+            fail_registration: false,
+        })
+    }
+
     /// Whether the backend registers each socket and pipe: the poller and the port do.
     #[cfg(unix)]
     const fn registers(&self) -> bool {
@@ -1038,15 +1068,15 @@ impl Resources {
 
     /// The free slots.
     fn free(&self) -> u32 {
-        let free = self.slots.iter().filter(|slot| !slot.used()).count();
-        u32::try_from(free).unwrap_or(u32::MAX)
+        self.free
     }
 
     /// Takes `fd` into the first free slot, and registers it in the poller on the epoll and kqueue
     /// backends, or associates it with the port on IOCP. A file has no readiness, so it has no
     /// registration.
     fn take(&mut self, fd: Handle, medium: Medium) -> Result<Resource, (Reason, Handle)> {
-        let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| !slot.used()) else {
+        let index = self.first_free;
+        let Some(slot) = self.slots.get_mut(index as usize) else {
             return Err((Reason::Resources, fd));
         };
         #[cfg(unix)]
@@ -1082,6 +1112,8 @@ impl Resources {
         }
         slot.fd = Some(fd);
         slot.medium = medium;
+        self.first_free = slot.next_free;
+        self.free -= 1;
         Ok(Resource {
             driver: self.driver,
             index,
@@ -1102,7 +1134,8 @@ impl Resources {
         if self.reserved > 0 && self.free() <= self.reserved {
             return Err((Reason::Resources, file));
         }
-        let Some((index, slot)) = (0..).zip(self.slots.iter_mut()).find(|(_, slot)| !slot.used()) else {
+        let index = self.first_free;
+        let Some(slot) = self.slots.get_mut(index as usize) else {
             return Err((Reason::Resources, file));
         };
         // The ring refuses a file on a port, so a driver with a ring keeps its files off the port.
@@ -1119,6 +1152,8 @@ impl Resources {
         slot.file = Some(file);
         slot.medium = medium;
         slot.skips = false;
+        self.first_free = slot.next_free;
+        self.free -= 1;
         Ok(Resource {
             driver: self.driver,
             index,
@@ -1157,6 +1192,9 @@ impl Resources {
         slot.generation = slot.generation.wrapping_add(1);
         slot.directions = tcp::Directions::default();
         slot.running = 0;
+        slot.next_free = self.first_free;
+        self.first_free = resource.index;
+        self.free += 1;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             slot.exclusive = None;
@@ -1516,13 +1554,7 @@ impl Driver {
             queue: Queue::Port(port),
             table,
             shared,
-            resources: Resources {
-                driver,
-                slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
-                reserved: 0,
-                registrar,
-                fail_registration: false,
-            },
+            resources: Resources::new(driver, config.resources, registrar).map_err(refused)?,
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
@@ -1582,13 +1614,7 @@ impl Driver {
             queue: Queue::Poller(poller),
             table,
             shared,
-            resources: Resources {
-                driver,
-                slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
-                reserved: 0,
-                registrar: Some(registrar),
-                fail_registration: false,
-            },
+            resources: Resources::new(driver, config.resources, Some(registrar)).map_err(refused)?,
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
@@ -1696,13 +1722,7 @@ impl Driver {
             queue,
             table,
             shared,
-            resources: Resources {
-                driver,
-                slots: items(config.resources, |_| Owned::default()).map_err(refused)?,
-                reserved: 0,
-                registrar,
-                fail_registration: false,
-            },
+            resources: Resources::new(driver, config.resources, registrar).map_err(refused)?,
             children: process::Children::new(config.children, driver).map_err(Error::System)?,
             taken: room(config.operations as usize * 2).map_err(refused)?,
             pending: room(config.resources as usize).map_err(refused)?,

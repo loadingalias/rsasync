@@ -149,8 +149,9 @@
 //!   - Close (`law`): `a_dropped_receive_leaves_its_datagram_metadata_and_truncation_to_the_next_receive`.
 //! - Pipe
 //!   - Receive, send, and close (`law`): the pipe cases.
-//!   - Adoption: `an_adopted_nonblocking_read_end_waits_for_data` and
-//!     `an_adoption_refuses_a_socket_a_wrong_direction_and_a_full_driver`.
+//!   - Adoption: `an_adopted_nonblocking_read_end_waits_for_data`,
+//!     `an_adoption_refuses_a_socket_a_wrong_direction_and_a_full_driver`, and
+//!     `a_driver_with_one_resource_slot_takes_a_new_resource_after_each_close`.
 //!   - Receive into a selected buffer: `idle_read_ends_with_a_waiting_selecting_receive_hold_no_buffer`.
 //!   - Half-close: `a_half_close_of_a_pipe_writer_refuses_and_changes_nothing`.
 //!   - The piped streams of a child: `the_caller_writes_the_input_while_both_outputs_drain`.
@@ -582,6 +583,8 @@ mod operation {
         // Pipe.
         #[cfg(unix)]
         pipe::tests => an_adopted_nonblocking_read_end_waits_for_data,
+        #[cfg(unix)]
+        pipe::tests => a_driver_with_one_resource_slot_takes_a_new_resource_after_each_close,
         #[cfg(unix)]
         pipe::tests => idle_read_ends_with_a_waiting_selecting_receive_hold_no_buffer,
         #[cfg(unix)]
