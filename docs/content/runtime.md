@@ -428,8 +428,9 @@ CPU work that cannot yield goes to the [compute service](blocking-service.md#the
 
 ## Run the examples
 
-Three examples use the runtime with the types of `rsasync::local`, on Linux. Each one runs one task
-on worker 0, prints one line for each outcome, and ends with a shutdown that has no live debt.
+These examples use the runtime on Linux. Each one prints one line for each outcome, and it ends
+with a shutdown that has no live debt. The three examples of `rsasync::local` each run one task on
+worker 0.
 
 - `cargo run -p local_only` keeps the state of its task in an `Rc` across each wait, and it does
   file, TCP, UDP, and IPC stream I/O. It shows partial progress, the reuse of a buffer after a
@@ -438,6 +439,9 @@ on worker 0, prints one line for each outcome, and ends with a shutdown that has
   `core::future::join!`, `poll_fn`, and a small select. Its join borrows data on the stack of the
   task, and its select abandons a receive. It shows partial progress, and the reuse of a lease
   after a failure.
+- `cargo run -p movable_only` and `cargo run -p mixed_mode` run movable workers, and a local
+  worker with them in the second one: see [Run the examples](mixed-mode.md#run-the-examples) of
+  the mixed-mode page.
 - `cargo run -p process_supervision` supervises two children with piped standard streams. It
   needs `sh`, `tee`, `sleep`, and `kill` on the host. The steps are:
   1. Register a stream of `SIGINT` with `Escalation::At(2)`, so a second interrupt ends a stuck

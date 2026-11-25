@@ -1,0 +1,15 @@
+[package]
+name = "movable_only"
+version = "0.0.0"
+description = "The movable-only example of rsasync: Send tasks on a work-stealing pool, with TCP I/O on the types of rsasync::movable under task and I/O pressure."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The movable workers need Linux on x86_64 or aarch64, and io_uring for the movable types. The
+# movable mode needs `local` too: each movable worker is a local owner that runs the pool.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../..", default-features = false, features = ["movable"] }
+
+[lints]
+workspace = true

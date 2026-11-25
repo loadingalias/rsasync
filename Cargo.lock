@@ -119,6 +119,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mixed_mode"
+version = "0.0.0"
+dependencies = [
+ "rsasync",
+]
+
+[[package]]
+name = "movable_only"
+version = "0.0.0"
+dependencies = [
+ "rsasync",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

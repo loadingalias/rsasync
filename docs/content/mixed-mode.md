@@ -79,3 +79,48 @@ so a provider that a consumer needs stays driven until the consumer ends.
 `default-features = false, features = ["local"]` gives the local mode only: no movable pool, no
 movable workers, no `spawn_movable`, and no `rsasync::movable`. The movable mode needs `local`
 too, because each movable worker, as each `block_on`, is a local owner that runs the pool.
+
+## Run the examples
+
+Two examples run the movable workers on Linux, on io_uring. Each one prints one line for each
+outcome, and it ends with a shutdown that has no live debt.
+
+- `cargo run -p movable_only` runs a runtime with two movable workers and no local worker. 64 echo
+  tasks and 8 tasks that use the CPU run in the pool at one time, and an accept loop gives each
+  connection to a task of its own. Then one task shows partial progress, the reuse of a buffer
+  after a success and of a lease after a failed send, and a dropped receive. The shutdown cancels a
+  task whose receive waits.
+- `cargo run -p mixed_mode` runs one local worker, two movable workers, and a compute service. The
+  local task keeps its state in an `Rc`, and it hands typed requests to a movable task, which sums
+  on the compute service and replies. It shows the reuse of a value that a full channel gave back,
+  a wait that drops before its reply, TCP from a movable stream to a local stream with partial
+  progress, and a cancel of a movable task from the local task. The shutdown joins both modes.
+
+The expected output of `movable_only`:
+
+<!-- The same text as `EXPECTED` of `examples/movable_only/src/main.rs`. Edit both. -->
+```text
+pressure: 64 echo tasks each got their 4 KiB back in order
+pressure: 8 tasks that use the CPU each summed 1000000 numbers
+tcp: the receive gave 8 of the 11 sent bytes: "hello wo"
+tcp: the same buffer then received the rest: "rld"
+tcp: after a dropped receive, the next receive gave "late"
+tcp: a send to a peer that reset failed, and the same lease then went on a new stream: "again"
+tcp: closed each stream and the listener
+shutdown: 1 movable task cancelled, 0 operations of debt, grace period expired: false
+```
+
+The expected output of `mixed_mode`:
+
+<!-- The same text as `EXPECTED` of `examples/mixed_mode/src/main.rs`. Edit both. -->
+```text
+plan: worker 0 is local, workers 1 and 2 are movable, and 1 compute thread runs beside them
+handoff: the local task sent 3 requests, and the movable task sent back the sums [45, 4950, 499500]
+handoff: a full channel gave the request back, and the same request then went through: 10
+tcp: the local stream received 8 of the 11 bytes that the movable stream sent: "hello wo"
+tcp: the same buffer then received the rest: "rld"
+state: one Rc kept the 4 notes of the local task on worker 0
+cancel: the local task cancelled the movable task that waited: Cancelled
+handoff: the movable task found that the local task dropped its wait, and the reply came back
+shutdown: 1 local and 1 movable task cancelled, 0 operations of debt, 0 compute jobs ran at the end, grace period expired: false
+```

@@ -1,0 +1,14 @@
+[package]
+name = "mixed_mode"
+version = "0.0.0"
+description = "The mixed-mode example of rsasync: a local task and movable tasks in one runtime, with typed handoff, a compute service, cancellation, and a joined shutdown."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The workers need Linux on x86_64 or aarch64, and io_uring for the movable types.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+rsasync = { path = "../..", default-features = false, features = ["local", "movable"] }
+
+[lints]
+workspace = true

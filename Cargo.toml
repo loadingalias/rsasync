@@ -50,7 +50,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = [".", "examples/driver_only", "examples/local_only", "examples/process_supervision", "examples/standard_futures", "probe", "rsnetwork-udp", "rstypes", "xtask"]
+members = [".", "examples/driver_only", "examples/local_only", "examples/mixed_mode", "examples/movable_only", "examples/process_supervision", "examples/standard_futures", "probe", "rsnetwork-udp", "rstypes", "xtask"]
 
 # `rust-version` is the release number of the nightly that rust-toolchain.toml pins. Cargo then
 # refuses an older toolchain with one message. A crate that turns on an unstable feature also needs
