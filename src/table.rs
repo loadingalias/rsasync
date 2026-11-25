@@ -353,11 +353,6 @@ impl<T> Table<T> {
     /// operation. An end of interest applies first. A cancel of a running operation goes to `on`
     /// for the backend.
     pub(crate) fn take_requests(&mut self, mut on: impl FnMut(Taken<T>)) {
-        // A post that a wake announces happens before the turn that the wake starts, so this load
-        // sees it. Another post waits for the next take.
-        if self.requests.is_empty() {
-            return;
-        }
         let shared = Arc::clone(&self.requests.0);
         // Acquire: each poster wrote the `next` of its entry before its release of the head.
         let mut index = shared.head.swap(NIL, Ordering::Acquire);

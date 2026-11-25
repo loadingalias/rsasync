@@ -2303,15 +2303,19 @@ impl Driver {
     /// Applies the requests that other threads posted, and the closes that drops of local resources
     /// recorded.
     fn take_requests(&mut self) {
-        let mut taken = mem::take(&mut self.taken);
-        self.table.take_requests(|request| taken.push(request));
-        for request in taken.drain(..) {
-            match request {
-                Taken::Cancel(id) => self.cancel(id),
-                Taken::Abandoned(id, ended) => self.claimed(id, ended),
+        // A post that a wake announces happens before the turn that the wake starts, so this load
+        // sees it. Another post waits for the next take.
+        if !self.shared.requests.is_empty() {
+            let mut taken = mem::take(&mut self.taken);
+            self.table.take_requests(|request| taken.push(request));
+            for request in taken.drain(..) {
+                match request {
+                    Taken::Cancel(id) => self.cancel(id),
+                    Taken::Abandoned(id, ended) => self.claimed(id, ended),
+                }
             }
+            self.taken = taken;
         }
-        self.taken = taken;
         #[cfg(all(feature = "local", target_os = "linux"))]
         self.take_closes();
         self.attend();
@@ -2328,7 +2332,7 @@ impl Driver {
         let tag = ended.resources;
         match held {
             Some(held) => tcp::abandon(&mut self.resources, tag, ended.result, held),
-            None => tcp::taken(&mut self.resources, tag),
+            None => tcp::taken(&mut self.resources, tag, id),
         }
         tcp::after(&mut self.resources, &mut self.pending, tag);
     }
@@ -2405,13 +2409,16 @@ impl Driver {
         for cqe in native.iter_mut().flatten().chain(kept.iter_mut().flatten()) {
             completed += 1;
             let mut event = cqe.event();
+            // One look at the slot gives the tag of the operation, for each step below.
+            let op = OpId::from_user_data(cqe.user_data);
+            let tagged = op.and_then(|id| table.resources(id).copied());
             // The completion of an exit operation ends it when the home has the status of its child.
             #[cfg(unix)]
-            if let Some(id) = OpId::from_user_data(cqe.user_data)
-                && let Some(&Tag {
+            if let Some(id) = op
+                && let Some(Tag {
                     kind: Kind::Exit(child),
                     ..
-                }) = table.resources(id)
+                }) = tagged
                 && table.runs(id)
                 && let Some(slot) = shared.entries.get(id.index() as usize)
             {
@@ -2432,8 +2439,8 @@ impl Driver {
             }
             // A completion of a batch is one of its entries: its last one ends the batch, and the
             // result of the batch is its count.
-            if let Some(id) = OpId::from_user_data(cqe.user_data)
-                && table.resources(id).is_some_and(|tag| tag.kind.batch())
+            if let Some(id) = op
+                && tagged.is_some_and(|tag| tag.kind.batch())
                 && table.runs(id)
                 && let Some(slot) = shared.entries.get(id.index() as usize)
             {
@@ -2448,7 +2455,7 @@ impl Driver {
                 });
             }
             let outcome = table.complete(cqe.user_data, event);
-            let (id, abandoned, tag) = match (outcome, OpId::from_user_data(cqe.user_data)) {
+            let (id, abandoned, tag) = match (outcome, op) {
                 // The poll of the wake descriptor ended: the next wait polls it again. When
                 // something watches the descriptor, the turn clears it after the harvest, and
                 // registers it again on a kernel with the defect of `probe`.
@@ -2473,8 +2480,8 @@ impl Driver {
                     wakes.complete(data, cqe.res);
                     continue;
                 }
-                (Outcome::Ready, Some(id)) => match table.resources(id) {
-                    Some(&tag) => (id, false, tag),
+                (Outcome::Ready, Some(id)) => match tagged {
+                    Some(tag) => (id, false, tag),
                     None => continue,
                 },
                 (Outcome::Abandoned(Done { resources: tag, .. }), Some(id)) => (id, true, tag),

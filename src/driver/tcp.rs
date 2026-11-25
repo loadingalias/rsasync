@@ -29,7 +29,7 @@ use super::{
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
-use crate::table::OpId;
+use crate::table::{OpId, Shape};
 use crate::uring::Sqe;
 
 /// `ENOBUFS` (`include/uapi/asm-generic/errno.h`, and `sys/errno.h` of macOS), on Windows
@@ -797,9 +797,25 @@ impl Directions {
         Closed { sent: self.count() }
     }
 
-    /// The consumer of an operation of `kind` took its result. A send result that a future took
-    /// reports each byte up to its end.
-    pub(super) fn taken(&mut self, kind: Kind) {
+    /// Whether the resource now needs the home, because an operation or a close waits, and it is not
+    /// in the pending list of the driver yet. A `true` puts it there: the caller pushes it, and the
+    /// list holds each resource at most one time, so its capacity holds it.
+    fn needs_home(&mut self) -> bool {
+        let waits = self.read.first.is_some() || self.write.first.is_some() || self.closing.is_some();
+        let needs = waits && !self.pending;
+        self.pending |= needs;
+        needs
+    }
+
+    /// The consumer of the operation `id` of `kind` took its result: the direction forgets it, so
+    /// the next operation does not look at it. A send result that a future took reports each byte
+    /// up to its end.
+    pub(super) fn taken(&mut self, kind: Kind, id: OpId) {
+        if let Some(direction) = self.direction(kind)
+            && direction.current == Some(id)
+        {
+            direction.current = None;
+        }
         if matches!(kind, Kind::Send | Kind::Vectored) && self.sent == Sent::Ok {
             self.unreported = 0;
         }
@@ -1073,12 +1089,10 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, mut held
     }
 }
 
-/// The consumer of an operation of `tag` took its result ([`Directions::taken`]).
-pub(super) fn taken(resources: &mut Resources, tag: Tag) {
-    if matches!(tag.kind, Kind::Send | Kind::Vectored)
-        && let Some(owned) = tag.resource.and_then(|resource| resources.get(resource))
-    {
-        owned.directions.taken(tag.kind);
+/// The consumer of the operation `id` of `tag` took its result ([`Directions::taken`]).
+pub(super) fn taken(resources: &mut Resources, tag: Tag, id: OpId) {
+    if let Some(owned) = tag.resource.and_then(|resource| resources.get(resource)) {
+        owned.directions.taken(tag.kind, id);
     }
 }
 
@@ -1091,11 +1105,7 @@ pub(super) fn after(resources: &mut Resources, pending: &mut Vec<Resource>, tag:
     let Some(owned) = resources.get(resource) else {
         return;
     };
-    let directions = &mut owned.directions;
-    let waits = directions.read.first.is_some() || directions.write.first.is_some() || directions.closing.is_some();
-    if waits && !directions.pending {
-        directions.pending = true;
-        // At most one entry for each resource, so the capacity of the list holds it.
+    if owned.directions.needs_home() {
         pending.push(resource);
     }
 }
@@ -1592,13 +1602,13 @@ impl Driver {
     /// [`Driver::begin`] for an operation that pushes `entries` submission entries at one time,
     /// such as a batch. It refuses with [`Reason::Queue`] when the queue has fewer entries, because
     /// the operation can then never start.
-    pub(super) fn begin_entries<P>(
+    pub(super) fn begin_entries<P, H: FnOnce(P) -> Held>(
         &mut self,
         resource: Resource,
         kind: Kind,
         entries: u32,
         value: P,
-        held: impl FnOnce(P) -> Held,
+        held: H,
     ) -> Result<Completion, Refused<P>> {
         if entries > self.queue.entries() {
             return Err(Refused {
@@ -1606,6 +1616,15 @@ impl Driver {
                 value,
             });
         }
+        // macOS has no segmentation offload, so a send with a segment size ends at its start.
+        let (value, held) = if entries == 1 && !kind.batch() && !(cfg!(target_os = "macos") && kind == Kind::SendTo) {
+            match self.start_usual(resource, kind, value, held) {
+                Ok(completion) => return Ok(completion),
+                Err(general) => general,
+            }
+        } else {
+            (value, held)
+        };
         let Some((current, first)) = self
             .direction(resource, kind)
             .map(|direction| (direction.current, direction.first))
@@ -1662,6 +1681,80 @@ impl Driver {
             self.enqueue(resource, kind, id);
         }
         Ok(Completion::new(Arc::clone(&self.shared), id, !kind.writes()))
+    }
+
+    /// The usual start of an operation of one entry: its direction runs no operation, keeps
+    /// nothing, and has no failed send, and the table and the queue have room. The operation then
+    /// submits now, with one look at its resource, and its record and its entry are written in one
+    /// step. Gives `value` and `held` back for the general start otherwise, with no change.
+    fn start_usual<P, H: FnOnce(P) -> Held>(
+        &mut self,
+        resource: Resource,
+        kind: Kind,
+        value: P,
+        held: H,
+    ) -> Result<Completion, (P, H)> {
+        let Self {
+            resources,
+            table,
+            queue,
+            shared,
+            selected,
+            ..
+        } = self;
+        #[cfg(target_os = "windows")]
+        let ring = resources.registrar.ring;
+        let Some(owned) = resources.get(resource) else {
+            return Err((value, held));
+        };
+        let (Some(fd), pipe) = (owned.number(), owned.medium == Medium::Pipe) else {
+            return Err((value, held));
+        };
+        // The entry waits on the readiness of the resource, or names the facts of its packet.
+        #[cfg(unix)]
+        let token = super::poller::Token {
+            index: resource.index,
+            generation: resource.generation,
+        };
+        #[cfg(target_os = "windows")]
+        let token = super::iocp::Token {
+            skips: owned.skips,
+            file: owned.file.is_some(),
+            ring: ring && owned.medium == Medium::File,
+        };
+        let directions = &mut owned.directions;
+        let clear = directions.kept.is_none() && directions.sent == Sent::Ok;
+        let Some(direction) = directions
+            .direction(kind)
+            .filter(|direction| clear && direction.current.is_none() && direction.first.is_none() && queue.room() > 0)
+        else {
+            return Err((value, held));
+        };
+        let tag = Tag {
+            resource: Some(resource),
+            kind,
+        };
+        let Ok(id) = table.begin(tag, Shape::Single) else {
+            return Err((value, held));
+        };
+        let Some(slot) = shared.entries.get(id.index() as usize) else {
+            table.withdraw(id);
+            return Err((value, held));
+        };
+        direction.current = Some(id);
+        let group = selected.as_ref().map_or(0, |selected| selected.ring.group());
+        let slot_len = selected.as_ref().map_or(0, |selected| selected.len as usize);
+        slot.start(id, held(value), |held| {
+            let sqe = submission(held, kind, fd, pipe, group, slot_len).with_user_data(id.user_data());
+            // SAFETY: the entry names the loan, the lease, the regions, the message, or the peer
+            // address in the resources of `id`, which the home keeps in their slot until its
+            // terminal event, and the descriptor of `resource`, which stays open until its close,
+            // after each of its operations ends. The queue has room.
+            #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
+            let pushed = unsafe { queue.push(&sqe, Some(token)) }.is_ok();
+            assert!(pushed, "the queue has room for the entry");
+        });
+        Ok(Completion::new(Arc::clone(shared), id, !kind.writes()))
     }
 
     /// The direction of `kind` of `resource`.
@@ -1752,6 +1845,39 @@ impl Driver {
         false
     }
 
+    /// The consumer of `id`, an operation of this driver when `shared` is its own, took the result
+    /// on the thread of the home: the slot frees, and the direction forgets the operation. Gives
+    /// `false`, and changes nothing, for an operation of another driver.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn end_taken(&mut self, shared: &Arc<super::Shared>, id: OpId) -> bool {
+        if !Arc::ptr_eq(shared, &self.shared) {
+            return false;
+        }
+        // The consumer claimed the result, so the table holds it, and the slot frees here, as at
+        // the take of the end of interest at a turn.
+        if let Some(ended) = self.table.end_interest(id) {
+            self.claimed(id, ended);
+        }
+        true
+    }
+
+    /// The future of `id`, an operation of this driver when `shared` is its own, dropped on the
+    /// thread of the home: its interest ends now, and a running operation is cancelled when
+    /// `cancel` is true, as the requests of the drop do ([`Request`](crate::table::Request)). Gives
+    /// `false`, and changes nothing, for an operation of another driver.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn forgo_now(&mut self, shared: &Arc<super::Shared>, id: OpId, cancel: bool) -> bool {
+        if !Arc::ptr_eq(shared, &self.shared) {
+            return false;
+        }
+        match self.table.end_interest(id) {
+            Some(ended) => self.claimed(id, ended),
+            None if cancel => self.cancel(id),
+            None => {}
+        }
+        true
+    }
+
     /// The operation `id` has no future any more: the caller started the next operation in its
     /// direction. Its interest ends, as at a drop of its future.
     fn forgo(&mut self, id: OpId) {
@@ -1804,6 +1930,8 @@ impl Driver {
                 }
                 Some(0)
             }
+            // Nothing kept and no failed send: the operation needs its submission.
+            (_, None) if directions.sent == Sent::Ok => None,
             (kind, kept) => {
                 directions.kept = kept;
                 let (table, copied) = (&self.table, &mut self.copied);

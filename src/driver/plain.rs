@@ -304,7 +304,7 @@ impl Direction {
         let Some(tail) = &mut self.tail else {
             return Poll::Ready(Err(Gone));
         };
-        let kind = tail.kind;
+        let (kind, id) = (tail.kind, tail.completion.id().op);
         let taken = ready!(tail.completion.poll_with(cx, |result, held, _| {
             let chain = held.plain.as_mut().and_then(|plain| plain.chain.take());
             (chain, output(result, held))
@@ -313,7 +313,7 @@ impl Direction {
         Poll::Ready(taken.map(|(chain, output)| {
             if let Some(mut chain) = chain {
                 self.tail = chain.before[0].take();
-                chain.flow.taken(kind);
+                chain.flow.taken(kind, id);
                 if !chain.flow.is_clear() {
                     self.chain = Some(chain);
                 }

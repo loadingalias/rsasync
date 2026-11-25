@@ -69,6 +69,7 @@ impl<T> Entry<T> {
     /// The home starts the operation `id` of this slot with its resources, and gives `f` the
     /// resources in their place, for example to name their memory in a submission.
     #[expect(unsafe_code, reason = "the home owns the cell of a slot that has no consumer")]
+    #[inline]
     pub(crate) fn start<R>(&self, id: OpId, held: T, f: impl FnOnce(&mut T) -> R) -> R {
         // SAFETY: the table gave the slot to a new operation: the consumer of its last operation
         // took its resources or ended, and no consumer of `id` exists yet.

@@ -63,10 +63,20 @@ impl Completion {
         let output = entry.poll_take(cx, id, |result, held| take(result, held, self));
         if output.is_ready() {
             self.done = true;
-            // The home frees the slot at its next turn, and it needs no wake for that.
-            self.shared.requests.post(id, Request::EndInterest);
+            self.end_taken(id);
         }
         output
+    }
+
+    /// Frees the slot of the operation `id`, whose result the consumer took. On the thread of the
+    /// home, outside a turn, the driver frees it now, so the next operation of its direction does
+    /// not look at it. Else the home frees it at its next turn, and needs no wake for that.
+    fn end_taken(&self, id: OpId) {
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if crate::task::with_driver(id, |driver, id| driver.end_taken(&self.shared, id)) == Ok(true) {
+            return;
+        }
+        self.shared.requests.post(id, Request::EndInterest);
     }
 
     fn entry(&self) -> Option<&Entry<Held>> {
@@ -98,6 +108,15 @@ impl Drop for Completion {
         }
         if let Some(entry) = self.entry() {
             entry.cancel_wait();
+        }
+        // On the thread of the home, outside a turn, the driver ends the interest now, and the
+        // cancel needs no wake.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        {
+            let cancel = self.cancel_on_drop;
+            if crate::task::with_driver(self.id, |driver, id| driver.forgo_now(&self.shared, id, cancel)) == Ok(true) {
+                return;
+            }
         }
         self.shared.requests.post(self.id, Request::EndInterest);
         if self.cancel_on_drop {
