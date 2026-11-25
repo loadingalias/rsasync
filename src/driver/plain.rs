@@ -121,7 +121,7 @@ impl Chain {
                         tail.completion.cancel();
                     }
                 }
-                self.flow.abandon(kind, result, held);
+                self.flow.abandon(kind, result, held, &mut tcp::Shelf::default());
             }
         }
         self.before.iter().all(Option::is_none)
@@ -132,7 +132,9 @@ impl Chain {
     fn result(&mut self, held: &mut Held, kind: Kind, copied: &mut u64) -> Option<i32> {
         if kind != Kind::Accept {
             // The direction is the consumer of each operation, so each one has interest.
-            return self.flow.resume(held, kind, || true, copied);
+            return self
+                .flow
+                .resume(held, kind, || true, copied, &mut tcp::Shelf::default());
         }
         let Payload::Socket {
             peer,

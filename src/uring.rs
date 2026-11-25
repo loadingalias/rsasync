@@ -337,6 +337,16 @@ impl Sqe {
         }
     }
 
+    /// A multishot receive from the socket `fd` into buffers of the group `group`
+    /// (`IORING_RECV_MULTISHOT`): one completion for each buffer that the kernel fills, each with
+    /// `IORING_CQE_F_MORE`, until the terminal completion without it. The entry names no memory.
+    pub(crate) fn recv_multishot(fd: RawFd, group: u16) -> Self {
+        Self {
+            ioprio: sys::IORING_RECV_MULTISHOT,
+            ..Self::recv_selected(fd, group)
+        }
+    }
+
     /// A send of `len` bytes from `buffer` on the socket `fd` (`IORING_OP_SEND`). A closed peer
     /// gives `EPIPE` and no `SIGPIPE`.
     pub(crate) fn send(fd: RawFd, buffer: *const u8, len: u32) -> Self {

@@ -8,12 +8,12 @@ use std::io;
 use rscrypto::ChaCha20Rng;
 
 use super::placement::{Fallback, Placed, Selection};
-use super::{TimersError, WorkerError, WorkerReport, sys};
+use super::{ReceiveBuffers, TimersError, WorkerError, WorkerReport, sys};
 use crate::blocking::Submitter;
 use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
-use crate::driver::{Config, Driver};
+use crate::driver::{self, Config, Driver};
 use crate::sync::Arc;
 use crate::task::{self, Drain, Ended, Failure, Job, Placer, Pool, RingOwner, with_driver};
 use crate::time::Suspend;
@@ -63,6 +63,8 @@ pub(super) struct Start {
     pub(super) generator: ChaCha20Rng,
     /// The blocking service of the runtime, which the driver uses.
     pub(super) blocking: Option<Submitter>,
+    /// The provided buffers of the driver.
+    pub(super) receive_buffers: Option<ReceiveBuffers>,
 }
 
 /// The ready report of a worker, or why it did not start.
@@ -139,6 +141,7 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), Worke
         timers: limits,
         generator,
         blocking,
+        receive_buffers,
     } = start;
     if let Some(target) = &plan.target {
         match sys::bind(target) {
@@ -151,6 +154,12 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), Worke
     let mut driver = Driver::new(driver).map_err(WorkerError::Driver)?;
     if let Some(submitter) = blocking {
         driver.use_blocking(submitter);
+    }
+    if let Some(buffers) = receive_buffers {
+        let pool = buffers.pool(&budget).map_err(WorkerError::Buffers)?;
+        driver
+            .provide(pool)
+            .map_err(|error| WorkerError::Driver(driver::Error::System(error)))?;
     }
     let report = driver.report();
     let mut owner = RingOwner::new(&budget, slots, driver).map_err(WorkerError::Owner)?;

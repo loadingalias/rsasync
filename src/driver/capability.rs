@@ -225,6 +225,24 @@ pub enum Files {
     Registered,
 }
 
+/// How the receives of a stream into kernel-selected buffers run
+/// ([`Config::receives`](super::Config::receives)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shot {
+    /// One submission for each receive.
+    #[default]
+    Single,
+    /// One multishot receive for each stream, on io_uring: the first receive arms it, and it stays
+    /// armed in the read direction of the stream. The kernel takes a provided buffer for each
+    /// arrival of bytes, and each filled buffer goes to the receive that waits, or stays in the
+    /// direction for the next receive, in order. So a receive in steady state submits nothing, and
+    /// a dropped receive loses no byte. A direction that keeps [`KEPT_BUFFERS`](super::KEPT_BUFFERS)
+    /// buffers ends its multishot receive, and the next receive that finds none arms it again. A
+    /// pipe, a receive into the caller's buffer that finds no armed receive, and each other backend
+    /// use one submission for each receive.
+    Multi,
+}
+
 /// What a driver found and applied when it started. The report does not change after
 /// [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each call and the
 /// helper threads.
@@ -237,6 +255,7 @@ pub struct Report {
     probed: Features,
     rearms_wake: bool,
     files: Files,
+    receives: Shot,
 }
 
 impl Report {
@@ -249,6 +268,7 @@ impl Report {
             probed,
             rearms_wake,
             files: Files::Plain,
+            receives: Shot::Single,
         }
     }
 
@@ -256,6 +276,19 @@ impl Report {
     #[cfg(target_os = "linux")]
     pub(super) const fn with_files(self, files: Files) -> Self {
         Self { files, ..self }
+    }
+
+    /// The same report, with the receives `receives` in use.
+    #[cfg(target_os = "linux")]
+    pub(super) const fn with_receives(self, receives: Shot) -> Self {
+        Self { receives, ..self }
+    }
+
+    /// How the receives of a stream into kernel-selected buffers run: [`Shot::Multi`] when the
+    /// caller asked for it on io_uring, and else [`Shot::Single`].
+    #[must_use]
+    pub const fn receives(&self) -> Shot {
+        self.receives
     }
 
     /// The descriptors that the operations of the resources name: [`Files::Registered`] when the
@@ -382,6 +415,7 @@ impl fmt::Debug for Report {
             .field("helper_threads", &self.helper_threads())
             .field("rearms_wake", &self.rearms_wake)
             .field("files", &self.files)
+            .field("receives", &self.receives)
             .finish()
     }
 }

@@ -134,7 +134,7 @@ use crate::uring::{BufferRing, Cqe, Sqe};
 use crate::uring::{Ring, SetupError};
 use queue::Queue;
 
-pub use capability::{Backend, Call, Feature, Features, Files, Report, Route};
+pub use capability::{Backend, Call, Feature, Features, Files, Report, Route, Shot};
 pub use control::{Control, ControlError, Delivery, OperationId};
 #[cfg(target_os = "windows")]
 pub use file::NvmePath;
@@ -188,12 +188,13 @@ pub struct Config {
     backend: Option<Backend>,
     delivery: Delivery,
     files: Files,
+    receives: Shot,
 }
 
 impl Config {
     /// 64 submission entries, 256 operations, 256 resources, 64 children, 64 completions per turn,
-    /// no required feature, the permissive selection of the backend, native delivery, and plain
-    /// descriptors.
+    /// no required feature, the permissive selection of the backend, native delivery, plain
+    /// descriptors, and one submission for each receive.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -207,6 +208,7 @@ impl Config {
             backend: None,
             delivery: Delivery::Native,
             files: Files::Plain,
+            receives: Shot::Single,
         }
     }
 
@@ -277,6 +279,14 @@ impl Config {
     #[must_use]
     pub const fn files(self, files: Files) -> Self {
         Self { files, ..self }
+    }
+
+    /// How the receives of a stream into kernel-selected buffers run: [`Shot::Single`], the
+    /// default, or [`Shot::Multi`], one multishot receive for each stream on io_uring.
+    /// [`Report::receives`] gives the form in use.
+    #[must_use]
+    pub const fn receives(self, receives: Shot) -> Self {
+        Self { receives, ..self }
     }
 
     /// The resources, such as descriptors, that the driver can own at one time.
@@ -579,6 +589,10 @@ pub(crate) enum Kind {
     Recv,
     /// A receive into a buffer that the kernel selects, which becomes the loan.
     Selected,
+    /// The multishot receive of the read direction of a stream ([`Shot::Multi`]): one completion
+    /// for each provided buffer that it fills, which its direction keeps for the receives. No
+    /// future consumes it.
+    Multishot,
     /// A send of the lease.
     Send,
     /// A send of the regions, in order.
@@ -1049,6 +1063,8 @@ struct Resources {
     registrar: Registrar,
     /// The next registration fails ([`Control::fail_next_registration`]).
     fail_registration: bool,
+    /// The buffers that the multishot receives of the streams keep for their next receives.
+    shelf: tcp::Shelf,
 }
 
 /// No resource slot: the end of the free list.
@@ -1078,6 +1094,7 @@ impl Resources {
             reserved: 0,
             registrar,
             fail_registration: false,
+            shelf: tcp::Shelf::default(),
         })
     }
 
@@ -1242,6 +1259,26 @@ impl Resources {
             .filter(|slot| resource.driver == driver && slot.generation == resource.generation && slot.used())
     }
 
+    /// Puts `buffer`, which the multishot receive of `resource` filled, after the buffers that its
+    /// read direction keeps. Gives whether the resource needs the home now, because a receive
+    /// waits or the direction keeps its most buffers. A `true` puts it in the pending list: the
+    /// caller pushes it.
+    fn shelve(&mut self, resource: Resource, buffer: Backing) -> bool {
+        self.with_shelf(resource)
+            .is_some_and(|(owned, shelf)| owned.directions.shelve(buffer, shelf))
+    }
+
+    /// The slot of `resource`, as [`Resources::get`] gives it, and the shelf of the buffers that
+    /// its directions keep.
+    fn with_shelf(&mut self, resource: Resource) -> Option<(&mut Owned, &mut tcp::Shelf)> {
+        let driver = self.driver;
+        let owned = self
+            .slots
+            .get_mut(resource.index as usize)
+            .filter(|slot| resource.driver == driver && slot.generation == resource.generation && slot.used())?;
+        Some((owned, &mut self.shelf))
+    }
+
     /// The slot of `resource`, when this driver made it and the slot has its generation.
     fn slot(&self, resource: Resource) -> Option<&Owned> {
         self.slots
@@ -1264,6 +1301,8 @@ impl Resources {
             .get_mut(resource.index as usize)
             .filter(|slot| resource.driver == self.driver && slot.generation == resource.generation && slot.used())?;
         slot.generation = slot.generation.wrapping_add(1);
+        // The buffers that the stream keeps go back to their pool.
+        slot.directions.unshelve(&mut self.shelf);
         slot.directions = tcp::Directions::default();
         slot.running = 0;
         slot.next_free = self.first_free;
@@ -1307,6 +1346,12 @@ impl Resources {
 /// The buffer group of the provided ring.
 const GROUP: u16 = 0;
 
+/// The filled buffers that the read direction of a stream keeps before it ends its multishot
+/// receive ([`Shot::Multi`]), when no receive waits. The buffers that the kernel filled before the
+/// end still come, so a direction can keep more for a time. A low count shares the provided buffers
+/// among the streams, and the kernel keeps the later bytes in the socket.
+pub const KEPT_BUFFERS: u32 = 4;
+
 /// The user data of the poll of the wake descriptor that a wait keeps in the ring.
 #[cfg(target_os = "linux")]
 const WAKE: u64 = CONTROL;
@@ -1340,13 +1385,25 @@ struct Selected {
 
 impl Selected {
     /// Takes each slot of `pool`, up to 32768, and gives each to a new provided ring of `ring`.
-    fn new(queue: &mut Queue, mut pool: Pool) -> io::Result<Self> {
+    /// It counts the other slots, which a refill gives to the ring. The shelf of the multishot
+    /// receives has a place for each slot of the pool, and one for a buffer of a caller of each of
+    /// the `streams` resource slots.
+    fn new(queue: &mut Queue, mut pool: Pool, streams: u32) -> io::Result<(Self, tcp::Shelf)> {
         let mut buffers = Vec::new();
         while buffers.len() < 1 << 15 {
             let Ok(backing) = pool.acquire() else { break };
             buffers.try_reserve(1).map_err(|_| io::ErrorKind::OutOfMemory)?;
             buffers.push(Some(backing));
         }
+        let mut slots = u32::try_from(buffers.len()).unwrap_or(u32::MAX);
+        let mut more = Vec::new();
+        while let Ok(backing) = pool.acquire() {
+            more.try_reserve(1).map_err(|_| io::ErrorKind::OutOfMemory)?;
+            more.push(backing);
+            slots = slots.saturating_add(1);
+        }
+        // The other slots go back to the pool, for the refills.
+        drop(more);
         let count = u16::try_from(buffers.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
         let len = buffers
             .first()
@@ -1355,6 +1412,7 @@ impl Selected {
             .ok_or(io::ErrorKind::InvalidInput)?;
         // The memory comes before the buffer ring, so a refusal of the allocator provides nothing.
         let free = room(usize::from(count)).map_err(out_of_memory)?;
+        let shelf = tcp::Shelf::new(slots.saturating_add(streams)).map_err(out_of_memory)?;
         let mut selected = Self {
             ring: queue.provide(count.next_power_of_two(), GROUP)?,
             pool,
@@ -1368,7 +1426,20 @@ impl Selected {
             }
         }
         selected.ring.publish();
-        Ok(selected)
+        Ok((selected, shelf))
+    }
+
+    /// Takes the buffer that the kernel selected as `bid` and filled with the `result` bytes that
+    /// the result of its receive counts. `None` for a failed receive.
+    #[expect(unsafe_code, reason = "the kernel initialized the bytes that the result counts")]
+    fn filled(&mut self, bid: u16, result: i32) -> Option<Backing> {
+        let count = usize::try_from(result).ok()?;
+        let mut loan = WriteLoan::new(self.take(bid)?);
+        // SAFETY: a slot of the pool has no initialized bytes, so the loan starts at the start of
+        // the buffer. The kernel wrote the bytes that the result counts there, at most the slot
+        // capacity that the ring names.
+        unsafe { loan.set_filled(count) };
+        Some(loan.into_inner())
     }
 
     /// Takes the buffer that the kernel selected as `bid`.
@@ -1810,6 +1881,11 @@ impl Driver {
             resources.files = Some(ring.fd());
             files = Files::Registered;
         }
+        // Only a ring has a multishot receive.
+        let receives = match &queue {
+            Queue::Ring(_) => config.receives,
+            Queue::Poller(_) => Shot::Single,
+        };
         let shared = try_arc(Shared {
             driver,
             entries: items(config.operations, |_| Entry::new()).map_err(refused)?,
@@ -1832,7 +1908,9 @@ impl Driver {
             pending: room(config.resources as usize).map_err(refused)?,
             copied: 0,
             selected: None,
-            report: Report::new(selection, config.required, probed, false).with_files(files),
+            report: Report::new(selection, config.required, probed, false)
+                .with_files(files)
+                .with_receives(receives),
             completions_per_turn: config.completions_per_turn,
             waking: false,
             watched,
@@ -1966,7 +2044,10 @@ impl Driver {
         if self.selected.is_some() {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        self.selected = Some(Selected::new(&mut self.queue, pool)?);
+        let streams = u32::try_from(self.resources.slots.len()).unwrap_or(u32::MAX);
+        let (selected, shelf) = Selected::new(&mut self.queue, pool, streams)?;
+        self.resources.shelf = shelf;
+        self.selected = Some(selected);
         Ok(())
     }
 
@@ -2226,6 +2307,8 @@ impl Driver {
                     self.complete_now(id, -ECANCELED);
                 }
             }
+            // A receive that waits for the multishot receive of its stream has no submission.
+            self.end_awaiting(resource);
         }
         let mut cancelled = 0_u32;
         #[cfg(unix)]
@@ -2246,7 +2329,10 @@ impl Driver {
                 _ => {}
             }
             push_cancel(&mut self.queue, id)?;
-            cancelled = cancelled.saturating_add(1);
+            // The multishot receive of a stream is no operation of the caller.
+            if self.table.resources(id).is_none_or(|tag| tag.kind != Kind::Multishot) {
+                cancelled = cancelled.saturating_add(1);
+            }
         }
         while self.table.busy() {
             self.take_requests();
@@ -2358,7 +2444,7 @@ impl Driver {
         held: impl FnOnce(P) -> Result<Held, (Reason, P)>,
     ) -> Result<OpId, (Reason, P)> {
         // The table counts the completions of a batch until its last one.
-        let shape = if tag.kind.batch() {
+        let shape = if tag.kind.batch() || tag.kind == Kind::Multishot {
             Shape::Multishot
         } else {
             Shape::Single
@@ -2554,6 +2640,10 @@ impl Driver {
             self.complete_now(id, -ECANCELED);
             return;
         }
+        if self.unawait(tag, id) {
+            self.complete_now(id, -ECANCELED);
+            return;
+        }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.unwait(id) {
             return;
@@ -2645,6 +2735,24 @@ impl Driver {
                         (event.more, event.result) = udp::batch_completion(held, cqe.res, buffer);
                     }
                 });
+            }
+            // A buffer of a multishot receive goes to the shelf of its stream. A receive that waits
+            // takes it after the harvest, and a full shelf ends the multishot receive there.
+            if let Some(id) = op
+                && let Some(Tag {
+                    kind: Kind::Multishot,
+                    resource: Some(resource),
+                    ..
+                }) = tagged
+                && event.more
+                && table.runs(id)
+                && let Some(buffer) = cqe
+                    .buffer()
+                    .zip(selected.as_mut())
+                    .and_then(|(bid, selected)| selected.filled(bid, cqe.res))
+                && resources.shelve(resource, buffer)
+            {
+                pending.push(resource);
             }
             let outcome = table.complete(cqe.user_data, event);
             let (id, abandoned, tag) = match (outcome, op) {
@@ -2808,7 +2916,7 @@ fn finish(
                 }
             }
         }
-        Kind::Selected => {
+        Kind::Selected | Kind::Multishot => {
             if let Some(buffer) = cqe
                 .buffer()
                 .zip(selected)

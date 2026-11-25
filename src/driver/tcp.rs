@@ -6,6 +6,7 @@
 //! home keeps the state of each direction: the operation that runs, one operation that waits for
 //! it, what an abandoned receive or accept left, and the progress that dropped sends owe.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_int;
 #[cfg(unix)]
@@ -25,7 +26,7 @@ use super::iocp::sys::{self, WsaBuf as Region};
 use super::udp::{self, Arrivals, Batch};
 use super::{
     Borrowed, Call, Completion, Driver, ECANCELED, Handle, Held, Kind, Medium, Operation, Payload, Reason, Refused,
-    Resource, Resources, Route, Tag, borrow, number,
+    Resource, Resources, Route, Shot, Tag, borrow, number,
 };
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, WriteLoan};
 use crate::sync::Arc;
@@ -671,6 +672,133 @@ struct Direction {
     last: Option<OpId>,
 }
 
+/// No place of the [`Shelf`]: the end of a list.
+const NO_PLACE: u32 = u32::MAX;
+
+/// The filled buffers that the multishot receives of the streams of a driver keep for their next
+/// receives ([`Shot::Multi`](super::Shot::Multi)), as a list for the read direction of each
+/// stream. Each place holds one buffer, and the shelf has one place for each slot of the provided
+/// pool and one for each resource slot: the buffers of the pool, and one buffer of a caller that a
+/// receive copied into and dropped. So each kept buffer has a place, and a push allocates nothing.
+#[derive(Debug)]
+pub(super) struct Shelf {
+    places: Box<[Place]>,
+    /// The first free place, or `NO_PLACE`.
+    free: u32,
+}
+
+/// One place of the [`Shelf`].
+#[derive(Debug)]
+struct Place {
+    buffer: Option<Backing>,
+    /// The next place of its list, or of the free places.
+    next: u32,
+}
+
+impl Default for Shelf {
+    fn default() -> Self {
+        Self {
+            places: Box::default(),
+            free: NO_PLACE,
+        }
+    }
+}
+
+impl Shelf {
+    /// A shelf of `places` free places. It allocates here, one time, or refuses.
+    pub(super) fn new(places: u32) -> Result<Self, core::alloc::AllocError> {
+        Ok(Self {
+            places: crate::memory::items(places, |index| Place {
+                buffer: None,
+                next: if index + 1 < places { index + 1 } else { NO_PLACE },
+            })?,
+            free: if places > 0 { 0 } else { NO_PLACE },
+        })
+    }
+
+    /// Puts `buffer` at the end of `list`, or at its start when `first`.
+    fn put(&mut self, list: &mut Shelved, buffer: Backing, first: bool) {
+        let place = self.free;
+        // Each kept buffer is a slot of the pool, or the one buffer of a caller of its stream.
+        let slot = self
+            .places
+            .get_mut(place as usize)
+            .expect("the shelf has a place for each kept buffer");
+        self.free = slot.next;
+        slot.buffer = Some(buffer);
+        if first || list.first == NO_PLACE {
+            slot.next = list.first;
+            if list.first == NO_PLACE {
+                list.last = place;
+            }
+            list.first = place;
+            list.start = 0;
+        } else {
+            slot.next = NO_PLACE;
+            if let Some(last) = self.places.get_mut(list.last as usize) {
+                last.next = place;
+            }
+            list.last = place;
+        }
+        list.len += 1;
+    }
+
+    /// The first buffer of `list`, with the bytes that a receive took from its start.
+    fn first(&self, list: &Shelved) -> Option<(&Backing, usize)> {
+        let buffer = self.places.get(list.first as usize)?.buffer.as_ref()?;
+        Some((buffer, list.start))
+    }
+
+    /// Takes the first buffer of `list`, with the bytes that a receive took from its start.
+    fn take(&mut self, list: &mut Shelved) -> Option<(Backing, usize)> {
+        let place = list.first;
+        let slot = self.places.get_mut(place as usize)?;
+        let buffer = slot.buffer.take()?;
+        let start = list.start;
+        list.first = slot.next;
+        if list.first == NO_PLACE {
+            list.last = NO_PLACE;
+        }
+        list.start = 0;
+        list.len -= 1;
+        slot.next = self.free;
+        self.free = place;
+        Some((buffer, start))
+    }
+
+    /// Drops each buffer of `list`, whose slots go back to their pool.
+    pub(super) fn clear(&mut self, list: &mut Shelved) {
+        while self.take(list).is_some() {}
+    }
+}
+
+/// The buffers that the read direction of a stream keeps on the [`Shelf`], oldest first.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Shelved {
+    first: u32,
+    last: u32,
+    len: u32,
+    /// The bytes of the first buffer that a receive into the caller's buffer copied.
+    start: usize,
+}
+
+impl Default for Shelved {
+    fn default() -> Self {
+        Self {
+            first: NO_PLACE,
+            last: NO_PLACE,
+            len: 0,
+            start: 0,
+        }
+    }
+}
+
+impl Shelved {
+    const fn is_empty(&self) -> bool {
+        self.first == NO_PLACE
+    }
+}
+
 /// What an abandoned receive or accept left for the next one.
 #[derive(Debug)]
 enum Kept {
@@ -723,6 +851,17 @@ pub(super) struct Directions {
     closing: Option<Closing>,
     /// The resource is in the pending list of the driver.
     pending: bool,
+    /// The multishot receive of the read direction ([`Shot::Multi`](super::Shot::Multi)).
+    armed: Option<OpId>,
+    /// The current receive waits for a buffer of `armed`, or for its end, with no submission.
+    awaiting: bool,
+    /// `armed` filled no buffer yet.
+    fresh: bool,
+    /// The buffers that `armed` filled and no receive took, after `kept`.
+    shelved: Shelved,
+    /// The terminal result of the last multishot receive, after `shelved`: the end of the stream,
+    /// or an error.
+    ended: Option<i32>,
     kept: Option<Kept>,
 }
 
@@ -754,11 +893,34 @@ impl Directions {
                 Some(&mut self.read)
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::Multishot => None,
             Kind::File(_) => None,
             #[cfg(unix)]
             Kind::Spawn(_) | Kind::Exit(_) => None,
         }
+    }
+
+    /// Puts `buffer`, which the multishot receive filled, after the shelved buffers. Gives whether
+    /// the resource now needs the home, because a receive waits or the direction keeps its most
+    /// buffers, and it is not in the pending list yet. A `true` puts it there: the caller pushes
+    /// it.
+    pub(super) fn shelve(&mut self, buffer: Backing, shelf: &mut Shelf) -> bool {
+        shelf.put(&mut self.shelved, buffer, false);
+        self.fresh = false;
+        let needs = (self.awaiting || self.shelved.len >= super::KEPT_BUFFERS) && !self.pending;
+        self.pending |= needs;
+        needs
+    }
+
+    /// Gives each buffer that the direction keeps on `shelf` back to its pool.
+    pub(super) fn unshelve(&mut self, shelf: &mut Shelf) {
+        shelf.clear(&mut self.shelved);
+    }
+
+    /// Whether a receive of the read direction has a result here, or waits for the multishot
+    /// receive: so it needs no submission, and the usual start does not apply.
+    const fn receives_here(&self) -> bool {
+        self.armed.is_some() || !self.shelved.is_empty() || self.ended.is_some()
     }
 
     /// The listener keeps a connection that no accept took.
@@ -805,7 +967,11 @@ impl Directions {
     /// in the pending list of the driver yet. A `true` puts it there: the caller pushes it, and the
     /// list holds each resource at most one time, so its capacity holds it.
     fn needs_home(&mut self) -> bool {
-        let waits = self.read.first.is_some() || self.write.first.is_some() || self.closing.is_some();
+        // A receive that waited for a multishot receive that ended takes its result, or arms again.
+        let waits = self.read.first.is_some()
+            || self.write.first.is_some()
+            || self.closing.is_some()
+            || (self.awaiting && self.armed.is_none());
         let needs = waits && !self.pending;
         self.pending |= needs;
         needs
@@ -829,7 +995,7 @@ impl Directions {
     /// interest, with its resources `held`. Received bytes, the error of a receive, and an accepted
     /// connection stay for the next operation of the direction. A send that failed, sent only part
     /// of its bytes, or was cancelled makes the write direction fail.
-    pub(super) fn abandon(&mut self, kind: Kind, result: i32, held: Held) {
+    pub(super) fn abandon(&mut self, kind: Kind, result: i32, held: Held, shelf: &mut Shelf) {
         match kind {
             Kind::Recv | Kind::Selected => {
                 let buffer = held.loan.map(WriteLoan::into_inner);
@@ -838,6 +1004,10 @@ impl Directions {
                 {
                     // The receive copied its bytes from the kept buffer, which still holds them.
                     *start -= held.copied;
+                } else if held.copied > 0 && kind == Kind::Recv && self.shelved.start >= held.copied {
+                    // The receive copied its bytes from the first shelved buffer, which still
+                    // holds them: a later buffer starts with no copied byte.
+                    self.shelved.start -= held.copied;
                 } else if let (Ok(received), Some(buffer)) = (usize::try_from(result), buffer)
                     && received > 0
                 {
@@ -845,6 +1015,21 @@ impl Directions {
                     self.kept = Some(Kept::Bytes { buffer, start });
                 } else if result < 0 && result != -ECANCELED && result != -ENOBUFS {
                     self.kept = Some(Kept::Error(result));
+                }
+            }
+            // The multishot receive ended. Its last buffer, the end of the stream, or its error
+            // follows the buffers that the direction keeps. An empty ring ends no stream: a receive
+            // that waits gets it only when the receive filled no buffer, and else arms again, so
+            // a buffer that came back after the end is used. A cancel, at the bound or at a close,
+            // gives nothing.
+            Kind::Multishot => {
+                self.armed = None;
+                if let (Ok(count), Some(loan)) = (usize::try_from(result), held.loan)
+                    && count > 0
+                {
+                    shelf.put(&mut self.shelved, loan.into_inner(), false);
+                } else if result <= 0 && result != -ECANCELED && (result != -ENOBUFS || self.awaiting && self.fresh) {
+                    self.ended = Some(result);
                 }
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown => {
@@ -940,8 +1125,38 @@ impl Directions {
         kind: Kind,
         interest: impl Fn() -> bool,
         copied: &mut u64,
+        shelf: &mut Shelf,
     ) -> Option<i32> {
         match (kind, self.kept.take()) {
+            // The kept result of an abandoned receive comes first, then the shelved buffers of the
+            // multishot receive, in order, then its end.
+            (Kind::Selected, None) if !self.shelved.is_empty() => {
+                let (mut buffer, start) = shelf.take(&mut self.shelved)?;
+                let len = buffer.initialized() - start;
+                if start > 0 {
+                    buffer.bytes_mut().copy_within(start.., 0);
+                    buffer.truncate(len);
+                    *copied = copied.saturating_add(len as u64);
+                }
+                held.copied = if start > 0 { len } else { 0 };
+                held.loan = Some(WriteLoan::new(buffer));
+                Some(i32::try_from(len).unwrap_or(i32::MAX))
+            }
+            (Kind::Recv, None) if !self.shelved.is_empty() => {
+                let (buffer, start) = shelf.first(&self.shelved)?;
+                let bytes = buffer.bytes().get(start..).unwrap_or_default();
+                let count = held.loan.as_mut().map_or(0, |loan| loan.fill_from(bytes));
+                let rest = bytes.len() - count;
+                held.copied = count;
+                self.shelved.start += count;
+                if rest == 0 {
+                    drop(shelf.take(&mut self.shelved));
+                }
+                *copied = copied.saturating_add(count as u64);
+                // The bytes came from one kernel result, so their count fits an `i32`.
+                Some(i32::try_from(count).unwrap_or(i32::MAX))
+            }
+            (Kind::Recv | Kind::Selected, None) if self.ended.is_some() => self.ended.take(),
             (Kind::Recv, Some(Kept::Bytes { buffer, mut start })) => {
                 let count = held.loan.as_mut().map_or(0, |loan| {
                     loan.fill_from(buffer.bytes().get(start..).unwrap_or_default())
@@ -1041,14 +1256,25 @@ impl Directions {
     /// Whether an operation of `kind` has its result here, with no submission.
     fn has_result(&self, kind: Kind) -> bool {
         match kind {
-            Kind::Recv | Kind::Selected => matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_))),
+            Kind::Recv | Kind::Selected => {
+                matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_)))
+                    || !self.shelved.is_empty()
+                    || self.ended.is_some()
+                    || self.armed.is_some()
+            }
             Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
             Kind::Send | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
             Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => matches!(
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
+            Kind::Other
+            | Kind::Close
+            | Kind::Connect
+            | Kind::Bind
+            | Kind::SendTo
+            | Kind::SendBatch
+            | Kind::Multishot => false,
             Kind::File(_) => false,
             #[cfg(unix)]
             Kind::Spawn(_) | Kind::Exit(_) => false,
@@ -1088,8 +1314,8 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, mut held
     {
         *connection = held.accepted.take().and_then(|stream| resources.release(stream));
     }
-    if let Some(owned) = resources.get(resource) {
-        owned.directions.abandon(tag.kind, result, held);
+    if let Some((owned, shelf)) = resources.with_shelf(resource) {
+        owned.directions.abandon(tag.kind, result, held, shelf);
     }
 }
 
@@ -1691,6 +1917,7 @@ impl Driver {
     ) -> Result<Completion, (P, H)> {
         #[cfg(all(feature = "local", target_os = "linux"))]
         let consumer = self.consumer();
+        let multi = self.report.receives() == Shot::Multi;
         let Self {
             resources,
             table,
@@ -1720,7 +1947,10 @@ impl Driver {
             ring: ring && owned.medium == Medium::File,
         };
         let directions = &mut owned.directions;
-        let clear = directions.kept.is_none() && directions.sent == Sent::Ok;
+        let clear = directions.kept.is_none()
+            && directions.sent == Sent::Ok
+            && !(matches!(kind, Kind::Recv | Kind::Selected)
+                && (directions.receives_here() || multi && kind == Kind::Selected));
         let Some(direction) = directions
             .direction(kind)
             .filter(|direction| clear && direction.current.is_none() && direction.first.is_none() && queue.room() > 0)
@@ -1942,7 +2172,7 @@ impl Driver {
     /// submits it. Gives `false`, and changes nothing, when it needs a submission and the queue has
     /// no room.
     fn start(&mut self, id: OpId, resource: Resource, kind: Kind) -> bool {
-        let Some(owned) = self.resources.get(resource) else {
+        let Some((owned, shelf)) = self.resources.with_shelf(resource) else {
             return true;
         };
         let Some(fd) = owned.number() else {
@@ -1953,6 +2183,8 @@ impl Driver {
             return true;
         };
         let directions = &mut owned.directions;
+        let receive = matches!(kind, Kind::Recv | Kind::Selected);
+        let here = receive && (!directions.shelved.is_empty() || directions.ended.is_some());
         let result = match (kind, directions.kept.take()) {
             (Kind::Accept, Some(Kept::Connection { fd, peer, peer_len })) => {
                 match self.resources.adopt(fd, Medium::Stream) {
@@ -1975,21 +2207,40 @@ impl Driver {
                 Some(0)
             }
             // Nothing kept and no failed send: the operation needs its submission.
-            (_, None) if directions.sent == Sent::Ok => None,
+            (_, None) if directions.sent == Sent::Ok && !here => None,
             (kind, kept) => {
                 directions.kept = kept;
                 let (table, copied) = (&self.table, &mut self.copied);
                 let mut result = None;
                 slot.update(id, |held| {
                     if let Some(held) = held {
-                        result = directions.resume(held, kind, || table.interest(id), copied);
+                        result = directions.resume(held, kind, || table.interest(id), copied, shelf);
                     }
                 });
                 result
             }
         };
         if let Some(result) = result {
+            if let Some(owned) = self.resources.get(resource) {
+                owned.directions.awaiting = false;
+            }
             self.complete_now(id, result);
+            return true;
+        }
+        // A receive waits for the multishot receive of its direction. A receive into the caller's
+        // buffer ends it, so the next bytes go to that buffer with no copy once the shelved ones
+        // are copied.
+        if receive
+            && let Some(owned) = self.resources.get(resource)
+            && let Some(armed) = owned.directions.armed
+        {
+            owned.directions.awaiting = true;
+            if kind == Kind::Recv {
+                self.cancel(armed);
+            }
+            return true;
+        }
+        if kind == Kind::Selected && !pipe && self.report.receives() == Shot::Multi && self.arm(resource, fd, place) {
             return true;
         }
         // macOS has no segmentation offload: a send with a segment size ends with no call.
@@ -2025,6 +2276,76 @@ impl Driver {
             });
         }
         true
+    }
+
+    /// Arms the multishot receive of the read direction of the stream `resource`, whose current
+    /// receive then waits for its first buffer. No future consumes the multishot receive: its
+    /// direction keeps each buffer, until its terminal completion. Gives `false`, and changes
+    /// nothing, when the driver has no provided buffers, or the table or the queue has no room.
+    fn arm(&mut self, resource: Resource, fd: i32, place: Option<u32>) -> bool {
+        let Some(group) = self.selected.as_ref().map(|selected| selected.ring.group()) else {
+            return false;
+        };
+        if !self.room(1) {
+            return false;
+        }
+        let Ok(id) = self
+            .table
+            .begin(Tag::new(Some(resource), Kind::Multishot), Shape::Multishot)
+        else {
+            return false;
+        };
+        let Some(slot) = self.shared.entries.get(id.index() as usize) else {
+            self.table.withdraw(id);
+            return false;
+        };
+        slot.start(id, Held::default(), |_| ());
+        // No future has interest: the terminal completion goes to the abandoned rule.
+        let ended = self.table.end_interest(id);
+        assert!(ended.is_none(), "a new operation runs");
+        // SAFETY: the entry names no memory, and the descriptor of `resource`, which stays open
+        // until its close, after the terminal completion of the receive. The queue has room.
+        #[expect(unsafe_code, reason = "the kernel uses the descriptor of the resource")]
+        unsafe {
+            self.push(id, |_| {
+                let sqe = Sqe::recv_multishot(fd, group);
+                place.map_or(sqe, |place| sqe.fixed_file(fd, place))
+            });
+        }
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.armed = Some(id);
+            owned.directions.awaiting = true;
+            owned.directions.fresh = true;
+        }
+        true
+    }
+
+    /// Ends the receive of `resource` that waits for the multishot receive of its stream, with no
+    /// submission, as at a teardown.
+    pub(super) fn end_awaiting(&mut self, resource: Resource) {
+        let current = self
+            .direction(resource, Kind::Recv)
+            .and_then(|direction| direction.current);
+        if let Some(id) = current
+            && let Some(&tag) = self.table.resources(id)
+            && self.unawait(tag, id)
+        {
+            self.complete_now(id, -ECANCELED);
+        }
+    }
+
+    /// Ends `id` when it is the receive that waits for the multishot receive of its direction,
+    /// with no submission: gives whether it waited.
+    pub(super) fn unawait(&mut self, tag: Tag, id: OpId) -> bool {
+        let Some(owned) = tag.resource.and_then(|resource| self.resources.get(resource)) else {
+            return false;
+        };
+        let directions = &mut owned.directions;
+        let waits = directions.awaiting && directions.read.current == Some(id);
+        if waits {
+            directions.awaiting = false;
+        }
+        waits
     }
 
     /// Submits the batch `id` on the socket `fd`: one entry for each datagram, each linked to the
@@ -2104,6 +2425,7 @@ impl Driver {
                 continue;
             };
             owned.directions.pending = false;
+            self.attend_armed(resource);
             for kind in [Kind::Recv, Kind::Send] {
                 let table = &self.table;
                 let runs = self
@@ -2131,6 +2453,38 @@ impl Driver {
                 }
             }
             self.close_if_idle(resource);
+        }
+    }
+
+    /// The read direction of `resource` with a multishot receive: the receive that waits takes a
+    /// shelved buffer or the end, or arms again, and a direction with no waiting receive that
+    /// keeps [`KEPT_BUFFERS`](super::KEPT_BUFFERS) buffers ends its multishot receive.
+    fn attend_armed(&mut self, resource: Resource) {
+        let Some(owned) = self.resources.get(resource) else {
+            return;
+        };
+        let directions = &owned.directions;
+        let (awaiting, current, armed) = (directions.awaiting, directions.read.current, directions.armed);
+        let full = directions.shelved.len >= super::KEPT_BUFFERS;
+        let waiting = current
+            .filter(|&current| awaiting && self.table.runs(current))
+            .and_then(|current| Some((current, self.table.resources(current)?.kind)));
+        if awaiting && waiting.is_none() {
+            owned.directions.awaiting = false;
+        }
+        if let Some((current, kind)) = waiting
+            && !self.start(current, resource, kind)
+        {
+            if let Some(owned) = self.resources.get(resource) {
+                owned.directions.awaiting = false;
+            }
+            self.wait_first(resource, kind, current);
+        }
+        if let Some(armed) = armed
+            && !awaiting
+            && full
+        {
+            self.cancel(armed);
         }
     }
 
@@ -2201,6 +2555,10 @@ impl Driver {
                 }
             }
         }
+        let armed = self.resources.get(resource).and_then(|owned| owned.directions.armed);
+        if let Some(armed) = armed {
+            self.cancel(armed);
+        }
         self.close_if_idle(resource);
         // A close can release a resource that the pending list holds, so the list is empty
         // before a new resource takes that slot.
@@ -2218,7 +2576,7 @@ impl Driver {
         let Some(closing) = directions.closing else {
             return;
         };
-        let runs = [directions.read.current, directions.write.current]
+        let runs = [directions.read.current, directions.write.current, directions.armed]
             .into_iter()
             .flatten()
             .any(|operation| table.runs(operation))

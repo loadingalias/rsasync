@@ -65,9 +65,14 @@ impl RingOwner {
         slots: u32,
         config: Config,
         blocking: Option<crate::blocking::Submitter>,
+        buffers: Option<crate::runtime::ReceiveBuffers>,
     ) -> Result<Self, Refused> {
         let local = Local::new(budget, slots, Home::new(thread::current(), None), driver::MESSAGES)?;
-        local.lazy.set(Some((config, blocking)));
+        local.lazy.set(Some(super::owner::Lazy {
+            config,
+            blocking,
+            buffers: buffers.map(|buffers| (buffers, budget.clone())),
+        }));
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
             pool: None,
@@ -329,10 +334,25 @@ impl Local {
             return Err(value);
         };
         if slot.is_none() {
-            let Some((config, blocking)) = self.lazy.take() else {
+            let Some(super::owner::Lazy {
+                config,
+                blocking,
+                buffers,
+            }) = self.lazy.take()
+            else {
                 return Err(value);
             };
-            match Driver::new(config) {
+            let started = Driver::new(config).and_then(|mut driver| {
+                // The budget charges the pool, and a refusal fails the owner as its driver would.
+                if let Some((buffers, budget)) = buffers {
+                    let pool = buffers
+                        .pool(&budget)
+                        .map_err(|refused| driver::Error::System(io::Error::other(refused)))?;
+                    driver.provide(pool).map_err(driver::Error::System)?;
+                }
+                Ok(driver)
+            });
+            match started {
                 Ok(mut driver) => {
                     if let Some(submitter) = blocking {
                         driver.use_blocking(submitter);

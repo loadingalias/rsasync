@@ -29,7 +29,7 @@ use crate::buffer::{Backing, Buffer as _, Lease};
 use crate::capacity::Budget;
 use crate::channel::oneshot;
 use crate::driver::{
-    ChildOptions, Config, Datagram, End, Escalation, OpenOptions, Reason, SendCount, Signal, Stale, SyncMode,
+    ChildOptions, Config, Datagram, End, Escalation, OpenOptions, Reason, SendCount, Shot, Signal, Stale, SyncMode,
     TcpOptions, UdpOptions, WriteMode,
 };
 use crate::runtime::{GroupError, Runtime, WorkerId};
@@ -87,6 +87,35 @@ fn bytes_cross_local_tcp_streams_and_their_halves() {
             server.close().unwrap().await.unwrap();
             client.close().unwrap().await.unwrap();
             listener.close().unwrap().await.unwrap();
+        })
+        .unwrap();
+}
+
+/// A local stream receives into the provided buffers of the driver of its owner, with one
+/// submission for each receive and with the multishot receive of its stream, and the bytes come
+/// in order. A runtime with no provided buffers refuses the receive with `Reason::Buffers`.
+#[test]
+fn a_local_stream_receives_into_the_provided_buffers_of_its_owner() {
+    for shot in [Shot::Single, Shot::Multi] {
+        let runtime = Runtime::builder().driver(Config::new().receives(shot)).build().unwrap();
+        runtime
+            .block_on(async {
+                let (_listener, mut server, mut client) = pair().await;
+                let (mut read, _write) = server.split();
+                for bytes in [&b"first"[..], b"second"] {
+                    let (sent, _lease) = client.send(Lease::from(bytes.to_vec())).unwrap().await.unwrap();
+                    assert_eq!(sent.unwrap(), bytes.len());
+                    let received = read.recv_selected().unwrap().await.unwrap().unwrap();
+                    assert_eq!(received.bytes(), bytes);
+                }
+            })
+            .unwrap();
+    }
+    let runtime = Runtime::builder().receive_buffers(None).build().unwrap();
+    runtime
+        .block_on(async {
+            let (_listener, mut server, _client) = pair().await;
+            assert_eq!(server.recv_selected().unwrap_err().reason(), Reason::Buffers);
         })
         .unwrap();
 }

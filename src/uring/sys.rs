@@ -129,6 +129,9 @@ pub(crate) const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
 /// `IOSQE_CQE_SKIP_SUCCESS` (Linux 5.17): the entry posts a completion only when it fails.
 pub(crate) const IOSQE_CQE_SKIP_SUCCESS: u8 = 1 << 6;
 
+/// `IORING_RECV_MULTISHOT` (Linux 6.0), in the `ioprio` of a receive: the receive stays armed and
+/// posts one completion with `IORING_CQE_F_MORE` for each buffer that it fills.
+pub(crate) const IORING_RECV_MULTISHOT: u16 = 1 << 1;
 pub(crate) const IORING_CQE_F_BUFFER: u32 = 1 << 0;
 pub(crate) const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 pub(super) const IORING_CQE_F_MORE: u32 = 1 << 1;

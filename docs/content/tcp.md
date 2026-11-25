@@ -210,13 +210,17 @@ same as on the driver.
 | `listener.accept()` | `Driver::accept` |
 | `TcpStream::connect(address, options)` | `Driver::connect` |
 | `stream.recv(backing)`, `stream.send(lease)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send`, `Driver::send_vectored` |
+| `stream.recv_selected()` | `Driver::recv_selected`, into the provided buffers of the owner |
 | `stream.shutdown_write()` | `Driver::shutdown_write` |
 | `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
 | `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
 
 `stream.split()` gives a `rsasync::local::ReadHalf` and a `WriteHalf`, so a receive and a
-send run at one time. A receive into a buffer that the kernel selects is not a local call yet: it
-needs a pool on each worker.
+send run at one time. `recv_selected()` waits with no buffer and gives a buffer from the provided
+buffers of the driver of the owner when the bytes come. Each worker and each `block_on` has these
+buffers by [`receive_buffers`](runtime.md#start-a-runtime). With
+`Config::receives(Shot::Multi)`, the receives of a stream take the buffers of one multishot
+receive: see [Driver-only use](driver-only.md#one-multishot-receive-for-each-stream).
 
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};

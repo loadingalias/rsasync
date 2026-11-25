@@ -147,7 +147,7 @@ that the kernel ran and that failed gives the `io::Error` of the kernel.
 | `Refused` with `Reason::Resources` | Each resource slot is in use | Close a resource, then try again |
 | `Refused` with `Reason::Resource` | The descriptor or the child is not one that this driver owns | Do not use it with this driver: it closed, or another driver owns it. `Driver::close_child` gives the `Child` back |
 | `Refused` with `Reason::NoDriver` | A call of `rsasync::local` or `rsasync::movable` with no driver that it can use: no runtime owner, a `task::LocalOwner`, a driver of `block_on` that did not start, or a call in a destructor that a turn of the driver runs | Make the call in a task or the root of a `Runtime`. A drop needs no call: it closes the resource. For a failed start, read the `BlockOnError` |
-| `Refused` with `Reason::Buffers` | The driver has no provided buffers | Call `Driver::provide` |
+| `Refused` with `Reason::Buffers` | The driver has no provided buffers | Call `Driver::provide`. For a local type, give the runtime `receive_buffers(Some(...))` |
 | `Refused` with `Reason::NotPipe`, `Reason::Direction` | The descriptor is not a pipe, or its direction is wrong | Give a pipe end with the direction of the adoption |
 | `Refused` with `Reason::Unsupported` | The operation does not apply to the resource. A call of `rsasync::movable` also gives it on a worker that runs on epoll | Use an operation of that resource. For a movable call, run the workers on io_uring, or use the types of `rsasync::local` (see [TCP from a movable task](tcp.md#use-tcp-from-a-movable-task)) |
 | `Refused` with `Reason::Alignment` | A direct-I/O buffer, length, or offset is not aligned | Align each one to the `Alignment` of the file |

@@ -52,6 +52,7 @@ Each setting has a default:
 | `handles(n)` | 64 | The handles that can exist at one time |
 | `blocking(config)` | `Some(blocking::Config::new())`: 4 threads, 64 jobs, 2 MiB of stack each | The blocking service of the runtime, or `None` for no service. See [The blocking service](#the-blocking-service) |
 | `grace_period(duration)` | 5 s (`DEFAULT_GRACE`) | The grace period of `shutdown()`. See [Stop a runtime](#stop-a-runtime) |
+| `receive_buffers(buffers)` | `Some(DEFAULT_RECEIVE_BUFFERS)`: 128 slots of 4096 bytes, 512 KiB | The provided buffers of the driver of each worker and each `block_on`, which `recv_selected` takes when its bytes come. The budget charges them. `None` gives no buffers, and `recv_selected` then refuses with `Reason::Buffers`. A pool that the budget refuses fails the start with `WorkerError::Buffers` |
 
 ## How a start works
 
@@ -124,6 +125,7 @@ match Runtime::builder().local_workers(4).build() {
 | `Owner(task::Refused)` | The task tables of the worker do not fit in the budget | Give a larger budget or fewer task slots |
 | `Inbox(channel::Refused)` | The inbox of the worker does not fit in the budget | Give a larger budget, fewer task slots, or fewer handles |
 | `Timers(TimersError)` | The timers of the worker did not start | Give a valid timer capacity and resolution |
+| `Buffers(PoolRefused)` | The pool of the provided buffers of the worker does not fit in the budget, or the allocator refused it | Give a larger budget, or fewer or smaller buffers with `receive_buffers` |
 | `Ended` | The thread of the worker ended with no report: it panicked | Report a defect |
 
 `Outcome::Failed(io::Error)` in a cleanup means that the teardown of the driver of that worker

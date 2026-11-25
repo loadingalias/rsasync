@@ -228,6 +228,16 @@ pub(super) fn init<T>(mut memory: alloc::sync::Arc<MaybeUninit<T>>, value: T) ->
     unsafe { memory.assume_init() }
 }
 
+/// The settings of the driver that an owner makes at its first operation that needs a home
+/// (`RingOwner::lazy`): its limits, the blocking service, and the provided buffers, which the budget
+/// charges then.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(super) struct Lazy {
+    pub(super) config: crate::driver::Config,
+    pub(super) blocking: Option<crate::blocking::Submitter>,
+    pub(super) buffers: Option<(crate::runtime::ReceiveBuffers, crate::capacity::Budget)>,
+}
+
 pub(super) struct Local {
     shared: Arc<Shared>,
     budget: Budget,
@@ -245,7 +255,7 @@ pub(super) struct Local {
     /// The limits of the driver that this owner makes at the first operation that needs a home,
     /// if it has no driver.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub(super) lazy: Cell<Option<(crate::driver::Config, Option<crate::blocking::Submitter>)>>,
+    pub(super) lazy: Cell<Option<Lazy>>,
     /// The live tasks that the end of the last `block_on` cancelled.
     pub(super) cancelled: Cell<u32>,
     /// The owner has a driver, so the messages of its outbox go out at its next turn or wait.

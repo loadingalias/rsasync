@@ -217,6 +217,17 @@ impl ReadHalf<'_> {
         let read = &mut *self.read;
         submit(buffer, |driver, buffer| driver.recv(read, buffer)).map(Operation::home)
     }
+
+    /// Receives into a buffer that the kernel selects from the provided buffers of the worker, as
+    /// [`TcpStream::recv_selected`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv_selected`].
+    pub fn recv_selected(&mut self) -> Result<Operation<'_, io::Result<Backing>>, Refused<()>> {
+        let read = &mut *self.read;
+        submit((), |driver, ()| driver.recv_selected(read)).map(Operation::home)
+    }
 }
 
 /// The write half of a stream of this module, a [`TcpStream`] or an [`IpcStream`]: its sends

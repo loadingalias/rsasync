@@ -38,7 +38,7 @@ use super::{
     SendCount, TcpListener, TcpOptions, TcpStream, UdpOptions, UdpSocket, WriteFailed,
 };
 #[cfg(target_os = "linux")]
-use super::{Call, Error, Feature, Features, Files, Route, eventfd, probe, sys};
+use super::{Call, Error, Feature, Features, Files, KEPT_BUFFERS, Route, Shot, eventfd, probe, sys};
 #[cfg(unix)]
 use super::{Ended, PipeReader};
 use crate::buffer::{Backing, Buffer as _, BufferMut as _, Lease, Pool, Release, WriteLoan};
@@ -926,6 +926,101 @@ fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStr
     let close = driver.close_listener(listener).expect("the test driver has room");
     drive(driver, close).expect("the driver runs");
     (stream, peer)
+}
+
+/// The bytes of a stream cross its multishot receive in order and with no gap. The receives
+/// alternate between selected buffers and the caller's buffer, which ends the multishot receive
+/// and copies the kept bytes, also a part of one buffer. With no receive, the direction keeps its
+/// most buffers, the receive ends, the pool runs out, and each later receive arms it again.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_bytes_of_a_stream_cross_its_multishot_receive_in_order_through_its_bound_and_an_empty_pool() {
+    let budget = pool_budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut driver = driver(Config::new().receives(Shot::Multi));
+    driver
+        .provide(Pool::new(&budget, NonZeroU32::new(KEPT_BUFFERS * 2).unwrap(), slot).unwrap())
+        .unwrap();
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let sent = numbered(0, 64 * 48);
+    let first = driver.recv_selected(&mut stream).unwrap();
+    driver.turn().unwrap();
+    peer.write_all(&sent).unwrap();
+    let mut received = drive(&mut driver, first).unwrap().unwrap().bytes().to_vec();
+    // No receive waits: the multishot receive fills buffers until its end.
+    for _ in 0..64 {
+        driver.turn().unwrap();
+    }
+    for selected in [true, false].into_iter().cycle() {
+        if received.len() == sent.len() {
+            break;
+        }
+        let bytes = if selected {
+            let receive = driver.recv_selected(&mut stream).unwrap();
+            drive(&mut driver, receive).unwrap().unwrap().bytes().to_vec()
+        } else {
+            let receive = driver.recv(&mut stream, Backing::from(Vec::with_capacity(48))).unwrap();
+            let (count, buffer) = drive(&mut driver, receive).unwrap();
+            assert_eq!(count.unwrap(), buffer.bytes().len());
+            buffer.bytes().to_vec()
+        };
+        assert!(
+            (1..=64).contains(&bytes.len()),
+            "a receive gives the bytes of one buffer"
+        );
+        received.extend_from_slice(&bytes);
+    }
+    assert_eq!(received, sent);
+}
+
+/// A receive that drops while it waits loses no byte: the multishot receive of its direction
+/// fills a buffer with the bytes that come after the drop, and the next receive gets that buffer.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_next_receive_gets_the_bytes_that_the_multishot_receive_took_after_a_dropped_receive() {
+    let budget = pool_budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut pool = Pool::new(&budget, NonZeroU32::MIN, slot).unwrap();
+    let mut zeroed = WriteLoan::new(pool.acquire().unwrap());
+    zeroed.fill_from(&[0; 64]);
+    let slot = zeroed.into_inner().as_ptr();
+    let mut driver = driver(Config::new().receives(Shot::Multi));
+    driver.provide(pool).unwrap();
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let receive = driver.recv_selected(&mut stream).unwrap();
+    driver.turn().unwrap();
+    drop(receive);
+    driver.turn().unwrap();
+    peer.write_all(b"kept").unwrap();
+    assert_eq!(written_in_place(&mut driver, slot, 4), b"kept");
+    let receive = driver.recv_selected(&mut stream).unwrap();
+    let kept = drive(&mut driver, receive).unwrap().unwrap();
+    assert_eq!((kept.bytes(), kept.as_ptr()), (&b"kept"[..], slot));
+}
+
+/// The kernel never writes a buffer that a caller holds: the multishot receive fills only the
+/// buffers of the ring, and a held buffer goes back to the ring only after its drop.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_multishot_receive_never_writes_a_buffer_that_a_caller_holds() {
+    let budget = pool_budget();
+    let slot = Layout::from_size_align(64, 64).unwrap();
+    let mut driver = driver(Config::new().receives(Shot::Multi));
+    driver
+        .provide(Pool::new(&budget, NonZeroU32::new(2).unwrap(), slot).unwrap())
+        .unwrap();
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    peer.write_all(&[1; 64]).unwrap();
+    let receive = driver.recv_selected(&mut stream).unwrap();
+    let mut held = drive(&mut driver, receive).unwrap().unwrap();
+    held.bytes_mut().fill(0xa5);
+    for round in 2..10 {
+        peer.write_all(&[round; 64]).unwrap();
+        let receive = driver.recv_selected(&mut stream).unwrap();
+        let buffer = drive(&mut driver, receive).unwrap().unwrap();
+        assert_eq!(buffer.bytes(), [round; 64]);
+    }
+    assert_eq!(held.bytes(), [0xa5; 64]);
 }
 
 /// Whether the kernel of the host frees the file of an emptied place of a file table at once, also

@@ -71,6 +71,7 @@ mod worker;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::cell::Cell;
 use core::fmt;
 use core::future::Future;
@@ -86,6 +87,7 @@ pub use rscrypto::ChaCha20Rng;
 pub use topology::{Host, Quota};
 
 use crate::blocking::{self, Service, Submitter};
+use crate::buffer::PoolRefused;
 use crate::capacity::Budget;
 use crate::channel::{self, TrySendError, mpsc};
 use crate::clock::{self, NativeClock, Until};
@@ -110,6 +112,15 @@ pub const DEFAULT_HANDLES: u32 = 64;
 /// The grace period that [`Builder::grace_period`] did not change: 5 s, inside the 10 s stop timeout
 /// of `docker stop` and the 30 s default grace of Kubernetes.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
+/// The provided buffers of each worker that [`Builder::receive_buffers`] did not change: 128 slots
+/// of 4096 bytes, 512 KiB, which the budget charges.
+pub const DEFAULT_RECEIVE_BUFFERS: ReceiveBuffers = ReceiveBuffers {
+    slots: NonZeroU32::new(128).expect("the default is not zero"),
+    slot: match Layout::from_size_align(4096, 64) {
+        Ok(slot) => slot,
+        Err(_) => panic!("the default slot has a layout"),
+    },
+};
 /// The most workers of one runtime: its local and its movable workers together.
 pub const MAX_WORKERS: u32 = placement::MAX_CPUS;
 
@@ -127,13 +138,37 @@ pub struct Builder {
     handles: u32,
     blocking: Option<blocking::Config>,
     grace: Duration,
+    receive_buffers: Option<ReceiveBuffers>,
+}
+
+/// The provided buffers of each worker ([`Builder::receive_buffers`]): a pool of `slots` buffers
+/// with the size and the alignment of `slot`. A receive into a selected buffer, such as
+/// [`local::TcpStream::recv_selected`](crate::local::TcpStream::recv_selected), takes one when its
+/// bytes come, so a receive that waits holds no buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveBuffers {
+    slots: NonZeroU32,
+    slot: Layout,
+}
+
+impl ReceiveBuffers {
+    /// `slots` buffers of the size and the alignment of `slot`.
+    #[must_use]
+    pub const fn new(slots: NonZeroU32, slot: Layout) -> Self {
+        Self { slots, slot }
+    }
+
+    /// The pool of these buffers, charged to `budget`.
+    pub(crate) fn pool(self, budget: &Budget) -> Result<crate::buffer::Pool, PoolRefused> {
+        crate::buffer::Pool::new(budget, self.slots, self.slot)
+    }
 }
 
 impl Builder {
     /// No local worker, no movable worker, [`DEFAULT_TASK_SLOTS`], a budget of [`DEFAULT_BUDGET`] bytes, the driver of
     /// [`Config::new`], [`DEFAULT_TIMERS`] at [`DEFAULT_TIMER_RESOLUTION`], `Domain` placement that
     /// is permissive, a seed from the operating system, [`DEFAULT_HANDLES`], a blocking service of
-    /// [`blocking::Config::new`], and [`DEFAULT_GRACE`].
+    /// [`blocking::Config::new`], [`DEFAULT_GRACE`], and [`DEFAULT_RECEIVE_BUFFERS`].
     fn new() -> Self {
         Self {
             local_workers: 0,
@@ -151,6 +186,7 @@ impl Builder {
             handles: DEFAULT_HANDLES,
             blocking: Some(blocking::Config::new()),
             grace: DEFAULT_GRACE,
+            receive_buffers: Some(DEFAULT_RECEIVE_BUFFERS),
         }
     }
 
@@ -259,6 +295,17 @@ impl Builder {
         }
     }
 
+    /// The provided buffers of each worker, which its receives into a selected buffer take. Each
+    /// worker makes its pool at its start, and the budget charges it. `None` gives a worker no
+    /// buffers: such a receive then refuses with [`Reason::Buffers`](driver::Reason::Buffers).
+    #[must_use]
+    pub fn receive_buffers(self, buffers: Option<ReceiveBuffers>) -> Self {
+        Self {
+            receive_buffers: buffers,
+            ..self
+        }
+    }
+
     /// The grace period of [`Runtime::shutdown`]: the time from the request until the end of the
     /// wait for the operations to end by themselves.
     #[must_use]
@@ -340,6 +387,7 @@ impl Builder {
                 timers: self.timers,
                 generator: generator.child(b"worker\0\0", u64::from(index)),
                 blocking: submitter.clone(),
+                receive_buffers: self.receive_buffers,
             };
             if let Err((cause, failed)) = started.start(start, self.handles) {
                 let mut cleanup = started.stop(pool.as_deref());
@@ -373,6 +421,7 @@ impl Builder {
             budget,
             slots: self.task_slots,
             driver: self.driver,
+            receive_buffers: self.receive_buffers,
             timers: self.timers,
             generator,
             calls: Cell::new(0),
@@ -536,6 +585,8 @@ pub struct Runtime {
     budget: Budget,
     slots: u32,
     driver: Config,
+    /// The provided buffers of the driver of each call of `block_on`.
+    receive_buffers: Option<ReceiveBuffers>,
     timers: (NonZeroU32, Duration),
     generator: ChaCha20Rng,
     /// The calls of `block_on` so far: the index of the generator of the next call.
@@ -595,7 +646,7 @@ impl Runtime {
         let call = self.calls.get();
         self.calls.set(call.wrapping_add(1));
         let blocking = self.blocking.as_ref().map(Service::submitter);
-        let mut owner = match RingOwner::lazy(&self.budget, self.slots, self.driver, blocking) {
+        let mut owner = match RingOwner::lazy(&self.budget, self.slots, self.driver, blocking, self.receive_buffers) {
             Ok(owner) => owner,
             Err(refused) => return Err(BlockOnError::Owner(refused, root)),
         };
@@ -1112,6 +1163,8 @@ pub enum WorkerError {
     Inbox(channel::Refused),
     /// Its timers did not start.
     Timers(TimersError),
+    /// The pool of its provided buffers did not fit ([`Builder::receive_buffers`]).
+    Buffers(PoolRefused),
     /// Its thread ended with no report.
     Ended,
 }
@@ -1125,6 +1178,7 @@ impl fmt::Display for WorkerError {
             Self::Owner(refused) => write!(f, "its task tables did not fit: {refused}"),
             Self::Inbox(refused) => write!(f, "its inbox did not fit: {refused}"),
             Self::Timers(error) => write!(f, "its timers did not start: {error}"),
+            Self::Buffers(refused) => write!(f, "the pool of its provided buffers did not fit: {refused}"),
             Self::Ended => f.write_str("its thread ended with no report"),
         }
     }
@@ -1138,6 +1192,7 @@ impl core::error::Error for WorkerError {
             Self::Owner(refused) => Some(refused),
             Self::Inbox(refused) => Some(refused),
             Self::Timers(error) => Some(error),
+            Self::Buffers(refused) => Some(refused),
             Self::Ended => None,
         }
     }

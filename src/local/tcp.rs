@@ -162,6 +162,20 @@ impl TcpStream {
         submit(buffer, |driver, buffer| driver.recv(stream, buffer)).map(Operation::home)
     }
 
+    /// Receives into a buffer that the kernel selects from the provided buffers of the worker when
+    /// the bytes come, as [`Driver::recv_selected`](crate::driver::Driver::recv_selected) does: a
+    /// receive that waits holds no buffer. The future gives the buffer with the received bytes,
+    /// and an empty buffer at the end of the stream. A worker has these buffers by
+    /// [`Builder::receive_buffers`](crate::runtime::Builder::receive_buffers).
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`], and `Reason::Buffers` when the worker has no provided buffers.
+    pub fn recv_selected(&mut self) -> Result<Operation<'_, io::Result<Backing>>, Refused<()>> {
+        let stream = &mut self.inner.resource;
+        submit((), |driver, ()| driver.recv_selected(stream)).map(Operation::home)
+    }
+
     /// Sends the bytes of `lease`, as [`Driver::send`](crate::driver::Driver::send) does.
     ///
     /// # Errors

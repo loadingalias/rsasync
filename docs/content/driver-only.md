@@ -366,6 +366,34 @@ If no slot is free when the kernel tries the receive, the receive ends with the 
 (`io::Error::raw_os_error`). The data stays in the socket, so receive again after a slot comes
 back.
 
+### One multishot receive for each stream
+
+With `Config::receives(Shot::Multi)`, an io_uring driver keeps one multishot receive in the read
+direction of each TCP stream. The first `recv_selected` arms it with one submission. Then the
+kernel fills a slot each time that bytes come, and the receive stays armed. The driver gives each
+filled slot to the receive that waits, or keeps it for the next receive, in order. So a receive in
+steady state submits nothing. `Report::receives()` gives the form in use. It is `Shot::Single` on
+epoll, kqueue, and IOCP, which submit one receive for each call.
+
+- A receive that drops loses no byte: the next receive gets the slots that the multishot receive
+  filled after the drop, with no submission.
+- A direction keeps at most `KEPT_BUFFERS` (4) filled slots while no receive waits. Then it ends
+  its multishot receive, and the kernel keeps the later bytes in the socket. The slots that the
+  kernel filled before the end still come. The next receive that finds no kept slot arms it
+  again. So one slow stream holds only a few slots of the pool.
+- When the pool has no free slot, the multishot receive ends. A receive that waits arms it again.
+  It gets `ENOBUFS` only when that new receive fills no slot, as with one submission for each
+  receive.
+- `Driver::recv` into your buffer ends the multishot receive of its stream. It copies the kept
+  slots first, counted in `Driver::copied()`, and then it receives into your buffer with no copy.
+  The next `recv_selected` arms the multishot receive again.
+- A close and a teardown cancel the multishot receive, and they end after its last completion.
+  The slots that the stream keeps go back to the pool at the close.
+- A pipe and a datagram socket use one submission for each receive.
+
+The default is `Shot::Single` until a measurement on the thread-per-core TCP cell selects the
+default.
+
 `Driver::close` closes a stream, and `Driver::close_listener` closes a listener. Each one cancels the
 operations that run on the socket, and its future is ready after the kernel ends each one: see
 [Close](tcp.md#close).
@@ -383,6 +411,7 @@ operations that run on the socket, and its future is ready after the kernel ends
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
 | `delivery` | `Delivery::Native` | How the driver gives each completion to its operation. Under `Delivery::Controlled`, `Driver::control()` lets a test hold, fail, or repeat a completion: see [Test your code under controlled completions](controlled-delivery.md) |
 | `files` | `Files::Plain` | The descriptor that each operation of a resource names. See [Registered files](#registered-files) |
+| `receives` | `Shot::Single` | How a receive of a stream into a selected slot runs. See [One multishot receive for each stream](#one-multishot-receive-for-each-stream) |
 
 A limit of 0, other than `children`, gives `Error::Config`.
 

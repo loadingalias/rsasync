@@ -658,6 +658,10 @@ fn a_factory_spawn_that_the_allocator_refuses_gives_its_factory_back() {
         .build()
         .unwrap();
     let mut handle = runtime.handle().unwrap();
+    // The worker releases the charge of its ready report after `build` returns, so the read of the
+    // budget waits for the first poll of a task.
+    let first = handle.spawn_on(WorkerId::new(0), || async {}).unwrap();
+    assert_matches!(first.join_blocking(), TaskOutcome::Completed(()));
     let before = budget.available();
     let refusals = each_refusal(|| {
         handle
