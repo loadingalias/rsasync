@@ -115,7 +115,7 @@ A failed call changes nothing and gives a `ControlError`:
 | `ControlError::NoCompletion` | `repeat` found no completion of the operation: none reached its future yet, or a later operation of its slot got a completion since | Repeat after the completion, and before the next operation of the slot ends |
 | `ControlError::Full` | `repeat` found the control at its completion room | Turn the driver, or deliver a held operation, then repeat |
 | `ControlError::NoCode` | `fail` got an error with no code of the system | Make the error with `io::Error::from_raw_os_error` |
-| `ControlError::NoRegistration` | `fail_next_registration` on io_uring with plain descriptors, which registers no resource | Run the test on epoll (`Config::backend(Backend::Epoll)`), kqueue, IOCP, or io_uring with `Config::files(Files::Registered)` |
+| `ControlError::NoRegistration` | `fail_next_registration` on io_uring with plain descriptors, which registers no resource. `Report::files()` gives `Files::Plain` then, also with `Config::files(Files::Registered)` on a kernel that keeps the file of an emptied place open, such as Linux 6.1 | Run the test on epoll (`Config::backend(Backend::Epoll)`), kqueue, IOCP, or io_uring where `Report::files()` gives `Files::Registered` |
 
 ## Limits
 

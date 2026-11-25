@@ -65,16 +65,26 @@ pub(in crate::driver) fn a_numbered_stream_crosses_a_pipe_with_no_gap_and_ends_a
     assert_eq!(driver.copied(), u64::try_from(kept).unwrap());
 }
 
-/// A send after the read end closed gives `EPIPE`, and the process lives: a Rust program
-/// ignores `SIGPIPE`.
+/// A send after the read end closed gives `EPIPE`, also while a receive of another pipe waits, and
+/// the process lives: a Rust program ignores `SIGPIPE`. A file table that frees the file of a
+/// removed place only after the earlier operations end keeps the read end open.
 pub(in crate::driver) fn a_send_after_the_reader_closed_gives_broken_pipe(backend: Backend) {
     let mut driver = suite::driver(Config::new(), backend);
     let (reader, mut writer) = adopted(&mut driver);
+    let (mut waiting, mut other) = adopted(&mut driver);
+    let receive = driver.recv(&mut waiting, Backing::from(Vec::with_capacity(4))).unwrap();
+    // The turn submits the receive, which finds no byte and waits.
+    driver.turn().unwrap();
     let close = driver.close_reader(reader).unwrap();
     drive(&mut driver, close).unwrap();
     let send = driver.send(&mut writer, Lease::from(b"lost".to_vec())).unwrap();
     let error = drive(&mut driver, send).unwrap().0.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+    let send = driver.send(&mut other, Lease::from(b"kept".to_vec())).unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), 4);
+    let (count, buffer) = drive(&mut driver, receive).unwrap();
+    assert_eq!((count.unwrap(), buffer.bytes()), (4, &b"kept"[..]));
 }
 
 /// The bytes in the pipe of the read end `fd`.

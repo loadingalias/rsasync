@@ -388,14 +388,21 @@ A limit of 0, other than `children`, gives `Error::Config`.
 
 ## Registered files
 
-With `Config::files(Files::Registered)`, an io_uring driver registers a file table at its start
-(Linux 5.19), with one place for each resource slot. Each socket and pipe that the driver adopts
-gets the place of its slot, and each receive, send, accept, and half-close names that place, so the
-kernel takes no reference of the file for the operation. The close empties the place before it
-closes the descriptor, so the socket closes as with a plain descriptor.
+With `Config::files(Files::Registered)`, an io_uring driver registers a file table at its start,
+with one place for each resource slot. Each socket and pipe that the driver adopts gets the place
+of its slot, and each receive, send, accept, and half-close names that place, so the kernel takes
+no reference of the file for the operation. The close empties the place before it closes the
+descriptor, so the socket closes as with a plain descriptor.
 
-- `Report::files()` gives the table in use. It is `Files::Plain` on epoll, and when the kernel
-  refuses the table.
+A close closes its file at once only when the kernel frees the file of an emptied place at once.
+Linux 6.1 frees it up to one second later. A kernel that frees the files of emptied places in
+their order frees each one only after each earlier operation of the table ends, so one idle
+receive keeps each closed socket open. At its start, the driver probes the release itself: it
+empties one place while an operation runs on another place. Where the probe fails, the driver
+names the plain descriptors. The probe passed on Linux 7.0 and failed on Linux 6.1.
+
+- `Report::files()` gives the table in use. It is `Files::Plain` on epoll, when the kernel refuses
+  the table, and when the probe fails.
 - A resource whose registration fails keeps its plain descriptor, and its operations run on it, with
   no refusal. Under controlled delivery, `Control::fail_next_registration()` makes that failure.
 - The operations of a file, and the operations of a movable resource, name the plain descriptor.

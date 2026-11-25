@@ -198,7 +198,8 @@ pub(super) enum Backend {
     #[cfg(target_os = "linux")]
     Epoll,
     /// The io_uring ring with its file table (`Files::Registered`): each operation of a socket or a
-    /// pipe names its place in the table.
+    /// pipe names its place in the table. A kernel that keeps the file of an emptied place open
+    /// gives the ring no table, so the cases there check that the setting keeps each contract.
     #[cfg(target_os = "linux")]
     Registered,
     /// The completion port, where each socket that passes the installed-provider check skips the
@@ -252,11 +253,7 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
     };
     let mut driver = super::tests::driver(config.backend(selected));
     if backend == Backend::Registered {
-        assert_eq!(
-            driver.report().files(),
-            super::Files::Registered,
-            "the ring registers its table"
-        );
+        assert_eq!(driver.report().files(), super::tests::registered_files());
     }
     if backend == Backend::Epoll {
         driver.use_blocking(service().submitter());

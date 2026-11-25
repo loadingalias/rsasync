@@ -1758,7 +1758,7 @@ impl Driver {
                 Err(SetupError::Failed(error)) => return Err(Error::System(error)),
             },
         };
-        let (queue, probed) = match ring {
+        let (mut queue, probed) = match ring {
             Some(mut ring) => {
                 // The probe needs a new ring, with no entry, completion, or buffer group.
                 let probed = Features::probed(ring.probe().map_err(Error::System)?);
@@ -1800,10 +1800,11 @@ impl Driver {
         let table = Table::new(config.operations).map_err(refused)?;
         let driver = DriverId::next()?;
         let mut resources = Resources::new(driver, config.resources, registrar).map_err(refused)?;
-        // A ring that cannot register its table names the plain descriptors.
+        // A ring that cannot register its table, or whose kernel keeps the file of an emptied place
+        // open, names the plain descriptors.
         let mut files = Files::Plain;
         if config.files == Files::Registered
-            && let Queue::Ring(ring) = &queue
+            && let Queue::Ring(ring) = &mut queue
             && ring.register_files(config.resources).is_ok()
         {
             resources.files = Some(ring.fd());

@@ -67,6 +67,10 @@ const PROBE_GROUP: u16 = u16::MAX;
 #[cfg(target_os = "linux")]
 const PROBE_MESSAGE: u64 = u64::MAX;
 
+/// The user data of the poll that the probe of the file table runs on a place of the table.
+#[cfg(target_os = "linux")]
+const PROBE_FILES: u64 = u64::MAX - 1;
+
 /// Why a ring was not created.
 #[derive(Debug)]
 #[cfg(target_os = "linux")]
@@ -791,10 +795,61 @@ impl Ring {
         unsafe { register(self.fd(), sys::IORING_REGISTER_EVENTFD, (&raw mut fd).cast(), 1) }.map(drop)
     }
 
+    /// Registers a file table of `places` empty places, and at least 2, when the kernel frees the
+    /// file of a place at its removal ([`frees_at_removal`](Self::frees_at_removal)). Else the ring
+    /// keeps no table, and the error is `Unsupported`. [`update_file`] fills a place. Call it on a
+    /// ring with no entry or completion.
+    pub(crate) fn register_files(&mut self, places: u32) -> io::Result<()> {
+        self.register_file_table(places.max(2))?;
+        let probed = self.frees_at_removal();
+        if !matches!(probed, Ok(true)) {
+            // No operation runs on the table, so its end waits for none.
+            drop(self.unregister_files());
+        }
+        probed?.then_some(()).ok_or_else(|| io::ErrorKind::Unsupported.into())
+    }
+
+    /// Whether the kernel frees the file of a place when the place empties, also while an operation
+    /// on another place runs. Linux 6.1 frees it up to a second later. A kernel that frees the
+    /// files of removed places in their order frees it only after each operation that started
+    /// before the removal ends, so one idle receive keeps each closed socket open.
+    ///
+    /// A socket of a pair takes place 1, and a poll of its peer runs on place 0. Place 1 empties,
+    /// and the descriptor of the socket closes: the peer then reads the end of the stream at once
+    /// only when the kernel freed the file. The shutdown of the peer then ends the poll on each
+    /// kernel, also when the probe fails after the poll starts, and both places end empty.
+    #[expect(unsafe_code, reason = "the kernel runs the poll on a place of the table")]
+    fn frees_at_removal(&mut self) -> io::Result<bool> {
+        use std::io::Read as _;
+        use std::os::unix::net::UnixStream;
+
+        let (removed, peer) = UnixStream::pair()?;
+        peer.set_nonblocking(true)?;
+        update_file(self.fd(), 0, peer.as_raw_fd())?;
+        update_file(self.fd(), 1, removed.as_raw_fd())?;
+        let poll = Sqe::poll_readable(peer.as_raw_fd())
+            .fixed_file(peer.as_raw_fd(), 0)
+            .with_user_data(PROBE_FILES);
+        // SAFETY: the poll names no memory, and place 0 holds the file of `peer` until the poll
+        // ends below.
+        unsafe { self.push(&poll) }.map_err(|Full| io::Error::from(io::ErrorKind::Other))?;
+        self.submit_all(0)?;
+        let emptied = update_file(self.fd(), 1, -1);
+        drop(removed);
+        let freed = emptied.is_ok() && matches!((&peer).read(&mut [0]), Ok(0));
+        peer.shutdown(std::net::Shutdown::Both)?;
+        self.submit_all(1)?;
+        if self.completions().filter(|cqe| cqe.user_data == PROBE_FILES).count() != 1 {
+            return Err(io::ErrorKind::Other.into());
+        }
+        update_file(self.fd(), 0, -1)?;
+        Ok(freed)
+    }
+
     /// Registers a file table of `places` empty places (`IORING_REGISTER_FILES2` with
-    /// `IORING_RSRC_REGISTER_SPARSE`, Linux 5.19). [`update_file`] fills a place.
+    /// `IORING_RSRC_REGISTER_SPARSE`, Linux 5.19).
     #[expect(unsafe_code, reason = "the kernel reads the structure of the registration")]
-    pub(crate) fn register_files(&self, places: u32) -> io::Result<()> {
+    fn register_file_table(&self, places: u32) -> io::Result<()> {
         let mut table = sys::RsrcRegister {
             nr: places,
             flags: sys::IORING_RSRC_REGISTER_SPARSE,
@@ -900,16 +955,18 @@ impl Ring {
             return Ok(false);
         }
         // The kernel owes this ring one completion. Take it, so that the probe leaves no entry.
+        self.submit_all(1)?;
+        Ok(self.completions().filter(|cqe| cqe.user_data == PROBE_MESSAGE).count() == 1)
+    }
+
+    /// [`submit`](Self::submit), again after each interrupt of the wait by a signal.
+    fn submit_all(&mut self, wait: u32) -> io::Result<u32> {
         loop {
-            match self.submit(1) {
+            match self.submit(wait) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => {
-                    result?;
-                    break;
-                }
+                result => return result,
             }
         }
-        Ok(self.completions().filter(|cqe| cqe.user_data == PROBE_MESSAGE).count() == 1)
     }
 
     /// The shared word at byte `offset` of the ring mapping.

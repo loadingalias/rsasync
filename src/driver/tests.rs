@@ -928,16 +928,41 @@ fn connected(driver: &mut Driver, address: &str) -> (TcpStream, std::net::TcpStr
     (stream, peer)
 }
 
+/// Whether the kernel of the host frees the file of an emptied place of a file table at once, also
+/// while other operations of the table run: Linux 6.13 and later, where each file of the table has
+/// its own count of references. The version is the expectation of the probe of the ring, which
+/// tests the release itself.
+#[cfg(target_os = "linux")]
+pub(in crate::driver) fn kernel_frees_a_removed_file_at_once() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").expect("Linux gives its release");
+    let mut numbers = release.split(['.', '-']).map(|number| number.trim().parse::<u32>());
+    let version = (numbers.next(), numbers.next());
+    let (Some(Ok(major)), Some(Ok(minor))) = version else {
+        panic!("the release {release:?} starts with its version")
+    };
+    (major, minor) >= (6, 13)
+}
+
+/// The files that a ring with `Files::Registered` names on the kernel of the host.
+#[cfg(target_os = "linux")]
+pub(in crate::driver) fn registered_files() -> Files {
+    if kernel_frees_a_removed_file_at_once() {
+        Files::Registered
+    } else {
+        Files::Plain
+    }
+}
+
 /// A stream that gets no place in the file table of the ring, as at a refusal of the kernel,
-/// keeps its plain descriptor: its send and its receive run on it, and its close closes it.
+/// keeps its plain descriptor: its send and its receive run on it, and its close closes it. A
+/// kernel that keeps the file of an emptied place open gives the ring no table.
 #[cfg(target_os = "linux")]
 pub(in crate::driver) fn a_stream_with_no_place_in_the_file_table_runs_on_its_plain_descriptor() {
     let mut driver = driver(Config::new().files(Files::Registered).delivery(Delivery::Controlled));
-    assert_eq!(
-        driver.report().files(),
-        Files::Registered,
-        "the ring registers its table"
-    );
+    assert_eq!(driver.report().files(), registered_files());
+    if driver.report().files() == Files::Plain {
+        return;
+    }
     let mut listener = listen(&mut driver, "127.0.0.1:0");
     let mut peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
     driver.control().unwrap().fail_next_registration().unwrap();

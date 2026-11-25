@@ -215,9 +215,12 @@ pub enum Files {
     /// operation.
     #[default]
     Plain,
-    /// A place of a file table that the ring registers at its start (Linux 5.19), one for each
-    /// resource slot: the kernel takes no reference of the file for an operation. Only io_uring
-    /// has the table. A resource whose registration fails keeps its plain descriptor, and the
+    /// A place of a file table that the ring registers at its start, one for each resource slot:
+    /// the kernel takes no reference of the file for an operation. Only io_uring has the table.
+    /// The ring uses it only where a probe at its start finds that the kernel frees the file of a
+    /// place when the place empties, also while other operations of the table run, so that a
+    /// close closes its file at once. Linux 6.1 does not, and the driver then names the plain
+    /// descriptors. A resource whose registration fails keeps its plain descriptor, and the
     /// operations of a file and of a movable resource use the plain descriptor.
     Registered,
 }
