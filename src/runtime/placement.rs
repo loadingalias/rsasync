@@ -11,7 +11,7 @@ use core::alloc::AllocError;
 use core::fmt;
 
 use super::Cause;
-use super::topology::Host;
+use super::topology::{Host, Quota};
 use crate::driver::filled;
 use crate::memory::{push, room};
 
@@ -223,6 +223,18 @@ impl Placed {
     }
 }
 
+/// Whether the workers of a plan can outnumber the CPUs of the process
+/// ([`Builder::oversubscription`](super::Builder::oversubscription)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Oversubscription {
+    /// A plan with more workers than CPUs refuses with [`PlanError::Oversubscribed`].
+    #[default]
+    Refuse,
+    /// The workers share the CPUs, and the kernel divides their time. A worker then waits for
+    /// its CPU, which adds to the latency of each of its tasks.
+    Allow,
+}
+
 /// Why a plan is invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -240,6 +252,15 @@ pub enum PlanError {
     },
     /// `Exact` names this CPU two times.
     DuplicateCpu(u32),
+    /// The local and the movable workers outnumber the CPUs that the process can use: the CPUs of
+    /// its CPU set, and at most the CPU quota of its cgroup, rounded up. Give fewer workers, or
+    /// [`Oversubscription::Allow`].
+    Oversubscribed {
+        /// The workers.
+        workers: u32,
+        /// The CPUs.
+        cpus: u32,
+    },
     /// `Exact` names a CPU that is not below [`MAX_CPUS`].
     NoSuchCpu(u32),
     /// The selection is strict, and the plan of this worker falls back.
@@ -258,6 +279,9 @@ impl fmt::Display for PlanError {
             Self::TooManyWorkers => write!(f, "a runtime has at most {} workers", super::MAX_WORKERS),
             Self::TooFewCpus { workers, cpus } => write!(f, "{workers} workers need more than {cpus} CPUs"),
             Self::DuplicateCpu(cpu) => write!(f, "the CPU list names CPU {cpu} two times"),
+            Self::Oversubscribed { workers, cpus } => {
+                write!(f, "{workers} workers outnumber the {cpus} CPUs of the process")
+            }
             Self::NoSuchCpu(cpu) => write!(f, "CPU {cpu} is not below {MAX_CPUS}"),
             Self::Refused { worker, fallback } => {
                 write!(f, "the strict placement of worker {worker} falls back: {fallback:?}")
@@ -332,6 +356,53 @@ pub(super) fn resolve(
         return Err(Cause::Plan(PlanError::Refused { worker, fallback }));
     }
     Ok(plans)
+}
+
+/// The CPUs that the process can use for its time: the CPUs of its CPU set, and at most its CPU
+/// quota, rounded up. `None` when the host gave no CPU set.
+fn usable(host: &Host) -> Option<u32> {
+    let cpus = host.allowed.as_ref()?.len();
+    Some(match host.quota {
+        Quota::Millis(millis) => cpus.min(u32::try_from(millis.div_ceil(1000)).unwrap_or(u32::MAX).max(1)),
+        Quota::None | Quota::Unknown => cpus,
+    })
+}
+
+/// Refuses `workers` workers that outnumber the CPUs that the process can use, unless
+/// `oversubscription` allows it. A host with no CPU set gives no count, so nothing refuses.
+pub(super) fn check(workers: u32, host: &Host, oversubscription: Oversubscription) -> Result<(), PlanError> {
+    match usable(host) {
+        Some(cpus) if workers > cpus && oversubscription == Oversubscription::Refuse => {
+            Err(PlanError::Oversubscribed { workers, cpus })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// For each plan, the CPUs of its worker that another worker of the plans can also run on. An
+/// unpinned worker can run on each CPU of the process. Empty when the host gave no CPU set.
+pub(super) fn shared(plans: &[Placed], host: &Host) -> Result<Vec<CpuSet>, AllocError> {
+    let all = host.allowed.clone().unwrap_or_default();
+    let runs_on = |plan: &Placed| plan.target.as_ref().unwrap_or(&all).clone();
+    let mut workers = filled(MAX_CPUS as usize, || 0_u32)?;
+    for plan in plans {
+        for cpu in runs_on(plan).iter() {
+            if let Some(count) = workers.get_mut(cpu as usize) {
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    let mut shared = room(plans.len())?;
+    shared.extend(plans.iter().map(|plan| {
+        let mut cpus = CpuSet::new();
+        for cpu in runs_on(plan).iter() {
+            if workers.get(cpu as usize).is_some_and(|count| *count > 1) {
+                cpus.insert(cpu);
+            }
+        }
+        cpus
+    }));
+    Ok(shared)
 }
 
 fn unpinned(request: Request, fallback: Option<Fallback>) -> Placed {

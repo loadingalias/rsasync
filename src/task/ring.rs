@@ -37,6 +37,7 @@ pub(crate) struct RingOwner {
     local: Rc<Local>,
     /// The pool and the lane of a movable worker ([`RingOwner::attach`]): its home counts the
     /// worker parked at each park.
+    #[cfg(feature = "movable")]
     pool: Option<(Arc<super::Pool>, u32)>,
 }
 
@@ -53,6 +54,7 @@ impl RingOwner {
         local.sends.set(true);
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
+            #[cfg(feature = "movable")]
             pool: None,
         })
     }
@@ -75,6 +77,7 @@ impl RingOwner {
         }));
         Ok(Self {
             local: Rc::try_new(local).map_err(|_| Refused::Allocation)?,
+            #[cfg(feature = "movable")]
             pool: None,
         })
     }
@@ -92,6 +95,7 @@ impl RingOwner {
 
     /// Makes this owner worker `lane` of `pool`: a push to the list of the worker wakes the root
     /// future of this owner, and each park of this owner counts the worker parked.
+    #[cfg(feature = "movable")]
     pub(crate) fn attach(&mut self, pool: &Arc<super::Pool>, lane: u32) {
         pool.attach(lane, Arc::clone(self.local.shared()));
         self.pool = Some((Arc::clone(pool), lane));
@@ -112,8 +116,12 @@ impl RingOwner {
     /// As for [`RingOwner::block_on`].
     pub(crate) fn serve<F: Future<Output = (Drain, u64)>>(self, root: F) -> Result<Ended, Failure> {
         let mut enter = Enter::new(&self.local);
-        let worker = self.pool.as_ref().map(|(pool, lane)| (&**pool, *lane));
-        let output = self.local.block_on(root, &mut Drive(worker));
+        let mut drive = Drive {
+            #[cfg(feature = "movable")]
+            worker: self.pool.as_ref().map(|(pool, lane)| (&**pool, *lane)),
+            _pool: core::marker::PhantomData,
+        };
+        let output = self.local.block_on(root, &mut drive);
         enter.ended = output.is_ok();
         let (drain, sent) = output?;
         let cancelled = self.local.cancelled.get();
@@ -165,7 +173,14 @@ impl RingOwner {
     /// `OwnerFailed`. If the teardown fails, the output of `root` drops.
     pub(crate) fn block_on<F: Future>(self, root: F) -> Result<F::Output, Failure> {
         let mut enter = Enter::new(&self.local);
-        let output = self.local.block_on(root, &mut Drive(None));
+        let output = self.local.block_on(
+            root,
+            &mut Drive {
+                #[cfg(feature = "movable")]
+                worker: None,
+                _pool: core::marker::PhantomData,
+            },
+        );
         enter.ended = output.is_ok();
         let output = output?;
         // The slot stays borrowed through the teardown, and the owner makes no other driver: a
@@ -224,8 +239,14 @@ impl Drop for RingOwner {
 }
 
 /// The work and the wait of a home that can have a ring: the driver of the owner, while it has
-/// one, and else its thread. A worker of a pool has its pool and its lane.
-struct Drive<'a>(Option<(&'a super::Pool, u32)>);
+/// one, and else its thread.
+struct Drive<'a> {
+    /// The pool and the lane of a movable worker.
+    #[cfg(feature = "movable")]
+    worker: Option<(&'a super::Pool, u32)>,
+    /// The lifetime of the pool, which a build with no pool has too.
+    _pool: core::marker::PhantomData<&'a ()>,
+}
 
 impl Drive<'_> {
     /// Waits in the driver of the owner, or parks its thread.
@@ -271,19 +292,20 @@ impl Park for Drive<'_> {
     }
 
     fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Failure> {
-        let Some((pool, lane)) = self.0 else {
-            return Self::wait(local, until);
-        };
         // A worker of a pool counts itself parked only for this wait, so a balance wake of the
         // pool goes to a worker that waits, not to one that runs a local task. A queue of the
         // pool that holds a task ends the park before the wait, and the root future turns again.
-        if !pool.park(lane) {
-            local.shared().wake_root();
-            return Ok(());
+        #[cfg(feature = "movable")]
+        if let Some((pool, lane)) = self.worker {
+            if !pool.park(lane) {
+                local.shared().wake_root();
+                return Ok(());
+            }
+            let waited = Self::wait(local, until);
+            pool.unpark(lane);
+            return waited;
         }
-        let waited = Self::wait(local, until);
-        pool.unpark(lane);
-        waited
+        Self::wait(local, until)
     }
 }
 

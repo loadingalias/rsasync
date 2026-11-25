@@ -7,15 +7,18 @@ use std::io;
 
 use rscrypto::ChaCha20Rng;
 
-use super::placement::{Fallback, Placed, Selection};
-use super::{ReceiveBuffers, TimersError, WorkerError, WorkerReport, sys};
+use super::placement::{CpuSet, Fallback, Placed, Selection};
+use super::{Mode, ReceiveBuffers, TimersError, WorkerError, WorkerReport, sys};
 use crate::blocking::Submitter;
 use crate::capacity::Budget;
 use crate::channel::{mpsc, oneshot};
 use crate::clock::NativeClock;
 use crate::driver::{self, Config, Driver};
+#[cfg(feature = "movable")]
 use crate::sync::Arc;
-use crate::task::{self, Drain, Ended, Failure, Job, Placer, Pool, RingOwner, with_driver};
+#[cfg(feature = "movable")]
+use crate::task::{self, Pool};
+use crate::task::{Drain, Ended, Failure, Job, Placer, RingOwner, with_driver};
 use crate::time::Suspend;
 use crate::timer::Timers;
 
@@ -44,6 +47,7 @@ pub(super) enum Role {
     /// Its own tasks, and the factory spawns of its inbox.
     Local,
     /// The turns of `lane` of the movable pool.
+    #[cfg(feature = "movable")]
     Movable(u32),
 }
 
@@ -52,6 +56,7 @@ pub(super) struct Start {
     pub(super) role: Role,
     /// The movable pool of the runtime, if it has one: the pool of `task::spawn_movable` on this
     /// thread.
+    #[cfg(feature = "movable")]
     pub(super) pool: Option<Arc<Pool>>,
     pub(super) index: u32,
     pub(super) plan: Placed,
@@ -65,6 +70,8 @@ pub(super) struct Start {
     pub(super) blocking: Option<Submitter>,
     /// The provided buffers of the driver.
     pub(super) receive_buffers: Option<ReceiveBuffers>,
+    /// The CPUs of the worker that another worker can also run on.
+    pub(super) shared: CpuSet,
 }
 
 /// The ready report of a worker, or why it did not start.
@@ -85,23 +92,31 @@ pub(super) fn timers(
 /// failure of the teardown of its driver, or `Ok` with nothing if it did not start.
 pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::Sender<Ready>) -> io::Result<Ended> {
     let budget = start.budget.clone();
-    let role = match start.role {
-        Role::Local => None,
-        Role::Movable(lane) => Some(lane),
+    #[cfg(feature = "movable")]
+    let (lane, pool) = match start.role {
+        Role::Local => (None, start.pool.clone()),
+        Role::Movable(lane) => (Some(lane), start.pool.clone()),
     };
-    let pool = start.pool.clone();
     match prepare(start) {
-        Ok((mut owner, report, steal)) => {
-            if let (Some(lane), Some(pool)) = (role, &pool) {
-                owner.attach(pool, lane);
+        Ok((owner, report, steal)) => {
+            #[cfg(feature = "movable")]
+            let mut owner = owner;
+            #[cfg(feature = "movable")]
+            {
+                if let (Some(lane), Some(pool)) = (lane, &pool) {
+                    owner.attach(pool, lane);
+                }
+                let _none = task::use_pool(pool.clone());
             }
-            let _none = task::use_pool(pool.clone());
             let placer = owner.placer(&budget);
             // The start waits for the report, so only a start that ended can refuse it.
             if ready.send(Ok((report, placer))).is_err() {
                 return Ok(Ended::default());
             }
-            let served = match (role, pool) {
+            #[cfg(not(feature = "movable"))]
+            let (_steal, served) = (steal, owner.serve(serve(inbox)));
+            #[cfg(feature = "movable")]
+            let served = match (lane, pool) {
                 (Some(lane), Some(pool)) => {
                     let served = owner.serve(serve_movable(Arc::clone(&pool), lane, inbox, steal));
                     // The tasks of this worker wait in its queue and its list for a thief.
@@ -130,8 +145,9 @@ pub(super) fn run(start: Start, inbox: mpsc::Receiver<Message>, ready: oneshot::
 /// generator of the steals of a movable worker.
 fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), WorkerError> {
     let Start {
-        role: _,
-        pool: _,
+        role,
+        #[cfg(feature = "movable")]
+            pool: _,
         index: _,
         mut plan,
         selection,
@@ -142,6 +158,7 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), Worke
         generator,
         blocking,
         receive_buffers,
+        shared,
     } = start;
     if let Some(target) = &plan.target {
         match sys::bind(target) {
@@ -170,7 +187,13 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), Worke
     let steal = generator.child(b"steal\0\0\0", 0);
     owner.use_generator(generator);
     let report = WorkerReport {
+        mode: match role {
+            Role::Local => Mode::Local,
+            #[cfg(feature = "movable")]
+            Role::Movable(_) => Mode::Movable,
+        },
         placement: plan,
+        shared,
         driver: report,
     };
     Ok((owner, report, steal))
@@ -179,6 +202,7 @@ fn prepare(start: Start) -> Result<(RingOwner, WorkerReport, ChaCha20Rng), Worke
 /// The root of a movable worker: it runs the turns of `lane` of `pool` until the pool closed and
 /// its last task ended. Each steal starts at a value of `steal`. Then it takes the stop, which the
 /// close sends, and gives its drain, and the count of `Driver::dropped_sent` at that time.
+#[cfg(feature = "movable")]
 async fn serve_movable(
     pool: Arc<Pool>,
     lane: u32,

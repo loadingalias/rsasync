@@ -82,7 +82,7 @@ use std::io;
 use std::thread::JoinHandle as Thread;
 
 pub use group::{Group, GroupError};
-pub use placement::{CpuSet, Fallback, MAX_CPUS, Placed, Placement, PlanError, Request, Selection};
+pub use placement::{CpuSet, Fallback, MAX_CPUS, Oversubscription, Placed, Placement, PlanError, Request, Selection};
 pub use rscrypto::ChaCha20Rng;
 pub use topology::{Host, Quota};
 
@@ -94,7 +94,9 @@ use crate::clock::{self, NativeClock, Until};
 use crate::driver::{self, Config};
 use crate::memory::room;
 use crate::sync::{Arc, try_arc};
-use crate::task::{self, Drain, Ended, JoinHandle, Placer, Pool, RingOwner, SpawnRefused};
+#[cfg(feature = "movable")]
+use crate::task::Pool;
+use crate::task::{self, Drain, Ended, JoinHandle, Placer, RingOwner, SpawnRefused};
 use crate::time::Suspend;
 use crate::timer;
 use worker::Message;
@@ -139,6 +141,7 @@ pub struct Builder {
     blocking: Option<blocking::Config>,
     grace: Duration,
     receive_buffers: Option<ReceiveBuffers>,
+    oversubscription: Oversubscription,
 }
 
 /// The provided buffers of each worker ([`Builder::receive_buffers`]): a pool of `slots` buffers
@@ -187,6 +190,7 @@ impl Builder {
             blocking: Some(blocking::Config::new()),
             grace: DEFAULT_GRACE,
             receive_buffers: Some(DEFAULT_RECEIVE_BUFFERS),
+            oversubscription: Oversubscription::Refuse,
         }
     }
 
@@ -201,10 +205,12 @@ impl Builder {
     }
 
     /// The movable workers: threads that poll the tasks of one movable pool, which an idle worker
-    /// steals ([`spawn_movable`](crate::task::spawn_movable)). They start after the local workers,
+    /// steals ([`spawn_movable`](crate::task::spawn_movable)). A build with no `movable` feature
+    /// has none. They start after the local workers,
     /// so their [`WorkerId`]s follow those of the local workers. The local and the movable workers
     /// together are at most [`MAX_WORKERS`].
     #[must_use]
+    #[cfg(feature = "movable")]
     pub fn movable_workers(self, workers: u32) -> Self {
         Self {
             movable_workers: workers,
@@ -243,6 +249,17 @@ impl Builder {
     pub fn timers(self, capacity: NonZeroU32, resolution: Duration) -> Self {
         Self {
             timers: (capacity, resolution),
+            ..self
+        }
+    }
+
+    /// Whether the local and the movable workers together can outnumber the CPUs that the process
+    /// can use. [`Oversubscription::Refuse`], the default, refuses such a plan before a worker
+    /// starts with [`PlanError::Oversubscribed`], so a sharing of CPUs is always your choice.
+    #[must_use]
+    pub fn oversubscription(self, oversubscription: Oversubscription) -> Self {
+        Self {
+            oversubscription,
             ..self
         }
     }
@@ -342,7 +359,9 @@ impl Builder {
         // The clock of the grace period of the shutdown.
         let clock = NativeClock::new(Suspend::Pauses).map_err(|error| fail(Cause::Clock(error)))?;
         let host = topology::discover().map_err(|_| fail(Cause::Allocation))?;
+        placement::check(workers, &host, self.oversubscription).map_err(|error| fail(Cause::Plan(error)))?;
         let plans = placement::resolve(&self.placement, self.selection, workers, &host).map_err(fail)?;
+        let shared = placement::shared(&plans, &host).map_err(|_| fail(Cause::Allocation))?;
         let generator = match self.generator {
             Some(generator) => generator,
             None => entropy::generator().map_err(|error| fail(Cause::Seed(error)))?,
@@ -356,6 +375,7 @@ impl Builder {
         let submitter = service.as_ref().map(Service::submitter);
         let closed = try_arc(AtomicBool::new(false)).map_err(|_| fail(Cause::Allocation))?;
         // The pool, with the cache domain of each movable worker for the order of its steals.
+        #[cfg(feature = "movable")]
         let pool = match self.movable_workers {
             0 => None,
             movable => {
@@ -370,13 +390,15 @@ impl Builder {
                 Some(try_arc(pool).map_err(|_| fail(Cause::Allocation))?)
             }
         };
-        for (index, plan) in (0_u32..).zip(plans) {
+        for ((index, plan), shared) in (0_u32..).zip(plans).zip(shared) {
             let role = match index.checked_sub(self.local_workers) {
+                #[cfg(feature = "movable")]
                 Some(lane) => worker::Role::Movable(lane),
-                None => worker::Role::Local,
+                _ => worker::Role::Local,
             };
             let start = worker::Start {
                 role,
+                #[cfg(feature = "movable")]
                 pool: pool.clone(),
                 index,
                 plan,
@@ -388,9 +410,14 @@ impl Builder {
                 generator: generator.child(b"worker\0\0", u64::from(index)),
                 blocking: submitter.clone(),
                 receive_buffers: self.receive_buffers,
+                shared,
             };
             if let Err((cause, failed)) = started.start(start, self.handles) {
-                let mut cleanup = started.stop(pool.as_deref());
+                #[cfg(feature = "movable")]
+                if let Some(pool) = &pool {
+                    pool.close();
+                }
+                let mut cleanup = started.stop();
                 cleanup.extend(failed);
                 // No thread of the start remains, also no thread of the service.
                 if let Some(service) = service {
@@ -412,6 +439,7 @@ impl Builder {
                 routes: routes.into_boxed_slice(),
                 blocking: submitter,
                 closed,
+                #[cfg(feature = "movable")]
                 pool,
             },
             stops: stops.into_boxed_slice(),
@@ -485,7 +513,7 @@ impl Started {
     /// if its thread started, its cleanup outcome.
     fn start(&mut self, start: worker::Start, handles: u32) -> Result<(), (Cause, Option<Cleanup>)> {
         let index = start.index;
-        let movable = matches!(start.role, worker::Role::Movable(_));
+        let movable = !matches!(start.role, worker::Role::Local);
         let failed = |error| (Cause::Worker { index, error }, None);
         let budget = start.budget.clone();
         // A place for each slot, and one for the stop.
@@ -496,6 +524,7 @@ impl Started {
         let thread = std::thread::Builder::new()
             .name(match start.role {
                 worker::Role::Local => alloc::format!("rsasync-local-{index}"),
+                #[cfg(feature = "movable")]
                 worker::Role::Movable(lane) => alloc::format!("rsasync-movable-{lane}"),
             })
             .spawn(move || worker::run(start, inbox, ready))
@@ -525,8 +554,8 @@ impl Started {
 
     /// Stops each worker that started, and joins it. Gives the outcome of each, with room for the
     /// outcome of the worker that failed.
-    fn stop(&mut self, pool: Option<&Pool>) -> Vec<Cleanup> {
-        stop(&mut self.routes, &mut self.stops, pool, Drain::Now);
+    fn stop(&mut self) -> Vec<Cleanup> {
+        stop(&mut self.routes, &mut self.stops, Drain::Now);
         let mut cleanup = core::mem::take(&mut self.cleanup);
         for (index, thread) in (0..).zip(self.workers.drain(..)) {
             cleanup.push(join(index, thread));
@@ -535,13 +564,10 @@ impl Started {
     }
 }
 
-/// Closes `pool`, which cancels each of its tasks, and sends the stop with `drain` to each worker:
-/// the operations of the worker can end by themselves until the end of the drain. Each inbox has a
-/// place for it.
-fn stop(routes: &mut [Route], stops: &mut [mpsc::Sender<Message>], pool: Option<&Pool>, drain: Drain) {
-    if let Some(pool) = pool {
-        pool.close();
-    }
+/// Sends the stop with `drain` to each worker: the operations of the worker can end by themselves
+/// until the end of the drain. Each inbox has a place for it. The caller closes the movable pool
+/// first, which cancels each of its tasks.
+fn stop(routes: &mut [Route], stops: &mut [mpsc::Sender<Message>], drain: Drain) {
     for sender in routes.iter_mut().map(|route| &mut route.sender).chain(stops) {
         // A worker whose driver failed ended, and its inbox is closed.
         let sent = sender.try_send(Message::Stop(drain));
@@ -659,6 +685,7 @@ impl Runtime {
         }
         owner.use_generator(self.generator.child(b"block_on", call));
         // The pool of the thread comes back also when the root panics.
+        #[cfg(feature = "movable")]
         let _restore = core::mem::DropGuard::new(task::use_pool(self.handle.pool.clone()), |before| {
             task::use_pool(before);
         });
@@ -675,12 +702,11 @@ impl Runtime {
     /// each worker stops with `drain`.
     fn close(&mut self, drain: Drain) {
         self.handle.closed.store(true, Ordering::Release);
-        stop(
-            &mut self.handle.routes,
-            &mut self.stops,
-            self.handle.pool.as_deref(),
-            drain,
-        );
+        #[cfg(feature = "movable")]
+        if let Some(pool) = &self.handle.pool {
+            pool.close();
+        }
+        stop(&mut self.handle.routes, &mut self.stops, drain);
     }
 
     /// Stops the runtime in one bounded, reported lifecycle, and gives its [`Shutdown`] report.
@@ -725,7 +751,10 @@ impl Runtime {
                 }
             })
             .collect();
+        #[cfg(feature = "movable")]
         let movable_cancelled = self.handle.pool.as_ref().map_or(0, |pool| pool.cancelled());
+        #[cfg(not(feature = "movable"))]
+        let movable_cancelled = 0;
         let blocking = self.blocking.take().map(Service::teardown);
         Shutdown {
             workers,
@@ -785,6 +814,7 @@ pub struct Handle {
     /// The runtime stops: each spawn refuses.
     closed: Arc<AtomicBool>,
     /// The movable pool, if the runtime has movable workers.
+    #[cfg(feature = "movable")]
     pool: Option<Arc<Pool>>,
 }
 
@@ -850,6 +880,7 @@ impl Handle {
     /// [`SpawnRefused`] with the future and the [`Reason`](crate::task::Reason): `NoPool` (the
     /// runtime has no movable worker), `NoSlot`, `Budget`, `Allocation`, or `Closed` (the runtime
     /// stops). A refusal keeps no charge and no reservation.
+    #[cfg(feature = "movable")]
     pub fn spawn_movable<F>(&self, future: F) -> Result<JoinHandle<F::Output>, SpawnRefused<F>>
     where
         F: Future + Send + 'static,
@@ -879,6 +910,7 @@ impl Handle {
             routes: routes.into_boxed_slice(),
             blocking: self.blocking.clone(),
             closed: Arc::clone(&self.closed),
+            #[cfg(feature = "movable")]
             pool: self.pool.clone(),
         })
     }
@@ -939,14 +971,42 @@ impl Startup {
     }
 }
 
+/// The mode of a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// A local worker: it owns its tasks and its driver ([`Builder::local_workers`]).
+    Local,
+    /// A movable worker: it polls the tasks of the movable pool, which an idle worker steals
+    /// ([`Builder::movable_workers`]).
+    Movable,
+}
+
 /// What one worker found and applied when it started.
 #[derive(Debug)]
 pub struct WorkerReport {
-    placement: Placed,
-    driver: driver::Report,
+    pub(super) mode: Mode,
+    pub(super) placement: Placed,
+    /// The CPUs of the worker that another worker of the runtime can also run on.
+    pub(super) shared: CpuSet,
+    pub(super) driver: driver::Report,
 }
 
 impl WorkerReport {
+    /// The mode of the worker.
+    #[must_use]
+    pub const fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// The CPUs that the worker can run on and that another worker of the runtime, of either
+    /// mode, can also run on: the CPUs of the host plan that the two share. Empty when no other
+    /// worker runs there, and when the host gave no CPU set. An unpinned worker can run on each
+    /// CPU of the process.
+    #[must_use]
+    pub const fn shared(&self) -> &CpuSet {
+        &self.shared
+    }
+
     /// The requested, resolved, and applied placement of the worker.
     #[must_use]
     pub const fn placement(&self) -> &Placed {

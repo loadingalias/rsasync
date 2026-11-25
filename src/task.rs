@@ -138,7 +138,11 @@ use crate::timer::{self, Timer, Timers};
 
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod deque;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -151,7 +155,11 @@ mod late;
 mod owner;
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 mod pool;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -163,7 +171,11 @@ mod waiting;
 pub(crate) use factory::{Job, Placer};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use owner::MAX_SLOTS;
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    feature = "movable",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) use pool::{Pool, serve as serve_pool};
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) use ring::{Drain, Ended, Failure, RingOwner};
@@ -203,7 +215,11 @@ std::thread_local! {
     static OWNER: Cell<*const Local> = const { Cell::new(ptr::null()) };
 }
 
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    feature = "movable",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 std::thread_local! {
     /// The movable pool of the runtime of this thread, for [`spawn_movable`]: on each worker of a
     /// runtime with movable workers, and on the caller of its `block_on` during the call.
@@ -211,7 +227,11 @@ std::thread_local! {
 }
 
 /// Makes `pool` the pool of this thread, and gives the pool before.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    feature = "movable",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub(crate) fn use_pool(pool: Option<crate::sync::Arc<pool::Pool>>) -> Option<crate::sync::Arc<pool::Pool>> {
     POOL.try_with(|current| current.replace(pool)).ok().flatten()
 }
@@ -227,7 +247,11 @@ pub(crate) fn use_pool(pool: Option<crate::sync::Arc<pool::Pool>>) -> Option<cra
 /// [`SpawnRefused`] with the future and the [`Reason`]: `NoSlot` (each slot of the pool is in
 /// use), `Budget`, `Allocation`, `Closed` (the runtime stops), or `NoPool` (this thread runs no
 /// runtime with movable workers). A refusal keeps no charge and no reservation.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    feature = "movable",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub fn spawn_movable<F>(future: F) -> Result<JoinHandle<F::Output>, SpawnRefused<F>>
 where
     F: Future + Send + 'static,
@@ -830,7 +854,11 @@ enum Target {
     /// A task of the movable pool.
     #[cfg(any(
         all(test, loom),
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+        all(
+            feature = "movable",
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     Movable(alloc::sync::Arc<pool::MovableRef>),
 }
@@ -844,7 +872,11 @@ impl CancelHandle {
             Target::Remote(remote) => remote.cancel(),
             #[cfg(any(
                 all(test, loom),
-                all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+                all(
+                    feature = "movable",
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
             ))]
             Target::Movable(task) => task.cancel(),
         }

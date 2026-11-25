@@ -5,8 +5,10 @@ its tasks, its driver, and its timers. Its tasks never move to another thread, s
 `!Send` state, such as an `Rc`. rsasync is in development, and the runtime is not in a published
 release yet.
 
-The runtime needs the `local` feature, which is on by default. It is on Linux only, on x86_64 and
-aarch64. A worker runs its driver on io_uring, or on epoll when the kernel refuses io_uring (see
+The runtime needs the `local` feature, which is on by default. The movable workers, `spawn_movable`,
+and `rsasync::movable` need the `movable` feature too, which is also on by default. A build with
+`default-features = false, features = ["local"]` has the local mode only: no movable code. It is
+on Linux only, on x86_64 and aarch64. A worker runs its driver on io_uring, or on epoll when the kernel refuses io_uring (see
 [Capability report](capability-report.md)). macOS and Windows get local workers later. Until then,
 use [`LocalOwner`](tasks.md) or [driver-only use](driver-only.md) there.
 
@@ -52,6 +54,7 @@ Each setting has a default:
 | `handles(n)` | 64 | The handles that can exist at one time |
 | `blocking(config)` | `Some(blocking::Config::new())`: 4 threads, 64 jobs, 2 MiB of stack each | The blocking service of the runtime, or `None` for no service. See [The blocking service](#the-blocking-service) |
 | `grace_period(duration)` | 5 s (`DEFAULT_GRACE`) | The grace period of `shutdown()`. See [Stop a runtime](#stop-a-runtime) |
+| `oversubscription(choice)` | `Oversubscription::Refuse` | Whether the local and the movable workers together can outnumber the CPUs of the process. See [Share CPUs](#share-cpus) |
 | `receive_buffers(buffers)` | `Some(DEFAULT_RECEIVE_BUFFERS)`: 128 slots of 4096 bytes, 512 KiB | The provided buffers of the driver of each worker and each `block_on`, which `recv_selected` takes when its bytes come. The budget charges them. `None` gives no buffers, and `recv_selected` then refuses with `Reason::Buffers`. A pool that the budget refuses fails the start with `WorkerError::Buffers` |
 
 ## How a start works
@@ -110,7 +113,7 @@ match Runtime::builder().local_workers(4).build() {
 
 | `Cause` | When | Recovery |
 | --- | --- | --- |
-| `Plan(PlanError)` | A setting is invalid, or a strict placement falls back. No worker started | Correct the setting. See [Placement](#placement) |
+| `Plan(PlanError)` | A setting is invalid, a strict placement falls back, or the workers outnumber the CPUs. No worker started | Correct the setting. See [Placement](#placement) and [Share CPUs](#share-cpus) |
 | `Seed(io::Error)` | The kernel gave no seed. No worker started | Give a seed with `seed`, or start again |
 | `Allocation` | The allocator did not give the memory of the start: the default budget, the facts of the host, the plans, or the tables of the workers. No worker started | Start fewer workers, or start again when memory is free |
 | `Pool(Refused)` | The budget (`Refused::Budget`) or the allocator (`Refused::Allocation`) refused the tables of the movable pool. No worker started | Give a larger budget, or fewer movable workers or task slots |
@@ -329,6 +332,24 @@ system refuses then fails its start with `WorkerError::Placement`.
 `Dedicated` and `Exact` refuse with `PlanError::TooFewCpus` when there are fewer CPUs than workers.
 `Exact` refuses with `DuplicateCpu` or `NoSuchCpu` for a CPU that it names two times, or that is
 not below `MAX_CPUS` (4096).
+
+### Share CPUs
+
+One plan places the local and the movable workers together. A worker that waits for its CPU adds
+that wait to the latency of each of its tasks, so a sharing of CPUs is always your choice:
+
+- A plan with more workers than the CPUs that the process can use refuses with
+  `PlanError::Oversubscribed { workers, cpus }`, before a worker starts. The CPUs are the CPUs of the
+  CPU set of the process, and at most the CPU quota of its cgroup, rounded up.
+- `oversubscription(Oversubscription::Allow)` starts such a plan. The kernel then divides the time
+  of the CPUs among the workers.
+- A host that gives no CPU set gives no count, so no plan refuses there.
+
+`runtime.report().workers()[i].mode()` gives `Mode::Local` or `Mode::Movable`, and `shared()`
+gives the CPUs of worker `i` that another worker of the runtime can also run on. It is empty when
+no other worker runs there. An unpinned worker can run on each CPU of the process, so two unpinned
+workers share each CPU. Two workers of one cache domain share the CPUs of that domain. A shared CPU
+is a fact of the plan, not of the load: the workers then compete only when both are busy.
 
 ### Read the placement report
 

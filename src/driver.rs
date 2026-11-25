@@ -69,7 +69,7 @@ mod iocp;
 mod ipc;
 #[cfg(unix)]
 mod pipe;
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(all(feature = "movable", target_os = "linux"))]
 mod plain;
 #[cfg(unix)]
 mod poller;
@@ -169,9 +169,9 @@ pub(crate) use completion::Completion;
 #[cfg(all(feature = "local", target_os = "linux"))]
 pub(crate) use home::{Cleanup, Home, MESSAGES};
 // The operations of the movable I/O types, and their outputs.
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(all(feature = "movable", target_os = "linux"))]
 pub(crate) use plain::{Direction, PlainSocket, socket as plain_socket};
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(all(feature = "movable", target_os = "linux"))]
 pub(crate) use tcp::{received, sent};
 
 /// The limits of a driver, each of which bounds memory that the driver allocates when it starts,
@@ -457,7 +457,7 @@ pub(crate) struct Held {
     /// The report of a close.
     pub(crate) closed: Option<Closed>,
     /// The descriptor and the chain of an operation of a movable resource, which no driver owns.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[cfg(all(feature = "movable", target_os = "linux"))]
     pub(crate) plain: Option<plain::Plain>,
     /// The resources of the kind of the operation. Its start sets the variant, and nothing
     /// changes the variant before the terminal event.
@@ -477,7 +477,7 @@ impl Held {
             copied: 0,
             cancelled: false,
             error: None,
-            #[cfg(all(feature = "local", target_os = "linux"))]
+            #[cfg(all(feature = "movable", target_os = "linux"))]
             plain: None,
         }
     }
@@ -1603,7 +1603,7 @@ pub struct Driver {
     /// The operations of movable resources that wait here before their submission: for an earlier
     /// operation of their direction, or for room in the queue. At most one entry for each
     /// operation.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[cfg(all(feature = "movable", target_os = "linux"))]
     following: Vec<OpId>,
     /// The consumers of the home operations: the operations of local types.
     #[cfg(all(feature = "local", target_os = "linux"))]
@@ -1922,7 +1922,7 @@ impl Driver {
             jobs: room(config.operations as usize).map_err(refused)?,
             #[cfg(all(feature = "local", target_os = "linux"))]
             wakes,
-            #[cfg(all(feature = "local", target_os = "linux"))]
+            #[cfg(all(feature = "movable", target_os = "linux"))]
             following: room(config.operations as usize).map_err(refused)?,
             #[cfg(feature = "local")]
             consumers: home::Consumers::new(config.operations).map_err(refused)?,
@@ -2080,7 +2080,7 @@ impl Driver {
         let completed = self.harvest(self.completions_per_turn);
         // Start the operations that waited for an operation that ended, and end the closes.
         self.attend();
-        #[cfg(all(feature = "local", target_os = "linux"))]
+        #[cfg(all(feature = "movable", target_os = "linux"))]
         self.follow();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.start_waiting();
@@ -2274,7 +2274,7 @@ impl Driver {
             control.deliver_all();
         }
         // An operation that waits for an earlier one of its direction never ran, so it ends now.
-        #[cfg(all(feature = "local", target_os = "linux"))]
+        #[cfg(all(feature = "movable", target_os = "linux"))]
         self.end_following();
         // A spawn cannot be cancelled, and its child starts at the end of its job, so teardown
         // applies the end of each child after each spawn ended.
@@ -2635,7 +2635,7 @@ impl Driver {
             self.complete_now(id, -ECANCELED);
             return;
         }
-        #[cfg(all(feature = "local", target_os = "linux"))]
+        #[cfg(all(feature = "movable", target_os = "linux"))]
         if self.unfollow(id) {
             self.complete_now(id, -ECANCELED);
             return;
@@ -3042,11 +3042,10 @@ impl Drop for Driver {
             drop(ring.unregister_files());
         }
         #[cfg(all(feature = "local", target_os = "linux"))]
-        {
-            self.settle_messages();
-            // The kernel uses nothing of an operation that waits for its start, so it leaks nothing.
-            self.end_following();
-        }
+        self.settle_messages();
+        // The kernel uses nothing of an operation that waits for its start, so it leaks nothing.
+        #[cfg(all(feature = "movable", target_os = "linux"))]
+        self.end_following();
         let busy = self.table.busy();
         for entry in &self.shared.entries {
             entry.close();

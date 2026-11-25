@@ -11,12 +11,16 @@ rust-version.workspace = true
 include = ["/src", "/LICENSE", "/README.md"]
 
 [features]
-default = ["std", "local"]
+default = ["std", "local", "movable"]
 # Without `std`, the crate needs only `core` and `alloc`.
 std = ["rstypes/std", "dep:rsnetwork-udp"]
 # The local tasks of `rsasync::task`: a scheduler. Without it, the driver builds with no scheduler.
 # On Linux, it also gives `rsasync::runtime`, whose workers take their generators from rscrypto.
 local = ["std", "dep:rscrypto"]
+# The movable tasks of `rsasync::task`: the work-stealing pool, its workers, and the I/O types of
+# `rsasync::movable`. A movable worker is an owner of `local`, as `block_on` is. Without it, a
+# build has no pool and no movable code.
+movable = ["local"]
 
 [dependencies]
 # The shared types. Users reach them through this crate and never name it.

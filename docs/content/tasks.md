@@ -3,7 +3,7 @@
 `rsasync::task` runs local tasks: futures that one thread polls, and drops, only on itself. A task
 can hold `!Send` state, such as an `Rc`. rsasync is in development, and the tasks on this page are
 not in a published release yet. They need the `local` feature, which is on by default and turns on
-the `std` feature.
+the `std` feature. Movable tasks also need the `movable` feature, which is on by default too.
 
 A `LocalOwner` runs tasks with no driver and no other thread. On Linux, the
 [runtime](runtime.md) gives each of its workers, and each call of its `block_on`, an owner with a

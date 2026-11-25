@@ -929,7 +929,7 @@ impl Directions {
     }
 
     /// Takes the connection that the listener keeps, with the address of its peer.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[cfg(all(feature = "movable", target_os = "linux"))]
     pub(super) fn take_connection(&mut self) -> Option<(Handle, SockAddrStorage, u32)> {
         match self.kept.take() {
             Some(Kept::Connection { fd, peer, peer_len }) => Some((fd, peer, peer_len)),
@@ -942,14 +942,14 @@ impl Directions {
 
     /// Whether the directions hold nothing for a later operation: no kept result, and no failure
     /// and no count of the write direction.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[cfg(all(feature = "movable", target_os = "linux"))]
     pub(super) fn is_clear(&self) -> bool {
         self.kept.is_none() && self.sent == Sent::Ok && self.unreported == 0
     }
 
     /// Takes from `earlier` the state of the direction of an operation of `kind`: what its receives
     /// or accepts keep, or the progress of its sends.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    #[cfg(all(feature = "movable", target_os = "linux"))]
     pub(super) fn inherit(&mut self, earlier: &mut Self, kind: Kind) {
         if kind.writes() {
             (self.sent, self.unreported) = (earlier.sent, earlier.unreported);
@@ -2698,7 +2698,7 @@ const fn running(owned: &super::Owned) -> bool {
 
 /// A new nonblocking TCP socket that listens at the address `storage` of `len` bytes, with
 /// `options`, as [`Driver::bind`] makes it, and its local address. No driver owns the socket.
-#[cfg(all(feature = "local", target_os = "linux"))]
+#[cfg(all(feature = "movable", target_os = "linux"))]
 pub(super) fn listening(
     (storage, len): (SockAddrStorage, u32),
     options: TcpOptions,

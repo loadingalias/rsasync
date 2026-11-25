@@ -1005,3 +1005,132 @@ fn a_kill_child_dies_and_a_keep_child_runs_on_and_the_report_counts_it() {
         .unwrap();
     assert!(killed.success());
 }
+
+/// The report of a plan gives the mode of each worker, and the CPUs that it shares with another
+/// worker: none for workers pinned to two CPUs, and each CPU of the process for unpinned workers.
+#[test]
+fn the_report_gives_the_mode_of_each_worker_and_the_cpus_that_it_shares() {
+    let allowed = sys::affinity().unwrap();
+    let mut cpus = allowed.iter();
+    let pinned = Box::from([cpus.next().unwrap(), cpus.next().unwrap()]);
+    for (placement, shared) in [
+        (Placement::Exact(pinned), CpuSet::new()),
+        (Placement::Unpinned, allowed.clone()),
+    ] {
+        let runtime = Runtime::builder()
+            .local_workers(1)
+            .movable_workers(1)
+            .placement(placement, Selection::Strict)
+            .build()
+            .unwrap();
+        let workers = runtime.report().workers();
+        assert_eq!(
+            workers.iter().map(WorkerReport::mode).collect::<Vec<_>>(),
+            [Mode::Local, Mode::Movable]
+        );
+        assert!(workers.iter().all(|worker| *worker.shared() == shared));
+    }
+}
+
+/// A plan with more workers than CPUs refuses before a worker starts, with both counts, and the
+/// same plan starts when the builder allows oversubscription.
+#[test]
+fn a_plan_with_more_workers_than_cpus_refuses_unless_the_builder_allows_oversubscription() {
+    let cpus = sys::affinity().unwrap().len();
+    let builder = || Runtime::builder().local_workers(cpus).movable_workers(1);
+    let failure = builder().build().unwrap_err();
+    assert_matches!(
+        failure.cause(),
+        Cause::Plan(PlanError::Oversubscribed { workers, cpus: usable }) if *workers == cpus + 1 && *usable <= cpus
+    );
+    assert!(failure.cleanup().is_empty(), "no worker started");
+    let runtime = builder().oversubscription(Oversubscription::Allow).build().unwrap();
+    assert_eq!(runtime.report().workers().len(), cpus as usize + 1);
+}
+
+/// A local task and a movable task hand typed values to each other through bounded channels: the
+/// local task sends a request with the sender of its reply, and the movable task replies.
+#[test]
+fn a_local_task_and_a_movable_task_hand_typed_values_to_each_other() {
+    let runtime = Runtime::builder().local_workers(1).movable_workers(1).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let channels = budget();
+    let (mut requests, mut inbox) =
+        crate::channel::mpsc::channel::<(u32, oneshot::Sender<String>)>(&channels, 4, 1).unwrap();
+    let server = handle
+        .spawn_movable(async move {
+            let mut served = 0;
+            while let Ok((value, reply)) = inbox.recv().await {
+                reply.send(alloc::format!("{}", value * 2)).unwrap();
+                served += 1;
+            }
+            served
+        })
+        .unwrap();
+    let client = handle
+        .spawn_on(WorkerId::new(0), move || async move {
+            let mut replies = Vec::new();
+            for value in [1, 21] {
+                let (reply, mut answer) = oneshot::channel(&channels).unwrap();
+                requests.send((value, reply)).await.unwrap();
+                replies.push(answer.recv().await.unwrap());
+            }
+            replies
+        })
+        .unwrap();
+    assert_eq!(completed(client.join_blocking()), ["2", "42"]);
+    assert_eq!(
+        completed(server.join_blocking()),
+        2,
+        "the end of the client closes the channel"
+    );
+}
+
+/// A shutdown with a receive in flight on a local worker and one on a movable worker returns one
+/// report: each worker of each mode with no debt, the cancelled local task of its worker, and the
+/// cancelled movable task. Each stream closes.
+#[test]
+fn a_shutdown_with_receives_in_both_modes_returns_one_report_of_each_worker() {
+    use std::io::Read as _;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let runtime = Runtime::builder().local_workers(1).movable_workers(2).build().unwrap();
+    let mut handle = runtime.handle().unwrap();
+    let local = waiting_receive(&mut handle, 0, address);
+    let movable = handle
+        .spawn_movable(async move {
+            let mut stream = crate::movable::TcpStream::connect(address, driver::TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let _received = stream
+                .recv(crate::buffer::Backing::from(Vec::with_capacity(64)))
+                .unwrap()
+                .await;
+        })
+        .unwrap();
+    let mut peers = [(); 2].map(|()| listener.accept().unwrap().0);
+    let report = runtime.shutdown();
+    assert!(!report.expired(), "the receives did not end inside the grace period");
+    assert_eq!(report.workers().len(), 3);
+    for (index, worker) in (0..).zip(report.workers()) {
+        assert_eq!(worker.worker(), WorkerId::new(index));
+        let cancelled = u32::from(index == 0);
+        assert_eq!(
+            (worker.outcome(), worker.cancelled(), worker.debt()),
+            (&Outcome::Joined, cancelled, 0)
+        );
+    }
+    assert_eq!(report.movable_cancelled(), 1);
+    for peer in &mut peers {
+        assert_eq!(
+            peer.read(&mut [0; 8]).unwrap(),
+            0,
+            "the stream of a cancelled task stayed open"
+        );
+    }
+    assert_matches!(local.join_blocking(), TaskOutcome::Cancelled);
+    assert_matches!(movable.join_blocking(), TaskOutcome::Cancelled);
+}

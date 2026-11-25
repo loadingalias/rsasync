@@ -88,13 +88,21 @@ const CANCEL: u64 = 1 << 3;
 /// such task, whatever its generation.
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const LIVE: u64 = 1 << 4;
 /// In a slot word of the movable pool: the close of the pool requested the cancel.
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 const CLOSING: u64 = 1 << 5;
 /// The generation is above these bits.
@@ -352,7 +360,11 @@ pub(super) fn start(word: &AtomicU64) {
 
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 /// Starts a new task in a free slot word of the movable pool, as `start` does, and marks the slot
 /// live.
@@ -364,7 +376,11 @@ pub(super) fn start_live(word: &AtomicU64) {
 
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 /// Requests the cancel of the live task of a slot word of the movable pool, whatever its
 /// generation, as `wake` does with a cancel. Gives `None` if the slot is free or the cancel was
@@ -394,7 +410,11 @@ pub(super) fn cancel_live(word: &AtomicU64) -> Option<bool> {
 /// calls it, after its poll start found the cancel.
 #[cfg(any(
     all(test, loom),
-    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    all(
+        feature = "movable",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 ))]
 pub(super) fn closing(word: &AtomicU64) -> bool {
     // Ordering: `Relaxed`: the poll start read the change that set the bit, which no change clears

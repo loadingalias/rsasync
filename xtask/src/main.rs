@@ -218,7 +218,7 @@ impl Repo {
                 .args(&scope),
         )?;
         self.clippy_no_std(&scope)?;
-        self.clippy_driver_only(&scope)
+        self.clippy_alone(&scope)
     }
 
     /// Lints each package in `NO_STD_PACKAGES` with no default feature: its
@@ -256,28 +256,29 @@ impl Repo {
         step("clippy tests without std", &mut tests)
     }
 
-    /// Lints the driver-only example alone, on the host or on the `--target` of the caller. Its
-    /// build of rsasync has `std` and not `local`, so a driver that needs the scheduler, or code
-    /// that only the scheduler uses, fails it. In a build of the workspace, the features of the
-    /// other packages hide both. It runs only when `scope` is the whole workspace, and it takes no
-    /// other argument of the caller: a feature argument applies to the other steps.
-    fn clippy_driver_only(&self, scope: &[&str]) -> Result<(), Failure> {
-        if !scope.contains(&"--workspace") {
-            eprintln!("── clippy driver only\n   not run: the arguments select packages; run with no -p or --package");
-            return Ok(());
+    /// Lints each example whose build of rsasync has fewer features, alone, on the host or on the
+    /// `--target` of the caller: the driver-only example (`std`, and not `local`), and the
+    /// local-only example (`local`, and not `movable`). So a driver that needs the scheduler, a
+    /// local owner that needs the pool, or code that only the other features use, fails it. In a
+    /// build of the workspace, the features of the other packages hide each of them. It runs only
+    /// when `scope` is the whole workspace, and it takes no other argument of the caller: a
+    /// feature argument applies to the other steps.
+    fn clippy_alone(&self, scope: &[&str]) -> Result<(), Failure> {
+        for (name, package) in [
+            ("clippy driver only", "driver_only"),
+            ("clippy local only", "local_only"),
+        ] {
+            if !scope.contains(&"--workspace") {
+                eprintln!("── {name}\n   not run: the arguments select packages; run with no -p or --package");
+                continue;
+            }
+            step(
+                name,
+                self.cargo(&["clippy", "--locked", "--quiet", "--all-targets", "--package", package])
+                    .args(target(scope)),
+            )?;
         }
-        step(
-            "clippy driver only",
-            self.cargo(&[
-                "clippy",
-                "--locked",
-                "--quiet",
-                "--all-targets",
-                "--package",
-                "driver_only",
-            ])
-            .args(target(scope)),
-        )
+        Ok(())
     }
 
     /// Checks formatting, lints, and rustdoc. It changes no file.
@@ -290,7 +291,7 @@ impl Repo {
                 .args(&scope),
         )?;
         self.clippy_no_std(&scope)?;
-        self.clippy_driver_only(&scope)?;
+        self.clippy_alone(&scope)?;
         step(
             "rustdoc",
             self.cargo(&["doc", "--locked", "--no-deps", "--quiet"]).args(&scope),

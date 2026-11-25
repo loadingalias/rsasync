@@ -75,7 +75,7 @@ pub mod clock;
 pub mod local;
 /// The I/O types of a movable task, on Linux, on io_uring workers.
 #[cfg(all(
-    feature = "local",
+    feature = "movable",
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]

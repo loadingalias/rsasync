@@ -6,9 +6,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The local workers of the runtime need Linux on x86_64 or aarch64.
+# The local workers of the runtime need Linux on x86_64 or aarch64. The build has the local mode
+# only, with no movable pool (`movable` stays off), so `cargo xtask check` lints it alone.
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
-rsasync = { path = "../.." }
+rsasync = { path = "../..", default-features = false, features = ["local"] }
 
 [lints]
 workspace = true
