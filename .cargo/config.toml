@@ -8,3 +8,10 @@ nextest-run = ["nextest", "run"]
 # that panics stops its process, and Nextest reports that test as failed.
 [target.wasm32-wasip1]
 runner = "wasmtime"
+
+# The Linux tests of this Mac: `cargo xtask test --target aarch64-unknown-linux-musl`
+# runs each test binary in the Docker VM (`probe/linux-runner.sh`). On a Linux host,
+# the runner runs the binary itself.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+runner = "probe/linux-runner.sh"
