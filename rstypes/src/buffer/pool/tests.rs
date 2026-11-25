@@ -1,11 +1,15 @@
 extern crate std;
 
-use core::alloc::{GlobalAlloc, Layout};
+use core::alloc::{AllocError, Allocator, GlobalAlloc, Layout};
 use core::cell::Cell;
 use core::num::{NonZeroU32, NonZeroU64};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::System;
 
 use super::{Pool, PoolEmpty, PoolRefused};
+use alloc::alloc::Global;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::buffer::{Backing, Buffer, BufferMut, Lease, WriteLoan};
@@ -75,6 +79,47 @@ fn slot() -> Layout {
 
 fn pool(budget: &Budget, slots: u32) -> Pool {
     Pool::new(budget, NonZeroU32::new(slots).unwrap(), slot()).unwrap()
+}
+
+/// An allocator that gives each call to `Global` and records its blocks, so that a test can show
+/// where a pool takes its slots and when it gives them back. It is not zero-sized.
+struct Recording(Arc<Record>);
+
+#[derive(Default)]
+struct Record {
+    /// The address and the size of the last block that the allocator gave.
+    given: [AtomicUsize; 2],
+    /// The address and the size of the last block that the allocator got back.
+    freed: [AtomicUsize; 2],
+    frees: AtomicUsize,
+}
+
+fn block(of: &[AtomicUsize; 2]) -> (usize, usize) {
+    (of[0].load(Ordering::Relaxed), of[1].load(Ordering::Relaxed))
+}
+
+#[expect(unsafe_code, reason = "the test allocator gives each call to `Global`")]
+// SAFETY: each method gives its call to `Global` with the same arguments, and only records it.
+unsafe impl Allocator for Recording {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let given = Global.allocate(layout)?;
+        self.0.given[0].store(given.addr().get(), Ordering::Relaxed);
+        self.0.given[1].store(layout.size(), Ordering::Relaxed);
+        Ok(given)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.0.freed[0].store(ptr.addr().get(), Ordering::Relaxed);
+        self.0.freed[1].store(layout.size(), Ordering::Relaxed);
+        self.0.frees.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `allocate` gave `ptr` from `Global`, with `layout`.
+        unsafe { Global.deallocate(ptr, layout) }
+    }
+}
+
+fn pool_in(budget: &Budget, record: &Arc<Record>) -> Result<Pool, PoolRefused> {
+    let recording = Recording(Arc::clone(record));
+    Pool::new_in(budget, NonZeroU32::new(2).unwrap(), slot(), recording)
 }
 
 #[test]
@@ -247,25 +292,60 @@ fn a_split_that_fills_its_slot_returns_that_slot_and_no_other() {
     drop((again, second));
 }
 
-/// Each refusal of the allocator gives `Allocation`, and keeps no charge and no memory. Run `n`
-/// refuses allocation `n`, counted from 0, and each later one, until a run fails no allocation. A
-/// pool whose last allocation aborts the process fails.
+/// Each refusal of the allocator gives `Allocation`, and keeps no charge and no memory, for
+/// `Pool::new` and for `Pool::new_in` with an allocator that is not zero-sized, whose box is one
+/// more allocation. Run `n` refuses allocation `n`, counted from 0, and each later one, until a run
+/// fails no allocation. A pool whose last allocation aborts the process fails.
 #[test]
 fn a_pool_that_the_allocator_refuses_keeps_no_charge_and_no_memory() {
     let budget = budget();
-    let mut refused = 0;
-    loop {
-        let held = HELD.with(Cell::get);
-        REFUSE_FROM.with(|from| from.set(ALLOCATIONS.with(Cell::get) + refused));
-        let made = Pool::new(&budget, NonZeroU32::new(2).unwrap(), slot());
-        REFUSE_FROM.with(|from| from.set(usize::MAX));
-        let Err(reason) = made else { break };
-        let kept = HELD.with(Cell::get) - held;
-        assert_eq!((reason, kept, budget.available()), (PoolRefused::Allocation, 0, MIB));
-        refused += 1;
-        assert!(refused < 16, "a pool makes a few allocations");
+    let record = Arc::new(Record::default());
+    let makes: [&dyn Fn() -> Result<Pool, PoolRefused>; 2] =
+        [&|| Pool::new(&budget, NonZeroU32::new(2).unwrap(), slot()), &|| {
+            pool_in(&budget, &record)
+        }];
+    for make in makes {
+        let mut refused = 0;
+        loop {
+            let held = HELD.with(Cell::get);
+            REFUSE_FROM.with(|from| from.set(ALLOCATIONS.with(Cell::get) + refused));
+            let made = make();
+            REFUSE_FROM.with(|from| from.set(usize::MAX));
+            let Err(reason) = made else { break };
+            let kept = HELD.with(Cell::get) - held;
+            assert_eq!((reason, kept, budget.available()), (PoolRefused::Allocation, 0, MIB));
+            refused += 1;
+            assert!(refused < 16, "a pool makes a few allocations");
+        }
+        assert!(refused > 0);
     }
-    assert!(refused > 0);
+}
+
+/// A pool from `new_in` takes each slot from the one block of its allocator, and charges each byte
+/// that it allocates. The allocator gets the block back one time, after the pool and the last slot
+/// drop, also when the last slot drops on another thread.
+#[test]
+fn a_pool_in_an_allocator_takes_its_slots_from_it_and_gives_them_back_after_the_last_slot() {
+    let budget = budget();
+    let record = Arc::new(Record::default());
+    let (mut pool, bytes) = allocated(|| pool_in(&budget, &record).unwrap());
+    // One block of two rounded slots. The charge also covers the box of the allocator.
+    let (start, size) = block(&record.given);
+    assert_eq!((size, start % 4096), (2 * 4096, 0));
+    assert_eq!(budget.available(), MIB - bytes);
+
+    let (first, second) = (pool.acquire().unwrap(), pool.acquire().unwrap());
+    let mut slots = [first.as_ptr().addr(), second.as_ptr().addr()];
+    slots.sort_unstable();
+    assert_eq!(slots, [start, start + 4096]);
+
+    // The last slot keeps the block after the pool drops.
+    drop((pool, first));
+    assert_eq!(record.frees.load(Ordering::Relaxed), 0);
+    std::thread::spawn(move || drop(second)).join().unwrap();
+    assert_eq!(record.frees.load(Ordering::Relaxed), 1);
+    assert_eq!(block(&record.freed), (start, size));
+    assert_eq!(budget.available(), MIB);
 }
 
 /// An owner aligned to 64 bytes, so the reference count of its lease has padding.

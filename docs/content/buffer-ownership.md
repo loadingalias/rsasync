@@ -224,6 +224,13 @@ receive.
   size that is too large, `Budget` when the budget has too few free units, and `Allocation` when
   the allocator gives no memory for one of its allocations. A refusal keeps no charge and no
   memory.
+- `Pool::new_in(&budget, slots, layout, allocator)` makes the same pool with all of its slots in one
+  block from `allocator`, an `Allocator + Send + 'static`. Use it when the slots need a special
+  kind of memory, for example a mapping that a child process does not inherit. The pool gives the
+  block back to `allocator` one time, after the pool and each slot drop, on the thread of the last
+  drop. The pool keeps the allocator in a box, and the charge includes the size of the allocator:
+  a zero-sized allocator needs no allocation. The charge counts the layout of the slots, not a
+  larger block that the allocator gives. A refusal of `allocator` gives `Allocation`.
 - `Pool::acquire` gives a free slot, or refuses with `PoolEmpty`. It allocates nothing. The backing
   has the capacity of the slot size and the allocation size of the rounded slot size, and none of
   its bytes are initialized.

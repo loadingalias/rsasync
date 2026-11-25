@@ -82,8 +82,10 @@ struct Shared {
     capacity: usize,
     slots: Box<[Slot]>,
     returned: ReturnList,
-    /// The charge of the arena. Fields drop after `Drop::drop`, so the charge ends after the arena
-    /// is freed.
+    /// The allocator of the arena, which gets the arena back in `Drop::drop`.
+    allocator: Box<dyn Allocator + Send>,
+    /// The charge of the pool. Fields drop after `Drop::drop` and in order, so the charge ends
+    /// after the arena and the allocator are freed.
     _charge: Permit,
 }
 
@@ -170,6 +172,23 @@ impl Pool {
     /// each allocation of the pool to `budget` before it allocates: all of the slots at their
     /// rounded size, their entries, and its shared state.
     pub fn new(budget: &Budget, slots: NonZeroU32, slot: Layout) -> Result<Self, PoolRefused> {
+        Self::new_in(budget, slots, slot, Global)
+    }
+
+    /// Makes a pool as [`new`](Self::new) does, with all of its slots in one block from
+    /// `allocator`. For example, a pool of direct-I/O buffers takes its slots from an allocator
+    /// that maps memory that a child process does not inherit.
+    ///
+    /// The pool gives the block back to `allocator` one time, after the pool and each slot drop, on
+    /// the thread of the last drop. Until then it keeps `allocator` in a box, which it charges: a
+    /// zero-sized allocator needs no allocation. The charge counts the layout of the slots, not a
+    /// larger block that `allocator` gives.
+    pub fn new_in<A: Allocator + Send + 'static>(
+        budget: &Budget,
+        slots: NonZeroU32,
+        slot: Layout,
+        allocator: A,
+    ) -> Result<Self, PoolRefused> {
         let count = slots.get();
         if slot.size() == 0 || count == NONE {
             return Err(PoolRefused::Layout);
@@ -183,11 +202,13 @@ impl Pool {
         let charge = Layout::array::<Slot>(count as usize)
             .ok()
             .and_then(|entries| entries.size().checked_add(arena_layout.size()))
+            .and_then(|size| size.checked_add(size_of::<A>()))
             .and_then(|size| size.checked_add(arc_size::<Shared>()))
             .and_then(|size| u64::try_from(size).ok())
             .ok_or(PoolRefused::Layout)?;
         let charge = budget.reserve(charge).map_err(PoolRefused::Budget)?;
 
+        let allocator: Box<dyn Allocator + Send> = Box::try_new(allocator).map_err(|_| PoolRefused::Allocation)?;
         let mut entries = Vec::new();
         entries
             .try_reserve_exact(count as usize)
@@ -197,7 +218,7 @@ impl Pool {
             count: AtomicU64::new(0),
             next: AtomicU32::new(if next == count { NONE } else { next }),
         }));
-        let arena = Global
+        let arena = allocator
             .allocate(arena_layout)
             .map_err(|_| PoolRefused::Allocation)?
             .cast();
@@ -212,6 +233,7 @@ impl Pool {
             returned: ReturnList {
                 head: AtomicU32::new(NONE),
             },
+            allocator,
             _charge: charge,
         })
         .map_err(|_| PoolRefused::Allocation)?;
@@ -268,20 +290,21 @@ impl fmt::Debug for Pool {
 impl Drop for Shared {
     #[expect(unsafe_code, reason = "the pool frees its arena when no slot is in use")]
     fn drop(&mut self) {
-        // SAFETY: `Pool::new` allocated the arena from `Global` with `arena_layout`. Each slot in
-        // use keeps a reference to the pool, so no slot is in use now.
-        unsafe { Global.deallocate(self.arena, self.arena_layout) };
+        // SAFETY: `Pool::new_in` allocated the arena from `allocator` with `arena_layout`. Each slot
+        // in use keeps a reference to the pool, so no slot is in use now.
+        unsafe { self.allocator.deallocate(self.arena, self.arena_layout) };
     }
 }
 
 #[expect(unsafe_code, reason = "the arena pointer of a pool is for each thread")]
 // SAFETY: the pool itself uses its arena only to free it. Each slot of the arena is for the owners
-// of that slot, which `Backing` and `Lease` make safe on each thread. The other fields are atomic,
-// immutable, or a `Permit`, which each thread can use.
+// of that slot, which `Backing` and `Lease` make safe on each thread. The allocator is `Send`. The
+// other fields are atomic, immutable, or a `Permit`, which each thread can use.
 unsafe impl Send for Shared {}
 
 #[expect(unsafe_code, reason = "the arena pointer of a pool is for each thread")]
-// SAFETY: see `Send`. A shared `Shared` gives only atomic operations and immutable facts.
+// SAFETY: see `Send`. A shared `Shared` gives only atomic operations and immutable facts. Only
+// `Drop::drop`, which has the only reference, uses the allocator, so the allocator needs no `Sync`.
 unsafe impl Sync for Shared {}
 
 /// One count of a slot in use, which each backing, lease, and view of the slot holds. The index,

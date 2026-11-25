@@ -7,9 +7,9 @@
 //! Without the `std` feature, which is on by default, the crate needs only `core` and `alloc`.
 
 #![no_std]
-// `Arc::try_new`: each allocation on a refusal path refuses, and does not abort
-// (docs/content/unstable-features.md). The loom form of `sync::try_arc` does not use it.
-#![cfg_attr(not(all(test, loom)), feature(allocator_ext))]
+// `Arc::try_new` and `Box::try_new`: each allocation on a refusal path refuses, and does not abort
+// (docs/content/unstable-features.md).
+#![feature(allocator_ext)]
 
 extern crate alloc;
 #[cfg(feature = "std")]
