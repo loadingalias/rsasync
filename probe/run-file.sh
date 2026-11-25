@@ -10,16 +10,19 @@
 #     bash probe/run-file.sh
 #
 # The cases:
-# - `fio`: fio with no registered files or buffers.
+# - `fio`: fio with no registered files or buffers, with each fio process on the CPU. `fioalone`
+#   puts only the job of fio on the CPU, and `fioqos` runs `fio` with the latency limit below.
 # - `turn`, `lean`, `spin`: `probe file` of the checkout. `turn` is the loop of driver-only.md,
-#   `lean` waits at once while an operation is pending, and `spin` turns and never waits.
-# - `nopoll`, `coop`: `probe file --drive turn` of a copy of the checkout with one change. `nopoll`
-#   pushes no poll of the wake descriptor in a wait. `coop` sets `IORING_SETUP_COOP_TASKRUN` in place
-#   of `IORING_SETUP_TASKRUN_FLAG`, as fio does.
+#   `lean` waits at once while an operation is pending, and `spin` turns and never waits. `qos` runs
+#   `turn` with a limit of 20 µs on the wake latency of the CPU (`pm_qos_resume_latency_us`).
+# - `nopoll`, `coop`, `bound<µs>`: `probe file --drive turn` of a copy of the checkout with one
+#   change. `nopoll` pushes no poll of the wake descriptor in a wait. `coop` sets
+#   `IORING_SETUP_COOP_TASKRUN` in place of `IORING_SETUP_TASKRUN_FLAG`, as fio does. `bound<µs>`
+#   waits with a timeout of that many microseconds, and enters again until a completion is ready.
 #
 # Each run prints one JSON line, with the change of the use count and the time of each idle state
-# of the CPU. Then the 4 KiB read of `fio` and of `turn` runs one more time under `perf stat`, for
-# the scheduler, interrupt, idle, and io_uring events of the CPU. `PROBE_CASES`, `PROBE_OPS`,
+# of the CPU. Then the 4 KiB read of `PROBE_EVENTS` runs one more time under `perf stat`, for the
+# scheduler, interrupt, idle, and io_uring events of the CPU. `PROBE_CASES`, `PROBE_OPS`,
 # `PROBE_ROUNDS`, and `PROBE_COUNT` select a partial rerun.
 set -euo pipefail
 
@@ -31,7 +34,8 @@ host="$(~/dev-machines/dev-machine nodes rsasync "$target" --live | sed -n 's/^1
 # A command over SSH has no login shell, so the script gets the path of the toolchain here.
 ~/dev-machines/ssh-bin/ssh "ubuntu@$host" \
     "PATH=\$HOME/.cargo/bin:\$PATH CPU=${PROBE_CPU:-1} COUNT=${PROBE_COUNT:-40000} \
-     ROUNDS=${PROBE_ROUNDS:-5} CASES='${PROBE_CASES:-fio turn lean spin nopoll coop}' \
+     ROUNDS=${PROBE_ROUNDS:-5} CASES='${PROBE_CASES:-fio fioalone fioqos turn qos spin bound125 bound250 bound500}' \
+     EVENTS='${PROBE_EVENTS:-fio turn bound250}' \
      OPS='${PROBE_OPS:-read:4096 read:65536 write:4096 write:65536}' bash -s" <<'EOF'
 set -euo pipefail
 size=$((4 << 30))
@@ -80,19 +84,48 @@ fio --name=layout --filename="$file" --size="$size" --rw=write --bs=1m --direct=
 ls -l "$file"
 
 echo "== trees"
+trees=""
+for case in $CASES; do
+    case "$case" in nopoll | coop | bound*) trees="$trees $case" ;; esac
+done
 # Each copy has one change, and the check of each change fails the run if the source moved.
-for tree in nopoll coop; do
+for tree in $trees; do
     rm -rf ~/"$tree"
     mkdir ~/"$tree"
     tar -C ~/rsasync --exclude=./target --exclude=./.git --exclude=./docs -cf - . | tar -C ~/"$tree" -xf -
+    case "$tree" in
+        nopoll)
+            sed -i 's/^        if self\.queue\.as_ring()\.is_some() && !self\.waking {$/        if false \&\& self.queue.as_ring().is_some() \&\& !self.waking {/' \
+                ~/nopoll/src/driver.rs
+            [ "$(grep -c '^        if false && self\.queue\.as_ring()' ~/nopoll/src/driver.rs)" = 1 ]
+            ;;
+        coop)
+            sed -i 's/^    | sys::IORING_SETUP_TASKRUN_FLAG$/    | (1 << 8)/' ~/coop/src/uring.rs
+            [ "$(grep -c '^    | (1 << 8)$' ~/coop/src/uring.rs)" = 1 ]
+            ;;
+        bound*)
+            python3 - ~/"$tree"/src/driver.rs "${tree#bound}" <<'PATCH'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+wait = "        self.wait_in(|queue| queue.submit(1))\n"
+assert text.count(wait) == 1
+path.write_text(text.replace(wait, f"""        self.wait_in(|queue| match queue.ring() {{
+            Some(ring) => loop {{
+                let taken = ring.submit_timeout(1, core::time::Duration::from_micros({sys.argv[2]}))?;
+                if ring.ready() || ring.needs_enter() {{
+                    break Ok(taken);
+                }}
+            }},
+            None => queue.submit(1),
+        }})
+"""))
+PATCH
+            ;;
+    esac
 done
-sed -i 's/^        if self\.queue\.as_ring()\.is_some() && !self\.waking {$/        if false \&\& self.queue.as_ring().is_some() \&\& !self.waking {/' \
-    ~/nopoll/src/driver.rs
-[ "$(grep -c '^        if false && self\.queue\.as_ring()' ~/nopoll/src/driver.rs)" = 1 ]
-sed -i 's/^    | sys::IORING_SETUP_TASKRUN_FLAG$/    | (1 << 8)/' ~/coop/src/uring.rs
-[ "$(grep -c '^    | (1 << 8)$' ~/coop/src/uring.rs)" = 1 ]
 # The copies need the lints capped, and each tree builds with the same flags.
-for tree in rsasync nopoll coop; do
+for tree in rsasync $trees; do
     (cd ~/"$tree" && RUSTFLAGS=--cap-lints=warn cargo build --quiet --release --locked -p probe --target-dir ~/target-"$tree")
 done
 
@@ -104,17 +137,17 @@ idle() {
     true
 }
 
-# Runs case `$1` for operation `$2` and block size `$3`, and prints its JSON line.
-run() {
-    local rw=randread sync=""
+# Runs fio for operation `$2` and block size `$3`. With `$1` of `pinned`, each fio process runs on
+# the CPU. With `alone`, only the job runs there, and the other processes run on CPU 0.
+fio_on() {
+    local rw=randread sync="" main="$CPU"
     [ "$2" = write ] && { rw=randwrite; sync=--sync=dsync; }
-    case "$1" in
-        fio)
-            taskset -c "$CPU" fio --name=probe --filename="$file" --size="$size" --ioengine=io_uring \
-                --direct=1 --rw="$rw" $sync --bs="$3" --iodepth=1 --number_ios="$COUNT" --norandommap \
-                --randrepeat=0 --lat_percentiles=1 --clat_percentiles=0 --registerfiles=0 --fixedbufs=0 \
-                --output-format=json |
-                python3 -c '
+    [ "$1" = alone ] && main=0
+    taskset -c "$main" fio --name=probe --filename="$file" --size="$size" --ioengine=io_uring \
+        --cpus_allowed="$CPU" --direct=1 --rw="$rw" $sync --bs="$3" --iodepth=1 --number_ios="$COUNT" \
+        --norandommap --randrepeat=0 --lat_percentiles=1 --clat_percentiles=0 --registerfiles=0 \
+        --fixedbufs=0 --output-format=json |
+        python3 -c '
 import json, sys
 job = json.load(sys.stdin)["jobs"][0]
 side = job["read"] if job["read"]["total_ios"] else job["write"]
@@ -123,11 +156,34 @@ p = lat["percentile"]
 print(json.dumps({"op": sys.argv[1], "block": int(sys.argv[2]), "drive": "fio", "count": side["total_ios"],
     "latency_ns": {"p50": p["50.000000"], "p99": p["99.000000"], "p999": p["99.900000"], "max": lat["max"]}},
     separators=(",", ":")))' "$2" "$3"
-            ;;
-        turn | lean | spin) taskset -c "$CPU" "$home"/target-rsasync/release/probe file --path "$file" --op "$2" \
-            --block "$3" --size "$size" --count "$COUNT" --seed "$RANDOM" --drive "$1" ;;
-        nopoll | coop) taskset -c "$CPU" "$home"/target-"$1"/release/probe file --path "$file" --op "$2" \
-            --block "$3" --size "$size" --count "$COUNT" --seed "$RANDOM" --drive turn ;;
+}
+
+# Runs `probe file` of tree `$1` with the loop `$2`, for operation `$3` and block size `$4`.
+probe_on() {
+    taskset -c "$CPU" "$home"/target-"$1"/release/probe file --path "$file" --op "$3" --block "$4" \
+        --size "$size" --count "$COUNT" --seed "$RANDOM" --drive "$2"
+}
+
+# Runs the command with a limit of 20 µs on the wake latency of the CPU, which keeps the CPU out of
+# each idle state with a longer exit, and then gives the CPU its earlier limit.
+with_qos() {
+    local limit=/sys/devices/system/cpu/cpu"$CPU"/power/pm_qos_resume_latency_us earlier status=0
+    earlier="$(cat "$limit")"
+    echo 20 | sudo tee "$limit" > /dev/null
+    "$@" || status=$?
+    echo "$earlier" | sudo tee "$limit" > /dev/null
+    return "$status"
+}
+
+# Runs case `$1` for operation `$2` and block size `$3`, and prints its JSON line.
+run() {
+    case "$1" in
+        fio) fio_on pinned "$2" "$3" ;;
+        fioalone) fio_on alone "$2" "$3" ;;
+        fioqos) with_qos fio_on pinned "$2" "$3" ;;
+        turn | lean | spin) probe_on rsasync "$1" "$2" "$3" ;;
+        qos) with_qos probe_on rsasync turn "$2" "$3" ;;
+        nopoll | coop | bound*) probe_on "$1" turn "$2" "$3" ;;
         *) echo "unknown case $1" >&2; return 1 ;;
     esac
 }
@@ -161,8 +217,8 @@ for event in sched:sched_switch sched:sched_wakeup irq:irq_handler_entry power:c
 done
 echo "events: ${events:-none}"
 if [ -n "$events" ]; then
-    for case in fio turn; do
-        output="$(sudo perf stat -C "$CPU" -x, -e "$events" -- bash -c "$(declare -f run); CPU=$CPU \
+    for case in $EVENTS; do
+        output="$(sudo perf stat -C "$CPU" -x, -e "$events" -- bash -c "$(declare -f run fio_on probe_on with_qos); CPU=$CPU \
             COUNT=$COUNT size=$size file=$file home=$home run $case read 4096" 2>&1 > /dev/null)"
         echo "$case $COUNT operations: $(awk -F, '$3 != "" { printf "%s=%s ", $3, $1 }' <<< "$output")"
     done
