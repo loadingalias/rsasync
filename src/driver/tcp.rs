@@ -707,11 +707,14 @@ enum Sent {
 }
 
 /// The directions of a stream or a listener, at the home.
+///
+/// The order of the fields is stated: a receive or a send reads the directions and the state of
+/// the sends, and the large kept result is last.
 #[derive(Debug, Default)]
+#[repr(C)]
 pub(super) struct Directions {
     read: Direction,
     write: Direction,
-    kept: Option<Kept>,
     sent: Sent,
     /// The bytes that dropped sends sent, since the end of the last send whose result a future
     /// took, or since the last report.
@@ -720,6 +723,7 @@ pub(super) struct Directions {
     closing: Option<Closing>,
     /// The resource is in the pending list of the driver.
     pending: bool,
+    kept: Option<Kept>,
 }
 
 /// Who waits for the close of a resource.

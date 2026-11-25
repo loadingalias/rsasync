@@ -45,11 +45,15 @@ const PHASE: u64 = 0xFF;
 pub(crate) struct Gone;
 
 /// The completion entry of one slot, with the resources `T` of its operation.
+// The order of the fields and the alignment are stated: the phase, the result, and the waiter are
+// on the first cache line of the entry, with the start of the resources, so an operation of a cold
+// connection touches as few lines as it can.
+#[repr(C, align(64))]
 pub(crate) struct Entry<T> {
     state: AtomicU64,
     result: AtomicI32,
-    held: UnsafeCell<Option<T>>,
     waiter: Waiter,
+    held: UnsafeCell<Option<T>>,
 }
 
 fn word(id: OpId, phase: u64) -> u64 {

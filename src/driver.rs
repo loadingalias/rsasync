@@ -412,30 +412,34 @@ impl WakeHandle {
 /// operation, in the slot of the operation, so each address that the kernel uses stays the same.
 /// The fields hold what the home writes for the kinds of more than one medium, and the payload
 /// holds the resources of the kind.
+///
+/// The order of the fields is stated: the fields of each kind come first, and the large payload
+/// last, so a receive or a send touches the first cache lines of its slot.
 #[derive(Debug)]
+#[repr(C)]
 pub(crate) struct Held {
-    /// The resources of the kind of the operation. Its start sets the variant, and nothing
-    /// changes the variant before the terminal event.
-    pub(crate) payload: Payload,
     /// The loan of the buffer that a receive or a read fills.
     pub(crate) loan: Option<WriteLoan<Backing>>,
-    /// The socket that an accept, a connect, or a bind gave, or the file that an open gave.
-    pub(crate) accepted: Option<Resource>,
     /// The next operation that waits in the same direction, in start order.
     pub(crate) next: Option<OpId>,
-    /// A send on a failed direction gives this error, with no submission.
-    pub(crate) failed: Option<WriteFailed>,
-    /// The report of a close.
-    pub(crate) closed: Option<Closed>,
-    /// The bytes that a receive copied from the data that an abandoned receive left.
-    pub(crate) copied: usize,
     /// The home asked the kernel to cancel the operation.
     pub(crate) cancelled: bool,
     /// An error of the home that the future gives in place of the result of the kernel.
     pub(crate) error: Option<io::ErrorKind>,
+    /// The bytes that a receive copied from the data that an abandoned receive left.
+    pub(crate) copied: usize,
+    /// A send on a failed direction gives this error, with no submission.
+    pub(crate) failed: Option<WriteFailed>,
+    /// The socket that an accept, a connect, or a bind gave, or the file that an open gave.
+    pub(crate) accepted: Option<Resource>,
+    /// The report of a close.
+    pub(crate) closed: Option<Closed>,
     /// The descriptor and the chain of an operation of a movable resource, which no driver owns.
     #[cfg(all(feature = "local", target_os = "linux"))]
     pub(crate) plain: Option<plain::Plain>,
+    /// The resources of the kind of the operation. Its start sets the variant, and nothing
+    /// changes the variant before the terminal event.
+    pub(crate) payload: Payload,
 }
 
 impl Held {
@@ -884,16 +888,20 @@ pub(crate) struct Resource {
 }
 
 /// One descriptor slot of the driver.
+///
+/// The order of the fields is stated: each look checks the generation and the descriptor, and a
+/// receive or a send uses the medium and its direction, so these come first.
 #[derive(Debug, Default)]
+#[repr(C)]
 struct Owned {
     generation: u32,
     fd: Option<Handle>,
-    /// The directions of a stream or a listener, and what they keep.
-    directions: tcp::Directions,
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
     /// The operations of a file that run, which its close waits for.
     running: u32,
+    /// The directions of a stream or a listener, and what they keep.
+    directions: tcp::Directions,
     /// The last operation of the file that runs alone on it (`file::Op::Alone`), on macOS and
     /// Windows, while the table says that it runs.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
