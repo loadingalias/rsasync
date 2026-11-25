@@ -12,6 +12,8 @@ root="$(cd "$(dirname "$0")/.." && pwd -P)"
 binary="$(realpath "$1")"
 shift
 directory="$(dirname "$binary")"
-exec docker run --rm --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
+# `--init`: the test binary is no PID 1, which ignores `SIGTERM`, so the signal of a timeout of
+# nextest ends the test, and `--rm` then removes its container.
+exec docker run --rm --init --security-opt seccomp=unconfined --cap-add SYS_PTRACE \
     --ulimit nofile=65536:65536 -v "$root:$root" -v "$directory:$directory" -w "$(pwd -P)" \
     rsasync-linux "$binary" "$@"
