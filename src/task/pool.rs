@@ -319,13 +319,21 @@ impl Shared {
     /// Takes the oldest slot. A thief can also take a bounded prefix into its own queue.
     fn take_list(&self, lane: u32, into: Option<&Deque>) -> Option<u32> {
         let lane = &self.lanes[lane as usize];
-        // Ordering: these loads only skip an empty or claimed list. The swap claims the links.
+        // Ordering: these loads only skip an empty or claimed list. `TAKING` is not a slot: another
+        // taker holds the links.
         let observed = lane.oldest.load(Ordering::Relaxed);
-        if observed == TAKING || (observed == u64::from(END) && lane.remote.load(Ordering::Relaxed) == END) {
+        let mut first = u32::try_from(observed).ok()?;
+        if first == END && lane.remote.load(Ordering::Relaxed) == END {
             return None;
         }
-        // Acquire reads the previous taker's release. Another taker skips this lane while it is claimed.
-        let mut first = u32::try_from(lane.oldest.swap(TAKING, Ordering::AcqRel)).ok()?;
+        // The exchange claims the links from the value that this taker read. A taker that loses
+        // writes nothing and skips this lane, so the release of the holder is the last write of the
+        // word. A blind swap of `TAKING` is a write that loom can order after that release: it has
+        // no rule for the atomicity of a read-modify-write, and the list then stays claimed.
+        // Ordering: `Acquire` reads the release of the last taker.
+        lane.oldest
+            .compare_exchange(observed, TAKING, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()?;
         if first == END {
             // Acquire reads the published links. Producers can push the next group during this reversal.
             let mut head = lane.remote.swap(END, Ordering::AcqRel);
@@ -800,19 +808,8 @@ impl Pool {
     }
 
     fn run_turn(&self, lane: u32, start: u32) -> Turn {
-        let shared = &*self.shared;
-        // The oldest entry of the own list runs first in each turn, so a queue that never empties
-        // does not starve the list: a spawn or a wake from another thread, or a cancel.
-        let mut polls = 0;
-        if let Some(first) = shared.take_list(lane, None) {
-            self.run(lane, first);
-            if WOKE.with(|woke| woke.replace(false)) {
-                return Turn::Busy;
-            }
-            polls = 1;
-        }
-        for _ in polls..TURN_TASKS {
-            let Some(slot) = self.next(lane).or_else(|| self.search(lane, start)) else {
+        for polled in 0..TURN_TASKS {
+            let Some(slot) = self.next(lane, start, polled) else {
                 return if self.ended() { Turn::Ended } else { Turn::Idle };
             };
             self.run(lane, slot);
@@ -824,13 +821,21 @@ impl Pool {
         Turn::Busy
     }
 
-    /// The next task of the queue of `lane`, or of its list.
-    fn next(&self, lane: u32) -> Option<u32> {
+    /// The scheduling choice of worker `lane`: the task that it polls next, after the `polled`
+    /// tasks of this turn. The first choice of a turn is the oldest entry of its own list, so a
+    /// queue that never empties does not starve the list: a spawn or a wake from another thread, or
+    /// a cancel. Then come its queue, its list, and a steal.
+    fn next(&self, lane: u32, start: u32, polled: u32) -> Option<u32> {
         let shared = &*self.shared;
-        if let Some(slot) = shared.lanes[lane as usize].queue.pop() {
-            return Some(slot);
-        }
-        shared.take_list(lane, None)
+        let listed = if polled == 0 {
+            shared.take_list(lane, None)
+        } else {
+            None
+        };
+        listed
+            .or_else(|| shared.lanes[lane as usize].queue.pop())
+            .or_else(|| shared.take_list(lane, None))
+            .or_else(|| self.search(lane, start))
     }
 
     /// Steals a task for `lane`, if fewer than half of the workers search.
