@@ -1,9 +1,9 @@
 //! The named risks: a worker steals a task while another worker polls it, or the location of a
 //! task is not the worker that polls it; a close that races a spawn leaves the task uncancelled, or
-//! the pool does not end.
+//! the pool does not end; a cancel from another thread that races the turns of two workers is lost.
 
 use core::cell::Cell;
-use core::future::{pending, poll_fn};
+use core::future::{Future as _, pending, poll_fn};
 use core::num::NonZeroU64;
 use core::task::Poll;
 
@@ -109,5 +109,46 @@ fn a_close_that_races_a_spawn_cancels_its_task_and_the_pool_ends() {
         if let Some(handle) = handle {
             assert!(matches!(handle.join_blocking(), Outcome::Cancelled));
         }
+    });
+}
+
+#[test]
+fn a_cancel_from_another_thread_that_races_a_steal_ends_the_task_once_and_the_pool_ends() {
+    let mut model = loom::model::Builder::new();
+    // Four threads: 1 preemption in the default suite; the R407 campaign raises it.
+    model.preemption_bound = Some(1);
+    model.max_branches = 10_000;
+    model.check(|| {
+        let pool = pool(1);
+        let polls = Arc::new(AtomicU32::new(0));
+        let task = {
+            let polls = Arc::clone(&polls);
+            // The first poll wakes its task, so either worker can take it. Then it waits, and only
+            // the cancel ends it.
+            poll_fn(move |cx| {
+                if polls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    cx.waker().wake_by_ref();
+                }
+                Poll::<()>::Pending
+            })
+        };
+        let handle = pool.spawn(task).unwrap();
+        let cancel = handle.cancel_handle();
+        let canceller = loom::thread::spawn(move || cancel.cancel());
+        let (first, second) = (worker(&pool, 0), worker(&pool, 1));
+        canceller.join().unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        // The turns after the cancel drop the future. A lost cancel leaves the task waiting, and
+        // its join pending.
+        for _ in 0..3 {
+            pool.turn(0, 0);
+        }
+        let mut join = core::pin::pin!(handle.join());
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert!(
+            matches!(join.as_mut().poll(&mut cx), Poll::Ready(Outcome::Cancelled)),
+            "the cancel was lost"
+        );
     });
 }
