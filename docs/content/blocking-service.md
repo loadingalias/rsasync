@@ -14,6 +14,20 @@ file call with no overlapped form on [IOCP](iocp.md#files), and for each file ca
 ring does not have on [IoRing](iocp.md#ioring-files): see
 [Length and space](files.md#length-and-space).
 
+## Blocking work or CPU work
+
+Select the service by what the job waits for:
+
+| The job | Service | Why |
+| --- | --- | --- |
+| Waits for the host: a name lookup, a host trust check, a blocking system call | The blocking service | Its threads sleep in the call, so they cost little CPU. The plan does not count them, and a runtime starts one by default |
+| Uses the CPU and cannot yield: a hash of a large file, a compression, a parse of a large document | The [compute service](#the-compute-service) of a runtime | Its threads run on the CPUs of the workers, so the plan counts them. You admit it explicitly |
+| Uses the CPU and can yield | A task | A movable task moves to an idle worker, and a local task yields at its checkpoints |
+
+Neither service is a second runtime: each one runs only the jobs that you submit, and no job runs
+a task. No job is cancelled, because no closure can be made to stop: a long job holds its thread
+until it returns.
+
 ## Start a service and submit a job
 
 `Service::new` starts the threads. `Service::submitter` gives a `Submitter`, which each library
@@ -169,3 +183,40 @@ size by the platform. Keep headroom in the budget for them, or charge them in yo
 
 `Service::threads`, `Service::jobs`, and `Service::stack` give the limits of a running service, so
 that a host can put its threads and its stack memory in its plan.
+
+## The compute service
+
+A runtime starts a compute service only when you give `Builder::compute(Some(config))`. It is the
+same bounded service with its own threads (`rsasync-compute`), and the runtime places it in its
+plan:
+
+- The plan counts its threads with the local and the movable workers. A plan whose workers and
+  compute threads outnumber the CPUs of the process refuses with `PlanError::Oversubscribed`,
+  unless `oversubscription(Oversubscription::Allow)` allows it (see
+  [Share CPUs](runtime.md#share-cpus)).
+- `runtime.report().compute_threads()` gives its threads. Each one runs unpinned on the CPUs of
+  the process, so `shared()` of each worker gives each CPU of that worker.
+- `handle.compute()` gives its `Submitter`. A full service gives the job back with
+  `Reason::Full`. A task waits for the result with `waiter.wait().await`, so its worker runs other
+  tasks meanwhile.
+- `runtime.shutdown()` cancels the tasks and joins the workers first. Then it ends the compute
+  service, and it waits for each job that runs. `Shutdown::compute()` gives the teardown: the jobs
+  that ran (`running()`) and the queued jobs that did not run (`dropped()`), whose waiters give
+  `Failed::Ended`.
+
+```rust
+use rsasync::blocking::Config;
+use rsasync::runtime::Runtime;
+
+let runtime = Runtime::builder()
+    .local_workers(2)
+    .compute(Some(Config::new().threads(2).jobs(16)))
+    .build()?;
+let handle = runtime.handle()?;
+let compute = handle.compute().expect("the runtime has a compute service");
+let mut sum = compute.submit(|| (0..1_000_000_u64).sum::<u64>())?;
+assert_eq!(sum.wait_blocking()?, 499_999_500_000);
+let report = runtime.shutdown();
+assert_eq!(report.compute().map(|teardown| teardown.dropped()), Some(0));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```

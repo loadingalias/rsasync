@@ -223,14 +223,15 @@ impl Placed {
     }
 }
 
-/// Whether the workers of a plan can outnumber the CPUs of the process
+/// Whether the workers and the compute threads of a plan can outnumber the CPUs of the process
 /// ([`Builder::oversubscription`](super::Builder::oversubscription)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Oversubscription {
-    /// A plan with more workers than CPUs refuses with [`PlanError::Oversubscribed`].
+    /// A plan with more workers and compute threads than CPUs refuses with
+    /// [`PlanError::Oversubscribed`].
     #[default]
     Refuse,
-    /// The workers share the CPUs, and the kernel divides their time. A worker then waits for
+    /// The threads share the CPUs, and the kernel divides their time. A worker then waits for
     /// its CPU, which adds to the latency of each of its tasks.
     Allow,
 }
@@ -252,12 +253,12 @@ pub enum PlanError {
     },
     /// `Exact` names this CPU two times.
     DuplicateCpu(u32),
-    /// The local and the movable workers outnumber the CPUs that the process can use: the CPUs of
-    /// its CPU set, and at most the CPU quota of its cgroup, rounded up. Give fewer workers, or
-    /// [`Oversubscription::Allow`].
+    /// The local and the movable workers and the compute threads outnumber the CPUs that the
+    /// process can use: the CPUs of its CPU set, and at most the CPU quota of its cgroup, rounded
+    /// up. Give fewer workers or compute threads, or [`Oversubscription::Allow`].
     Oversubscribed {
-        /// The workers.
-        workers: u32,
+        /// The workers and the compute threads.
+        threads: u32,
         /// The CPUs.
         cpus: u32,
     },
@@ -279,8 +280,11 @@ impl fmt::Display for PlanError {
             Self::TooManyWorkers => write!(f, "a runtime has at most {} workers", super::MAX_WORKERS),
             Self::TooFewCpus { workers, cpus } => write!(f, "{workers} workers need more than {cpus} CPUs"),
             Self::DuplicateCpu(cpu) => write!(f, "the CPU list names CPU {cpu} two times"),
-            Self::Oversubscribed { workers, cpus } => {
-                write!(f, "{workers} workers outnumber the {cpus} CPUs of the process")
+            Self::Oversubscribed { threads, cpus } => {
+                write!(
+                    f,
+                    "{threads} workers and compute threads outnumber the {cpus} CPUs of the process"
+                )
             }
             Self::NoSuchCpu(cpu) => write!(f, "CPU {cpu} is not below {MAX_CPUS}"),
             Self::Refused { worker, fallback } => {
@@ -368,23 +372,30 @@ fn usable(host: &Host) -> Option<u32> {
     })
 }
 
-/// Refuses `workers` workers that outnumber the CPUs that the process can use, unless
-/// `oversubscription` allows it. A host with no CPU set gives no count, so nothing refuses.
-pub(super) fn check(workers: u32, host: &Host, oversubscription: Oversubscription) -> Result<(), PlanError> {
+/// Refuses `threads` workers and compute threads that outnumber the CPUs that the process can
+/// use, unless `oversubscription` allows it. A host with no CPU set gives no count, so nothing
+/// refuses.
+pub(super) fn check(threads: u32, host: &Host, oversubscription: Oversubscription) -> Result<(), PlanError> {
     match usable(host) {
-        Some(cpus) if workers > cpus && oversubscription == Oversubscription::Refuse => {
-            Err(PlanError::Oversubscribed { workers, cpus })
+        Some(cpus) if threads > cpus && oversubscription == Oversubscription::Refuse => {
+            Err(PlanError::Oversubscribed { threads, cpus })
         }
         _ => Ok(()),
     }
 }
 
-/// For each plan, the CPUs of its worker that another worker of the plans can also run on. An
-/// unpinned worker can run on each CPU of the process. Empty when the host gave no CPU set.
-pub(super) fn shared(plans: &[Placed], host: &Host) -> Result<Vec<CpuSet>, AllocError> {
+/// For each plan, the CPUs of its worker that another worker of the plans, or one of `unpinned`
+/// other threads such as the compute threads, can also run on. An unpinned thread can run on each
+/// CPU of the process. Empty when the host gave no CPU set.
+pub(super) fn shared(plans: &[Placed], host: &Host, unpinned: u32) -> Result<Vec<CpuSet>, AllocError> {
     let all = host.allowed.clone().unwrap_or_default();
     let runs_on = |plan: &Placed| plan.target.as_ref().unwrap_or(&all).clone();
     let mut workers = filled(MAX_CPUS as usize, || 0_u32)?;
+    for cpu in all.iter() {
+        if let Some(count) = workers.get_mut(cpu as usize) {
+            *count = unpinned;
+        }
+    }
     for plan in plans {
         for cpu in runs_on(plan).iter() {
             if let Some(count) = workers.get_mut(cpu as usize) {

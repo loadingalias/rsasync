@@ -188,6 +188,16 @@ impl Config {
     pub const fn stack(self, bytes: usize) -> Self {
         Self { stack: bytes, ..self }
     }
+
+    /// The threads of these limits.
+    #[cfg(all(
+        feature = "local",
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) const fn thread_count(self) -> u32 {
+        self.threads
+    }
 }
 
 impl Default for Config {
@@ -247,9 +257,9 @@ pub enum Reason {
 impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full => f.write_str("each job slot of the blocking service is occupied"),
+            Self::Full => f.write_str("each job slot of the service is occupied"),
             Self::Budget(refused) => write!(f, "the budget cannot charge the job: {refused}"),
-            Self::Ended => f.write_str("the blocking service stopped"),
+            Self::Ended => f.write_str("the service stopped"),
             Self::Allocation => f.write_str("the allocator did not give the memory of the job"),
         }
     }
@@ -297,7 +307,7 @@ pub enum Failed {
 impl fmt::Display for Failed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ended => f.write_str("the blocking service stopped before the job ran"),
+            Self::Ended => f.write_str("the service stopped before the job ran"),
             Self::Panicked => f.write_str("the job panicked"),
         }
     }
@@ -386,6 +396,8 @@ pub struct Service {
     queue: mpmc::Receiver<Box<dyn Run>>,
     threads: Vec<JoinHandle<Teardown>>,
     config: Config,
+    /// The name of each thread.
+    name: &'static str,
 }
 
 impl Service {
@@ -400,6 +412,12 @@ impl Service {
     /// [`Error::Thread`] when the system did not start a thread. The threads that started then
     /// end, and the service joins them before it returns.
     pub fn new(budget: &Budget, config: Config) -> Result<Self, Error> {
+        Self::named(budget, config, "rsasync-blocking")
+    }
+
+    /// Starts a service as [`Service::new`] does, whose threads have the name `name`: the compute
+    /// service of a runtime is a service of its own.
+    pub(crate) fn named(budget: &Budget, config: Config, name: &'static str) -> Result<Self, Error> {
         let Config { threads, jobs, stack } = config;
         let Some(slots) = NonZeroU64::new(u64::from(jobs)).filter(|_| threads > 0 && stack > 0) else {
             return Err(Error::Config);
@@ -437,6 +455,7 @@ impl Service {
             queue: receiver,
             threads: handles,
             config,
+            name,
         };
         for _ in 0..threads {
             if let Err(error) = service.start(budget, stack_units) {
@@ -454,7 +473,7 @@ impl Service {
         let queue = self.queue.try_clone().map_err(|TooManyReceivers| Error::Config)?;
         let shared = Arc::clone(&self.shared);
         let thread = thread::Builder::new()
-            .name("rsasync-blocking".into())
+            .name(self.name.into())
             .stack_size(self.config.stack)
             .spawn(move || serve(&shared, queue, stack))
             .map_err(Error::Thread)?;

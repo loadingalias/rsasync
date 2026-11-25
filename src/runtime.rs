@@ -139,6 +139,7 @@ pub struct Builder {
     generator: Option<ChaCha20Rng>,
     handles: u32,
     blocking: Option<blocking::Config>,
+    compute: Option<blocking::Config>,
     grace: Duration,
     receive_buffers: Option<ReceiveBuffers>,
     oversubscription: Oversubscription,
@@ -171,7 +172,8 @@ impl Builder {
     /// No local worker, no movable worker, [`DEFAULT_TASK_SLOTS`], a budget of [`DEFAULT_BUDGET`] bytes, the driver of
     /// [`Config::new`], [`DEFAULT_TIMERS`] at [`DEFAULT_TIMER_RESOLUTION`], `Domain` placement that
     /// is permissive, a seed from the operating system, [`DEFAULT_HANDLES`], a blocking service of
-    /// [`blocking::Config::new`], [`DEFAULT_GRACE`], and [`DEFAULT_RECEIVE_BUFFERS`].
+    /// [`blocking::Config::new`], no compute service, [`DEFAULT_GRACE`], and
+    /// [`DEFAULT_RECEIVE_BUFFERS`].
     fn new() -> Self {
         Self {
             local_workers: 0,
@@ -188,6 +190,7 @@ impl Builder {
             generator: None,
             handles: DEFAULT_HANDLES,
             blocking: Some(blocking::Config::new()),
+            compute: None,
             grace: DEFAULT_GRACE,
             receive_buffers: Some(DEFAULT_RECEIVE_BUFFERS),
             oversubscription: Oversubscription::Refuse,
@@ -323,6 +326,21 @@ impl Builder {
         }
     }
 
+    /// The compute service of the runtime: bounded threads for CPU work that cannot yield, such as
+    /// a hash of a large file or a compression, so that it never blocks a worker. Its threads run
+    /// on the CPUs of the process with the workers, so the plan counts them as it counts the
+    /// workers ([`Builder::oversubscription`]), and the report gives them
+    /// ([`Startup::compute_threads`]). [`Handle::compute`] gives its submitter, and a full service
+    /// gives the job back with its reason. The budget charges it. `None`, the default, starts no
+    /// service.
+    #[must_use]
+    pub fn compute(self, config: Option<blocking::Config>) -> Self {
+        Self {
+            compute: config,
+            ..self
+        }
+    }
+
     /// The grace period of [`Runtime::shutdown`]: the time from the request until the end of the
     /// wait for the operations to end by themselves.
     #[must_use]
@@ -359,9 +377,12 @@ impl Builder {
         // The clock of the grace period of the shutdown.
         let clock = NativeClock::new(Suspend::Pauses).map_err(|error| fail(Cause::Clock(error)))?;
         let host = topology::discover().map_err(|_| fail(Cause::Allocation))?;
-        placement::check(workers, &host, self.oversubscription).map_err(|error| fail(Cause::Plan(error)))?;
+        // The compute threads run their jobs on the CPUs of the workers.
+        let compute_threads = self.compute.map_or(0, blocking::Config::thread_count);
+        let threads = workers.saturating_add(compute_threads);
+        placement::check(threads, &host, self.oversubscription).map_err(|error| fail(Cause::Plan(error)))?;
         let plans = placement::resolve(&self.placement, self.selection, workers, &host).map_err(fail)?;
-        let shared = placement::shared(&plans, &host).map_err(|_| fail(Cause::Allocation))?;
+        let shared = placement::shared(&plans, &host, compute_threads).map_err(|_| fail(Cause::Allocation))?;
         let generator = match self.generator {
             Some(generator) => generator,
             None => entropy::generator().map_err(|error| fail(Cause::Seed(error)))?,
@@ -373,6 +394,18 @@ impl Builder {
             .transpose()
             .map_err(|error| fail(Cause::Blocking(error)))?;
         let submitter = service.as_ref().map(Service::submitter);
+        let compute = match self
+            .compute
+            .map(|config| Service::named(&budget, config, "rsasync-compute"))
+        {
+            Some(Err(error)) => {
+                if let Some(service) = service {
+                    let _teardown = service.teardown();
+                }
+                return Err(fail(Cause::Compute(error)));
+            }
+            started => started.transpose().ok().flatten(),
+        };
         let closed = try_arc(AtomicBool::new(false)).map_err(|_| fail(Cause::Allocation))?;
         // The pool, with the cache domain of each movable worker for the order of its steals.
         #[cfg(feature = "movable")]
@@ -419,8 +452,8 @@ impl Builder {
                 }
                 let mut cleanup = started.stop();
                 cleanup.extend(failed);
-                // No thread of the start remains, also no thread of the service.
-                if let Some(service) = service {
+                // No thread of the start remains, also no thread of a service.
+                for service in [compute, service].into_iter().flatten() {
                     let _teardown = service.teardown();
                 }
                 return Err(StartFailure { cause, cleanup });
@@ -438,12 +471,14 @@ impl Builder {
             handle: Handle {
                 routes: routes.into_boxed_slice(),
                 blocking: submitter,
+                compute: compute.as_ref().map(Service::submitter),
                 closed,
                 #[cfg(feature = "movable")]
                 pool,
             },
             stops: stops.into_boxed_slice(),
             blocking: service,
+            compute,
             grace: self.grace,
             clock,
             budget,
@@ -456,6 +491,7 @@ impl Builder {
             report: Startup {
                 host,
                 workers: reports.into_boxed_slice(),
+                compute_threads,
             },
         })
     }
@@ -620,6 +656,8 @@ pub struct Runtime {
     report: Startup,
     /// The blocking service of each driver of the runtime ([`Builder::blocking`]).
     blocking: Option<Service>,
+    /// The compute service of the runtime ([`Builder::compute`]).
+    compute: Option<Service>,
     /// The grace period of [`Runtime::shutdown`].
     grace: Duration,
     /// The clock that measures the grace period.
@@ -755,10 +793,14 @@ impl Runtime {
         let movable_cancelled = self.handle.pool.as_ref().map_or(0, |pool| pool.cancelled());
         #[cfg(not(feature = "movable"))]
         let movable_cancelled = 0;
+        // The tasks ended, so no task waits for a job: the compute service ends after them, when
+        // each of its running jobs returned.
+        let compute = self.compute.take().map(Service::teardown);
         let blocking = self.blocking.take().map(Service::teardown);
         Shutdown {
             workers,
             movable_cancelled,
+            compute,
             blocking,
         }
     }
@@ -772,8 +814,8 @@ impl Drop for Runtime {
             // The drop is a backstop: the shutdown of R305 reports these outcomes.
             let _outcome = join(index, thread);
         }
-        // After the workers, whose drivers submit to it.
-        if let Some(service) = self.blocking.take() {
+        // After the workers, whose tasks and drivers submit to them.
+        for service in [self.compute.take(), self.blocking.take()].into_iter().flatten() {
             let _teardown = service.teardown();
         }
     }
@@ -811,6 +853,7 @@ impl WorkerId {
 pub struct Handle {
     routes: Box<[Route]>,
     blocking: Option<Submitter>,
+    compute: Option<Submitter>,
     /// The runtime stops: each spawn refuses.
     closed: Arc<AtomicBool>,
     /// The movable pool, if the runtime has movable workers.
@@ -909,6 +952,7 @@ impl Handle {
         Ok(Self {
             routes: routes.into_boxed_slice(),
             blocking: self.blocking.clone(),
+            compute: self.compute.clone(),
             closed: Arc::clone(&self.closed),
             #[cfg(feature = "movable")]
             pool: self.pool.clone(),
@@ -920,6 +964,15 @@ impl Handle {
     #[must_use]
     pub const fn blocking(&self) -> Option<&Submitter> {
         self.blocking.as_ref()
+    }
+
+    /// The submitter of the compute service of the runtime ([`Builder::compute`]), for CPU work
+    /// that cannot yield, or `None` when the runtime has no compute service. A task waits for the
+    /// result of a job with [`Waiter::wait`](crate::blocking::Waiter::wait), so its worker runs
+    /// other tasks meanwhile.
+    #[must_use]
+    pub const fn compute(&self) -> Option<&Submitter> {
+        self.compute.as_ref()
     }
 }
 
@@ -955,6 +1008,7 @@ impl core::error::Error for HandleRefused {}
 pub struct Startup {
     host: Host,
     workers: Box<[WorkerReport]>,
+    compute_threads: u32,
 }
 
 impl Startup {
@@ -968,6 +1022,14 @@ impl Startup {
     #[must_use]
     pub const fn workers(&self) -> &[WorkerReport] {
         &self.workers
+    }
+
+    /// The threads of the compute service ([`Builder::compute`]), 0 with no service. Each one runs
+    /// unpinned on the CPUs of the process, so it shares each CPU of each worker
+    /// ([`WorkerReport::shared`]).
+    #[must_use]
+    pub const fn compute_threads(&self) -> u32 {
+        self.compute_threads
     }
 }
 
@@ -1081,6 +1143,8 @@ pub enum Cause {
     },
     /// The blocking service did not start ([`Builder::blocking`]). No worker started.
     Blocking(blocking::Error),
+    /// The compute service did not start ([`Builder::compute`]). No worker started.
+    Compute(blocking::Error),
     /// The system has no native clock that pauses while it is suspended, which measures the grace
     /// period. No worker started.
     Clock(clock::Unsupported),
@@ -1097,6 +1161,7 @@ impl fmt::Display for Cause {
             Self::Allocation => f.write_str("the allocator did not give the tables of the start"),
             Self::Worker { index, error } => write!(f, "worker {index} did not start: {error}"),
             Self::Blocking(error) => write!(f, "the blocking service did not start: {error}"),
+            Self::Compute(error) => write!(f, "the compute service did not start: {error}"),
             Self::Clock(error) => write!(f, "no native clock: {error}"),
             Self::Pool(refused) => write!(f, "the movable pool did not start: {refused}"),
         }
@@ -1110,7 +1175,7 @@ impl core::error::Error for Cause {
             Self::Seed(error) => Some(error),
             Self::Allocation => None,
             Self::Worker { error, .. } => Some(error),
-            Self::Blocking(error) => Some(error),
+            Self::Blocking(error) | Self::Compute(error) => Some(error),
             Self::Clock(error) => Some(error),
             Self::Pool(refused) => Some(refused),
         }
@@ -1122,6 +1187,7 @@ impl core::error::Error for Cause {
 pub struct Shutdown {
     workers: Box<[WorkerShutdown]>,
     movable_cancelled: u32,
+    compute: Option<blocking::Teardown>,
     blocking: Option<blocking::Teardown>,
 }
 
@@ -1145,6 +1211,15 @@ impl Shutdown {
     #[must_use]
     pub fn expired(&self) -> bool {
         self.workers.iter().any(WorkerShutdown::expired)
+    }
+
+    /// What the teardown of the compute service did, or `None` for a runtime with no compute
+    /// service. The shutdown ends the service after the workers, and it waits for each running job
+    /// to return: [`blocking::Teardown::running`] counts them, and
+    /// [`blocking::Teardown::dropped`] the jobs of its queue that did not run.
+    #[must_use]
+    pub const fn compute(&self) -> Option<blocking::Teardown> {
+        self.compute
     }
 
     /// What the teardown of the blocking service did, or `None` for a runtime with no service.

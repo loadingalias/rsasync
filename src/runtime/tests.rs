@@ -1041,7 +1041,7 @@ fn a_plan_with_more_workers_than_cpus_refuses_unless_the_builder_allows_oversubs
     let failure = builder().build().unwrap_err();
     assert_matches!(
         failure.cause(),
-        Cause::Plan(PlanError::Oversubscribed { workers, cpus: usable }) if *workers == cpus + 1 && *usable <= cpus
+        Cause::Plan(PlanError::Oversubscribed { threads, cpus: usable }) if *threads == cpus + 1 && *usable <= cpus
     );
     assert!(failure.cleanup().is_empty(), "no worker started");
     let runtime = builder().oversubscription(Oversubscription::Allow).build().unwrap();
@@ -1133,4 +1133,84 @@ fn a_shutdown_with_receives_in_both_modes_returns_one_report_of_each_worker() {
     }
     assert_matches!(local.join_blocking(), TaskOutcome::Cancelled);
     assert_matches!(movable.join_blocking(), TaskOutcome::Cancelled);
+}
+
+/// A full compute service refuses a job with its reason and gives the job back: its one thread
+/// runs a job, and its one job slot holds that job.
+#[test]
+fn a_full_compute_service_refuses_a_job_with_its_reason_and_gives_it_back() {
+    let runtime = Runtime::builder()
+        .local_workers(1)
+        .compute(Some(blocking::Config::new().threads(1).jobs(1).stack(256 << 10)))
+        .build()
+        .unwrap();
+    let handle = runtime.handle().unwrap();
+    let compute = handle.compute().unwrap();
+    let (release, wait) = mpsc::channel::<()>();
+    let mut running = compute.submit(move || wait.recv().is_ok()).unwrap();
+    let refused = compute.submit(|| 7).unwrap_err();
+    assert_eq!(refused.reason, blocking::Reason::Full);
+    assert_eq!((refused.job)(), 7, "the refused job comes back and runs");
+    release.send(()).unwrap();
+    assert!(running.wait_blocking().unwrap());
+}
+
+/// A shutdown ends the compute service after the workers, and it waits for the job that runs:
+/// the job returns its result, the queued job does not run, and the report counts both.
+#[test]
+fn a_shutdown_waits_for_the_running_compute_job_and_reports_the_jobs() {
+    let runtime = Runtime::builder()
+        .local_workers(1)
+        .compute(Some(blocking::Config::new().threads(1).jobs(2).stack(256 << 10)))
+        .build()
+        .unwrap();
+    let handle = runtime.handle().unwrap();
+    let compute = handle.compute().unwrap();
+    let (started, start) = mpsc::channel::<()>();
+    let mut running = compute
+        .submit(move || {
+            started.send(()).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            1
+        })
+        .unwrap();
+    let mut queued = compute.submit(|| 2).unwrap();
+    start.recv().unwrap();
+    let report = runtime.shutdown();
+    let teardown = report.compute().unwrap();
+    assert_eq!((teardown.running(), teardown.dropped()), (1, 1));
+    assert_eq!(running.wait_blocking().unwrap(), 1);
+    assert_matches!(queued.wait_blocking(), Err(blocking::Failed::Ended));
+}
+
+/// The plan counts the compute threads with the workers: one thread more than the CPUs refuses,
+/// and a plan that fits reports its compute threads, which share each CPU of each worker.
+#[test]
+fn the_plan_counts_the_compute_threads_with_the_workers_and_reports_them() {
+    let allowed = sys::affinity().unwrap();
+    let cpus = allowed.len();
+    let compute = |threads| Some(blocking::Config::new().threads(threads).stack(256 << 10));
+    let failure = Runtime::builder()
+        .local_workers(cpus - 1)
+        .compute(compute(2))
+        .build()
+        .unwrap_err();
+    assert_matches!(
+        failure.cause(),
+        Cause::Plan(PlanError::Oversubscribed { threads, .. }) if *threads == cpus + 1
+    );
+    let runtime = Runtime::builder()
+        .local_workers(cpus - 1)
+        .compute(compute(1))
+        .build()
+        .unwrap();
+    assert_eq!(runtime.report().compute_threads(), 1);
+    for worker in runtime.report().workers() {
+        let cpus = worker.placement().resolved().unwrap_or(&allowed);
+        assert_eq!(
+            worker.shared(),
+            cpus,
+            "a compute thread can run on each CPU of the worker"
+        );
+    }
 }

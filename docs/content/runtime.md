@@ -53,6 +53,7 @@ Each setting has a default:
 | `seed(seed)` or `generator(generator)` | A seed from the operating system | The generator of the runtime. See [Random values](#random-values) |
 | `handles(n)` | 64 | The handles that can exist at one time |
 | `blocking(config)` | `Some(blocking::Config::new())`: 4 threads, 64 jobs, 2 MiB of stack each | The blocking service of the runtime, or `None` for no service. See [The blocking service](#the-blocking-service) |
+| `compute(config)` | `None` | The compute service of the runtime, for CPU work that cannot yield. The plan counts its threads. See [The compute service](blocking-service.md#the-compute-service) |
 | `grace_period(duration)` | 5 s (`DEFAULT_GRACE`) | The grace period of `shutdown()`. See [Stop a runtime](#stop-a-runtime) |
 | `oversubscription(choice)` | `Oversubscription::Refuse` | Whether the local and the movable workers together can outnumber the CPUs of the process. See [Share CPUs](#share-cpus) |
 | `receive_buffers(buffers)` | `Some(DEFAULT_RECEIVE_BUFFERS)`: 128 slots of 4096 bytes, 512 KiB | The provided buffers of the driver of each worker and each `block_on`, which `recv_selected` takes when its bytes come. The budget charges them. `None` gives no buffers, and `recv_selected` then refuses with `Reason::Buffers`. A pool that the budget refuses fails the start with `WorkerError::Buffers` |
@@ -113,10 +114,12 @@ match Runtime::builder().local_workers(4).build() {
 
 | `Cause` | When | Recovery |
 | --- | --- | --- |
-| `Plan(PlanError)` | A setting is invalid, a strict placement falls back, or the workers outnumber the CPUs. No worker started | Correct the setting. See [Placement](#placement) and [Share CPUs](#share-cpus) |
+| `Plan(PlanError)` | A setting is invalid, a strict placement falls back, or the workers and compute threads outnumber the CPUs. No worker started | Correct the setting. See [Placement](#placement) and [Share CPUs](#share-cpus) |
 | `Seed(io::Error)` | The kernel gave no seed. No worker started | Give a seed with `seed`, or start again |
 | `Allocation` | The allocator did not give the memory of the start: the default budget, the facts of the host, the plans, or the tables of the workers. No worker started | Start fewer workers, or start again when memory is free |
 | `Pool(Refused)` | The budget (`Refused::Budget`) or the allocator (`Refused::Allocation`) refused the tables of the movable pool. No worker started | Give a larger budget, or fewer movable workers or task slots |
+| `Blocking(blocking::Error)` | The blocking service did not start: a limit of its `Config` is 0 or too large, the budget refused it, or the system started no thread. No worker started | Correct the `Config`, give a larger budget, or start fewer threads |
+| `Compute(blocking::Error)` | The compute service did not start, for the same reasons. No worker started | As for `Blocking` |
 | `Clock(clock::Unsupported)` | The target has no native clock that pauses while the system is suspended, which measures the grace period. No worker started | Use a target of [Native clock of each target](clocks.md#native-clock-of-each-target) |
 | `Worker { index, error }` | Worker `index` did not start | See `WorkerError` below |
 
@@ -419,6 +422,9 @@ charges the service, and `runtime.report()` does not list it.
   such as a name lookup. A full service gives the job back with the reason.
 - `blocking(None)` starts no service. Those calls then refuse with `Reason::Blocking`, and
   `handle.blocking()` gives `None`.
+
+CPU work that cannot yield goes to the [compute service](blocking-service.md#the-compute-service)
+(`compute(Some(config))`), whose threads the plan counts with the workers.
 
 ## Run the examples
 
