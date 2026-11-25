@@ -120,7 +120,7 @@ child gives `SignalChildError::OtherDriver`.
 | `Driver::report()` | What the driver found and applied when it started: the [capability report](capability-report.md) |
 | `Driver::turn()` | One bounded turn that never blocks. It takes the requests of other threads, submits, enters the kernel only when there is work for it, and takes up to `Config::completions_per_turn` completions from the ring. It gives the completion of each operation to its future. The bound and `Turn::completed()` also count the completions of the driver itself, such as cancel results |
 | `Turn::more()` | Work remains. Turn again before you wait |
-| `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. A handled signal also ends the wait, with no completion. The kernel runs its deferred work during the wait |
+| `Driver::wait()` | Blocks in the kernel until a completion is ready, or a request or a wake from another thread comes. A handled signal also ends the wait, with no completion. The kernel runs its deferred work during the wait. On io_uring, while a file operation runs, the wait enters the kernel again after each 250 µs, but it still returns only for these reasons. See [Wake latency of a wait](#wake-latency-of-a-wait) |
 | `Driver::wait_until(deadline, clock)` | Blocks as `wait()` does, but at most until `deadline`, an instant of the `NativeClock` `clock`. See [Wait until a deadline](#wait-until-a-deadline) |
 | The wake descriptor (`AsFd` of the driver) | Becomes readable when work comes: a completion, deferred work of the kernel, or a request or a wake from another thread. On io_uring, the first `as_fd()` registers it. Some kernels signal deferred work only one time; see [Drive it from another reactor](#drive-it-from-another-reactor) |
 | `Driver::wake_handle()` | A `WakeHandle` that any thread can use to make the wake descriptor readable and to end a wait. A turn takes a wake that came before it |
@@ -205,6 +205,35 @@ Rules for the loop:
 - On epoll and IOCP, the kernel counts the wait in milliseconds, so the driver rounds the time up.
 
 The timed wait has the same form on io_uring, epoll, kqueue, and IOCP.
+
+### Wake latency of a wait
+
+While a thread waits, the kernel can put its CPU in a deep idle state. A deep state takes longer
+to wake: C6 of an Intel Xeon server takes 190 µs. The kernel selects the state from its estimate
+of the sleep, and the next timer of the CPU limits that estimate. So a wait that ends at a device
+completion can end later than the device.
+
+On io_uring, the driver prevents this while a file operation runs. Each entry of the kernel in
+`wait()` or `wait_until()` ends after 250 µs at most, and the wait enters again. With this timer,
+the kernel selects no idle state that needs a longer sleep. Most file operations end before the
+timer, so they cost no other wakeup. A longer operation costs one more entry for each 250 µs. A
+wait while no file operation runs, for example while only TCP receives wait, sleeps until its
+wake, so an idle driver does not wake its CPU.
+
+A receive on a socket can come after any time, so the driver does not limit that wait. On a host
+that needs a low latency for network requests, limit the wake latency of the CPUs of your loops.
+This command keeps CPU 1 out of each idle state that takes more than 20 µs to wake:
+
+```sh
+echo 20 | sudo tee /sys/devices/system/cpu/cpu1/power/pm_qos_resume_latency_us
+```
+
+The CPU then uses more power while it is idle. `0` removes the limit. To see the idle states of a
+CPU and their wake latencies in microseconds:
+
+```sh
+cd /sys/devices/system/cpu/cpu1/cpuidle && grep . state*/name state*/latency
+```
 
 ## Drive it from another reactor
 

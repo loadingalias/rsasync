@@ -1036,6 +1036,9 @@ struct Resources {
     first_free: u32,
     /// The number of free slots.
     free: u32,
+    /// The operations of files that run, the sum of `Owned::running`. A wait of the ring bounds
+    /// each entry of the kernel while one runs (`FILE_WAIT`).
+    file_operations: u32,
     /// The descriptor of the ring whose file table has a place for each slot ([`Files::Registered`]).
     #[cfg(target_os = "linux")]
     files: Option<std::os::fd::RawFd>,
@@ -1069,6 +1072,7 @@ impl Resources {
             })?,
             first_free: if count > 0 { 0 } else { NO_SLOT },
             free: count,
+            file_operations: 0,
             #[cfg(target_os = "linux")]
             files: None,
             reserved: 0,
@@ -1306,6 +1310,14 @@ const GROUP: u16 = 0;
 /// The user data of the poll of the wake descriptor that a wait keeps in the ring.
 #[cfg(target_os = "linux")]
 const WAKE: u64 = CONTROL;
+
+/// The longest entry of the kernel in a wait while a file operation runs on the ring. The kernel
+/// selects the idle state of the CPU from the time to its next timer, so the CPU then enters no
+/// state whose target residency is longer, such as C6 of an Intel Xeon server: a residency of
+/// 600 µs and an exit of 190 µs. The device wakes the CPU at once when the operation ends, and
+/// most file operations end before this time. A longer one costs one more entry for each 250 µs.
+#[cfg(target_os = "linux")]
+const FILE_WAIT: core::time::Duration = core::time::Duration::from_micros(250);
 
 /// The user data of the poll of the timer of the children whose poll found no status, on the
 /// ring or on epoll.
@@ -2040,7 +2052,7 @@ impl Driver {
     /// A failure of the kernel entry other than an interrupt or a full queue, which leave work for
     /// the next turn.
     pub fn wait(&mut self) -> io::Result<()> {
-        self.wait_in(|queue| queue.submit(1))
+        self.wait_in(None)
     }
 
     /// Blocks as [`wait`](Self::wait) does, but at most until `deadline`, an instant of `clock`. A
@@ -2088,7 +2100,7 @@ impl Driver {
 
     /// The wait of [`wait_until`](Self::wait_until), until a deadline that has its clock.
     pub(crate) fn wait_to(&mut self, until: crate::clock::Until) -> io::Result<()> {
-        self.wait_in(|queue| queue.submit_until(1, until))
+        self.wait_in(Some(until))
     }
 
     /// Clears a wake descriptor that something watches outside a wait, after a harvest with no
@@ -2104,9 +2116,9 @@ impl Driver {
         self.shared.clear();
     }
 
-    /// The wait of [`wait`](Self::wait), in `enter`, with no limit or with one. On IOCP, a request
-    /// or a wake of another thread posts a packet to the port, which ends the wait.
-    fn wait_in(&mut self, enter: impl FnOnce(&mut Queue) -> io::Result<u32>) -> io::Result<()> {
+    /// The wait of [`wait`](Self::wait), with no limit or until `until`. On IOCP, a request or a
+    /// wake of another thread posts a packet to the port, which ends the wait.
+    fn wait_in(&mut self, until: Option<crate::clock::Until>) -> io::Result<()> {
         // A completion that the control keeps for the next turn is ready.
         if self.control.as_ref().is_some_and(control::Controlled::due) {
             return Ok(());
@@ -2129,13 +2141,36 @@ impl Driver {
                 Err(error) => return Err(error),
             }
         }
-        let entered = enter(&mut self.queue);
+        let entered = self.enter_wait(until);
         // A handled signal ends the wait with `Interrupted`, also under `SA_RESTART`. The wait
         // then returns: a second entry with the same time left would wait the whole time again,
         // so signals that come faster than that time would keep it past `until`.
         match entered {
             Err(error) if !retryable(&error) => Err(error),
             _ => Ok(()),
+        }
+    }
+
+    /// Enters the kernel for a wait until a completion is ready, or until `until`. While a file
+    /// operation runs on the ring, each entry ends after `FILE_WAIT` at most, and the wait enters
+    /// again: so the CPU sleeps in no idle state that wakes later than the device ends.
+    fn enter_wait(&mut self, until: Option<crate::clock::Until>) -> io::Result<u32> {
+        #[cfg(target_os = "linux")]
+        if self.resources.file_operations > 0
+            && let Some(ring) = self.queue.ring()
+        {
+            loop {
+                let left = until.map_or(FILE_WAIT, |until| until.remaining().min(FILE_WAIT));
+                let taken = ring.submit_timeout(1, left)?;
+                // A shorter entry ended at the deadline.
+                if ring.ready() || ring.needs_enter() || left < FILE_WAIT {
+                    return Ok(taken);
+                }
+            }
+        }
+        match until {
+            None => self.queue.submit(1),
+            Some(until) => self.queue.submit_until(1, until),
         }
     }
 

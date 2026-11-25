@@ -781,6 +781,7 @@ pub(super) fn ended(resources: &mut Resources, pending: &mut Vec<Resource>, tag:
     };
     // Each start of an operation of the file counted it, and this is its one terminal event.
     owned.running -= 1;
+    resources.file_operations -= 1;
     super::tcp::after(resources, pending, tag);
 }
 
@@ -1985,6 +1986,7 @@ impl Driver {
     fn count_start(&mut self, resource: Option<Resource>) {
         if let Some(owned) = resource.and_then(|resource| self.resources.get(resource)) {
             owned.running += 1;
+            self.resources.file_operations += 1;
         }
     }
 }

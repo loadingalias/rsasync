@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use super::super::suite::{self, Backend};
 #[cfg(target_os = "linux")]
 use super::super::tests::driver;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use super::super::tests::held;
 use super::super::tests::{Log, drive, hold, note, numbered, posted, recorded, taken};
 use super::super::{Call, Config, Delivery, Driver, Reason, Route};
@@ -246,6 +246,35 @@ fn kernel() -> (u32, u32) {
             .expect("a release starts with its major and minor numbers")
     };
     (next(), next())
+}
+
+/// The sleeps of this thread in the kernel: its voluntary context switches.
+#[cfg(target_os = "linux")]
+fn sleeps() -> u64 {
+    let status = fs::read_to_string("/proc/thread-self/status").expect("Linux gives the status of a thread");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .and_then(|count| count.trim().parse().ok())
+        .expect("the status counts the voluntary context switches")
+}
+
+/// Waits in `driver` until another thread wakes it after `after`, and gives the sleeps of the
+/// wait in the kernel.
+#[cfg(target_os = "linux")]
+fn sleeps_of_a_wait(driver: &mut Driver, after: Duration) -> u64 {
+    let wake = driver.wake_handle();
+    let start = std::time::Instant::now();
+    let waker = std::thread::spawn(move || {
+        std::thread::sleep(after);
+        wake.wake();
+    });
+    let before = sleeps();
+    driver.wait().expect("the wait of the test driver works");
+    let (slept, waited) = (sleeps() - before, start.elapsed());
+    waker.join().expect("the waker ends");
+    assert!(waited >= after, "the wait ended after {waited:?}, before its wake");
+    slept
 }
 
 /// Holds the one job slot of a blocking service until its drop.
@@ -791,4 +820,34 @@ fn an_nvme_report_that_the_allocator_refuses_keeps_no_memory() {
             .iter()
             .all(|refusal| *refusal == (-sys::ERROR_NOT_ENOUGH_MEMORY, 0))
     );
+}
+
+/// While a file operation runs on the ring, a wait enters the kernel with a short timeout, so the
+/// CPU takes no idle state that wakes later than the device ends. The wait enters again after
+/// each timeout, so it still ends only at a completion or a wake. After the last file operation
+/// ends, a wait sleeps until its wake, so an idle driver does not wake the CPU. The control holds
+/// the completion of the read, so the driver counts the read as running, and only the wake ends
+/// the wait.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_wait_enters_the_kernel_again_after_a_short_timeout_only_while_a_file_operation_runs() {
+    let scratch = Scratch::new("bounded-wait");
+    let path = scratch.join("data");
+    fs::write(&path, b"data").expect("the test writes its file");
+    let mut driver = driver(Config::new().delivery(Delivery::Controlled));
+    let file = open(&mut driver, &path, OpenOptions::new());
+    let read = driver
+        .read_at(&file, Backing::from(Vec::with_capacity(4)), 0)
+        .expect("the test driver has room");
+    let id = hold(&mut driver, &read);
+    assert_eq!(held(&mut driver, id).expect("the read works"), 4);
+    // 100 ms is 400 entries of 250 µs. A slow test host made 26 or more.
+    let slept = sleeps_of_a_wait(&mut driver, Duration::from_millis(100));
+    assert!(slept >= 5, "the wait slept {slept} times while a read ran");
+
+    assert_eq!(posted(&mut driver, id).expect("the read works"), 4);
+    let (read, _) = drive(&mut driver, read).expect("the driver runs");
+    assert_eq!(read.expect("the read works"), 4);
+    let slept = sleeps_of_a_wait(&mut driver, Duration::from_millis(100));
+    assert!(slept <= 3, "the wait slept {slept} times with no file operation");
 }

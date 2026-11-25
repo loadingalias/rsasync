@@ -43,7 +43,7 @@ fn main() -> Result<(), String> {
             "usage: probe server --workers N --port P --completions N | probe client --target ADDRESS \
                   --connections N --rate PER_SECOND --workers N --warmup SECONDS --window SECONDS \
                   --seed N | probe file --path FILE --op read|write --block BYTES --size BYTES \
-                  --count N --seed N --drive turn|lean|spin"
+                  --count N --seed N --drive turn|spin"
                 .to_owned(),
         ),
     }

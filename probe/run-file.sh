@@ -12,13 +12,11 @@
 # The cases:
 # - `fio`: fio with no registered files or buffers, with each fio process on the CPU. `fioalone`
 #   puts only the job of fio on the CPU, and `fioqos` runs `fio` with the latency limit below.
-# - `turn`, `lean`, `spin`: `probe file` of the checkout. `turn` is the loop of driver-only.md,
-#   `lean` waits at once while an operation is pending, and `spin` turns and never waits. `qos` runs
-#   `turn` with a limit of 20 µs on the wake latency of the CPU (`pm_qos_resume_latency_us`).
-# - `nopoll`, `coop`, `bound<µs>`: `probe file --drive turn` of a copy of the checkout with one
-#   change. `nopoll` pushes no poll of the wake descriptor in a wait. `coop` sets
-#   `IORING_SETUP_COOP_TASKRUN` in place of `IORING_SETUP_TASKRUN_FLAG`, as fio does. `bound<µs>`
-#   waits with a timeout of that many microseconds, and enters again until a completion is ready.
+# - `turn`, `spin`: `probe file` of the checkout. `turn` is the loop of driver-only.md, and `spin`
+#   turns and never waits. `qos` runs `turn` with a limit of 20 µs on the wake latency of the CPU
+#   (`pm_qos_resume_latency_us`).
+# - `before`: `probe file --drive turn` of a copy of the checkout whose waits have no bound while a
+#   file operation runs (`FILE_WAIT` in src/driver.rs), as before R230.
 #
 # Each run prints one JSON line, with the change of the use count and the time of each idle state
 # of the CPU. Then the 4 KiB read of `PROBE_EVENTS` runs one more time under `perf stat`, for the
@@ -34,8 +32,8 @@ host="$(~/dev-machines/dev-machine nodes rsasync "$target" --live | sed -n 's/^1
 # A command over SSH has no login shell, so the script gets the path of the toolchain here.
 ~/dev-machines/ssh-bin/ssh "ubuntu@$host" \
     "PATH=\$HOME/.cargo/bin:\$PATH CPU=${PROBE_CPU:-1} COUNT=${PROBE_COUNT:-40000} \
-     ROUNDS=${PROBE_ROUNDS:-5} CASES='${PROBE_CASES:-fio fioalone fioqos turn qos spin bound125 bound250 bound500}' \
-     EVENTS='${PROBE_EVENTS:-fio turn bound250}' \
+     ROUNDS=${PROBE_ROUNDS:-5} CASES='${PROBE_CASES:-fio turn before}' \
+     EVENTS='${PROBE_EVENTS:-fio turn before}' \
      OPS='${PROBE_OPS:-read:4096 read:65536 write:4096 write:65536}' bash -s" <<'EOF'
 set -euo pipefail
 size=$((4 << 30))
@@ -86,44 +84,18 @@ ls -l "$file"
 echo "== trees"
 trees=""
 for case in $CASES; do
-    case "$case" in nopoll | coop | bound*) trees="$trees $case" ;; esac
+    case "$case" in before) trees="$trees $case" ;; esac
 done
-# Each copy has one change, and the check of each change fails the run if the source moved.
+# Each copy has one change, and the check of the change fails the run if the source moved.
 for tree in $trees; do
     rm -rf ~/"$tree"
     mkdir ~/"$tree"
     tar -C ~/rsasync --exclude=./target --exclude=./.git --exclude=./docs -cf - . | tar -C ~/"$tree" -xf -
-    case "$tree" in
-        nopoll)
-            sed -i 's/^        if self\.queue\.as_ring()\.is_some() && !self\.waking {$/        if false \&\& self.queue.as_ring().is_some() \&\& !self.waking {/' \
-                ~/nopoll/src/driver.rs
-            [ "$(grep -c '^        if false && self\.queue\.as_ring()' ~/nopoll/src/driver.rs)" = 1 ]
-            ;;
-        coop)
-            sed -i 's/^    | sys::IORING_SETUP_TASKRUN_FLAG$/    | (1 << 8)/' ~/coop/src/uring.rs
-            [ "$(grep -c '^    | (1 << 8)$' ~/coop/src/uring.rs)" = 1 ]
-            ;;
-        bound*)
-            python3 - ~/"$tree"/src/driver.rs "${tree#bound}" <<'PATCH'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-text = path.read_text()
-wait = "        self.wait_in(|queue| queue.submit(1))\n"
-assert text.count(wait) == 1
-path.write_text(text.replace(wait, f"""        self.wait_in(|queue| match queue.ring() {{
-            Some(ring) => loop {{
-                let taken = ring.submit_timeout(1, core::time::Duration::from_micros({sys.argv[2]}))?;
-                if ring.ready() || ring.needs_enter() {{
-                    break Ok(taken);
-                }}
-            }},
-            None => queue.submit(1),
-        }})
-"""))
-PATCH
-            ;;
-    esac
 done
+if [ -d ~/before ]; then
+    sed -i 's/^        if self\.resources\.file_operations > 0$/        if false/' ~/before/src/driver.rs
+    [ "$(grep -c '^        if false$' ~/before/src/driver.rs)" = 1 ]
+fi
 # The copies need the lints capped, and each tree builds with the same flags.
 for tree in rsasync $trees; do
     (cd ~/"$tree" && RUSTFLAGS=--cap-lints=warn cargo build --quiet --release --locked -p probe --target-dir ~/target-"$tree")
@@ -181,9 +153,9 @@ run() {
         fio) fio_on pinned "$2" "$3" ;;
         fioalone) fio_on alone "$2" "$3" ;;
         fioqos) with_qos fio_on pinned "$2" "$3" ;;
-        turn | lean | spin) probe_on rsasync "$1" "$2" "$3" ;;
+        turn | spin) probe_on rsasync "$1" "$2" "$3" ;;
         qos) with_qos probe_on rsasync turn "$2" "$3" ;;
-        nopoll | coop | bound*) probe_on "$1" turn "$2" "$3" ;;
+        before) probe_on before turn "$2" "$3" ;;
         *) echo "unknown case $1" >&2; return 1 ;;
     esac
 }

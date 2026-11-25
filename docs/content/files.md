@@ -108,6 +108,10 @@ of the file. `Buffers` holds the buffers of a vectored read: the read fills each
 capacity before the next one, and `Buffers::into_buffers` gives them back in order. `Regions`, the
 type of a vectored send, holds the leases of a vectored write.
 
+On io_uring, a wait of the driver while a file operation runs keeps the CPU out of the deep idle
+states, so the completion of the device ends the wait at once. See
+[Wake latency of a wait](driver-only.md#wake-latency-of-a-wait).
+
 ## Exact read
 
 `Driver::read_exact_at` reads into the whole capacity of the buffer after its initialized bytes, in

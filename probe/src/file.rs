@@ -32,8 +32,6 @@ enum Drive {
     /// Poll, turn, poll again, and wait when the turn has no more work: the loop of
     /// `driver-only.md`.
     Turn,
-    /// Poll, and wait at once while the operation is pending, then turn.
-    Lean,
     /// Poll and turn, and never wait.
     Spin,
 }
@@ -52,7 +50,7 @@ pub(crate) struct Plan {
 
 impl Plan {
     /// Parses `--path P --op read|write --block BYTES --size BYTES --count N --seed N
-    /// --drive turn|lean|spin`.
+    /// --drive turn|spin`.
     pub(crate) fn parse(arguments: &[String]) -> Result<Self, String> {
         let kind = match value::<String>(arguments, "op")?.as_str() {
             "read" => Kind::Read,
@@ -61,9 +59,8 @@ impl Plan {
         };
         let drive = match value::<String>(arguments, "drive")?.as_str() {
             "turn" => Drive::Turn,
-            "lean" => Drive::Lean,
             "spin" => Drive::Spin,
-            other => return Err(format!("--drive: {other:?} is not turn, lean, or spin")),
+            other => return Err(format!("--drive: {other:?} is not turn or spin")),
         };
         Ok(Self {
             path: value(arguments, "path")?,
@@ -97,24 +94,14 @@ fn run_to_end<F: Future>(
         if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
             return Ok(output);
         }
-        let more = match drive {
-            Drive::Lean => false,
-            Drive::Turn | Drive::Spin => {
-                counts.turns += 1;
-                let more = driver.turn().map_err(|error| format!("turn: {error}"))?.more();
-                if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-                    return Ok(output);
-                }
-                more
-            }
-        };
-        if !more && !matches!(drive, Drive::Spin) {
+        counts.turns += 1;
+        let more = driver.turn().map_err(|error| format!("turn: {error}"))?.more();
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return Ok(output);
+        }
+        if !more && matches!(drive, Drive::Turn) {
             counts.waits += 1;
             driver.wait().map_err(|error| format!("wait: {error}"))?;
-            if matches!(drive, Drive::Lean) {
-                counts.turns += 1;
-                driver.turn().map_err(|error| format!("turn: {error}"))?;
-            }
         }
     }
 }
@@ -207,7 +194,6 @@ pub(crate) fn run(plan: &Plan) -> Result<(), String> {
         plan.block,
         match plan.drive {
             Drive::Turn => "turn",
-            Drive::Lean => "lean",
             Drive::Spin => "spin",
         },
         latency.total(),
