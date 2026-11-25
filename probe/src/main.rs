@@ -1,4 +1,5 @@
-//! The early probe of rsasync: TCP request/response on local workers against a baseline server.
+//! The early probe of rsasync: TCP request/response on local workers against a baseline server,
+//! and file operations at queue depth 1 on a driver that its own loop drives.
 //!
 //! `probe server` runs an echo server on local workers, one reuse-port listener on each worker.
 //! `probe client` offers an open-loop load to a server and prints one JSON line: the offered and
@@ -9,10 +10,18 @@
 //! probe server --workers 4 --port 7000 --completions 64
 //! probe client --target 10.0.0.2:7000 --connections 1000 --rate 200000 --workers 15 \
 //!     --warmup 10 --window 60 --seed 1
+//! probe file --path /mnt/probe/data --op read --block 4096 --size 4294967296 --count 40000 \
+//!     --seed 1 --drive turn
 //! ```
+//!
+//! `probe file` prints one JSON line: the latency at the 50th, 99th, and 99.9th percentiles, and the
+//! turns, waits, and voluntary context switches of each operation. `probe/run-file.sh` compares it
+//! with fio on one host.
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod client;
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod file;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod histogram;
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -29,10 +38,12 @@ fn main() -> Result<(), String> {
     match arguments.split_first() {
         Some((command, rest)) if command == "server" => server::run(&server::Plan::parse(rest)?),
         Some((command, rest)) if command == "client" => client::run(client::Plan::parse(rest)?),
+        Some((command, rest)) if command == "file" => file::run(&file::Plan::parse(rest)?),
         _ => Err(
             "usage: probe server --workers N --port P --completions N | probe client --target ADDRESS \
                   --connections N --rate PER_SECOND --workers N --warmup SECONDS --window SECONDS \
-                  --seed N"
+                  --seed N | probe file --path FILE --op read|write --block BYTES --size BYTES \
+                  --count N --seed N --drive turn|lean|spin"
                 .to_owned(),
         ),
     }
