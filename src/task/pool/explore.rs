@@ -115,7 +115,8 @@ fn a_close_that_races_a_spawn_cancels_its_task_and_the_pool_ends() {
 #[test]
 fn a_cancel_from_another_thread_that_races_a_steal_ends_the_task_once_and_the_pool_ends() {
     let mut model = loom::model::Builder::new();
-    // Four threads: 1 preemption in the default suite; the R407 campaign raises it.
+    // Three threads, and each turn of a worker searches the queues of the other: 1 preemption in
+    // the default suite, so it stays near the other models in time; the R407 campaign raises it.
     model.preemption_bound = Some(1);
     model.max_branches = 10_000;
     model.check(|| {
@@ -133,10 +134,9 @@ fn a_cancel_from_another_thread_that_races_a_steal_ends_the_task_once_and_the_po
             })
         };
         let handle = pool.spawn(task).unwrap();
-        let cancel = handle.cancel_handle();
-        let canceller = loom::thread::spawn(move || cancel.cancel());
+        // The cancel comes from this thread while both workers turn.
         let (first, second) = (worker(&pool, 0), worker(&pool, 1));
-        canceller.join().unwrap();
+        handle.cancel_handle().cancel();
         first.join().unwrap();
         second.join().unwrap();
         // The turns after the cancel drop the future. A lost cancel leaves the task waiting, and
