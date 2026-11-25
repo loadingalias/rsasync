@@ -486,6 +486,17 @@ pub(crate) fn with_driver<V, R>(value: V, f: impl FnOnce(&mut crate::driver::Dri
     with_owner(value, |local, value| local.with_driver(value, f)).unwrap_or_else(Err)
 }
 
+/// Reserves `amount` units of the budget of the owner of this thread, which is the budget of its
+/// runtime: `None` when the thread has no owner.
+#[cfg(all(
+    feature = "movable",
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn reserve(amount: u64) -> Option<Result<crate::capacity::Permit, Exhausted>> {
+    with_owner((), |local, ()| local.budget.reserve(amount)).ok()
+}
+
 /// Calls `f` with the owner of this thread and `value`, with no count of its `Rc`, or gives
 /// `value` back when the thread has no owner.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -504,3 +504,110 @@ fn a_worker_on_epoll_refuses_each_movable_call() {
         })
         .unwrap();
 }
+
+/// The halves of a movable stream run a receive and a send at one time. A vectored send gives its
+/// regions in order, a receive into a selected buffer takes a buffer of the driver of its worker,
+/// and a half-close ends the stream of the peer while the receives go on.
+#[test]
+fn the_halves_of_a_movable_stream_receive_and_send_and_a_half_close_ends_the_peer_stream() {
+    let runtime = runtime();
+    let (address, addressed) = mpsc::channel();
+    let server = runtime
+        .handle()
+        .unwrap()
+        .spawn_movable(async move {
+            let (_listener, mut stream) = accepted(address).await;
+            let (mut read, mut write) = stream.split();
+            let receive = read.recv(buffer(64)).unwrap();
+            let mut regions = crate::driver::Regions::with_capacity(2);
+            regions.push(Lease::from(b"pi".to_vec()));
+            regions.push(Lease::from(b"ng".to_vec()));
+            let (sent, _regions) = write.send_vectored(regions).unwrap().await.unwrap();
+            assert_eq!(sent.unwrap(), 4);
+            let (received, bytes) = receive.await.unwrap();
+            assert_eq!((received.unwrap(), bytes.bytes()), (4, &b"pong"[..]));
+            stream.shutdown_write().unwrap().await.unwrap().unwrap();
+            let selected = stream.recv_selected().unwrap().await.unwrap().unwrap();
+            selected.bytes().to_vec()
+        })
+        .unwrap();
+    let mut client = client(&addressed);
+    let mut ping = [0; 4];
+    client.read_exact(&mut ping).unwrap();
+    assert_eq!(&ping, b"ping");
+    client.write_all(b"pong").unwrap();
+    assert_eq!(client.read(&mut [0; 8]).unwrap(), 0, "the half-close ends the stream");
+    client.write_all(b"after").unwrap();
+    assert_matches!(server.join_blocking(), Outcome::Completed(bytes) if bytes == b"after");
+}
+
+/// The socket of a movable stream charges the one budget of the runtime, on each worker: with the
+/// budget held, a connect gives `OutOfMemory` and closes its socket, and after the release the
+/// next connect works. A worker with a budget of its own would admit the connect.
+#[test]
+fn the_socket_of_a_movable_stream_charges_the_one_budget_of_the_runtime() {
+    let budget = crate::capacity::Budget::new(core::num::NonZeroU64::new(crate::runtime::DEFAULT_BUDGET).unwrap());
+    let runtime = Runtime::builder()
+        .movable_workers(2)
+        .driver(Config::new().backend(Backend::IoUring))
+        .budget(budget.clone())
+        .build()
+        .unwrap();
+    let listener = net::TcpListener::bind(loopback()).unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = runtime.handle().unwrap();
+    for held in [true, false] {
+        let (go, wait) = mpsc::channel::<()>();
+        let task = handle
+            .spawn_movable(async move {
+                wait.recv().unwrap();
+                TcpStream::connect(address, TcpOptions::default())
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .map(drop)
+                    .map_err(|error| error.kind())
+            })
+            .unwrap();
+        // The spawn charged the task, so only the charge of the socket is left to take.
+        let drained = held.then(|| budget.reserve(budget.available()).unwrap());
+        go.send(()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let connected = task.join_blocking();
+        drop(drained);
+        let expected = if held {
+            Err(std::io::ErrorKind::OutOfMemory)
+        } else {
+            Ok(())
+        };
+        assert_matches!(connected, Outcome::Completed(result) if result == expected);
+    }
+
+    // A receive after a receive whose future dropped needs the memory of a chain, which the budget
+    // charges too: with the budget held, it refuses with `Reason::Budget` and gives its buffer back.
+    let (go, wait) = mpsc::channel::<()>();
+    let (charged, wait_charge) = mpsc::channel::<()>();
+    let task = handle
+        .spawn_movable(async move {
+            let mut stream = TcpStream::connect(address, TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            drop(stream.recv(buffer(8)).unwrap());
+            charged.send(()).unwrap();
+            wait.recv().unwrap();
+            let refused = stream.recv(buffer(8)).unwrap_err().reason();
+            // A close takes a chain too, so the drop ends the stream.
+            drop(stream);
+            refused
+        })
+        .unwrap();
+    let (_peer, _) = listener.accept().unwrap();
+    wait_charge.recv().unwrap();
+    let drained = budget.reserve(budget.available()).unwrap();
+    go.send(()).unwrap();
+    let refused = task.join_blocking();
+    drop(drained);
+    assert_matches!(refused, Outcome::Completed(Reason::Budget));
+}

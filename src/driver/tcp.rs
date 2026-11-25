@@ -315,7 +315,7 @@ impl TcpOptions {
     }
 
     /// Reads each option of `socket`.
-    fn read(socket: Borrowed<'_>) -> io::Result<Self> {
+    pub(super) fn read(socket: Borrowed<'_>) -> io::Result<Self> {
         let flag = |level, name| int(socket, level, name).map(|value| Some(value != 0));
         let size = |name| {
             let value = int(socket, sys::SOL_SOCKET, name)?;
@@ -1345,6 +1345,37 @@ pub(crate) fn received(result: i32, held: &mut Held) -> Option<(io::Result<usize
     Some((count(result), held.loan.take()?.into_inner()))
 }
 
+/// The output of a vectored send: the count of sent bytes, or the failure of the write direction,
+/// and the regions.
+pub(crate) fn sent_regions(result: i32, held: &mut Held) -> Option<(io::Result<usize>, Regions)> {
+    let sent = held
+        .failed
+        .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
+    let Payload::Regions(regions) = core::mem::take(&mut held.payload) else {
+        return None;
+    };
+    Some((sent, regions))
+}
+
+/// The output of a half-close: its result, or the failure of the write direction.
+pub(crate) fn shut(result: i32, held: &mut Held) -> Option<io::Result<()>> {
+    Some(match held.failed {
+        Some(failed) => Err(io::Error::other(failed)),
+        None => count(result).map(|_| ()),
+    })
+}
+
+/// The output of a receive into a buffer that the kernel selected: the buffer with the received
+/// bytes, or an empty buffer at the end of the stream, where no buffer was selected.
+pub(crate) fn received_selected(result: i32, held: &mut Held) -> Option<io::Result<Backing>> {
+    // An empty `Vec` allocates nothing.
+    Some(count(result).map(|_| {
+        held.loan
+            .take()
+            .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner)
+    }))
+}
+
 /// The output of a send: the count of sent bytes, or the failure of the write direction, and the
 /// lease.
 pub(crate) fn sent(result: i32, held: &mut Held) -> Option<(io::Result<usize>, Lease)> {
@@ -1576,15 +1607,7 @@ impl Driver {
             ..Held::default()
         };
         let completion = self.begin(writer.as_mut().resource, Kind::Vectored, regions, held)?;
-        Ok(Operation::new(completion, |result, held| {
-            let sent = held
-                .failed
-                .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
-            let Payload::Regions(regions) = core::mem::take(&mut held.payload) else {
-                return None;
-            };
-            Some((sent, regions))
-        }))
+        Ok(Operation::new(completion, sent_regions))
     }
 
     /// Ends the write side of the stream after the sends before it (`SHUT_WR`): the peer reads
@@ -1615,12 +1638,7 @@ impl Driver {
             });
         }
         let completion = self.begin(resource, Kind::Shutdown, (), |()| Held::default())?;
-        Ok(Operation::new(completion, |result, held| {
-            Some(match held.failed {
-                Some(failed) => Err(io::Error::other(failed)),
-                None => count(result).map(|_| ()),
-            })
-        }))
+        Ok(Operation::new(completion, shut))
     }
 
     /// Sets each option of `options` that is not `None` on `socket`.
@@ -1753,15 +1771,7 @@ impl Driver {
             });
         }
         let completion = self.begin(resource, Kind::Selected, (), |()| Held::default())?;
-        Ok(Operation::new(completion, |result, held| {
-            // With no selected buffer, for example at the end of the stream, the backing is empty,
-            // and an empty `Vec` allocates nothing.
-            Some(count(result).map(|_| {
-                held.loan
-                    .take()
-                    .map_or_else(|| Backing::from(Vec::new()), WriteLoan::into_inner)
-            }))
-        }))
+        Ok(Operation::new(completion, received_selected))
     }
 
     /// Sends the bytes of `lease`. The future gives the count of sent bytes, and the lease. The

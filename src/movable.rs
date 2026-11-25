@@ -74,7 +74,7 @@ use core::task::{Context, Poll, ready};
 use std::io;
 
 use crate::buffer::{Backing, Lease};
-use crate::driver::{self, Closed, Direction, Ended, Held, PlainSocket, Refused, TcpOptions};
+use crate::driver::{self, Closed, Direction, Ended, Held, PlainSocket, Refused, Regions, TcpOptions};
 use crate::local::{rewrap, submit_any};
 
 /// A listening TCP socket that moves with its task.
@@ -207,6 +207,19 @@ impl TcpStream {
         Ok(Operation::borrowed(read, driver::received))
     }
 
+    /// Receives into a buffer that the kernel selects from the provided buffers of the driver of
+    /// this thread when the bytes come, as
+    /// [`local::TcpStream::recv_selected`](crate::local::TcpStream::recv_selected) does: a receive
+    /// that waits holds no buffer. A drop of the future asks for a cancel.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`], and `Reason::Buffers` when the driver of this thread has no
+    /// provided buffers.
+    pub fn recv_selected(&mut self) -> Result<Operation<'_, io::Result<Backing>>, Refused<()>> {
+        recv_selected(&self.socket, &mut self.read)
+    }
+
     /// Sends the bytes of `lease`, as [`local::TcpStream::send`](crate::local::TcpStream::send)
     /// does. A drop of the future does not cancel the send.
     ///
@@ -217,6 +230,59 @@ impl TcpStream {
         let Self { socket, write, .. } = self;
         submit_any(lease, |driver, lease| write.send(driver, socket, lease))?;
         Ok(Operation::borrowed(write, driver::sent))
+    }
+
+    /// Sends the bytes of `regions` in order, in one operation, as
+    /// [`local::TcpStream::send_vectored`](crate::local::TcpStream::send_vectored) does. A drop of
+    /// the future does not cancel the send.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`], with the regions.
+    pub fn send_vectored(
+        &mut self,
+        regions: Regions,
+    ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
+        send_vectored(&self.socket, &mut self.write, regions)
+    }
+
+    /// Ends the write side of the stream after the sends before it, as
+    /// [`local::TcpStream::shutdown_write`](crate::local::TcpStream::shutdown_write) does: the peer
+    /// reads the end of the stream, and the receives go on.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`].
+    pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
+        shutdown_write(&self.socket, &mut self.write)
+    }
+
+    /// Gives a read half and a write half, so that a receive and a send run at one time, each in
+    /// its own direction. The halves borrow the stream.
+    pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
+        let Self { socket, read, write } = self;
+        (ReadHalf { socket, read }, WriteHalf { socket, write })
+    }
+
+    /// Reads each option of the stream, with the value of the kernel, as
+    /// [`local::TcpStream::options`](crate::local::TcpStream::options) does. It needs no driver.
+    ///
+    /// # Errors
+    ///
+    /// An error of the system.
+    pub fn options(&self) -> io::Result<TcpOptions> {
+        driver::plain_options(&self.socket)
+    }
+
+    /// Sets each option of `options` that is not `None`, as
+    /// [`local::TcpStream::set_options`](crate::local::TcpStream::set_options) does. It needs no
+    /// driver.
+    ///
+    /// # Errors
+    ///
+    /// An error of the system, or `InvalidInput` for a buffer size above `i32::MAX`.
+    pub fn set_options(&self, options: TcpOptions) -> io::Result<()> {
+        driver::set_plain_options(&self.socket, options)
     }
 
     /// Closes the stream: the close cancels each operation of the stream, a dropped send too, and
@@ -236,6 +302,105 @@ impl TcpStream {
             Err(refused) => Err(rewrap(refused, |(socket, read, write)| Self { socket, read, write })),
         }
     }
+}
+
+/// The read half of a [`TcpStream`]: its receives borrow it.
+#[derive(Debug)]
+pub struct ReadHalf<'a> {
+    socket: &'a PlainSocket,
+    read: &'a mut Direction,
+}
+
+impl ReadHalf<'_> {
+    /// Receives into the capacity of `buffer` after its initialized bytes, as
+    /// [`TcpStream::recv`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`].
+    pub fn recv(&mut self, buffer: Backing) -> Result<Operation<'_, (io::Result<usize>, Backing)>, Refused<Backing>> {
+        let Self { socket, read } = self;
+        submit_any(buffer, |driver, buffer| read.recv(driver, socket, buffer))?;
+        Ok(Operation::borrowed(read, driver::received))
+    }
+
+    /// Receives into a buffer that the kernel selects, as [`TcpStream::recv_selected`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv_selected`].
+    pub fn recv_selected(&mut self) -> Result<Operation<'_, io::Result<Backing>>, Refused<()>> {
+        recv_selected(self.socket, self.read)
+    }
+}
+
+/// The write half of a [`TcpStream`]: its sends borrow it.
+#[derive(Debug)]
+pub struct WriteHalf<'a> {
+    socket: &'a PlainSocket,
+    write: &'a mut Direction,
+}
+
+impl WriteHalf<'_> {
+    /// Sends the bytes of `lease`, as [`TcpStream::send`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::send`].
+    pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
+        let Self { socket, write } = self;
+        submit_any(lease, |driver, lease| write.send(driver, socket, lease))?;
+        Ok(Operation::borrowed(write, driver::sent))
+    }
+
+    /// Sends the bytes of `regions` in order, as [`TcpStream::send_vectored`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::send_vectored`].
+    pub fn send_vectored(
+        &mut self,
+        regions: Regions,
+    ) -> Result<Operation<'_, (io::Result<usize>, Regions)>, Refused<Regions>> {
+        send_vectored(self.socket, self.write, regions)
+    }
+
+    /// Ends the write side of the stream, as [`TcpStream::shutdown_write`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::shutdown_write`].
+    pub fn shutdown_write(&mut self) -> Result<Operation<'_, io::Result<()>>, Refused<()>> {
+        shutdown_write(self.socket, self.write)
+    }
+}
+
+/// Starts a receive into a selected buffer on `socket` in its direction `read`.
+fn recv_selected<'a>(
+    socket: &PlainSocket,
+    read: &'a mut Direction,
+) -> Result<Operation<'a, io::Result<Backing>>, Refused<()>> {
+    submit_any((), |driver, ()| read.recv_selected(driver, socket))?;
+    Ok(Operation::borrowed(read, driver::received_selected))
+}
+
+/// Starts a vectored send of `regions` on `socket` in its direction `write`.
+fn send_vectored<'a>(
+    socket: &PlainSocket,
+    write: &'a mut Direction,
+    regions: Regions,
+) -> Result<Operation<'a, (io::Result<usize>, Regions)>, Refused<Regions>> {
+    submit_any(regions, |driver, regions| write.send_vectored(driver, socket, regions))?;
+    Ok(Operation::borrowed(write, driver::sent_regions))
+}
+
+/// Starts a half-close of `socket` in its direction `write`.
+fn shutdown_write<'a>(
+    socket: &PlainSocket,
+    write: &'a mut Direction,
+) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
+    submit_any((), |driver, ()| write.shutdown_write(driver, socket))?;
+    Ok(Operation::borrowed(write, driver::shut))
 }
 
 /// The place of the operation of a future: the direction that the future borrows, or its own

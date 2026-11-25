@@ -38,13 +38,14 @@ use core::mem;
 use core::net::SocketAddr;
 use core::task::{Context, Poll, ready};
 use std::io;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 
 use rsnetwork_udp::{SockAddrStorage, sys};
 
-use super::tcp::{self, Directions, TcpOptions};
+use super::tcp::{self, Directions, Regions, TcpOptions};
 use super::{Completion, Driver, ECANCELED, Held, Kind, Payload, Reason, Refused, Tag, borrow, out_of_memory};
 use crate::buffer::{Backing, Lease, WriteLoan};
+use crate::capacity::Permit;
 use crate::completion::Gone;
 use crate::table::OpId;
 use crate::uring::Sqe;
@@ -53,7 +54,64 @@ use crate::uring::Sqe;
 /// after the resource dropped and each operation ended. It is not the `Arc` of the `sync` shims:
 /// no protocol that loom checks reads its count, and the size of [`Held`] then does not depend on
 /// the build.
-pub(crate) type PlainSocket = alloc::sync::Arc<OwnedFd>;
+pub(crate) type PlainSocket = alloc::sync::Arc<Socket>;
+
+/// The descriptor of a movable socket, with the charge of its memory to the budget of the owner
+/// that made it, which ends when the last holder drops.
+#[derive(Debug)]
+pub(crate) struct Socket {
+    fd: OwnedFd,
+    _charge: Permit,
+}
+
+impl Socket {
+    /// The number of the descriptor.
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+/// Reserves `size` bytes of memory from the budget of the owner of this thread: [`Reason::Budget`]
+/// when the budget refuses, and [`Reason::NoDriver`] when the thread has no owner, so no driver
+/// either.
+fn charge(size: usize) -> Result<Permit, Reason> {
+    match crate::task::reserve(u64::try_from(size).unwrap_or(u64::MAX)) {
+        Some(Ok(permit)) => Ok(permit),
+        Some(Err(_)) => Err(Reason::Budget),
+        None => Err(Reason::NoDriver),
+    }
+}
+
+/// Makes the movable socket of `fd`, charged to the budget of the owner of this thread. A
+/// refusal closes `fd`: `OutOfMemory` when the budget or the allocator refuses, and `NotFound`
+/// when the thread has no owner.
+fn charged(fd: OwnedFd) -> io::Result<PlainSocket> {
+    let charge = charge(crate::sync::arc_size::<Socket>()).map_err(|reason| match reason {
+        Reason::NoDriver => io::Error::from(io::ErrorKind::NotFound),
+        _ => io::Error::from(io::ErrorKind::OutOfMemory),
+    })?;
+    PlainSocket::try_new(Socket { fd, _charge: charge }).map_err(out_of_memory)
+}
+
+/// Reads each TCP option of `socket`.
+pub(crate) fn options(socket: &PlainSocket) -> io::Result<TcpOptions> {
+    TcpOptions::read(borrow(&socket.fd))
+}
+
+/// Sets each TCP option of `options` that is not `None` on `socket`.
+pub(crate) fn set_options(socket: &PlainSocket, options: TcpOptions) -> io::Result<()> {
+    options.apply(borrow(&socket.fd))
+}
+
+/// A new chain, with the charge of its memory to the budget of the owner of this thread.
+fn chain() -> Result<Box<Chain>, Reason> {
+    let charge = charge(size_of::<Chain>())?;
+    Box::try_new(Chain {
+        _charge: Some(charge),
+        ..Chain::default()
+    })
+    .map_err(|_| Reason::Allocation)
+}
 
 /// What an operation on a plain descriptor keeps beside the resources of its kind.
 #[derive(Debug)]
@@ -90,6 +148,8 @@ struct Chain {
     before: [Option<Tail>; 2],
     /// What the operations before left.
     flow: Directions,
+    /// The charge of the memory of the chain, which ends with the chain.
+    _charge: Option<Permit>,
 }
 
 impl Chain {
@@ -188,6 +248,38 @@ impl Direction {
         })
     }
 
+    /// Starts a send of the bytes of `regions` in order, in one operation, on `socket`, with
+    /// `driver` as its home.
+    pub(crate) fn send_vectored(
+        &mut self,
+        driver: &mut Driver,
+        socket: &PlainSocket,
+        regions: Regions,
+    ) -> Result<(), Refused<Regions>> {
+        self.begin(driver, socket, Kind::Vectored, regions, |regions| Held {
+            payload: Payload::Regions(regions),
+            ..Held::default()
+        })
+    }
+
+    /// Starts the end of the write side of the stream `socket`, after the sends before it, with
+    /// `driver` as its home.
+    pub(crate) fn shutdown_write(&mut self, driver: &mut Driver, socket: &PlainSocket) -> Result<(), Refused<()>> {
+        self.begin(driver, socket, Kind::Shutdown, (), |()| Held::default())
+    }
+
+    /// Starts a receive on `socket` into a buffer that the kernel selects from the provided
+    /// buffers of `driver`, its home. Refuses with [`Reason::Buffers`] when that driver has none.
+    pub(crate) fn recv_selected(&mut self, driver: &mut Driver, socket: &PlainSocket) -> Result<(), Refused<()>> {
+        if driver.selected.is_none() {
+            return Err(Refused {
+                reason: Reason::Buffers,
+                value: (),
+            });
+        }
+        self.begin(driver, socket, Kind::Selected, (), |()| Held::default())
+    }
+
     /// Starts an accept on the listening `socket`, with `driver` as its home.
     pub(crate) fn accept(&mut self, driver: &mut Driver, socket: &PlainSocket) -> Result<(), Refused<()>> {
         self.begin(driver, socket, Kind::Accept, (), |()| {
@@ -208,13 +300,10 @@ impl Direction {
     ) -> Result<(), Refused<P>> {
         // The memory comes before the slot, so the home makes the resources with no refusal.
         let fresh = if self.tail.is_some() && self.chain.is_none() {
-            let Ok(chain) = Box::try_new(Chain::default()) else {
-                return Err(Refused {
-                    reason: Reason::Allocation,
-                    value,
-                });
-            };
-            Some(chain)
+            match chain() {
+                Ok(chain) => Some(chain),
+                Err(reason) => return Err(Refused { reason, value }),
+            }
         } else {
             None
         };
@@ -253,13 +342,15 @@ impl Direction {
     ) -> Result<Self, Refused<(PlainSocket, Self, Self)>> {
         let tails = read.tail.is_some() || write.tail.is_some();
         let fresh = if tails && read.chain.is_none() && write.chain.is_none() {
-            let Ok(chain) = Box::try_new(Chain::default()) else {
-                return Err(Refused {
-                    reason: Reason::Allocation,
-                    value: (socket, read, write),
-                });
-            };
-            Some(chain)
+            match chain() {
+                Ok(chain) => Some(chain),
+                Err(reason) => {
+                    return Err(Refused {
+                        reason,
+                        value: (socket, read, write),
+                    });
+                }
+            }
         } else {
             None
         };
@@ -370,7 +461,7 @@ pub(crate) fn socket(result: i32, held: &mut Held) -> Option<io::Result<(PlainSo
         };
         let socket = connection.take().ok_or(io::ErrorKind::InvalidData)?;
         let address = peer.to_socket_addr(*peer_len).ok_or(io::ErrorKind::InvalidData)?;
-        Ok((PlainSocket::try_new(socket).map_err(out_of_memory)?, address))
+        Ok((charged(socket)?, address))
     }))
 }
 
@@ -473,12 +564,15 @@ impl Driver {
                 if !self.room(1) {
                     return false;
                 }
-                // SAFETY: the entry names the loan, the lease, or the peer address in the
-                // resources of `id`, which the home keeps until its terminal event. Those
+                // A receive into a selected buffer takes it from the provided buffers of this home.
+                let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
+                let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
+                // SAFETY: the entry names the loan, the lease, the regions, or the peer address in
+                // the resources of `id`, which the home keeps until its terminal event. Those
                 // resources hold the descriptor too, so it stays open. The queue has room.
                 #[expect(unsafe_code, reason = "the kernel uses the memory of the resources of the operation")]
                 unsafe {
-                    self.push(id, |held| tcp::submission(held, kind, fd, false, 0, 0));
+                    self.push(id, |held| tcp::submission(held, kind, fd, false, group, slot_len));
                 }
                 true
             }

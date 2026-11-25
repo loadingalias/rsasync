@@ -240,7 +240,7 @@ pub(super) struct Lazy {
 
 pub(super) struct Local {
     shared: Arc<Shared>,
-    budget: Budget,
+    pub(super) budget: Budget,
     entries: Box<[Cell<Option<Entry>>]>,
     free: RefCell<Vec<u32>>,
     /// The local ready queue. It holds at most one entry for each slot.

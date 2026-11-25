@@ -287,12 +287,22 @@ have a home:
 | `TcpListener::bind(address, options)`, `listener.local_addr()` | `Driver::bind`, `TcpListener::local_addr` |
 | `listener.accept()` | `Driver::accept` |
 | `TcpStream::connect(address, options)` | `Driver::connect` |
-| `stream.recv(backing)`, `stream.send(lease)` | `Driver::recv`, `Driver::send` |
+| `stream.recv(backing)`, `stream.send(lease)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send`, `Driver::send_vectored` |
+| `stream.recv_selected()` | `Driver::recv_selected`, into the provided buffers of the driver of the worker |
+| `stream.shutdown_write()` | `Driver::shutdown_write` |
+| `stream.split()` | `TcpStream::split`: a `movable::ReadHalf` (`recv`, `recv_selected`) and a `movable::WriteHalf` (`send`, `send_vectored`, `shutdown_write`) |
+| `stream.options()`, `stream.set_options(options)` | `Driver::options`, `Driver::set_options`, with no driver |
 | `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
 
 Each call gives a `rsasync::movable::Operation` future, with `cancel()` and the same outputs as
-on the driver. The halves of a stream, a vectored send, a half-close, the option calls, and the
-other kinds of resource are not movable calls yet.
+on the driver. The other kinds of resource are not movable calls yet.
+
+A movable resource charges its memory to the one budget of the runtime, as each worker charges
+its tables there: the socket of each stream and listener, and the state that a direction keeps
+after an operation whose future dropped. So the budget bounds the movable resources of all of the
+workers together. With no room in the budget, a connect, a bind, or an accept gives `OutOfMemory`
+and closes its socket, and an operation that needs that state refuses with `Reason::Budget` and
+gives back what you gave. A drop of a stream needs no memory.
 
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};

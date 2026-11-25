@@ -170,9 +170,11 @@ pub(crate) use completion::Completion;
 pub(crate) use home::{Cleanup, Home, MESSAGES};
 // The operations of the movable I/O types, and their outputs.
 #[cfg(all(feature = "movable", target_os = "linux"))]
-pub(crate) use plain::{Direction, PlainSocket, socket as plain_socket};
+pub(crate) use plain::{
+    Direction, PlainSocket, options as plain_options, set_options as set_plain_options, socket as plain_socket,
+};
 #[cfg(all(feature = "movable", target_os = "linux"))]
-pub(crate) use tcp::{received, sent};
+pub(crate) use tcp::{received, received_selected, sent, sent_regions, shut};
 
 /// The limits of a driver, each of which bounds memory that the driver allocates when it starts,
 /// and the features that it requires.
@@ -721,6 +723,11 @@ pub enum Reason {
     /// The allocator did not give the memory of the operation, such as the job of an operation on
     /// the blocking service. A later operation can succeed.
     Allocation,
+    /// The budget of the owner of the thread refused the memory of the operation: a call of
+    /// `rsasync::movable` charges the state that its direction keeps, as each owner of a runtime
+    /// charges its memory to the one budget of the runtime. A later operation can succeed.
+    #[cfg(all(feature = "movable", target_os = "linux"))]
+    Budget,
     /// Each child slot of the driver is in use ([`Config::children`]).
     #[cfg(unix)]
     Children,
