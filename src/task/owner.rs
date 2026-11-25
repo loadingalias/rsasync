@@ -548,6 +548,11 @@ impl Local {
         let Some((timers, clock)) = timers.as_mut() else {
             return false;
         };
+        // A storage with no waiting timer needs no read of the clock: `timer()` brings it to the
+        // clock before its next insert.
+        if timers.next_turn().is_none() {
+            return false;
+        }
         // No mismatch: `use_timers` checked that the clock is on the domain of the storage.
         timers.turn(clock.now(), TIMERS_PER_TURN).unwrap_or(false)
     }

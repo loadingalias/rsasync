@@ -225,6 +225,9 @@ pub(super) type Homes = alloc::vec::Vec<Arc<Home>>;
 /// Wakes each stream of `homes` whose signal arrived since the last turn, and forgets each stream
 /// that closed.
 pub(super) fn wake(homes: &mut Homes) {
+    if homes.is_empty() {
+        return;
+    }
     homes.retain(|home| {
         // The stream holds the other reference until it closes.
         if Arc::strong_count(home) == 1 {

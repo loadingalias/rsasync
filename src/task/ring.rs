@@ -282,7 +282,11 @@ impl Park for Drive<'_> {
 /// Sends a message from `driver` to each home in the outbox of `local`. The next submit of the
 /// driver sends them.
 fn flush(local: &Local, driver: &mut Driver) {
-    for home in local.outbox.borrow_mut().drain(..) {
+    let mut outbox = local.outbox.borrow_mut();
+    if outbox.is_empty() {
+        return;
+    }
+    for home in outbox.drain(..) {
         if let Err(home) = driver.message(home) {
             home.interrupt();
         }

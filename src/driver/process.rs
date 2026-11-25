@@ -1179,6 +1179,9 @@ impl Driver {
     /// earliest one. One that finds no room in the queue stays for the next turn.
     #[expect(unsafe_code, reason = "a poll names no memory")]
     pub(super) fn poll_again(&mut self) {
+        if self.children.again.is_empty() {
+            return;
+        }
         #[cfg(target_os = "linux")]
         let (now, mut earliest) = (self.children.clock.now(), None::<Instant>);
         #[cfg_attr(

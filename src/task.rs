@@ -392,7 +392,13 @@ pub fn timer(deadline: Deadline) -> Result<Timer, TimerRefused> {
     // The turn of the timers holds the storage while it wakes: a waker that makes a timer then
     // gets the refusal of an owner with no storage.
     let mut timers = local.timers.try_borrow_mut().map_err(|_| TimerRefused::NoTimers)?;
-    let (timers, _) = timers.as_mut().ok_or(TimerRefused::NoTimers)?;
+    let (timers, clock) = timers.as_mut().ok_or(TimerRefused::NoTimers)?;
+    // The owner does not turn a storage with no waiting timer (`Local::fire_timers`), so its tick
+    // can be old. A turn brings it to the clock first, so the range of the deadline counts from now.
+    // No mismatch: `use_timers` checked that the clock is on the domain of the storage.
+    if timers.next_turn().is_none() {
+        timers.turn(clock.now(), 1).unwrap_or(false);
+    }
     timers.insert(deadline).map_err(TimerRefused::Storage)
 }
 

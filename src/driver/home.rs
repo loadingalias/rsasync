@@ -169,7 +169,10 @@ impl Driver {
 
     /// Starts each close that a drop recorded ([`Cleanup::post`]).
     pub(super) fn take_closes(&mut self) {
-        if !self.shared.closes.posted.swap(false, Ordering::Acquire) {
+        // A load first: a turn with no record changes no shared line.
+        if !self.shared.closes.posted.load(Ordering::Relaxed)
+            || !self.shared.closes.posted.swap(false, Ordering::Acquire)
+        {
             return;
         }
         for index in 0..self.resources.slots.len() {
