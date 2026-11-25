@@ -1542,10 +1542,7 @@ impl Driver {
         writer: &'a mut W,
         lease: Lease,
     ) -> Result<Operation<'a, (io::Result<usize>, Lease)>, Refused<Lease>> {
-        let held = |lease| Held {
-            payload: Payload::Lease(lease),
-            ..Held::default()
-        };
+        let held = |lease| Held::with_payload(Payload::Lease(lease));
         let completion = self.begin(writer.as_mut().resource, Kind::Send, lease, held)?;
         Ok(Operation::new(completion, sent))
     }

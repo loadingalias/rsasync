@@ -217,27 +217,30 @@ pub(super) struct Home {
     ended: AtomicBool,
 }
 
-/// The homes of the streams of one driver, each at the slot of its stream. A new stream takes the
-/// place of the closed stream that had its slot, so the table never grows.
-pub(super) type Homes = alloc::boxed::Box<[Option<Arc<Home>>]>;
+/// The homes of the open streams of one driver, with room for [`STREAMS`]. A turn costs only the
+/// streams that it holds. A closed stream leaves at the next turn or registration, and the process
+/// has at most [`STREAMS`] open streams, so the list never grows.
+pub(super) type Homes = alloc::vec::Vec<Arc<Home>>;
 
 /// Wakes each stream of `homes` whose signal arrived since the last turn, and forgets each stream
 /// that closed.
-pub(super) fn wake(homes: &mut [Option<Arc<Home>>]) {
-    for place in homes.iter_mut() {
-        drop(place.take_if(|home| Arc::strong_count(home) == 1));
-        if let Some(home) = place {
-            let count = DELIVERIES[index(home.signal)].load(Ordering::SeqCst);
-            if home.woken.swap(count, Ordering::Relaxed) != count {
-                home.waiter.wake();
-            }
+pub(super) fn wake(homes: &mut Homes) {
+    homes.retain(|home| {
+        // The stream holds the other reference until it closes.
+        if Arc::strong_count(home) == 1 {
+            return false;
         }
-    }
+        let count = DELIVERIES[index(home.signal)].load(Ordering::SeqCst);
+        if home.woken.swap(count, Ordering::Relaxed) != count {
+            home.waiter.wake();
+        }
+        true
+    });
 }
 
 /// Ends each stream of `homes`: it gives [`Ended`].
-pub(super) fn end(homes: &[Option<Arc<Home>>]) {
-    for home in homes.iter().flatten() {
+pub(super) fn end(homes: &[Arc<Home>]) {
+    for home in homes {
         home.ended.store(true, Ordering::Release);
         home.waiter.wake();
     }
@@ -247,7 +250,7 @@ pub(super) fn end(homes: &[Option<Arc<Home>>]) {
 /// and gives the stream.
 pub(super) fn register(
     shared: &Arc<Shared>,
-    homes: &mut [Option<Arc<Home>>],
+    homes: &mut Homes,
     signal: Signal,
     escalation: Escalation,
 ) -> Result<SignalStream, SignalError> {
@@ -299,8 +302,14 @@ pub(super) fn register(
         reported: count,
         _shared: Arc::clone(shared),
     };
-    // The stream that had this slot closed, so its home leaves the table.
-    homes[slot] = Some(home);
+    // Each closed stream leaves the list first. The slot of this stream is one of `STREAMS`, so
+    // the list then has room.
+    homes.retain(|home| Arc::strong_count(home) > 1);
+    assert!(
+        homes.len() < homes.capacity(),
+        "a driver holds more homes than open streams"
+    );
+    homes.push(home);
     Ok(stream)
 }
 

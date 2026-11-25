@@ -389,7 +389,9 @@ fn current() -> Option<Rc<Local>> {
 /// [`TimerRefused`] gives the reason, and nothing changes.
 pub fn timer(deadline: Deadline) -> Result<Timer, TimerRefused> {
     let local = current().ok_or(TimerRefused::NoOwner)?;
-    let mut timers = local.timers.borrow_mut();
+    // The turn of the timers holds the storage while it wakes: a waker that makes a timer then
+    // gets the refusal of an owner with no storage.
+    let mut timers = local.timers.try_borrow_mut().map_err(|_| TimerRefused::NoTimers)?;
     let (timers, _) = timers.as_mut().ok_or(TimerRefused::NoTimers)?;
     timers.insert(deadline).map_err(TimerRefused::Storage)
 }
@@ -400,7 +402,8 @@ pub fn timer(deadline: Deadline) -> Result<Timer, TimerRefused> {
 pub enum TimerRefused {
     /// No `block_on` runs on this thread.
     NoOwner,
-    /// The owner has no timer storage: give it one with [`LocalOwner::use_timers`].
+    /// The owner has no timer storage: give it one with [`LocalOwner::use_timers`]. A waker that
+    /// calls [`timer()`] while the owner fires its due timers also gets this refusal.
     NoTimers,
     /// The storage refused the timer: it is full, the deadline is after its range, or the deadline
     /// is on another clock domain.

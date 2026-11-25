@@ -81,7 +81,9 @@ loop run the timers.
   task.
 
 `timer` refuses with `TimerRefused`: `NoOwner` when no `block_on` runs on the thread, `NoTimers`
-when the owner has no storage, and `Storage` with the `Refused` value of the storage.
+when the owner has no storage, and `Storage` with the `Refused` value of the storage. A waker that
+calls `timer` while the owner fires its due timers also gets `NoTimers`. Make the timer in the task
+that the waker wakes.
 
 ```rust
 use core::num::{NonZeroU32, NonZeroU64};

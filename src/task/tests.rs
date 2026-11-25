@@ -634,6 +634,55 @@ fn a_timer_never_fires_early_and_wakes_its_parked_owner() {
     }
 }
 
+/// A waker that makes a timer when a timer wakes it, and keeps what `timer` gave. Then it wakes
+/// the root future.
+struct MakesTimer {
+    deadline: crate::time::Deadline,
+    made: std::sync::Mutex<Option<Result<(), super::TimerRefused>>>,
+    root: Waker,
+}
+
+impl alloc::task::Wake for MakesTimer {
+    fn wake(self: Arc<Self>) {
+        *self.made.lock().unwrap() = Some(super::timer(self.deadline).map(drop));
+        self.root.wake_by_ref();
+    }
+}
+
+/// The owner holds its timer storage while it fires the due timers. A waker that makes a timer in
+/// that wake gets the refusal of an owner with no storage, and the owner does not panic.
+#[test]
+fn a_waker_that_makes_a_timer_while_the_owner_fires_its_timers_gets_a_refusal() {
+    let resolution = core::time::Duration::from_millis(1);
+    let budget = budget();
+    let (clock, timers) = timed(&budget, 4, resolution);
+    let mut owner = LocalOwner::new(&budget, 1).unwrap();
+    owner.use_timers(timers, clock).unwrap();
+    let deadline = crate::time::Deadline::at(clock.now().checked_add(resolution).unwrap());
+    let made = owner.block_on(async move {
+        let mut first = super::timer(deadline).unwrap();
+        let mut waker: Option<Arc<MakesTimer>> = None;
+        poll_fn(move |cx| {
+            let waker = waker.get_or_insert_with(|| {
+                Arc::new(MakesTimer {
+                    deadline,
+                    made: std::sync::Mutex::new(None),
+                    root: cx.waker().clone(),
+                })
+            });
+            let made = *waker.made.lock().unwrap();
+            if made.is_none() {
+                // The timer did not fire: the turn that fires it wakes this waker.
+                let inner = Waker::from(Arc::clone(waker));
+                assert!(Pin::new(&mut first).poll(&mut Context::from_waker(&inner)).is_pending());
+            }
+            made.map_or(Poll::Pending, Poll::Ready)
+        })
+        .await
+    });
+    assert_eq!(made, Err(super::TimerRefused::NoTimers));
+}
+
 /// A drop of a timer cancels it: its place is free for the next timer, and its deadline wakes no
 /// task.
 #[test]

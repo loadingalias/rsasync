@@ -412,7 +412,7 @@ impl WakeHandle {
 /// operation, in the slot of the operation, so each address that the kernel uses stays the same.
 /// The fields hold what the home writes for the kinds of more than one medium, and the payload
 /// holds the resources of the kind.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Held {
     /// The resources of the kind of the operation. Its start sets the variant, and nothing
     /// changes the variant before the terminal event.
@@ -436,6 +436,31 @@ pub(crate) struct Held {
     /// The descriptor and the chain of an operation of a movable resource, which no driver owns.
     #[cfg(all(feature = "local", target_os = "linux"))]
     pub(crate) plain: Option<plain::Plain>,
+}
+
+impl Held {
+    /// The operation starts with its payload and no result or waiter.
+    const fn with_payload(payload: Payload) -> Self {
+        Self {
+            payload,
+            loan: None,
+            accepted: None,
+            next: None,
+            failed: None,
+            closed: None,
+            copied: 0,
+            cancelled: false,
+            error: None,
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            plain: None,
+        }
+    }
+}
+
+impl Default for Held {
+    fn default() -> Self {
+        Self::with_payload(Payload::Empty)
+    }
 }
 
 // Each of the `Config::operations` slots holds one `Held`, so a kind with large inline resources
@@ -1562,7 +1587,7 @@ impl Driver {
             selected: None,
             report: Report::new(selection, config.required, Features::NONE, false),
             completions_per_turn: config.completions_per_turn,
-            signals: filled(signal::STREAMS, || None).map_err(refused)?.into_boxed_slice(),
+            signals: room(signal::STREAMS).map_err(refused)?,
             children: process::Children::new(config.children, driver).map_err(Error::System)?,
             blocking: None,
             job_waker,
@@ -1681,7 +1706,7 @@ impl Driver {
             watched,
             rearm_wake: Cell::new(false),
             wake_failed: Cell::new(None),
-            signals: filled(signal::STREAMS, || None).map_err(refused)?.into_boxed_slice(),
+            signals: room(signal::STREAMS).map_err(refused)?,
             blocking: None,
             job_waker,
             jobs: room(config.operations as usize).map_err(refused)?,

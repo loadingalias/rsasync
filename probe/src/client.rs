@@ -327,17 +327,23 @@ pub(crate) async fn send_all(write: &mut WriteHalf<'_>, lease: Lease) -> Result<
     let send = write
         .send(lease)
         .map_err(|error| format!("send: {:?}", error.reason()))?;
-    let (sent, lease) = send.await.map_err(|error| format!("send: {error:?}"))?;
-    let mut sent = sent.map_err(|error| format!("send: {error}"))?;
-    // A partial send leaves the rest, which a view of the lease sends with no copy.
-    while let Some(rest) = lease.view(sent..).filter(|rest| !rest.bytes().is_empty()) {
+    let (mut result, lease) = send.await.map_err(|error| format!("send: {error:?}"))?;
+    let mut sent = 0usize;
+    loop {
+        let count = result.map_err(|error| format!("send: {error}"))?;
+        sent = sent.checked_add(count).ok_or("send count overflow")?;
+        if sent == lease.initialized() {
+            return Ok(lease);
+        }
+        if count == 0 {
+            return Err("send returned zero with bytes left".into());
+        }
+        let rest = lease.view(sent..).ok_or("send exceeded the buffer length")?;
         let send = write
             .send(rest)
             .map_err(|error| format!("send: {:?}", error.reason()))?;
-        let (more, _rest) = send.await.map_err(|error| format!("send: {error:?}"))?;
-        sent = sent.saturating_add(more.map_err(|error| format!("send: {error}"))?);
+        (result, _) = send.await.map_err(|error| format!("send: {error:?}"))?;
     }
-    Ok(lease)
 }
 
 /// Polls `first` and `second` at one time, and gives the first error, else `Ok`.

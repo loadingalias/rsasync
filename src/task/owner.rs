@@ -541,16 +541,15 @@ impl Local {
 
     /// Fires the due timers, at most `TIMERS_PER_TURN`. Gives `true` if more timers are due.
     fn fire_timers(&self) -> bool {
-        // The turn wakes the tasks of the timers. The storage is out of its cell meanwhile, so a
-        // waker that makes a timer gets a refusal, not a panic of the cell.
-        let Some((mut timers, clock)) = self.timers.take() else {
+        // The turn wakes the tasks of the timers, and the storage stays borrowed in its place
+        // meanwhile: a waker that makes a timer gets a refusal (`timer()`). No other borrow is
+        // active here: each one ends in its call, and `use_timers` cannot run during `block_on`.
+        let mut timers = self.timers.borrow_mut();
+        let Some((timers, clock)) = timers.as_mut() else {
             return false;
         };
         // No mismatch: `use_timers` checked that the clock is on the domain of the storage.
-        let more = timers.turn(clock.now(), TIMERS_PER_TURN).unwrap_or(false);
-        let replaced = self.timers.replace(Some((timers, clock)));
-        drop(replaced);
-        more
+        timers.turn(clock.now(), TIMERS_PER_TURN).unwrap_or(false)
     }
 
     /// The next turn of the timers that has work, or `None` with no waiting timer. It is at most
