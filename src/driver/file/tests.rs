@@ -3,6 +3,8 @@ use core::alloc::Layout;
 use core::future::Future as _;
 use core::num::{NonZeroU32, NonZeroU64};
 use core::pin::Pin;
+#[cfg(target_os = "linux")]
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::fs;
@@ -248,32 +250,51 @@ fn kernel() -> (u32, u32) {
     (next(), next())
 }
 
-/// The sleeps of this thread in the kernel: its voluntary context switches.
+/// The status of this thread, at a path that another thread can read.
 #[cfg(target_os = "linux")]
-fn sleeps() -> u64 {
-    let status = fs::read_to_string("/proc/thread-self/status").expect("Linux gives the status of a thread");
-    status
+fn thread_status() -> PathBuf {
+    let link = fs::read_link("/proc/thread-self").expect("Linux names the thread");
+    let thread = link.file_name().expect("the link ends with the thread");
+    Path::new("/proc/self/task").join(thread).join("status")
+}
+
+/// The sleeps in the kernel of the thread of `status`: its voluntary context switches.
+#[cfg(target_os = "linux")]
+fn sleeps(status: &Path) -> u64 {
+    fs::read_to_string(status)
+        .expect("Linux gives the status of a thread")
         .lines()
         .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
         .and_then(|count| count.trim().parse().ok())
         .expect("the status counts the voluntary context switches")
 }
 
-/// Waits in `driver` until another thread wakes it after `after`, and gives the sleeps of the
-/// wait in the kernel.
+/// Waits in `driver`, and gives the sleeps of the wait in the kernel. Another thread wakes the
+/// wait when it has slept `slept` times, or after `at_most`, so the count does not depend on the
+/// speed of the host. The wait must end at that wake, not before it.
 #[cfg(target_os = "linux")]
-fn sleeps_of_a_wait(driver: &mut Driver, after: Duration) -> u64 {
-    let wake = driver.wake_handle();
-    let start = std::time::Instant::now();
-    let waker = std::thread::spawn(move || {
-        std::thread::sleep(after);
-        wake.wake();
-    });
-    let before = sleeps();
+fn sleeps_of_a_wait(driver: &mut Driver, slept: u64, at_most: Duration) -> u64 {
+    let status = thread_status();
+    let before = sleeps(&status);
+    let woken = Arc::new(AtomicBool::new(false));
+    let waker = {
+        let (status, woken, wake) = (status.clone(), Arc::clone(&woken), driver.wake_handle());
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while sleeps(&status) - before < slept && start.elapsed() < at_most {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            woken.store(true, Ordering::SeqCst);
+            wake.wake();
+        })
+    };
     driver.wait().expect("the wait of the test driver works");
-    let (slept, waited) = (sleeps() - before, start.elapsed());
+    let (ended_at_its_wake, slept) = (woken.load(Ordering::SeqCst), sleeps(&status) - before);
     waker.join().expect("the waker ends");
-    assert!(waited >= after, "the wait ended after {waited:?}, before its wake");
+    assert!(
+        ended_at_its_wake,
+        "the wait ended after {slept} sleeps, before its wake"
+    );
     slept
 }
 
@@ -841,13 +862,14 @@ fn a_wait_enters_the_kernel_again_after_a_short_timeout_only_while_a_file_operat
         .expect("the test driver has room");
     let id = hold(&mut driver, &read);
     assert_eq!(held(&mut driver, id).expect("the read works"), 4);
-    // 100 ms is 400 entries of 250 µs. A slow test host made 26 or more.
-    let slept = sleeps_of_a_wait(&mut driver, Duration::from_millis(100));
-    assert!(slept >= 5, "the wait slept {slept} times while a read ran");
+    // A wait with no bound sleeps one time, until the wake after 5 s.
+    let slept = sleeps_of_a_wait(&mut driver, 4, Duration::from_secs(5));
+    assert!(slept >= 4, "the wait slept {slept} times while a read ran");
 
     assert_eq!(posted(&mut driver, id).expect("the read works"), 4);
     let (read, _) = drive(&mut driver, read).expect("the driver runs");
     assert_eq!(read.expect("the read works"), 4);
-    let slept = sleeps_of_a_wait(&mut driver, Duration::from_millis(100));
+    // 50 ms is 200 entries of 250 µs.
+    let slept = sleeps_of_a_wait(&mut driver, u64::MAX, Duration::from_millis(50));
     assert!(slept <= 3, "the wait slept {slept} times with no file operation");
 }
