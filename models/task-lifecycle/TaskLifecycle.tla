@@ -110,22 +110,32 @@ Pick(s) ==
 (* which holds the generation and the scheduling state, and the push of a *)
 (* task that was idle (reduction 1).                                       *)
 
+\* A step of sender p that sends no signal. After a step of the signal home
+\* itself, a turn step, the home runs, so no signal waits for it: a timer
+\* that ends a park also takes the readable descriptor, and it makes the
+\* signal in each outbox useless (reduction 18).
+Quiet(p) ==
+  IF p = SH THEN sig' = FALSE /\ ob' = [w \in Workers |-> FALSE]
+            ELSE UNCHANGED <<sig, ob>>
+
 \* Publish slot s to the remote-ready list of o, from the thread of sender
 \* p. Only the push that finds the list empty signals the home: one signal
 \* for each batch. Ext writes the descriptor in the same step (reduction
 \* 14). Another worker puts the signal in its outbox, and Flush sends it.
 \* The signal home sends itself no signal: it looks at its list before it
-\* parks.
+\* parks. So a signal to a home that runs only ends a later park at once,
+\* and the model gives it no state (reduction 18).
 Push(o, s, p) ==
   IF o = SH
     THEN /\ rr' = Append(rr, s)
-         /\ CASE rr # <<>> \/ p = SH -> UNCHANGED <<sig, ob>>
+         /\ CASE rr # <<>> \/ p = SH \/ pk = "run" -> Quiet(p)
               [] p = Ext             -> sig' = TRUE /\ UNCHANGED ob
               [] OTHER               -> /\ ob' = [ob EXCEPT ![p] = TRUE]
                                         /\ UNCHANGED sig
          /\ UNCHANGED rq
     ELSE /\ rq' = [rq EXCEPT ![o] = Append(@, s)]
-         /\ UNCHANGED <<rr, sig, ob>>
+         /\ UNCHANGED rr
+         /\ Quiet(p)
 
 \* The effect of a current wake of slot s from sender p; c is the cancel
 \* bit.
@@ -139,21 +149,25 @@ WakeEffect(s, c, p) ==
          \* Coalesced: the poll end schedules the task again.
          /\ nt' = [nt EXCEPT ![s] = TRUE]
          /\ cx' = [cx EXCEPT ![s] = @ \/ c]
-         /\ UNCHANGED <<ss, rq, rr, sig, ob>>
+         /\ UNCHANGED <<ss, rq, rr>>
+         /\ Quiet(p)
     [] ss[s] = "sched" ->
          \* Coalesced: the task is in a queue already.
          /\ cx' = [cx EXCEPT ![s] = @ \/ c]
          /\ IF Bug = "doublePush" THEN Push(home[s], s, p)
-                                  ELSE UNCHANGED <<rq, rr, sig, ob>>
+                                  ELSE UNCHANGED <<rq, rr>> /\ Quiet(p)
          /\ UNCHANGED <<ss, nt>>
-    [] OTHER -> UNCHANGED <<ss, rq, rr, sig, ob, nt, cx>>
+    [] OTHER -> UNCHANGED <<ss, rq, rr, nt, cx>> /\ Quiet(p)
 
 \* A waker or a cancel handle of an earlier generation, from any thread at
-\* any time. The generation check rejects it (reduction 8).
+\* any time. The generation check rejects it (reduction 8), so in the
+\* correct model it changes no variable: it is a stuttering step, which
+\* [Next]_vars allows at each state, and the model gives it no step of its
+\* own (reduction 17). Only the "staleGen" variant, whose wake changes a
+\* task, has the step.
 Wake(s, g, c) ==
-  /\ g < gen[s]
-  /\ IF Bug = "staleGen" THEN WakeEffect(s, c, Ext)
-                         ELSE UNCHANGED <<ss, rq, rr, sig, ob, nt, cx>>
+  /\ Bug = "staleGen" /\ g < gen[s]
+  /\ WakeEffect(s, c, Ext)
   /\ UNCHANGED <<ing, bo, wk, pk, sf, cur, pc, gen, kind, home, ev, reg, tm>>
 
 \* The event of the task in slot s happens on the thread of sender p: set
@@ -162,7 +176,7 @@ PublishEffect(s, p) ==
   /\ ss[s] \in Live /\ ~ev[s]
   /\ ev' = [ev EXCEPT ![s] = TRUE]
   /\ IF reg[s] THEN reg' = [reg EXCEPT ![s] = FALSE] /\ WakeEffect(s, FALSE, p)
-               ELSE UNCHANGED <<reg, ss, rq, rr, sig, ob, nt, cx>>
+               ELSE UNCHANGED <<reg, ss, rq, rr, nt, cx>> /\ Quiet(p)
 
 \* A publisher on the thread of sender p. A task that waits for its timer
 \* waits for no other event.
@@ -175,7 +189,8 @@ Publish(s, p) ==
 \* and the kernel posts it in the ring of the signal home: the descriptor
 \* of the home is readable. A message that fails writes the interrupt
 \* descriptor of the home at a later turn of w; this step includes that
-\* path. The step can come at any step while w runs (reduction 15).
+\* path. The step can come at any step while w runs (reduction 15). An
+\* outbox holds a signal only while the home is parked (reduction 18).
 Flush(w) ==
   /\ ob[w] /\ wk[w] = "run" /\ Bug # "noFlush"
   /\ ob' = [ob EXCEPT ![w] = FALSE]
@@ -188,7 +203,7 @@ Flush(w) ==
 SigRaise ==
   /\ ~sf /\ wk[SH] = "run"
   /\ sf' = TRUE
-  /\ sig' = TRUE
+  /\ sig' = (pk = "parked")
   /\ UNCHANGED <<ing, bo, wk, pk, ob, cur, rq, rr, ss, pc, gen, kind, home,
                  ev, reg, tm, nt, cx>>
 
@@ -428,7 +443,8 @@ Unpark ==
   /\ wk[SH] = "run" /\ pk = "parked" /\ sig
   /\ pk' = "run"
   /\ sig' = FALSE
-  /\ UNCHANGED <<ing, bo, wk, sf, ob, cur, rq, rr, ss, pc, gen, kind, home,
+  /\ ob' = [w \in Workers |-> FALSE]
+  /\ UNCHANGED <<ing, bo, wk, sf, cur, rq, rr, ss, pc, gen, kind, home,
                  ev, reg, tm, nt, cx>>
 
 \* No worker exits while a task of the runtime remains. The exit notice
@@ -441,7 +457,7 @@ Exit(w) ==
   /\ wk' = [wk EXCEPT ![w] = "exit"]
   /\ pk' = IF w = SH THEN "run" ELSE pk
   /\ sig' = IF w = SH THEN FALSE ELSE sig \/ ob[w]
-  /\ ob' = [ob EXCEPT ![w] = FALSE]
+  /\ ob' = IF w = SH THEN [v \in Workers |-> FALSE] ELSE [ob EXCEPT ![w] = FALSE]
   /\ UNCHANGED <<ing, bo, sf, cur, rq, rr, ss, pc, gen, kind, home, ev,
                  reg, tm, nt, cx>>
 
@@ -616,6 +632,11 @@ BlockOnJoins ==
 \* flag is set.
 ParkedHasSignal ==
   pk = "parked" /\ (rr # <<>> \/ sf) => sig \/ \E w \in Workers : ob[w]
+
+\* A signal waits only for a parked home: the signal home that runs has no
+\* readable descriptor and no signal in an outbox (reduction 18).
+RunningHasNoSignal ==
+  pk = "run" => ~sig /\ \A w \in Workers : ~ob[w]
 
 \* A wake or a cancel of a stale generation changes no task.
 StaleWakeRejected ==

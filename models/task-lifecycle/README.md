@@ -68,8 +68,8 @@ where the output goes, and what a failure means.
 | Slots | `NSlots = 2` task slots, each with `MaxGen = 2` generations. `ss[s]` is `free`, `rsv` (reserved), `idle`, `sched` (in exactly one queue), or `run`. `gen[s]` names the task in slot `s`; `MaxGen + 1` retires the slot |
 | Tasks | `kind[s]` is `local` or `movable`. `home[s]` is the home of a local task, or the location of a movable task: the worker that last polled it. A movable spawn reserves a slot and then admits the task at a worker. A local spawn runs on its owner |
 | Queues | `rq[o]`, the run queue of each owner. `rr`, the remote-ready list of the signal home. A push that finds `rr` empty signals the signal home |
-| Senders | Each push to `rr` has a sender. `Ext` writes the descriptor `sig` at once. It is a thread with no ring, the block_on owner (a thread home, whose outbox has no room), or a worker with a full outbox. A worker other than `SH` puts the signal in its outbox. `SH` sends itself no signal |
-| Outbox | `ob[w]`: the outbox of worker `w` holds a signal of `SH`. The next drive turn or wait of `w` sends it (`Flush`), and then `sig` is readable. The exit of `w` also sends it |
+| Senders | Each push to `rr` has a sender. Only a parked home gets a signal (reduction 18). `Ext` writes the descriptor `sig` at once. It is a thread with no ring, the block_on owner (a thread home, whose outbox has no room), or a worker with a full outbox. A worker other than `SH` puts the signal in its outbox. `SH` sends itself no signal |
+| Outbox | `ob[w]`: the outbox of worker `w` holds a signal of `SH`. The next drive turn or wait of `w` sends it (`Flush`), and then `sig` is readable. The exit of `w` also sends it. A step that ends the park of `SH` empties each outbox (reduction 18) |
 | Polls | `cur[o]`, the task that `o` polls. A poll can return Ready (`Finish`), register its waker and recheck its event (`Register`), or arm its timer (`TimerArm`). It can return Pending with its registration, or after a wake during the poll (`Keep`). It can wake itself and return Pending when its poll budget is spent (`Yield`) |
 | Events | `ev[s]`, the event of the task in slot `s`, and `reg[s]`, its registered waker. A publish from any thread sets the event, takes the waker, and wakes it. `nt[s]` records a wake during a poll; `cx[s]` records a cancel request |
 | Timers | `tm[s]`: the task in slot `s` waits for its timer in the storage of `SH`, and the timer is its event. A turn of `SH` fires the timer (`TimerFire`). While a timer waits, the park of `SH` has a deadline (reduction 13) |
@@ -224,6 +224,63 @@ all of them, each known-bad variant still fails its own property (see the eviden
     task and move an older one, and two workers then moved one task back and forth with no poll,
     which violated `OwedWakeDelivered` (2026-11-22). So the remote-ready list of the code gives
     its tasks in the order of their pushes.
+17. A wake or a cancel of an earlier generation changes no variable in the correct model (reduction
+    8): it is a stuttering step, which `[Next]_vars` allows at each state, so the model gives it no
+    step of its own (R409, 2026-11-25). The behaviors are the same, and a stuttering step changes
+    no fairness condition. Only the `staleGen` variant has the step, because there the stale wake
+    changes a task. The distinct states of each profile stay the same (425,220 declared, 1,017,966
+    `Gens3`, 2,212,365 `Workers3`), and the generated states fall by a fifth (4,956,462 to
+    3,982,218 declared). Known-bad: `StaleGen_bad` still violates `StaleWakeRejected`.
+18. A signal waits only for a parked signal home (R409, 2026-11-25). The home reads its
+    descriptor only in `Unpark`, and it parks only with an empty list and a clear signal flag. So
+    a signal that comes while the home runs carries no work: it only ends the next park at once,
+    and the home then finds nothing. The model gives such a signal no state. A push, a flush, or
+    the signal handler sets `sig` or an outbox only while the home is parked, and each step that
+    ends a park (`Unpark`, `TimerFire`, and the exit of the home) clears `sig` and each outbox.
+    `RunningHasNoSignal` states this. The distinct states fall by 60% (425,220 to 168,895
+    declared).
+
+    Soundness: each fair behavior of the model before this reduction (the full model) has a fair
+    behavior of this model with the same values of each other variable. A full state and a state
+    of this model are related when they are equal but for `pk`, `sig`, and `ob`, and one of
+    these holds:
+    - (a) both homes run, and this home has no signal;
+    - (b) both homes are parked, with equal `sig` and `ob`;
+    - (c) the full home is parked with a readable descriptor or a signal in an outbox, and this
+      home runs with no signal.
+
+    For each step of the full model from a related pair, this model takes the same step or no
+    step, and the pair stays related:
+    - From (a), each step is the same step. A signal that the full step sets is dropped here. A
+      `Flush` of a signal that came while the home ran is no step here. A `Park` with no signal
+      gives (b). A `Park` with a signal is no step here, and it gives (c).
+    - From (b), each step is the same step: a push, a flush, and the handler signal a parked
+      home in both models. `Unpark`, `TimerFire`, and the exit of the home give (a).
+    - From (c), the full home takes only `Unpark`, `TimerFire`, or its exit, which give (a):
+      `Unpark` is no step here, and the two others are the same step. A step of another thread
+      is the same step, or no step for a `Flush`, and the full home keeps a signal: only these
+      three steps remove the last one.
+
+    No other guard reads `pk`, `sig`, or `ob`. The steps of the home that need a running home
+    are not enabled in a full state of (c), so this model must match none of them there. Each
+    property but `ParkedHasSignal` reads only the equal variables. `ParkedHasSignal` holds in a
+    full state of (a), where the home runs, and of (c), where it has a signal, and (b) has equal
+    states. So a violation in the full model is a violation here.
+
+    Fairness: a stay in (c) ends. A readable descriptor keeps `Unpark` enabled, and a signal in
+    the outbox of `w` keeps `Flush(w)` enabled until the flush or the exit of `w` writes the
+    descriptor. Weak fairness of both steps is in `Fairness`. Then take a fair step that stays
+    enabled in the behavior of this model. If its guard reads none of the three variables, it
+    is enabled in the full behavior too, so the full behavior takes it. `Unpark` and `Flush`
+    are enabled here only in (b), where the states are equal. A poll start, a poll step, or
+    `SigHandle` of the home needs a task in its queue, a running poll, or the signal flag, and
+    `Park` is not enabled with one of them. So the full home parks no more, its stay in (c)
+    ends, and the step is enabled in the full behavior from then on.
+
+    Known-bad: `ParkBeforeDrain_bad`, `ParkBeforeDrainLive_bad`, `ParkWithFlag_bad`,
+    `NoFlush_bad`, and `NoDeadline_bad` still fail. In these variants, a wrong park now fails
+    also when a signal came before it: the full model let that signal end the park. Witnesses:
+    `SignalWake_reach`, `DeferredSignal_reach`, and `TimerWake_reach` are still reached.
 
 The declared bounds are argued, not proven: two workers, two slots, and two generations. Each one
 has a raise-by-one profile.
@@ -280,6 +337,7 @@ it. A change to either side reopens the check. All paths are in `src/`.
 | `ExitAfterWork` | No worker exits while a task of the runtime remains | Invariant |
 | `BlockOnJoins` | block_on returns only after each task on its owner ended | Invariant |
 | `ParkedHasSignal` | The parked signal home has a readable descriptor or a signal in an outbox when its remote-ready list holds work or the signal flag is set | Invariant |
+| `RunningHasNoSignal` | The form of reduction 18: the signal home that runs has no readable descriptor and no signal in an outbox | Invariant |
 | `StaleWakeRejected` | Stale-wake rejection: a wake or a cancel of an earlier generation changes no task | Action property |
 | `NoAdmissionAfterClose` | No admission after ingress closure | Action property |
 | `StablePhases` | The side condition of the arguments below | Action property |

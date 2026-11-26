@@ -139,6 +139,25 @@ or durations. Its [limits](../../models/task-lifecycle/README.md#limits) give th
 On a smaller host, select the profiles that your change touches, and run the whole model before
 you record evidence.
 
+### Run a profile on a remote host
+
+`models/remote.sh` runs the selected profiles on one Linux host of `~/dev-machines`, for a
+profile that needs more cores or memory than your host has. Commit the model first: the host
+runs the commit `HEAD` of a clean checkout.
+
+```sh
+MODEL_TARGET=aws-linux-arm64-ubuntu2604 DEV_MACHINE_MAX_LEASE_MINUTES=100 \
+  ~/dev-machines/dev-machine run rsasync aws-linux-arm64-ubuntu2604 --ephemeral --execute \
+  --local bash models/remote.sh task-lifecycle/TaskLifecycle.Slots3.cfg
+```
+
+The script sends the commit to the host as a Git bundle, so the commit needs no push, and the
+record of the run names the revision. It copies TLC and Apalache from `~/.local/opt` of your
+host, so the remote host runs the same builds. The remote host downloads the JRE of its own
+platform and compares it with the SHA-256 of its release. The output ends with the record
+(`run.txt`) and the checker summary of each profile. The lease must cover the setup, the check,
+and the collection.
+
 ## When a profile fails
 
 - A main profile reports a violation. The trace in `trace.json` starts at an initial state.
