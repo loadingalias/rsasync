@@ -119,7 +119,7 @@ one job of the blocking service, which makes the macOS call with a duplicate of 
 | `read_at`, `read_vectored_at` | `pread`, `preadv` |
 | `write_at`, `write_vectored_at` | `pwrite`, `pwritev`. `WriteMode::DataSync` adds `F_FULLFSYNC` after the write, in the same job |
 | `file_len`, `set_file_len` | `fstat`, `ftruncate` |
-| `sync`, `sync_directory` | `F_FULLFSYNC`, for `SyncMode::Data` and `SyncMode::All` |
+| `sync`, `sync_directory` | `F_FULLFSYNC`, for `SyncMode::Data` and `SyncMode::All`. `sync_directory` runs only on APFS and HFS+ (`fstatfs`) |
 | `allocate` | `F_PREALLOCATE`, then `ftruncate` for `Length::Extend`. See [Preallocation](#preallocation) |
 | `punch_hole` | `F_PUNCHHOLE`, and zeros in the partial blocks. See [Hole punching](#hole-punching) |
 | `rename`, `unlink` | `renameat`, `unlinkat` |
@@ -134,7 +134,13 @@ device, where a power loss can lose them. So `Driver::sync` with each `SyncMode`
 `Driver::sync_directory`, and each write with `WriteMode::DataSync` use `F_FULLFSYNC`. It writes
 the cache of the device to its media, so it costs more than a sync on Linux. A file system with no
 `F_FULLFSYNC` makes the operation give `Unsupported`. The driver never makes a weaker sync in its
-place. The tests run `F_FULLFSYNC` on APFS, and a probe ran it on exFAT and FAT32 on 2026-11-17.
+place. `Driver::report().durability()` gives `Durability::FullFsync`. No path of the driver calls a
+plain `fsync` on macOS.
+
+The sync of a directory makes its creates, renames, and unlinks durable only on a file system that
+journals them: APFS and HFS+. Its job reads the type of the file system with `fstatfs`, and on each
+other file system, such as exFAT or FAT32, it gives `Unsupported` with no sync. The tests run each
+sync on APFS, HFS+, and exFAT disk images ([File systems](files.md#file-systems)).
 
 ### Direct I/O
 
@@ -151,6 +157,8 @@ length with `ftruncate` when the range ends after it.
 
 - A hole inside the file stays a hole: the job reserves no block for it, so a later write into the
   hole can still fail for space. On Linux, `fallocate` fills the hole.
+- On HFS+ and exFAT, the last close of the file frees the blocks that a `Length::Keep`
+  preallocation reserved after the end of the file. APFS keeps them.
 - The preallocation and the length change are two calls. So an allocation with `Length::Extend`
   runs alone on its file: it starts when each other operation of the file ended, and each later
   operation of the file waits until it ends. Thus a write that ends after the range keeps each of
@@ -162,8 +170,8 @@ length with `ftruncate` when the range ends after it.
 `F_PUNCHHOLE` frees only whole blocks of the file system, with the block size of `fstatfs`
 (4096 bytes on APFS). So `Driver::punch_hole` frees the whole blocks of the range, and then writes
 zeros into the bytes of the range in its first and last block, before the end of the file. The
-whole range reads as zeros, the bytes outside it stay, and the length stays, as on Linux. On exFAT
-and FAT32, macOS has no hole punching: the operation gives `Unsupported` before it changes a
+whole range reads as zeros, the bytes outside it stay, and the length stays, as on Linux. On HFS+,
+exFAT, and FAT32, macOS has no hole punching: the operation gives `Unsupported` before it changes a
 byte.
 
 ## Registrations

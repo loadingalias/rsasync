@@ -207,7 +207,7 @@ does, and a range of 0 bytes gives `InvalidInput`.
 
 On macOS, the calls are `F_PREALLOCATE` and `F_PUNCHHOLE`, with the same results and two limits: a
 hole inside the file stays a hole after a preallocation, and an allocation with `Length::Extend`
-runs alone on its file. exFAT and FAT32 have no hole punching there. See
+runs alone on its file. HFS+, exFAT, and FAT32 have no hole punching there. See
 [Preallocation](kqueue.md#preallocation) and [Hole punching](kqueue.md#hole-punching).
 
 On Windows, a preallocation is `SetFileInformationByHandle` with `FileAllocationInfo`, and then
@@ -223,7 +223,8 @@ then `FSCTL_SET_ZERO_DATA` frees the clusters of the range, which then reads as 
 length, also for a range that ends after the end of the file. A file system without sparse files
 gives `Unsupported`.
 
-The tests check both operations on ext4, on APFS, and on NTFS.
+[File systems](#file-systems) gives the result of each operation on each file system that the
+tests ran.
 
 ## Durability
 
@@ -233,20 +234,74 @@ this table gives:
 | Result | Call | Linux | macOS | Windows |
 | --- | --- | --- | --- | --- |
 | Durable contents | `Driver::sync(&file, SyncMode::Data)` or `SyncMode::All` after the writes, or each write with `WriteMode::DataSync` | `fdatasync`, `fsync`, and `RWF_DSYNC` | `F_FULLFSYNC` for each of them | `FlushFileBuffers` for a sync, or on IoRing a flush entry with `FILE_FLUSH_DEFAULT`, which the SDK defines as `FlushFileBuffers`, and a write through the write-through handle of the file (`FILE_FLAG_WRITE_THROUGH`) for `WriteMode::DataSync` |
-| Durable namespace change | `Driver::sync_directory(&directory)` on the parent directory, after a create, a rename, or an unlink | `fsync` of the directory | `F_FULLFSYNC` of the directory | Unsupported: the sync gives `Unsupported` at once |
+| Durable namespace change | `Driver::sync_directory(&directory)` on the parent directory, after a create, a rename, or an unlink | `fsync` of the directory | `F_FULLFSYNC` of the directory, on APFS and HFS+. On each other file system, the sync gives `Unsupported` with no sync | `FlushFileBuffers` of the directory, on NTFS. On each other file system, the sync gives `Unsupported` with no sync |
+
+`Driver::report().durability()` names these calls for the backend of the driver:
+`Durability::Fsync` on Linux, `Durability::FullFsync` on macOS, and `Durability::FlushFileBuffers`
+on Windows (see the [capability report](capability-report.md)).
 
 On macOS, a plain `fsync` leaves the bytes in the cache of the device, so the driver never uses it
 for durability. A file system with no `F_FULLFSYNC` gives `Unsupported` (see
-[Durability](kqueue.md#durability)).
+[Durability](kqueue.md#durability)). APFS and HFS+ journal their creates, renames, and unlinks, so
+the sync of a directory makes them durable there. No source states it for another file system, such
+as exFAT, where `F_FULLFSYNC` of a directory also succeeds. So there the sync gives `Unsupported`,
+and the driver makes no weaker sync.
 
-On Windows, no source states that a flush of a directory makes its creates, renames, and unlinks
-durable on NTFS, so `Driver::sync_directory` gives `Unsupported`, and the
-[capability report](capability-report.md#routes) gives `Route::Unsupported` for
-`Call::SyncDirectory`. A program that needs a durable namespace change on Windows cannot get it
-from the driver. The open of a file with writes makes the write-through handle, so that a
-`WriteMode::DataSync` write is one overlapped call, or one entry of the ring on IoRing.
+On Windows, `Driver::sync_directory` is `FlushFileBuffers` of the directory, as a job of the
+[blocking service](blocking-service.md), and it runs only on NTFS. MS-FSA 2.1.5.7 states that a
+flush of a directory makes the directory structure durable on NTFS only, and a power-loss test kept
+each name that the flush made durable ([File systems](#file-systems)). On each other file system,
+such as ReFS or exFAT, the sync gives `Unsupported` with no flush. The flush needs write access, so
+a directory open on Windows asks for it. The open of a file with writes makes the write-through
+handle, so that a `WriteMode::DataSync` write is one overlapped call, or one entry of the ring on
+IoRing.
 
 A sync covers the writes that ended before it. Start it after their futures are ready.
+
+To learn the namespace result of a directory before your first commit, open the directory and sync
+it once when your program starts. A sync that gives `Unsupported` tells that the file system of the
+directory has no qualified sync of a directory, so choose a commit that does not need one.
+
+## File systems
+
+The results of preallocation, hole punching, and durability depend on the file system. The tests
+make a volume of each file system in this table and run the cases of each operation on each backend
+of the system: io_uring and epoll on Linux, kqueue on macOS, and IOCP and IoRing on Windows.
+"Qualified" means that the cases gave the result that this page states. "Unsupported" means that the
+operation gave `Unsupported` and changed no byte.
+
+| File system | System | Preallocation | Hole punching | Durable contents | Durable namespace change |
+| --- | --- | --- | --- | --- | --- |
+| ext4 | Linux | Qualified | Qualified | Qualified, also across a crash | Qualified, also across a crash |
+| xfs | Linux | Qualified | Qualified | Qualified, also across a crash | Qualified, also across a crash |
+| exFAT | Linux | Unsupported before Linux 7.1 | Unsupported | The sync gives `Ok` | The sync gives `Ok` |
+| APFS | macOS | Qualified | Qualified | Qualified | Qualified |
+| HFS+ | macOS | Qualified | Unsupported | Qualified | Qualified |
+| exFAT | macOS | Not tested | Unsupported | The sync gives `Ok` | Unsupported |
+| NTFS | Windows | Qualified | Qualified | Qualified | Qualified, also across a power loss |
+| ReFS | Windows | Qualified | Qualified | Qualified | Unsupported |
+| exFAT | Windows | Not tested | Unsupported | The sync gives `Ok` | Unsupported |
+
+On ext4 and xfs, the crash test stops the file system at once after the syncs, as a power loss
+does (`FS_IOC_SHUTDOWN` with `FS_SHUTDOWN_FLAGS_NOLOGFLUSH`), and then mounts it again. The bytes of
+a file after a `SyncMode::Data` sync, a `SyncMode::All` sync, or a `WriteMode::DataSync` write stay,
+and so do a create and a rename after the sync of their directory. A write and a rename after the last sync
+are lost, so the stop is a real crash.
+
+On NTFS, a power-loss test of 2026-11-26 stopped an AWS EC2 instance with Windows Server 2025 with
+no shutdown of the system, nine times, and started it again. Before each stop, a program created
+and renamed files in batches on an NTFS volume, and flushed their directory after each batch. Each
+name of each flushed batch stayed: 268,320 names in all. The renames that came after the last flush
+were lost in each test, although a durable record on another volume showed that each of them
+ended. So the stop was a real power loss, and the flush made the names durable.
+
+On the other file systems, a test shows only that each sync gives its result, because the system
+has no such stop.
+
+Linux has no `fallocate` on exFAT before Linux 7.1, so a preallocation there gives `Unsupported`.
+On macOS, HFS+ and exFAT free the blocks that a `Length::Keep` preallocation reserved after the end
+of the file at the last close of the file, as NTFS does, and APFS keeps them (a probe of the free
+space on macOS 27.2.1, on 2026-11-26).
 
 ## Native NVMe on Windows
 

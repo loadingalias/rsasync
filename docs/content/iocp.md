@@ -123,7 +123,7 @@ driver.use_blocking(service.submitter());
 
 | Operation | On IOCP |
 | --- | --- |
-| Open and directory open | A job: one `CreateFileW` with `FILE_FLAG_OVERLAPPED`, which lets other handles read, write, rename, and delete the file. A file with writes gets a second handle of the same file with `FILE_FLAG_WRITE_THROUGH` (`ReOpenFile`), for the durable writes. A directory open uses `FILE_FLAG_BACKUP_SEMANTICS`. On `Backend::Iocp`, the driver associates each handle with its port |
+| Open and directory open | A job: one `CreateFileW` with `FILE_FLAG_OVERLAPPED`, which lets other handles read, write, rename, and delete the file. A file with writes gets a second handle of the same file with `FILE_FLAG_WRITE_THROUGH` (`ReOpenFile`), for the durable writes. A directory open uses `FILE_FLAG_BACKUP_SEMANTICS` and asks for write access, which the flush of the directory needs. On `Backend::Iocp`, the driver associates each handle with its port |
 | Read and write | One overlapped `ReadFile` or `WriteFile` at the offset of the `OVERLAPPED`. A read at or after the end of the file gives 0 |
 | Durable write (`WriteMode::DataSync`) | One overlapped `WriteFile` on the write-through handle |
 | Vectored read and write | One overlapped call for each region, in order: the next region starts at the packet of the one before it. A short or failed region ends the operation, with the bytes before it |
@@ -131,7 +131,7 @@ driver.use_blocking(service.submitter());
 | Preallocation | A job: `FileAllocationInfo`, and `FileEndOfFileInfo` for `Length::Extend`. It runs alone on its file (see [Length and space](files.md#length-and-space)) |
 | Hole punch | Two overlapped `DeviceIoControl` calls: `FSCTL_SET_SPARSE`, then `FSCTL_SET_ZERO_DATA` |
 | Sync | A job: `FlushFileBuffers` |
-| Directory sync | `Unsupported` at once, with no call (`Route::Unsupported` for `Call::SyncDirectory`): no source states that a flush of a directory makes its creates, renames, and unlinks durable on NTFS |
+| Directory sync | A job: `FlushFileBuffers` of the directory, only on NTFS (`GetVolumeInformationByHandleW`). On each other file system, such as ReFS or exFAT, it gives `Unsupported` with no flush (see [Durability](files.md#durability)) |
 | Rename and unlink | A job: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, and `DeleteFileW` |
 | NVMe report (`Driver::nvme_path`) | A job that reads the driver of each disk of the volume of the file (see [Native NVMe](#native-nvme)) |
 | Close | `CloseHandle` of each handle of the file, on the thread of the driver, after each operation of the file ended |

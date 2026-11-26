@@ -98,6 +98,14 @@ through the system calls of musl.
 Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both C libraries, as
 [The io_uring driver on Linux](#the-io_uring-driver-on-linux) shows for the driver.
 
+On 2026-11-26, the [file-system tests](files.md#file-systems) of revision `48dc2e7` passed as root
+on two AWS EC2 c8i.4xlarge instances: Ubuntu 26.04 with `7.0.0-1018-aws` (run
+`20261126T063300Z-36779`), and Debian 12 with `6.1.0-56-cloud-amd64` (run `20261126T063300Z-36780`).
+They made ext4, xfs, and exFAT volumes on loop devices, and ran the space and sync cases on io_uring
+and on epoll, with the crash test on ext4 and xfs. Debian 12 has no `xfsprogs` and no `exfatprogs`,
+so the run installed them from its archive. In the same runs, `cargo xtask test` ran the 761 tests of
+the whole workspace and the doctests.
+
 ## The runtime on Linux
 
 The [runtime](runtime.md), `rsasync::runtime`, is on Linux only. Its local workers, its movable
@@ -195,6 +203,10 @@ On 2026-11-17, these runs passed on an aarch64 Mac (MacBookPro18,3, Apple M1 Pro
   `ENOTTY` there, which the driver gives as `Unsupported`, and that `F_PREALLOCATE` and
   `F_FULLFSYNC` work there.
 
+On 2026-11-26, on the same Mac with the same macOS build, the
+[file-system tests](files.md#file-systems) of revision `48dc2e7` passed on kqueue, on APFS, HFS+,
+and exFAT disk images (`hdiutil`, with no root).
+
 On the same Mac, the tests of `rsnetwork-udp` pass with each of these commands:
 
 ```sh
@@ -261,6 +273,16 @@ At revision `d85222f`, 319 tests and 43 doctests passed. Nextest skipped four te
 The run passed 54 IOCP cases, 15 IoRing file cases, and all 14 tests of `rsnetwork-udp`.
 The backend selection test also checked the route for each file call. The system reported
 IoRing version 4 as its maximum. The driver used version 3.
+
+On 2026-11-26, the [file-system tests](files.md#file-systems) passed as an administrator on IOCP
+and on IoRing, on NTFS, ReFS, and exFAT virtual disks (`diskpart`). On an AWS EC2 c8i.2xlarge with
+Windows Server 2025, build `10.0.26100.33822`, they passed at revision `420138b`, whose directory
+sync runs on NTFS and gives `Unsupported` on ReFS and exFAT. On the Azure `Standard_D8ps_v6` with
+Windows 11 Enterprise, build `10.0.26300.9974`, they passed at revision `48dc2e7` (run
+`20261126T063627Z-43591`), before the directory sync of NTFS. In the same runs, `cargo xtask test`
+ran the 329 tests of the whole workspace and the doctests. On the EC2 host, an MSVC build of the
+Windows SDK 10.0.28000.0 headers showed that the new `GetVolumeInformationByHandleW` declaration
+matches them. The [power-loss test](files.md#file-systems) of NTFS ran on the same EC2 host.
 
 ## WebAssembly
 

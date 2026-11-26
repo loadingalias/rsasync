@@ -28,7 +28,8 @@ println!("{report:#?}");
 | Resolved | `fallback()` | The error number of the ring creation (`EPERM` or `ENOSYS`) when the permissive selection runs epoll for that reason, else `None`. On Windows, the `HRESULT` of the step of the IoRing probe that refused the ring when the permissive selection runs IOCP for that reason, for example `0x80460003` (`IORING_E_VERSION_NOT_SUPPORTED`) for a ring before version 3 (see [IoRing files](iocp.md#ioring-files)) |
 | Requested | `required()` | The features of `Config::require`. The driver has each of them |
 | Resolved | `probed()` | The features that the probes found on the ring of the driver. A probe runs the feature or reads it from the kernel. The version of the kernel proves nothing. On epoll, kqueue, IOCP, and IoRing, no feature probe runs, and the set is empty |
-| Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring` (an entry of io_uring, or of the I/O ring on `Backend::IoRing`), `Route::SystemCall`, `Route::BlockingService`, `Route::Poll`, or on Windows `Route::Port` and `Route::Unsupported` |
+| Resolved | `route(call)` | How `call` runs on this kernel: `Route::Ring` (an entry of io_uring, or of the I/O ring on `Backend::IoRing`), `Route::SystemCall`, `Route::BlockingService`, `Route::Poll`, or on Windows `Route::Port` |
+| Resolved | `durability()` | The calls that make writes durable: `Durability::Fsync` on io_uring and epoll (`fdatasync`, `fsync`, and `RWF_DSYNC`), `Durability::FullFsync` on kqueue (`F_FULLFSYNC`, never a plain `fsync`), and `Durability::FlushFileBuffers` on IOCP and IoRing. See [Durability](files.md#durability) and [File systems](files.md#file-systems) |
 | Applied | `helper_threads()` | The threads that the driver starts: 0. A call on `Route::BlockingService` runs on a thread of your service |
 | Applied | `rearms_wake()` | Whether the driver registers its wake descriptor again in each turn that takes a wake. It does so on a kernel whose registered event descriptor signals deferred work one time, such as Ubuntu 26.04 `7.0.0-1016-aws`. It also does so when a deferred signal came late during the probe of the kernel. A driver registers its wake descriptor only at its first use (`AsFd`), so this gives `false` before that use. It always gives `false` for a driver whose caller waits only in `Driver::wait` or `Driver::wait_until`, such as the driver of a runtime worker |
 
@@ -46,7 +47,7 @@ The features are `ChildWait` (Linux 6.7), `Truncate` (6.9), `Bundles` (6.10), `B
 | `Call::FileData` (the positional and vectored reads and writes of a file, see [files](files.md)) | The io_uring and IoRing backends | `Route::Port` on IOCP: overlapped calls on the completion port. `Route::BlockingService` on epoll and kqueue |
 | `Call::PunchHole` (`Driver::punch_hole`) | The io_uring backend | `Route::Port` on IOCP. `Route::BlockingService` on epoll, kqueue, and IoRing, whose ring has no hole punch |
 | `Call::SyncFile` (`Driver::sync`) | The io_uring and IoRing backends | `Route::BlockingService` on epoll, kqueue, and IOCP |
-| `Call::SyncDirectory` (`Driver::sync_directory`) | The io_uring backend | `Route::BlockingService` on epoll and kqueue. `Route::Unsupported` on IOCP and IoRing: the call gives `Unsupported` at once, because no source states that a flush of a directory makes its namespace changes durable on Windows |
+| `Call::SyncDirectory` (`Driver::sync_directory`) | The io_uring backend | `Route::BlockingService` on epoll, kqueue, IOCP, and IoRing. On macOS, the job syncs only on APFS and HFS+, and on Windows only on NTFS. On each other file system there, the call gives `Unsupported` with no sync (see [Durability](files.md#durability)) |
 | `Call::File` (each other file and directory operation: open, length, preallocation, rename, and unlink, and on Windows the NVMe report) | The io_uring backend | `Route::BlockingService`, on epoll, kqueue, IOCP, and IoRing |
 
 On epoll, kqueue, IOCP, and IoRing, no feature is probed. So `Call::Bind`, `Call::BindUdp`,
@@ -159,3 +160,7 @@ Report {
 ```
 
 `WaitChild` has no Windows form yet: no child process runs on Windows.
+
+These reports come from earlier revisions. A report of this revision also prints `durability` after
+`routes`, for example `durability: Fsync` on Linux, and the `files` and `receives` of the driver. On
+Windows, `SyncDirectory` is `BlockingService` in this revision.
