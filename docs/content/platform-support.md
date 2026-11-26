@@ -100,8 +100,9 @@ Each stage exit also runs the tests on x86_64 and aarch64 Linux hosts with both 
 
 ## The runtime on Linux
 
-The [runtime](runtime.md), `rsasync::runtime`, is on Linux only. Its local workers run on io_uring
-on these four hosts, with glibc. Each host was an AWS EC2 instance:
+The [runtime](runtime.md), `rsasync::runtime`, is on Linux only. Its local workers, its movable
+workers, and both together ([mixed mode](mixed-mode.md)) run on io_uring on these four hosts, with
+glibc. Each host was an AWS EC2 instance:
 
 | Distribution | Architecture | Kernel | Instance |
 | --- | --- | --- | --- |
@@ -110,10 +111,10 @@ on these four hosts, with glibc. Each host was an AWS EC2 instance:
 | Ubuntu 26.04 | x86_64 | `7.0.0-1018-aws` | c8i.4xlarge, 8 cores with SMT |
 | Ubuntu 26.04 | aarch64 | `7.0.0-1018-aws` | c8g.4xlarge, 16 cores |
 
-On 2026-11-22, `cargo xtask check` and `cargo xtask test` passed on each host. Each run passed 528
-tests and the doctests. Thirteen tests need root, `CAP_SYS_TIME`, or a second OS user, so they did
-not run. The three examples of [Run the examples](runtime.md#run-the-examples) printed their
-documented output. The runtime tests check a start that fails at one worker of four at the
+On 2026-11-25, `cargo xtask check` and `cargo xtask test` passed on each host. Each run passed 761
+tests and the doctests. Nineteen tests need root, `CAP_SYS_TIME`, or a second OS user, so they did
+not run. Each example of [Run the examples](runtime.md#run-the-examples) printed its documented
+output. The runtime tests check a start that fails at one worker of four at the
 descriptor limit, the factory spawn and its refusals, `Dedicated` placement on one CPU of each
 physical core, the release of the operations of `block_on` before it returns, a wake from another
 thread, a task that yields at its poll budget, a receive that one task submits and another task
@@ -123,17 +124,30 @@ spawn, the release, and the wake also run on epoll. No host with two NUMA nodes 
 domains ran them, so the spread of `Domain` and `Dedicated` over nodes and domains has only the
 test of the plan on the facts of such a host.
 
-On the same day, an exploration campaign on the aarch64 Debian 12 host checked the 14 loom models
-of wake publication, waker replacement, cancellation, close, and slot reuse. Each model passed
-with at most 4, 5, and 6 forced thread switches, and with no limit, which checks each thread order
-of the model.
+The movable workers and the [movable TCP types](tcp.md#use-tcp-from-a-movable-task),
+`rsasync::movable`, run on io_uring only. The same runs passed their tests on each of the four
+hosts. The pool tests check a steal by an idle worker, a spawn from another thread while the queue
+of its worker never empties, each outcome of a movable task, and a close that cancels each task
+of a full list.
+The tests of the movable types check a receive whose task goes to the other worker, a cancel and a
+close from the other worker, the bytes of a dropped receive, the order of two sends with different
+homes, and a shutdown. The mixed-mode tests check typed values between a local task and a movable
+task, the plan of both modes on the CPUs of the host, the compute service, and one shutdown
+report for both modes. The `movable_only` and `mixed_mode` examples of
+[Run the examples](mixed-mode.md#run-the-examples) printed their documented output. On epoll, each
+movable call refuses, and one test checks that refusal.
 
-The [movable TCP types](tcp.md#use-tcp-from-a-movable-task), `rsasync::movable`, run on io_uring
-only. On 2026-11-24, their tests passed on the x86_64 Debian 12 host (`6.1.0-56-cloud-amd64`) and
-on the aarch64 Ubuntu 26.04 host (`7.0.0-1018-aws`), each with two movable workers. The tests
-check a receive whose task goes to the other worker, a cancel and a close from the other worker,
-the bytes of a dropped receive, the order of two sends with different homes, and a shutdown. On
-epoll, each movable call refuses, and one test checks that refusal.
+Two exploration campaigns checked the loom models of the task code with more forced thread
+switches than the test suite uses:
+
+- On 2026-11-22, on the aarch64 Debian 12 host: the 14 models of wake publication, waker
+  replacement, cancellation, close, and slot reuse. Each model passed with at most 4, 5, and 6
+  forced thread switches, and with no limit, which checks each thread order of the model.
+- On 2026-11-25, on an aarch64 Ubuntu 26.04 host (`7.0.0-1018-aws`, c8g.2xlarge): the 21 models of
+  the movable pool and of the code that it builds on. They add the run queue of a worker, a steal,
+  a close that races a spawn, and a cancel from another thread that races a steal. Each model
+  passed with at most 2, 3, and 4 forced thread switches. This campaign has no run with no limit,
+  so it does not check each thread order: the model of the cancel takes 17 minutes at 4 switches.
 
 The timed wait of the driver, `Driver::wait_until`, runs on each backend. On 2026-11-24, its cases
 passed on io_uring and epoll on the x86_64 Debian 12 host (`6.1.0-56-cloud-amd64`) and the aarch64
