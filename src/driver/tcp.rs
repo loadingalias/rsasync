@@ -2260,8 +2260,11 @@ impl Driver {
         let directions = &mut owned.directions;
         let receive = matches!(kind, Kind::Recv | Kind::Selected);
         let here = receive && (!directions.shelved.is_empty() || directions.ended.is_some());
-        let result = match (kind, directions.kept.take()) {
-            (Kind::Accept, Some(Kept::Connection { fd, peer, peer_len })) => {
+        // The kept state is last in the directions and is large, so the start reads only its
+        // discriminant, and takes it only for an accept that gets its connection.
+        let connection = kind == Kind::Accept && matches!(directions.kept, Some(Kept::Connection { .. }));
+        let result = if connection {
+            if let Some(Kept::Connection { fd, peer, peer_len }) = directions.kept.take() {
                 match self.resources.adopt(fd, Medium::Stream) {
                     Ok(stream) => slot.update(id, |held| {
                         if let Some(held) = held {
@@ -2279,21 +2282,20 @@ impl Driver {
                         }
                     }
                 }
-                Some(0)
             }
+            Some(0)
+        } else if directions.kept.is_none() && directions.sent == Sent::Ok && !here {
             // Nothing kept and no failed send: the operation needs its submission.
-            (_, None) if directions.sent == Sent::Ok && !here => None,
-            (kind, kept) => {
-                directions.kept = kept;
-                let (table, copied) = (&self.table, &mut self.copied);
-                let mut result = None;
-                slot.update(id, |held| {
-                    if let Some(held) = held {
-                        result = directions.resume(held, kind, || table.interest(id), copied, shelf);
-                    }
-                });
-                result
-            }
+            None
+        } else {
+            let (table, copied) = (&self.table, &mut self.copied);
+            let mut result = None;
+            slot.update(id, |held| {
+                if let Some(held) = held {
+                    result = directions.resume(held, kind, || table.interest(id), copied, shelf);
+                }
+            });
+            result
         };
         if let Some(result) = result {
             if let Some(owned) = self.resources.get(resource) {
