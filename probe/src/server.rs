@@ -2,6 +2,11 @@
 //! worker, and one task for each connection, which sends back each received byte. Each receive
 //! takes a buffer from the pool of its worker, and the send of its bytes gives the buffer back.
 //!
+//! `--files registered` uses the file table of the ring. `--receives single|multi` receives into the
+//! provided buffers of the worker (`recv_selected`), with one submission for each receive or with
+//! one multishot receive for each stream. The default, `--receives pool`, is the receive into a
+//! buffer of the task.
+//!
 //! With `--movable N`, the runtime also has N movable workers, and `--bursts` gives them work in
 //! bursts of 100 ms, with 100 ms between two bursts: tasks that use the CPU, tasks that send
 //! 128 KiB blocks over loopback TCP to other movable tasks, or both. The echo path stays on the
@@ -18,12 +23,12 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use rsasync::buffer::{Backing, Lease, Pool};
+use rsasync::buffer::{Backing, Buffer as _, Lease, Pool};
 use rsasync::capacity::Budget;
-use rsasync::driver::{Config, TcpOptions};
+use rsasync::driver::{Config, Files, Shot, TcpOptions};
 use rsasync::local::{TcpListener, TcpStream};
 use rsasync::movable;
-use rsasync::runtime::{Handle, Placement, Runtime, Selection, WorkerId};
+use rsasync::runtime::{Handle, Placement, ReceiveBuffers, Runtime, Selection, WorkerId};
 use rsasync::task::{self, Outcome};
 
 use crate::client::send_all;
@@ -38,6 +43,19 @@ const BURST: Duration = Duration::from_millis(100);
 /// The streams of one I/O burst, and the bytes of each of their sends.
 const FLOODS: u32 = 32;
 const FLOOD_BYTES: usize = 128 << 10;
+
+/// The provided buffers of each worker for `recv_selected`: 4096 slots of 4 KiB.
+const PROVIDED: u32 = 4096;
+const PROVIDED_BYTES: usize = 4096;
+
+/// How the echo task receives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Receive {
+    /// `recv` into a buffer that the task takes from its pool.
+    Pool,
+    /// `recv_selected` into a provided buffer, with the form of the submissions.
+    Selected(Shot),
+}
 
 /// The work that the movable workers get in bursts.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,13 +77,35 @@ pub(crate) struct Plan {
     /// The movable workers, which run only the bursts.
     movable: u32,
     bursts: Bursts,
+    files: Files,
+    receive: Receive,
 }
 
 impl Plan {
-    /// The plan of `--workers`, `--port`, and `--completions`, and of `--movable N --bursts
+    /// The plan of `--workers`, `--port`, and `--completions`, of `--files plain|registered` and
+    /// `--receives pool|single|multi` (plain and pool when absent), and of `--movable N --bursts
     /// none|cpu|io|both` for a server with movable workers (none when absent).
     pub(crate) fn parse(arguments: &[String]) -> Result<Self, String> {
         let given = |name: &str| arguments.iter().any(|argument| argument == name);
+        let files = if given("--files") {
+            match value::<String>(arguments, "files")?.as_str() {
+                "plain" => Files::Plain,
+                "registered" => Files::Registered,
+                other => return Err(format!("--files: {other:?} is not plain or registered")),
+            }
+        } else {
+            Files::Plain
+        };
+        let receive = if given("--receives") {
+            match value::<String>(arguments, "receives")?.as_str() {
+                "pool" => Receive::Pool,
+                "single" => Receive::Selected(Shot::Single),
+                "multi" => Receive::Selected(Shot::Multi),
+                other => return Err(format!("--receives: {other:?} is not pool, single, or multi")),
+            }
+        } else {
+            Receive::Pool
+        };
         let movable = if given("--movable") {
             value(arguments, "movable")?
         } else {
@@ -91,6 +131,8 @@ impl Plan {
             completions: value(arguments, "completions")?,
             movable,
             bursts,
+            files,
+            receive,
         })
     }
 }
@@ -98,7 +140,12 @@ impl Plan {
 /// Runs the server until the process ends. It prints the backend and the placement of each worker.
 pub(crate) fn run(plan: &Plan) -> Result<(), String> {
     let slots = CONNECTIONS + 16;
-    let runtime = Runtime::builder()
+    let shot = match plan.receive {
+        Receive::Pool => Shot::Single,
+        Receive::Selected(shot) => shot,
+    };
+    let provided = core::alloc::Layout::from_size_align(PROVIDED_BYTES, 64).map_err(|error| error.to_string())?;
+    let mut builder = Runtime::builder()
         .local_workers(plan.workers)
         .movable_workers(plan.movable)
         .placement(Placement::Dedicated, Selection::Permissive)
@@ -108,18 +155,25 @@ pub(crate) fn run(plan: &Plan) -> Result<(), String> {
                 .resources(slots)
                 .operations(2 * slots)
                 .submissions(1024)
-                .completions_per_turn(plan.completions),
-        )
-        .build()
-        .map_err(|failure| format!("start: {failure:?}"))?;
+                .completions_per_turn(plan.completions)
+                .files(plan.files)
+                .receives(shot),
+        );
+    if plan.receive != Receive::Pool {
+        let slots = NonZeroU32::new(PROVIDED).ok_or("slots")?;
+        builder = builder.receive_buffers(Some(ReceiveBuffers::new(slots, provided)));
+    }
+    let runtime = builder.build().map_err(|failure| format!("start: {failure:?}"))?;
     let mut output = std::io::stdout().lock();
     for (index, worker) in runtime.report().workers().iter().enumerate() {
         writeln!(
             output,
-            "worker {index}: {:?}, {:?} on {:?}",
+            "worker {index}: {:?}, {:?} on {:?}, files {:?}, receives {:?}",
             worker.mode(),
             worker.placement().applied(),
-            worker.driver().backend()
+            worker.driver().backend(),
+            worker.driver().files(),
+            worker.driver().receives()
         )
         .map_err(|error| format!("output: {error}"))?;
     }
@@ -129,8 +183,15 @@ pub(crate) fn run(plan: &Plan) -> Result<(), String> {
         no_delay: Some(true),
         ..TcpOptions::default()
     };
+    let selected = plan.receive != Receive::Pool;
     let group = runtime
-        .block_on(async move { handle.tcp_group(address, options, serve).await })
+        .block_on(async move {
+            handle
+                .tcp_group(address, options, move |worker, listener| {
+                    serve(worker, listener, selected)
+                })
+                .await
+        })
         .map_err(|error| format!("block_on: {error:?}"))?
         .map_err(|error| format!("group: {error:?}"))?;
     writeln!(output, "listening on {}", group.local_addr()).map_err(|error| format!("output: {error}"))?;
@@ -146,8 +207,9 @@ pub(crate) fn run(plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-/// Accepts each connection of `listener`, and spawns its echo task on this worker.
-async fn serve(_worker: WorkerId, mut listener: TcpListener) -> Result<(), String> {
+/// Accepts each connection of `listener`, and spawns its echo task on this worker. With `selected`,
+/// the task receives into the provided buffers of the worker.
+async fn serve(_worker: WorkerId, mut listener: TcpListener, selected: bool) -> Result<(), String> {
     let budget = Budget::new(NonZeroU64::new(256 << 20).ok_or("budget")?);
     let layout = core::alloc::Layout::from_size_align(BUFFER, 64).map_err(|error| error.to_string())?;
     let slots = NonZeroU32::new(CONNECTIONS).ok_or("slots")?;
@@ -161,9 +223,43 @@ async fn serve(_worker: WorkerId, mut listener: TcpListener) -> Result<(), Strin
             .map_err(|error| format!("accept: {error:?}"))?
             .map_err(|error| format!("accept: {error}"))?;
         // A refused spawn gives the future back, and its drop closes the stream.
-        drop(task::spawn_local(echo(stream, Rc::clone(&pool))));
+        if selected {
+            drop(task::spawn_local(echo_selected(stream)));
+        } else {
+            drop(task::spawn_local(echo(stream, Rc::clone(&pool))));
+        }
     }
 }
+
+/// Sends back each byte that `stream` receives into a provided buffer, until the end of its stream.
+async fn echo_selected(mut stream: TcpStream) {
+    let (mut read, mut write) = stream.split();
+    loop {
+        let Ok(receive) = read.recv_selected() else { break };
+        let buffer = match receive.await {
+            Ok(Ok(buffer)) => buffer,
+            // No provided buffer is free: the bytes stay in the socket, and a buffer comes back
+            // after a send of another task.
+            Ok(Err(error)) if error.raw_os_error() == Some(ENOBUFS) => {
+                yield_once().await;
+                continue;
+            }
+            _ => break,
+        };
+        if buffer.bytes().is_empty() {
+            break;
+        }
+        if send_all(&mut write, Lease::from(buffer)).await.is_err() {
+            break;
+        }
+    }
+    if let Ok(close) = stream.close() {
+        let _closed = close.await;
+    }
+}
+
+/// The error number of a receive with no free provided buffer, on Linux.
+const ENOBUFS: i32 = 105;
 
 /// Sends back each byte that `stream` receives, until the end of its stream.
 async fn echo(mut stream: TcpStream, pool: Rc<RefCell<Pool>>) {
