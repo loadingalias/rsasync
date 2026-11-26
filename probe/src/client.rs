@@ -2,6 +2,8 @@
 //! own seeded Poisson schedule, also while its earlier responses are late. Each latency counts from
 //! the scheduled instant, so a stall of the server cannot hide behind a late send. The send lag,
 //! from the scheduled instant to the start of the send, tells whether the client kept its schedule.
+//! With `--slice MILLISECONDS`, the client also gives the 99.9th percentile of each slice of the
+//! window, by the scheduled instant of each request, so a short stall of the server shows.
 //!
 //! The client runs on local workers with epoll, not on the io_uring path of the server. On each
 //! worker, one pacer task polls in a loop and wakes each connection at its next instant.
@@ -41,6 +43,8 @@ pub(crate) struct Plan {
     warmup: Duration,
     window: Duration,
     seed: u64,
+    /// The time of each slice of the window, or zero for no slices.
+    slice: Duration,
 }
 
 impl Plan {
@@ -54,6 +58,11 @@ impl Plan {
             warmup: Duration::from_secs(value(arguments, "warmup")?),
             window: Duration::from_secs(value(arguments, "window")?),
             seed: value(arguments, "seed")?,
+            slice: if arguments.iter().any(|argument| argument == "--slice") {
+                Duration::from_millis(value(arguments, "slice")?)
+            } else {
+                Duration::ZERO
+            },
         };
         if plan.workers == 0 || plan.connections < plan.workers || !plan.rate.is_finite() || plan.rate <= 0.0 {
             return Err("give at least one worker, a connection for each worker, and a rate".to_owned());
@@ -71,6 +80,9 @@ struct Stats {
     lag: Histogram,
     /// The responses that came during the window.
     completed: u64,
+    /// The slice and the latency of each request that the window scheduled, with slices: the
+    /// nanoseconds of a latency stop at `u32::MAX`, about 4.3 s.
+    samples: Vec<(u32, u32)>,
 }
 
 impl Stats {
@@ -78,7 +90,33 @@ impl Stats {
         self.latency.merge(&other.latency);
         self.lag.merge(&other.lag);
         self.completed = self.completed.saturating_add(other.completed);
+        self.samples.extend_from_slice(&other.samples);
     }
+}
+
+/// The 99.9th percentile of the latency of each slice in `samples`, as a JSON object: the count of
+/// the slices, and the median, the 99th percentile, and the largest of these values.
+fn slices(samples: &mut [(u32, u32)], slice: Duration) -> String {
+    samples.sort_unstable();
+    let mut tails: Vec<u32> = samples
+        .chunk_by(|one, next| one.0 == next.0)
+        .map(|slice| slice[(slice.len() * 999).div_ceil(1000).max(1) - 1].1)
+        .collect();
+    tails.sort_unstable();
+    let at = |numerator: usize, denominator: usize| {
+        tails
+            .get((tails.len() * numerator).div_ceil(denominator).max(1) - 1)
+            .copied()
+            .unwrap_or(0)
+    };
+    format!(
+        "{{\"ms\":{},\"count\":{},\"p999_ns\":{{\"p50\":{},\"p99\":{},\"max\":{}}}}}",
+        slice.as_millis(),
+        tails.len(),
+        at(1, 2),
+        at(99, 100),
+        at(1, 1)
+    )
 }
 
 /// Runs the plan, and prints its result as one JSON line.
@@ -121,10 +159,15 @@ pub(crate) fn run(plan: Plan) -> Result<(), String> {
     let seconds = plan.window.as_secs_f64();
     #[expect(clippy::cast_precision_loss, reason = "a count of responses is far below 2^52")]
     let achieved = total.completed as f64 / seconds;
+    let sliced = if plan.slice.is_zero() {
+        String::new()
+    } else {
+        format!(",\"slices\":{}", slices(&mut total.samples, plan.slice))
+    };
     writeln!(
         std::io::stdout().lock(),
         "{{\"connections\":{},\"workers\":{},\"offered\":{:.0},\"achieved\":{achieved:.0},\
-         \"requests\":{},\"latency_ns\":{},\"lag_ns\":{}}}",
+         \"requests\":{},\"latency_ns\":{},\"lag_ns\":{}{sliced}}}",
         plan.connections,
         plan.workers,
         plan.rate,
@@ -161,6 +204,7 @@ async fn worker(plan: Plan, index: u32, start: Instant) -> Result<Stats, String>
         warm: nanos(plan.warmup),
         end: nanos(plan.warmup + plan.window),
         mean: 1e9 * f64::from(plan.connections) / plan.rate,
+        slice: nanos(plan.slice),
     };
     let pacer = Rc::new(Pacer::new(count));
     let stats = Rc::new(RefCell::new(Stats::default()));
@@ -208,6 +252,8 @@ struct Schedule {
     end: u64,
     /// The mean gap between two requests of one connection.
     mean: f64,
+    /// The nanoseconds of each slice of the window, or 0 for no slices.
+    slice: u64,
 }
 
 impl Schedule {
@@ -312,7 +358,14 @@ impl Connection {
                     .ok_or("a response came with no request")?;
                 let mut stats = self.stats.borrow_mut();
                 if (schedule.warm..schedule.end).contains(&at) {
-                    stats.latency.record(now.saturating_sub(at));
+                    let latency = now.saturating_sub(at);
+                    stats.latency.record(latency);
+                    if let Some(slice) = (at - schedule.warm).checked_div(schedule.slice) {
+                        stats.samples.push((
+                            u32::try_from(slice).unwrap_or(u32::MAX),
+                            u32::try_from(latency).unwrap_or(u32::MAX),
+                        ));
+                    }
                 }
                 if (schedule.warm..schedule.end).contains(&now) {
                     stats.completed = stats.completed.saturating_add(1);

@@ -3,14 +3,17 @@
 //! writes at queue depth 1.
 //!
 //! `probe server` runs an echo server on local workers, one reuse-port listener on each worker.
+//! With movable workers, it gives them bursts of CPU work, of loopback TCP work, or of both, for
+//! the mixed-mode probe (`probe/run-mixed.sh`).
 //! `probe client` offers an open-loop load to a server and prints one JSON line: the offered and
 //! the achieved rate, and the latency and the send lag at the 50th, 99th, and 99.9th percentiles.
 //! The same client measures each server, so a ratio of two servers comes from one method.
 //!
 //! ```sh
 //! probe server --workers 4 --port 7000 --completions 64
+//! probe server --workers 1 --port 7000 --completions 64 --movable 8 --bursts both
 //! probe client --target 10.0.0.2:7000 --connections 1000 --rate 200000 --workers 15 \
-//!     --warmup 10 --window 60 --seed 1
+//!     --warmup 10 --window 60 --seed 1 --slice 20
 //! probe file --path /mnt/probe/data --op read --block 4096 --size 4294967296 --count 40000 \
 //!     --seed 1 --drive turn --depth 32
 //! ```
@@ -42,9 +45,10 @@ fn main() -> Result<(), String> {
         Some((command, rest)) if command == "client" => client::run(client::Plan::parse(rest)?),
         Some((command, rest)) if command == "file" => file::run(&file::Plan::parse(rest)?),
         _ => Err(
-            "usage: probe server --workers N --port P --completions N | probe client --target ADDRESS \
-                  --connections N --rate PER_SECOND --workers N --warmup SECONDS --window SECONDS \
-                  --seed N | probe file --path FILE --op read|write --block BYTES --size BYTES \
+            "usage: probe server --workers N --port P --completions N [--movable N --bursts \
+                  none|cpu|io|both] | probe client --target ADDRESS --connections N --rate PER_SECOND \
+                  --workers N --warmup SECONDS --window SECONDS --seed N [--slice MILLISECONDS] | \
+                  probe file --path FILE --op read|write --block BYTES --size BYTES \
                   --count N --seed N --drive turn|spin [--depth N]"
                 .to_owned(),
         ),
