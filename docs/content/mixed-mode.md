@@ -87,9 +87,10 @@ outcome, and it ends with a shutdown that has no live debt.
 
 - `cargo run -p movable_only` runs a runtime with two movable workers and no local worker. 64 echo
   tasks and 8 tasks that use the CPU run in the pool at one time, and an accept loop gives each
-  connection to a task of its own. Then one task shows partial progress, the reuse of a buffer
-  after a success and of a lease after a failed send, and a dropped receive. The shutdown cancels a
-  task whose receive waits.
+  connection to a task of its own. The accept loop joins each of these tasks before it ends: a
+  shutdown cancels each task that still runs, and a join handle that drops does not wait for its
+  task. Then one task shows partial progress, the reuse of a buffer after a success and of a lease
+  after a failed send, and a dropped receive. The shutdown cancels a task whose receive waits.
 - `cargo run -p mixed_mode` runs one local worker, two movable workers, and a compute service. The
   local task keeps its state in an `Rc`, and it hands typed requests to a movable task, which sums
   on the compute service and replies. It shows the reuse of a value that a full channel gave back,

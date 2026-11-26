@@ -101,7 +101,9 @@ fn message(index: u32) -> Vec<u8> {
         .collect()
 }
 
-/// Accepts `ECHOES` connections, and gives each one to an echo task of its own.
+/// Accepts `ECHOES` connections, gives each one to a reply task of its own, and waits for the end of
+/// each reply task. So no task of this step still runs when the accept loop ends, and the shutdown
+/// finds only the task that it must cancel.
 async fn serve(addressed: mpsc::Sender<SocketAddr>) -> Result<(), String> {
     let mut listener = TcpListener::bind(loopback(), TcpOptions::default())
         .map_err(|refused| format!("{:?}", refused.reason()))?
@@ -111,6 +113,7 @@ async fn serve(addressed: mpsc::Sender<SocketAddr>) -> Result<(), String> {
     addressed
         .send(listener.local_addr())
         .map_err(|_| "no one waits for the address")?;
+    let mut replies = Vec::new();
     for _ in 0..ECHOES {
         let (stream, _peer) = listener
             .accept()
@@ -118,13 +121,19 @@ async fn serve(addressed: mpsc::Sender<SocketAddr>) -> Result<(), String> {
             .await
             .map_err(|_| "the accept ended")?
             .map_err(|error| error.to_string())?;
-        drop(task::spawn_movable(reply(stream)).map_err(|refused| format!("{:?}", refused.reason()))?);
+        replies.push(task::spawn_movable(reply(stream)).map_err(|refused| format!("{:?}", refused.reason()))?);
     }
     listener
         .close()
         .map_err(|_| "the close refused")?
         .await
         .map_err(|_| "the close ended")?;
+    // A reply task ends after its peer closed the connection.
+    for reply in replies {
+        if !matches!(reply.join().await, Outcome::Completed(())) {
+            return Err(String::from("a reply task did not complete"));
+        }
+    }
     Ok(())
 }
 
