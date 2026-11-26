@@ -1,5 +1,6 @@
 //! The early probe of rsasync: TCP request/response on local workers against a baseline server,
-//! and file operations at queue depth 1 on a driver that its own loop drives.
+//! and file operations on a driver that its own loop drives: reads at a queue depth, and durable
+//! writes at queue depth 1.
 //!
 //! `probe server` runs an echo server on local workers, one reuse-port listener on each worker.
 //! `probe client` offers an open-loop load to a server and prints one JSON line: the offered and
@@ -11,12 +12,13 @@
 //! probe client --target 10.0.0.2:7000 --connections 1000 --rate 200000 --workers 15 \
 //!     --warmup 10 --window 60 --seed 1
 //! probe file --path /mnt/probe/data --op read --block 4096 --size 4294967296 --count 40000 \
-//!     --seed 1 --drive turn
+//!     --seed 1 --drive turn --depth 32
 //! ```
 //!
-//! `probe file` prints one JSON line: the latency at the 50th, 99th, and 99.9th percentiles, and the
-//! turns, waits, and voluntary context switches of each operation. `probe/run-file.sh` compares it
-//! with fio on one host.
+//! `probe file` prints one JSON line: the latency at the 50th, 99th, and 99.9th percentiles, the
+//! turns, waits, and voluntary context switches of all of the operations, and the CPU time of the
+//! process. `probe/run-file.sh` compares it with fio at queue depth 1 on one host, and
+//! `probe/run-roofline.sh` compares its reads with fio and `t/io_uring` at each queue depth.
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod client;
@@ -43,7 +45,7 @@ fn main() -> Result<(), String> {
             "usage: probe server --workers N --port P --completions N | probe client --target ADDRESS \
                   --connections N --rate PER_SECOND --workers N --warmup SECONDS --window SECONDS \
                   --seed N | probe file --path FILE --op read|write --block BYTES --size BYTES \
-                  --count N --seed N --drive turn|spin"
+                  --count N --seed N --drive turn|spin [--depth N]"
                 .to_owned(),
         ),
     }
