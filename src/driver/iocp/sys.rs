@@ -571,6 +571,19 @@ unsafe extern "system" {
     ) -> i32;
     /// `BOOL FlushFileBuffers(HANDLE hFile)`.
     pub(crate) fn FlushFileBuffers(file: Handle) -> i32;
+    /// `BOOL GetVolumeInformationByHandleW(HANDLE hFile, LPWSTR lpVolumeNameBuffer, DWORD
+    /// nVolumeNameSize, LPDWORD lpVolumeSerialNumber, LPDWORD lpMaximumComponentLength, LPDWORD
+    /// lpFileSystemFlags, LPWSTR lpFileSystemNameBuffer, DWORD nFileSystemNameSize)`.
+    pub(crate) fn GetVolumeInformationByHandleW(
+        file: Handle,
+        volume: *mut u16,
+        volume_len: u32,
+        serial: *mut u32,
+        component_len: *mut u32,
+        flags: *mut u32,
+        file_system: *mut u16,
+        file_system_len: u32,
+    ) -> i32;
     /// `HANDLE CreateEventW(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset, BOOL
     /// bInitialState, LPCWSTR lpName)`.
     pub(crate) fn CreateEventW(security: *mut c_void, manual: i32, initial: i32, name: *const u16) -> Handle;

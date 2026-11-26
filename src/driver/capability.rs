@@ -189,10 +189,6 @@ pub enum Route {
     /// Overlapped calls on the completion port, on Windows: the packet of each call, or its return,
     /// ends it.
     Port,
-    /// No qualified form of the call: it gives `Unsupported` at once, with no system call. On
-    /// Windows, no source states that a flush of a directory makes its namespace changes durable,
-    /// so a directory sync has this route (selected on 2026-11-18).
-    Unsupported,
 }
 
 /// The calls that make the writes of a file durable on a backend ([`Report::durability`]). The end
@@ -213,8 +209,9 @@ pub enum Durability {
     FullFsync,
     /// Windows: `FlushFileBuffers` for each sync, which on [`Backend::IoRing`] is a flush entry with
     /// `FILE_FLUSH_DEFAULT`, the same call in the SDK. A data-sync write goes through the
-    /// write-through handle of its file (`FILE_FLAG_WRITE_THROUGH`). The sync of a directory gives
-    /// `Unsupported` at once ([`Route::Unsupported`]).
+    /// write-through handle of its file (`FILE_FLAG_WRITE_THROUGH`). The sync of a directory is
+    /// `FlushFileBuffers` of the directory, only on NTFS, and on each other file system it gives
+    /// `Unsupported` with no sync.
     FlushFileBuffers,
 }
 
@@ -369,7 +366,6 @@ impl Report {
     #[must_use]
     pub const fn route(&self, call: Call) -> Route {
         let uring = matches!(self.backend, Backend::IoUring);
-        let windows = matches!(self.backend, Backend::Iocp | Backend::IoRing);
         let ring = match call {
             Call::Bind => self.probed.contains(Feature::Bind) && self.probed.contains(Feature::Listen),
             Call::BindUdp => self.probed.contains(Feature::Bind),
@@ -381,7 +377,6 @@ impl Report {
         match (ring, call) {
             (true, _) => Route::Ring,
             (false, Call::FileData | Call::PunchHole) if matches!(self.backend, Backend::Iocp) => Route::Port,
-            (false, Call::SyncDirectory) if windows => Route::Unsupported,
             (false, Call::Bind | Call::BindUdp) => Route::SystemCall,
             (
                 false,

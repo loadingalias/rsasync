@@ -75,16 +75,6 @@ const EIO: i32 = 31;
 const EINVAL: i32 = 22;
 #[cfg(target_os = "windows")]
 const EINVAL: i32 = sys::ERROR_INVALID_PARAMETER;
-/// The error of a call with no qualified form ([`Route::Unsupported`]), which reads as
-/// `Unsupported`: `EOPNOTSUPP` on Linux, `ENOTSUP` on macOS, and `ERROR_CALL_NOT_IMPLEMENTED` on
-/// Windows.
-#[cfg(target_os = "linux")]
-const UNSUPPORTED: i32 = 95;
-#[cfg(target_os = "macos")]
-const UNSUPPORTED: i32 = 45;
-#[cfg(target_os = "windows")]
-const UNSUPPORTED: i32 = sys::ERROR_CALL_NOT_IMPLEMENTED;
-
 /// The descriptor of an entry that names no file: `AT_FDCWD` for a path relative to the working
 /// directory on Linux and macOS. A Windows call of a path takes no handle.
 #[cfg(unix)]
@@ -180,6 +170,8 @@ pub(crate) enum Op {
     Punch,
     /// A sync of the writes of a file. It gives only its result.
     Sync,
+    /// A sync of the creates, renames, and unlinks of a directory. It gives only its result.
+    SyncDirectory,
     /// An operation that gives only its result: a change of length or space, a `statx`, a rename,
     /// or an unlink.
     Plain,
@@ -197,6 +189,7 @@ impl Op {
             Self::Read | Self::ReadVectored | Self::Write(_) => Call::FileData,
             Self::Punch => Call::PunchHole,
             Self::Sync => Call::SyncFile,
+            Self::SyncDirectory => Call::SyncDirectory,
             _ => Call::File,
         }
     }
@@ -764,7 +757,7 @@ pub(super) fn finish(held: &mut Held, op: Op, result: i32, abandoned: bool, reso
                 buffers.fill(count);
             }
         }
-        Op::Write(_) | Op::Punch | Op::Sync | Op::Plain => {}
+        Op::Write(_) | Op::Punch | Op::Sync | Op::SyncDirectory | Op::Plain => {}
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Op::Alone => {}
     }
@@ -1379,16 +1372,17 @@ impl Driver {
     /// system: on macOS, `Unsupported` on a file system with no `F_FULLFSYNC`. The driver never
     /// makes a weaker sync in its place.
     pub fn sync<'a>(&mut self, file: &'a File, mode: SyncMode) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        self.fsync(file.resource, mode == SyncMode::Data)
+        self.fsync(file.resource, Op::Sync, mode == SyncMode::Data)
     }
 
     /// Makes the creates, renames, and unlinks in `directory` that ended before it durable
     /// (`IORING_OP_FSYNC` on the directory, and `F_FULLFSYNC` on macOS). A drop of the future does
     /// not cancel it. On macOS, the sync runs only on APFS and HFS+, which journal these changes,
     /// and on each other file system, such as exFAT, the future gives `Unsupported` with no sync.
-    /// On Windows, the future gives `Unsupported` at once ([`Route::Unsupported`] for
-    /// [`Call::SyncDirectory`]): no source states that a flush of a directory makes its namespace
-    /// changes durable.
+    /// On Windows, the sync is `FlushFileBuffers` of the directory, as a job of the blocking
+    /// service, and it runs only on NTFS, where a power-loss test kept each name that it made
+    /// durable. On each other file system, such as ReFS or exFAT, the future gives `Unsupported`
+    /// with no sync.
     ///
     /// # Errors
     ///
@@ -1397,12 +1391,7 @@ impl Driver {
         &mut self,
         directory: &'a Directory,
     ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
-        self.own(directory.resource, ())?;
-        if self.report.route(Call::SyncDirectory) == Route::Unsupported {
-            let completion = self.fail_now(UNSUPPORTED)?;
-            return Ok(Operation::new(completion, |result, held| Some(done(result, held))));
-        }
-        self.fsync(directory.resource, false)
+        self.fsync(directory.resource, Op::SyncDirectory, false)
     }
 
     /// Renames `from` to `to`, and replaces a file at `to` (`IORING_OP_RENAMEAT`). A sync of each
@@ -1636,10 +1625,15 @@ impl Driver {
         Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 
-    /// Starts a sync of `resource`: `fdatasync` when `data` holds, else `fsync`.
-    fn fsync<'a>(&mut self, resource: Resource, data: bool) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
+    /// Starts the sync `op` of `resource`: `fdatasync` when `data` holds, else `fsync`.
+    fn fsync<'a>(
+        &mut self,
+        resource: Resource,
+        op: Op,
+        data: bool,
+    ) -> Result<Operation<'a, io::Result<()>>, Refused<()>> {
         let entry = move |fd, _: &mut Held| Sqe::fsync(fd, data);
-        let completion = self.begin_file(Some(resource), Op::Sync, (), |()| Held::default(), entry, false)?;
+        let completion = self.begin_file(Some(resource), op, (), |()| Held::default(), entry, false)?;
         Ok(Operation::new(completion, |result, held| Some(done(result, held))))
     }
 

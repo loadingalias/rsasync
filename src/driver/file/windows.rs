@@ -84,11 +84,12 @@ impl Opening {
         })
     }
 
-    /// The open of the directory at `path`, or `None` for a path with a NUL unit.
+    /// The open of the directory at `path`, or `None` for a path with a NUL unit. The handle has
+    /// write access, which `FlushFileBuffers` of the directory needs ([`namespace`]).
     pub(super) fn directory(path: &Path) -> Option<Self> {
         Some(Self {
             path: wide(path)?,
-            access: sys::GENERIC_READ,
+            access: sys::GENERIC_READ | sys::GENERIC_WRITE,
             disposition: sys::OPEN_EXISTING,
             flags: sys::FILE_FLAG_OVERLAPPED | sys::FILE_FLAG_BACKUP_SEMANTICS,
             ..Self::default()
@@ -229,7 +230,9 @@ pub(crate) fn run_file(sqe: &Sqe) -> i32 {
     unsafe {
         match sqe.opcode {
             ring::IORING_OP_OPENAT => open(&mut *pointer::<Opening>(sqe.addr)),
-            ring::IORING_OP_FSYNC => status(sys::FlushFileBuffers(file)),
+            ring::IORING_OP_FSYNC => {
+                namespace(file).map_or_else(|error| error, |()| status(sys::FlushFileBuffers(file)))
+            }
             ring::IORING_OP_FTRUNCATE => set_end(file, sqe.off),
             ring::IORING_OP_FALLOCATE if sqe.len & ring::FALLOC_FL_PUNCH_HOLE != 0 => punch(file, sqe.off, sqe.addr),
             ring::IORING_OP_FALLOCATE => allocate(file, sqe.off, sqe.addr, sqe.len & ring::FALLOC_FL_KEEP_SIZE == 0),
@@ -334,6 +337,38 @@ fn standard(file: sys::Handle) -> Result<sys::FileStandardInfo, i32> {
     let mut info = sys::FileStandardInfo::default();
     query(file, sys::FILE_STANDARD_INFO, &mut info)?;
     Ok(info)
+}
+
+/// The file system whose flush of a directory makes its creates, renames, and unlinks durable:
+/// NTFS. MS-FSA 2.1.5.7 (Appendix A, note 80) states it for NTFS only, and a power-loss test of
+/// R511 on Windows Server 2025 kept each name that a flush of its directory made durable (selected
+/// on 2026-11-26, the user).
+const NAMESPACE: &[u16] = &[b'N' as u16, b'T' as u16, b'F' as u16, b'S' as u16];
+
+/// The UTF-16 units of the name of a file system that [`namespace`] reads (`MAX_PATH + 1`).
+const FILE_SYSTEM_NAME: usize = 261;
+
+/// Gives `ERROR_CALL_NOT_IMPLEMENTED`, which reads as `Unsupported`, when `file` is a directory on
+/// a file system other than [`NAMESPACE`], so the job makes no flush there. A file, and a directory
+/// on NTFS, give `Ok`.
+#[expect(unsafe_code, reason = "the call writes at most the length of the name buffer")]
+fn namespace(file: sys::Handle) -> Result<(), i32> {
+    if standard(file)?.directory == 0 {
+        return Ok(());
+    }
+    let mut name = [0_u16; FILE_SYSTEM_NAME];
+    let len = u32::try_from(name.len()).unwrap_or(u32::MAX);
+    let none = ptr::null_mut::<u32>;
+    // SAFETY: `name` holds `len` units, and the call writes at most that many. It writes no other
+    // value, because each other pointer is null.
+    let read = unsafe {
+        sys::GetVolumeInformationByHandleW(file, ptr::null_mut(), 0, none(), none(), none(), name.as_mut_ptr(), len)
+    };
+    if read == 0 {
+        return Err(last_error());
+    }
+    let end = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
+    (name.get(..end) == Some(NAMESPACE)).ok_or(-sys::ERROR_CALL_NOT_IMPLEMENTED)
 }
 
 /// Writes the information `class` of the open file `file` into `information`.

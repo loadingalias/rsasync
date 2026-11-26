@@ -414,24 +414,16 @@ pub(in crate::driver) fn a_length_change_runs_on_the_ring_from_linux_6_9_and_on_
     drive(&mut driver, close).unwrap();
 }
 
-/// Syncs `directory`. On Windows, the report gives the sync no qualified form, and the sync gives
-/// `Unsupported`.
+/// Syncs `directory`, on a file system whose table qualifies the sync of a directory.
 fn sync_directory(driver: &mut Driver, directory: &super::Directory) {
     let sync = driver.sync_directory(directory).unwrap();
-    let synced = drive(driver, sync).unwrap();
-    #[cfg(unix)]
-    synced.unwrap();
-    #[cfg(target_os = "windows")]
-    {
-        assert_eq!(driver.report().route(Call::SyncDirectory), Route::Unsupported);
-        assert_eq!(synced.unwrap_err().kind(), io::ErrorKind::Unsupported);
-    }
+    drive(driver, sync).unwrap().unwrap();
 }
 
 /// A file and a directory of another driver refuse with `Reason::Resource` before each other check,
 /// so no call reaches the slot of either on this driver. This driver has no blocking service, so a
-/// length change on the service would refuse with `Reason::Blocking` first. On Windows, a directory
-/// sync has no qualified form, so it would give an operation that fails with `Unsupported`.
+/// length change on the service, and a directory sync on Windows, would refuse with
+/// `Reason::Blocking` first.
 pub(in crate::driver) fn a_file_of_another_driver_refuses_before_each_other_check(backend: Backend) {
     let scratch = Scratch::new("foreign");
     let mut first = suite::driver(Config::new(), backend);
@@ -453,7 +445,7 @@ pub(in crate::driver) fn a_file_of_another_driver_refuses_before_each_other_chec
 }
 
 /// A rename, an unlink, and the sync of their directory complete, and the names change as they
-/// say. On Windows, the sync of the directory gives `Unsupported`.
+/// say.
 pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backend: Backend) {
     let scratch = Scratch::new("names");
     let mut driver = suite::driver(Config::new(), backend);
@@ -938,14 +930,34 @@ fn hole_punching(backend: Backend) {
 }
 
 /// Each sync mode and a data-sync write give `Ok`: the durable contents of the table. A rename, an
-/// unlink, and the sync of their directory give the namespace result of this system on a
-/// file system that its table qualifies: `Ok` on Linux and macOS, and `Unsupported` on Windows.
+/// unlink, and the sync of their directory complete on a file system whose table qualifies the
+/// sync of a directory.
 fn durability(backend: Backend) {
     a_rename_an_unlink_and_a_directory_sync_complete(backend);
+    file_syncs(backend);
+}
+
+/// Each sync mode and a data-sync write of a new file give `Ok`.
+fn file_syncs(backend: Backend) {
     let scratch = Scratch::new("syncs");
     let mut driver = suite::driver(Config::new(), backend);
     let file = open(&mut driver, &scratch.join("data"), writable());
     syncs(&mut driver, &file);
+}
+
+/// On a file system whose table does not qualify the sync of a directory, the sync gives
+/// `Unsupported`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn a_directory_sync_refuses_with_unsupported(backend: Backend) {
+    let scratch = Scratch::new("no-namespace");
+    let mut driver = suite::driver(Config::new(), backend);
+    let open = driver.open_directory(&scratch.0).unwrap();
+    let directory = drive(&mut driver, open).unwrap().unwrap();
+    let sync = driver.sync_directory(&directory).unwrap();
+    let synced = drive(&mut driver, sync).unwrap();
+    assert_eq!(synced.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    let close = driver.close_directory(directory).unwrap();
+    drive(&mut driver, close).unwrap();
 }
 
 /// Each sync mode and a data-sync write give `Ok`.
@@ -977,8 +989,9 @@ fn a_hole_punch_refuses_with_unsupported_and_changes_no_byte(backend: Backend) {
     assert_eq!((count.unwrap(), buffer.bytes()), (LEN, &numbered(0, LEN)[..]));
 }
 
-/// The cases of ext4, xfs, APFS, NTFS, and ReFS, which the table qualifies for preallocation and
-/// hole punching. On Linux, a crash after the syncs also keeps each synced byte and name.
+/// The cases of ext4, xfs, APFS, and NTFS, which the table qualifies for preallocation, hole
+/// punching, and the sync of a directory. On Linux, a crash after the syncs also keeps each synced
+/// byte and name.
 fn qualified(volume: &Volume, backend: Backend) {
     preallocation(backend);
     hole_punching(backend);
@@ -987,6 +1000,16 @@ fn qualified(volume: &Volume, backend: Backend) {
     synced_bytes_and_names_stay_after_a_crash(volume, backend);
     #[cfg(not(target_os = "linux"))]
     let _ = volume;
+}
+
+/// The cases of ReFS, which has preallocation and hole punching, and no qualified sync of a
+/// directory.
+#[cfg(target_os = "windows")]
+fn refs(_volume: &Volume, backend: Backend) {
+    preallocation(backend);
+    hole_punching(backend);
+    file_syncs(backend);
+    a_directory_sync_refuses_with_unsupported(backend);
 }
 
 /// The cases of HFS+, which has preallocation and the sync of a directory, and no hole punching.
@@ -1004,29 +1027,23 @@ fn hfs(_volume: &Volume, backend: Backend) {
 /// `Unsupported` there. The table does not qualify preallocation on exFAT on macOS and Windows.
 fn exfat(_volume: &Volume, backend: Backend) {
     a_hole_punch_refuses_with_unsupported_and_changes_no_byte(backend);
-    let scratch = Scratch::new("exfat");
-    let mut driver = suite::driver(Config::new(), backend);
-    let file = open(&mut driver, &scratch.join("data"), writable());
-    syncs(&mut driver, &file);
+    file_syncs(backend);
     #[cfg(target_os = "linux")]
-    for length in [Length::Keep, Length::Extend] {
-        let allocate = driver.allocate(&file, 0, 1 << 20, length).unwrap();
-        let allocated = drive(&mut driver, allocate).unwrap();
-        assert_eq!(allocated.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    {
+        let scratch = Scratch::new("exfat");
+        let mut driver = suite::driver(Config::new(), backend);
+        let file = open(&mut driver, &scratch.join("data"), writable());
+        for length in [Length::Keep, Length::Extend] {
+            let allocate = driver.allocate(&file, 0, 1 << 20, length).unwrap();
+            let allocated = drive(&mut driver, allocate).unwrap();
+            assert_eq!(allocated.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        }
+        let open = driver.open_directory(&scratch.0).unwrap();
+        let directory = drive(&mut driver, open).unwrap().unwrap();
+        sync_directory(&mut driver, &directory);
     }
-
-    let open = driver.open_directory(&scratch.0).unwrap();
-    let directory = drive(&mut driver, open).unwrap().unwrap();
-    let sync = driver.sync_directory(&directory).unwrap();
-    let synced = drive(&mut driver, sync).unwrap();
-    #[cfg(target_os = "linux")]
-    synced.unwrap();
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    assert_eq!(synced.unwrap_err().kind(), io::ErrorKind::Unsupported);
-    let close = driver.close_directory(directory).unwrap();
-    drive(&mut driver, close).unwrap();
-    let close = driver.close_file(file).unwrap();
-    drive(&mut driver, close).unwrap();
+    a_directory_sync_refuses_with_unsupported(backend);
 }
 
 /// `FS_IOC_SHUTDOWN` (`_IOR('X', 125, __u32)`, `include/uapi/linux/fs.h`), which ext4 and xfs
@@ -1139,8 +1156,7 @@ fn on_hfs_space_and_syncs_give_the_results_of_the_table() {
     on_volume(FileSystem::Hfs, hfs);
 }
 
-/// On NTFS, preallocation, hole punching, and each sync give the results of the table, and a
-/// directory sync gives `Unsupported`.
+/// On NTFS, preallocation, hole punching, and each sync give the results of the table.
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "attaches a virtual disk, which only an administrator can do"]
@@ -1148,13 +1164,13 @@ fn on_ntfs_space_and_syncs_give_the_results_of_the_table() {
     on_volume(FileSystem::Ntfs, qualified);
 }
 
-/// On ReFS, preallocation, hole punching, and each sync give the results of the table, and a
-/// directory sync gives `Unsupported`.
+/// On ReFS, preallocation, hole punching, and each sync of a file give the results of the table,
+/// and a directory sync refuses with `Unsupported`.
 #[cfg(target_os = "windows")]
 #[test]
 #[ignore = "attaches a virtual disk, which only an administrator can do"]
 fn on_refs_space_and_syncs_give_the_results_of_the_table() {
-    on_volume(FileSystem::Refs, qualified);
+    on_volume(FileSystem::Refs, refs);
 }
 
 /// On exFAT, a hole punch refuses with `Unsupported`, and preallocation and each sync give the

@@ -2678,15 +2678,15 @@ fn a_strict_requirement_refuses_before_the_driver_is_ready() {
 
 /// On Windows, the report gives the route of each file call on each backend, as the IoRing row of
 /// the design states: IoRing runs the reads, the writes, and the syncs of a file on its ring, and a
-/// hole punch on the blocking service, and IOCP runs the reads, the writes, and the hole punches on
-/// the port. Where the probe refuses the ring, a strict IoRing driver refuses before it exists, and
+/// hole punch and the sync of a directory on the blocking service, and IOCP runs the reads, the
+/// writes, and the hole punches on the port. Where the probe refuses the ring, a strict IoRing driver refuses before it exists, and
 /// the permissive driver runs IOCP and gives the `HRESULT` of the refusal. The test prints the
 /// report.
 #[test]
 #[cfg(target_os = "windows")]
 fn each_windows_backend_reports_the_route_of_each_file_call() {
     use super::{Backend, Call, Error, Report, Route};
-    use Route::{BlockingService as Service, Port, Ring, Unsupported};
+    use Route::{BlockingService as Service, Port, Ring};
 
     let routes = |report: Report| {
         [
@@ -2706,7 +2706,7 @@ fn each_windows_backend_reports_the_route_of_each_file_call() {
         (iocp.requested(), iocp.backend(), iocp.fallback()),
         (Some(Backend::Iocp), Backend::Iocp, None)
     );
-    assert_eq!(routes(iocp), [Port, Port, Service, Unsupported, Service, Service]);
+    assert_eq!(routes(iocp), [Port, Port, Service, Service, Service, Service]);
     match Driver::new(Config::new().backend(Backend::IoRing)) {
         Ok(strict) => {
             let report = strict.report();
@@ -2714,7 +2714,7 @@ fn each_windows_backend_reports_the_route_of_each_file_call() {
                 (report.requested(), report.backend(), report.fallback()),
                 (Some(Backend::IoRing), Backend::IoRing, None)
             );
-            assert_eq!(routes(report), [Ring, Service, Ring, Unsupported, Service, Service]);
+            assert_eq!(routes(report), [Ring, Service, Ring, Service, Service, Service]);
             assert_eq!((permissive.backend(), permissive.fallback()), (Backend::IoRing, None));
         }
         Err(Error::Refused(error)) => {
