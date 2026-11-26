@@ -436,8 +436,11 @@ names the plain descriptors. The probe passed on Linux 7.0 and failed on Linux 6
   no refusal. Under controlled delivery, `Control::fail_next_registration()` makes that failure.
 - The operations of a file, and the operations of a movable resource, name the plain descriptor.
 
-The default is `Files::Plain` until a measurement on the thread-per-core TCP cell selects the
-default.
+`Files::Plain` is the default, because the measurement on the thread-per-core TCP cell found no
+gain from the table. On two EC2 c8g.4xlarge with Linux 7.0 (2026-11-25), an echo server with four
+workers served 450,000 requests of 1 KiB each second on 10,000 connections. With the table, the
+CPU of a request was 0.7% lower with one form of the receive and 0.7% higher with the other. Two
+runs of one server differ by up to 0.9%. No file workload measured the table.
 
 ## End the driver
 
