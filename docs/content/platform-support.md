@@ -278,9 +278,10 @@ On 2026-11-26, the [file-system tests](files.md#file-systems) passed as an admin
 and on IoRing, on NTFS, ReFS, and exFAT virtual disks (`diskpart`). On an AWS EC2 c8i.2xlarge with
 Windows Server 2025, build `10.0.26100.33822`, they passed at revision `420138b`, whose directory
 sync runs on NTFS and gives `Unsupported` on ReFS and exFAT. On the Azure `Standard_D8ps_v6` with
-Windows 11 Enterprise, build `10.0.26300.9974`, they passed at revision `48dc2e7` (run
-`20261126T063627Z-43591`), before the directory sync of NTFS. In the same runs, `cargo xtask test`
-ran the 329 tests of the whole workspace and the doctests. On the EC2 host, an MSVC build of the
+Windows 11 Enterprise, build `10.0.26300.9974`, they passed at revision `977bf9e` (run
+`20261126T080320Z-89386`), which also opens a directory that you may only read. In the same runs,
+`cargo xtask test` ran the tests of the whole workspace and the doctests: 329 on EC2 and 332 on
+Azure. On the EC2 host, an MSVC build of the
 Windows SDK 10.0.28000.0 headers showed that the new `GetVolumeInformationByHandleW` declaration
 matches them. The [power-loss test](files.md#file-systems) of NTFS ran on the same EC2 host.
 
