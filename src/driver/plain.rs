@@ -127,6 +127,9 @@ pub(crate) struct Plain {
 struct Tail {
     completion: Completion,
     kind: Kind,
+    /// The future of this selected receive dropped with no cancel, so the next selected receive of
+    /// the direction takes the operation over, with no submission.
+    kept: bool,
 }
 
 impl Drop for Tail {
@@ -270,7 +273,15 @@ impl Direction {
 
     /// Starts a receive on `socket` into a buffer that the kernel selects from the provided
     /// buffers of `driver`, its home. Refuses with [`Reason::Buffers`] when that driver has none.
+    /// A selected receive whose future dropped with no cancel is the receive: the new future takes
+    /// it over at its own home, with no submission.
     pub(crate) fn recv_selected(&mut self, driver: &mut Driver, socket: &PlainSocket) -> Result<(), Refused<()>> {
+        if let Some(tail) = &mut self.tail
+            && tail.kept
+        {
+            tail.kept = false;
+            return Ok(());
+        }
         if driver.selected.is_none() {
             return Err(Refused {
                 reason: Reason::Buffers,
@@ -326,7 +337,11 @@ impl Direction {
                 ..held(value)
             }
         })?;
-        self.tail = Some(Tail { completion, kind });
+        self.tail = Some(Tail {
+            completion,
+            kind,
+            kept: false,
+        });
         Ok(())
     }
 
@@ -379,7 +394,11 @@ impl Direction {
     /// The place of the operation of `completion`, which has no resource.
     const fn of(completion: Completion, kind: Kind) -> Self {
         Self {
-            tail: Some(Tail { completion, kind }),
+            tail: Some(Tail {
+                completion,
+                kind,
+                kept: false,
+            }),
             chain: None,
         }
     }
@@ -422,15 +441,26 @@ impl Direction {
         }
     }
 
-    /// The future of the operation of the direction dropped: a receive, an accept, or a connect
-    /// gets a cancel, and a send runs on.
-    pub(crate) fn forgo(&self) {
-        if let Some(tail) = &self.tail
+    /// The future of the operation of the direction dropped, and it asked for a cancel when
+    /// `cancelled` holds. A selected receive with no cancel runs on, and the next selected receive
+    /// takes it over. Each other receive, an accept, or a connect gets a cancel, and a send runs
+    /// on.
+    pub(crate) fn forgo(&mut self, cancelled: bool) {
+        if let Some(tail) = &mut self.tail
             && !tail.kind.writes()
             && tail.kind != Kind::Close
         {
-            tail.completion.cancel();
+            if tail.kind == Kind::Selected && !cancelled {
+                tail.kept = true;
+            } else {
+                tail.completion.cancel();
+            }
         }
+    }
+
+    /// The identity of the operation of the direction, until a consumer takes its result.
+    pub(crate) fn id(&self) -> Option<super::OperationId> {
+        self.tail.as_ref().map(|tail| tail.completion.id())
     }
 }
 

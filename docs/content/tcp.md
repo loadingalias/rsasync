@@ -135,7 +135,7 @@ No byte and no connection is lost. These rules apply:
 
 | Operation | Its future drops or is forgotten | `Operation::cancel` |
 | --- | --- | --- |
-| Receive | The driver asks the kernel to cancel. The bytes that the receive got before the cancel took effect stay with the stream, in the receive's own buffer. The next receive gives them before it submits: `recv` copies as many as fit its buffer, and the stream keeps the rest; `recv_selected` gives that buffer. An error of the receive also stays, and the next receive gives it. Close releases the bytes that no receive took | The future gives the original buffer with the bytes that came before the cancel took effect, with no copy, or `ECANCELED` |
+| Receive | The driver asks the kernel to cancel. The bytes that the receive got before the cancel took effect stay with the stream, in the receive's own buffer. The next receive gives them before it submits: `recv` copies as many as fit its buffer, and the stream keeps the rest; `recv_selected` gives that buffer. An error of the receive also stays, and the next receive gives it. Close releases the bytes that no receive took. A dropped `recv_selected` asks for no cancel when the stream has a [multishot receive](driver-only.md#one-multishot-receive-for-each-stream) (`Shot::Multi`, the default on io_uring) or is a [movable stream](#use-tcp-from-a-movable-task): the next `recv_selected` takes its bytes with no submission. So a protocol can drop a selected receive at the end of each call and lose nothing. With `Shot::Single`, the drop asks for a cancel, and the next receive submits again | The future gives the original buffer with the bytes that came before the cancel took effect, with no copy, or `ECANCELED` |
 | Send, vectored send, and half-close | The operation is not cancelled. If a send sends all its bytes, it reports nothing. If it fails, sends only part of its bytes, or was cancelled, the write direction fails: see below | The future gives the lease or the regions with the exact count, or `ECANCELED`. The direction stays usable. On Windows, a cancel of a send that runs in the kernel aborts the connection: see [IOCP backend](iocp.md#differences-from-linux) |
 | Accept | The driver asks the kernel to cancel. A connection that the accept took before the cancel took effect stays with the listener, and the next accept gives it, with its peer address, before it submits. Close of the listener closes it | The future gives the connection that the accept took before the cancel took effect, or `ECANCELED` |
 | Connect | The driver asks the kernel to cancel. A connection that completes after the drop is closed at its end, so no descriptor stays open, and the peer reads the end of the stream | The future gives the stream that the connect made before the cancel took effect, or `ECANCELED` |
@@ -367,6 +367,10 @@ runtime.block_on(async {
 
 The rules of this page apply, with these differences from the local types:
 
+- A dropped `recv_selected` future that called no `cancel()` does not cancel its receive. The
+  receive runs on at its home, and the next `recv_selected` of the stream, on any worker, takes
+  it over with no submission: `Operation::id` gives the identity of that receive. A plain `recv`
+  or the close cancels it.
 - Each direction still runs one operation at a time, and a dropped receive leaves its bytes to
   the next receive. The stream keeps a dropped operation, not a driver. An operation that starts
   while a dropped one of its direction still runs gets its slot at once, at the driver of its own

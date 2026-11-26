@@ -22,7 +22,8 @@
 //!   terminal event of its operation.
 //! - A direction runs one operation at a time. A dropped receive leaves its bytes to the next
 //!   receive, and a dropped send runs on. The next operation of the direction starts after the
-//!   dropped one ended, also when the two have different homes.
+//!   dropped one ended, also when the two have different homes. A dropped `recv_selected` with
+//!   no cancel runs on, and the next `recv_selected` takes it over with no submission.
 //! - `close` cancels each operation of the resource, and its future ends after their terminal
 //!   events. A drop of the resource cancels them too, with no future, and the socket closes when
 //!   they ended.
@@ -70,6 +71,7 @@ use core::fmt;
 use core::future::Future;
 use core::net::SocketAddr;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, ready};
 use std::io;
 
@@ -210,7 +212,10 @@ impl TcpStream {
     /// Receives into a buffer that the kernel selects from the provided buffers of the driver of
     /// this thread when the bytes come, as
     /// [`local::TcpStream::recv_selected`](crate::local::TcpStream::recv_selected) does: a receive
-    /// that waits holds no buffer. A drop of the future asks for a cancel.
+    /// that waits holds no buffer. A drop of the future with no [`Operation::cancel`] does not
+    /// cancel the receive: it runs on at its home, and the next `recv_selected` of the stream, on
+    /// any worker, takes it over with no submission and gives its bytes. A plain receive or the
+    /// close cancels it.
     ///
     /// # Errors
     ///
@@ -425,6 +430,8 @@ pub struct Operation<'a, T> {
     place: Place<'a>,
     output: fn(i32, &mut Held) -> Option<T>,
     done: bool,
+    /// [`Operation::cancel`] asked the home to cancel the operation.
+    cancelled: AtomicBool,
 }
 
 impl<'a, T> Operation<'a, T> {
@@ -433,13 +440,23 @@ impl<'a, T> Operation<'a, T> {
             place: Place::Borrowed(direction),
             output,
             done: false,
+            cancelled: AtomicBool::new(false),
         }
+    }
+
+    /// The identity of the operation that the future waits for, or `None` after the future gave
+    /// its output. A selected receive that takes over the receive of a dropped future has the
+    /// identity of that receive.
+    #[must_use]
+    pub fn id(&self) -> Option<driver::OperationId> {
+        if self.done { None } else { self.direction().id() }
     }
 
     /// Asks the home of the operation to cancel it. The future keeps its interest: it later gives
     /// the result, with the original buffer and its exact progress.
     pub fn cancel(&self) {
         if !self.done {
+            self.cancelled.store(true, Ordering::Relaxed);
             self.direction().cancel();
         }
     }
@@ -458,6 +475,7 @@ impl<T> Operation<'static, T> {
             place: Place::Owned(place),
             output,
             done: false,
+            cancelled: AtomicBool::new(false),
         }
     }
 }
@@ -485,10 +503,15 @@ impl<T> Future for Operation<'_, T> {
 }
 
 impl<T> Drop for Operation<'_, T> {
-    /// The direction keeps the operation. A receive, an accept, or a connect gets a cancel.
+    /// The direction keeps the operation. A selected receive with no cancel runs on for the next
+    /// selected receive. Each other receive, an accept, or a connect gets a cancel.
     fn drop(&mut self) {
         if !self.done {
-            self.direction().forgo();
+            let cancelled = *self.cancelled.get_mut();
+            match &mut self.place {
+                Place::Borrowed(direction) => direction.forgo(cancelled),
+                Place::Owned(direction) => direction.forgo(cancelled),
+            }
         }
     }
 }

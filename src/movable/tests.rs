@@ -256,6 +256,48 @@ fn a_close_on_another_worker_ends_the_receive_at_its_home_and_closes_the_socket(
     );
 }
 
+/// R414: a dropped selected receive with no cancel runs on at its home. The next selected receive
+/// starts on the other worker and takes it over: it has the identity of the first receive, so the
+/// two calls submit one receive. It gives the bytes that the peer sends after the drop. A cancel
+/// at the drop would end the receive before the bytes come.
+#[test]
+fn a_selected_receive_on_another_worker_takes_over_the_receive_of_a_dropped_future() {
+    let runtime = runtime();
+    let (address, addressed) = mpsc::channel();
+    let (waits, waiting) = mpsc::channel();
+    let task = runtime
+        .handle()
+        .unwrap()
+        .spawn_movable(async move {
+            let (_listener, mut stream) = accepted(address).await;
+            let home = thread::current().id();
+            let mut first = stream.recv_selected().unwrap();
+            assert!(poll_once(&mut first).await.is_pending());
+            let id = first.id();
+            drop(first);
+            let blocked = away_from(home).await;
+            let second = stream.recv_selected().unwrap();
+            let took_over = second.id() == id && id.is_some();
+            drop(blocked);
+            waits.send(()).unwrap();
+            let (output, taker) = elsewhere(home, second).await;
+            (output.unwrap().unwrap().bytes().to_vec(), took_over, taker != home)
+        })
+        .unwrap();
+    let mut client = client(&addressed);
+    waiting.recv().unwrap();
+    // The home turns its driver first, so a cancel that the drop sent ends the receive before the
+    // bytes come.
+    thread::sleep(Duration::from_millis(100));
+    client.write_all(b"ping").unwrap();
+    let Outcome::Completed((bytes, took_over, elsewhere)) = task.join_blocking() else {
+        panic!("the task ended with no output");
+    };
+    assert_eq!(bytes, b"ping");
+    assert!(took_over, "the second receive has the identity of the first");
+    assert!(elsewhere, "the other worker took the result");
+}
+
 /// The bytes that a dropped receive took stay with the stream. The next receives start on the
 /// other worker, whose driver takes the bytes from the home of the dropped receive: they come in
 /// order, and none is lost.
