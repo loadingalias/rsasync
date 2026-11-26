@@ -1384,9 +1384,11 @@ impl Driver {
 
     /// Makes the creates, renames, and unlinks in `directory` that ended before it durable
     /// (`IORING_OP_FSYNC` on the directory, and `F_FULLFSYNC` on macOS). A drop of the future does
-    /// not cancel it. On Windows, the future gives `Unsupported` at once ([`Route::Unsupported`]
-    /// for [`Call::SyncDirectory`]): no source states that a flush of a directory makes its
-    /// namespace changes durable.
+    /// not cancel it. On macOS, the sync runs only on APFS and HFS+, which journal these changes,
+    /// and on each other file system, such as exFAT, the future gives `Unsupported` with no sync.
+    /// On Windows, the future gives `Unsupported` at once ([`Route::Unsupported`] for
+    /// [`Call::SyncDirectory`]): no source states that a flush of a directory makes its namespace
+    /// changes durable.
     ///
     /// # Errors
     ///

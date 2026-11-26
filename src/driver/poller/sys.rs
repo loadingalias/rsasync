@@ -155,6 +155,11 @@ pub(in crate::driver) const _SC_PAGESIZE: c_int = 29;
 /// The unit of `st_blocks` (`S_BLKSIZE`).
 #[cfg(target_os = "macos")]
 pub(super) const S_BLKSIZE: i64 = 512;
+/// The type bits of `st_mode`, and the type of a directory (`sys/stat.h`).
+#[cfg(target_os = "macos")]
+pub(super) const S_IFMT: u16 = 0o170_000;
+#[cfg(target_os = "macos")]
+pub(super) const S_IFDIR: u16 = 0o040_000;
 
 /// `fstore_t`: the request of `F_PREALLOCATE`, and the bytes that it allocated.
 #[cfg(target_os = "macos")]
@@ -194,14 +199,16 @@ pub(crate) struct Stat {
     _after_blocks: [u64; 4],
 }
 
-/// `struct statfs`, 2168 bytes: the block size of the file system, and the other fields as spare
-/// words.
+/// `struct statfs`, 2168 bytes: the block size and the type name of the file system, and the other
+/// fields as spare words.
 #[cfg(target_os = "macos")]
 #[repr(C)]
 pub(super) struct Statfs {
     pub(super) f_bsize: u32,
-    _after_bsize: [u32; 1],
-    _rest: [u64; 270],
+    _after_bsize: [u32; 17],
+    /// The name of the type of the file system, ended by a NUL byte (`MFSTYPENAMELEN`, 16).
+    pub(super) f_fstypename: [u8; 16],
+    _rest: [u64; 260],
 }
 
 #[cfg(target_os = "macos")]
@@ -209,8 +216,9 @@ impl Statfs {
     pub(super) const fn new() -> Self {
         Self {
             f_bsize: 0,
-            _after_bsize: [0],
-            _rest: [0; 270],
+            _after_bsize: [0; 17],
+            f_fstypename: [0; 16],
+            _rest: [0; 260],
         }
     }
 }
@@ -219,6 +227,7 @@ impl Statfs {
 const _: () = {
     assert!(size_of::<Statfs>() == 2168);
     assert!(offset_of!(Statfs, f_bsize) == 0);
+    assert!(offset_of!(Statfs, f_fstypename) == 72);
     assert!(size_of::<Fstore>() == 32);
     assert!(offset_of!(Fstore, fst_posmode) == 4);
     assert!(offset_of!(Fstore, fst_offset) == 8);

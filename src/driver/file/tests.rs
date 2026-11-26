@@ -26,15 +26,28 @@ use crate::blocking::{self, Service};
 use crate::buffer::{Backing, Buffer as _, Lease, Pool, WriteLoan};
 use crate::capacity::Budget;
 use crate::driver::Regions;
+use volume::{FileSystem, Volume};
 
-/// A new empty directory for one test, next to the test binary, so on the file system of the
-/// build and not on a `tmpfs`. Its drop removes it.
+mod volume;
+
+std::thread_local! {
+    /// The mount point of the volume on which a test of the file-system table runs its cases, or
+    /// none for the directory of the test binary.
+    static VOLUME: core::cell::RefCell<Option<PathBuf>> = const { core::cell::RefCell::new(None) };
+}
+
+/// A new empty directory for one test: on the volume of a test of the file-system table, and else
+/// next to the test binary, so on the file system of the build and not on a `tmpfs`. Its drop
+/// removes it.
 struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let mut path = std::env::current_exe().expect("the test knows its binary");
-        path.pop();
+        let mut path = VOLUME.with_borrow(Clone::clone).unwrap_or_else(|| {
+            let mut path = std::env::current_exe().expect("the test knows its binary");
+            path.pop();
+            path
+        });
         path.push(alloc::format!("rsasync-file-{name}-{}", std::process::id()));
         drop(fs::remove_dir_all(&path));
         fs::create_dir_all(&path).expect("the test makes its directory");
@@ -891,4 +904,271 @@ fn a_wait_enters_the_kernel_again_after_a_short_timeout_only_while_a_file_operat
     // 50 ms is 200 entries of 250 µs.
     let slept = sleeps_of_a_wait(&mut driver, u64::MAX, Duration::from_millis(50));
     assert!(slept <= 3, "the wait slept {slept} times with no file operation");
+}
+
+/// The backends of this system that run the cases of the file-system table on each volume.
+#[cfg(target_os = "linux")]
+const BACKENDS: [Backend; 2] = [Backend::Kernel, Backend::Epoll];
+#[cfg(target_os = "macos")]
+const BACKENDS: [Backend; 1] = [Backend::Kqueue];
+#[cfg(target_os = "windows")]
+const BACKENDS: [Backend; 2] = [Backend::Iocp, Backend::IoRing];
+
+/// Runs `cases` on each backend of this system, on a new volume of `file_system`.
+fn on_volume(file_system: FileSystem, cases: fn(&Volume, Backend)) {
+    let volume = Volume::new(file_system);
+    VOLUME.set(Some(volume.path().to_path_buf()));
+    for backend in BACKENDS {
+        cases(&volume, backend);
+    }
+    VOLUME.set(None);
+}
+
+/// A preallocation keeps or extends the length and allocates its blocks, also while a write after
+/// its end runs.
+fn preallocation(backend: Backend) {
+    a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks(backend);
+    a_write_after_the_end_of_an_extending_allocation_keeps_each_byte(backend);
+}
+
+/// A punched hole reads as zeros, keeps the length, and frees its blocks, also inside blocks.
+fn hole_punching(backend: Backend) {
+    a_punched_hole_reads_as_zeros_keeps_the_length_and_frees_its_blocks(backend);
+    an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay(backend);
+}
+
+/// Each sync mode and a data-sync write give `Ok`: the durable contents of the table. A rename, an
+/// unlink, and the sync of their directory give the namespace result of this system on a
+/// file system that its table qualifies: `Ok` on Linux and macOS, and `Unsupported` on Windows.
+fn durability(backend: Backend) {
+    a_rename_an_unlink_and_a_directory_sync_complete(backend);
+    let scratch = Scratch::new("syncs");
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), writable());
+    syncs(&mut driver, &file);
+}
+
+/// Each sync mode and a data-sync write give `Ok`.
+fn syncs(driver: &mut Driver, file: &File) {
+    for mode in [SyncMode::Data, SyncMode::All] {
+        let sync = driver.sync(file, mode).unwrap();
+        drive(driver, sync).unwrap().unwrap();
+    }
+    let write = driver
+        .write_at(file, Lease::from(numbered(0, 4096)), 0, WriteMode::DataSync)
+        .unwrap();
+    assert_eq!(drive(driver, write).unwrap().0.unwrap(), 4096);
+}
+
+/// On a file system with no hole punching, a hole punch gives `Unsupported` and changes no byte.
+fn a_hole_punch_refuses_with_unsupported_and_changes_no_byte(backend: Backend) {
+    const LEN: usize = 1 << 16;
+    let scratch = Scratch::new("no-holes");
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), writable().read(true));
+    write(&mut driver, &file, &numbered(0, LEN), 0);
+    let punch = driver.punch_hole(&file, 1000, 20_000).unwrap();
+    let punched = drive(&mut driver, punch).unwrap();
+    assert_eq!(punched.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    let read = driver
+        .read_at(&file, Backing::from(Vec::with_capacity(LEN)), 0)
+        .unwrap();
+    let (count, buffer) = drive(&mut driver, read).unwrap();
+    assert_eq!((count.unwrap(), buffer.bytes()), (LEN, &numbered(0, LEN)[..]));
+}
+
+/// The cases of ext4, xfs, APFS, NTFS, and ReFS, which the table qualifies for preallocation and
+/// hole punching. On Linux, a crash after the syncs also keeps each synced byte and name.
+fn qualified(volume: &Volume, backend: Backend) {
+    preallocation(backend);
+    hole_punching(backend);
+    durability(backend);
+    #[cfg(target_os = "linux")]
+    synced_bytes_and_names_stay_after_a_crash(volume, backend);
+    #[cfg(not(target_os = "linux"))]
+    let _ = volume;
+}
+
+/// The cases of HFS+, which has preallocation and the sync of a directory, and no hole punching.
+#[cfg(target_os = "macos")]
+fn hfs(_volume: &Volume, backend: Backend) {
+    preallocation(backend);
+    a_hole_punch_refuses_with_unsupported_and_changes_no_byte(backend);
+    durability(backend);
+}
+
+/// The cases of exFAT, which has no hole punching on Linux, macOS, or Windows. Each sync of a file
+/// gives `Ok`. The sync of a directory gives `Ok` on Linux, whose table qualifies it on each file
+/// system, and `Unsupported` on macOS and Windows, whose tables do not qualify it on exFAT. Linux
+/// before 7.1 has no `fallocate` on exFAT (`fs/exfat/file.c`), so a preallocation also gives
+/// `Unsupported` there. The table does not qualify preallocation on exFAT on macOS and Windows.
+fn exfat(_volume: &Volume, backend: Backend) {
+    a_hole_punch_refuses_with_unsupported_and_changes_no_byte(backend);
+    let scratch = Scratch::new("exfat");
+    let mut driver = suite::driver(Config::new(), backend);
+    let file = open(&mut driver, &scratch.join("data"), writable());
+    syncs(&mut driver, &file);
+    #[cfg(target_os = "linux")]
+    for length in [Length::Keep, Length::Extend] {
+        let allocate = driver.allocate(&file, 0, 1 << 20, length).unwrap();
+        let allocated = drive(&mut driver, allocate).unwrap();
+        assert_eq!(allocated.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    let open = driver.open_directory(&scratch.0).unwrap();
+    let directory = drive(&mut driver, open).unwrap().unwrap();
+    let sync = driver.sync_directory(&directory).unwrap();
+    let synced = drive(&mut driver, sync).unwrap();
+    #[cfg(target_os = "linux")]
+    synced.unwrap();
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    assert_eq!(synced.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    let close = driver.close_directory(directory).unwrap();
+    drive(&mut driver, close).unwrap();
+    let close = driver.close_file(file).unwrap();
+    drive(&mut driver, close).unwrap();
+}
+
+/// `FS_IOC_SHUTDOWN` (`_IOR('X', 125, __u32)`, `include/uapi/linux/fs.h`), which ext4 and xfs
+/// have, and its flag `FS_SHUTDOWN_FLAGS_NOLOGFLUSH`: the file system stops at once and writes
+/// nothing more, as at a power loss.
+#[cfg(target_os = "linux")]
+const FS_IOC_SHUTDOWN: core::ffi::c_ulong = 0x8004_587D;
+#[cfg(target_os = "linux")]
+const FS_SHUTDOWN_FLAGS_NOLOGFLUSH: u32 = 2;
+
+/// Stops the file system of `volume` as a power loss does.
+#[cfg(target_os = "linux")]
+#[expect(unsafe_code, reason = "the call reads one flag word of the test")]
+fn shut_down(volume: &Volume) {
+    use std::os::fd::AsRawFd as _;
+
+    unsafe extern "C" {
+        fn ioctl(fd: core::ffi::c_int, request: core::ffi::c_ulong, ...) -> core::ffi::c_int;
+    }
+    let root = fs::File::open(volume.path()).unwrap();
+    let flags = FS_SHUTDOWN_FLAGS_NOLOGFLUSH;
+    // SAFETY: the call reads the flag word, which lives until the call returns.
+    let stopped = unsafe { ioctl(root.as_raw_fd(), FS_IOC_SHUTDOWN, &raw const flags) };
+    assert_eq!(stopped, 0, "{}", io::Error::last_os_error());
+}
+
+/// A sync of each mode, a data-sync write, and the sync of a directory after a create and after a
+/// rename keep their bytes and names when the file system stops at once after them, as at a power
+/// loss. A write and a rename after the last sync are lost, so the stop is a real crash.
+#[cfg(target_os = "linux")]
+fn synced_bytes_and_names_stay_after_a_crash(volume: &Volume, backend: Backend) {
+    let scratch = Scratch::new("crash");
+    let bytes = numbered(0, 8192);
+    let mut driver = suite::driver(Config::new(), backend);
+    let mut files = Vec::new();
+    for (name, sync) in [
+        ("data", Some(SyncMode::Data)),
+        ("all", Some(SyncMode::All)),
+        ("through", None),
+    ] {
+        let file = open(&mut driver, &scratch.join(name), writable().create_new(true));
+        let mode = sync.map_or(WriteMode::DataSync, |_| WriteMode::Plain);
+        let write = driver.write_at(&file, Lease::from(bytes.clone()), 0, mode).unwrap();
+        assert_eq!(drive(&mut driver, write).unwrap().0.unwrap(), bytes.len());
+        if let Some(mode) = sync {
+            let sync = driver.sync(&file, mode).unwrap();
+            drive(&mut driver, sync).unwrap().unwrap();
+        }
+        files.push(file);
+    }
+    let open = driver.open_directory(&scratch.0).unwrap();
+    let directory = drive(&mut driver, open).unwrap().unwrap();
+    sync_directory(&mut driver, &directory);
+    let rename = driver.rename(&scratch.join("data"), &scratch.join("renamed")).unwrap();
+    drive(&mut driver, rename).unwrap().unwrap();
+    sync_directory(&mut driver, &directory);
+    // After the last sync: the crash loses both.
+    write(&mut driver, &files[1], &numbered(8192, 4096), 8192);
+    let rename = driver.rename(&scratch.join("through"), &scratch.join("lost")).unwrap();
+    drive(&mut driver, rename).unwrap().unwrap();
+
+    shut_down(volume);
+    for file in files {
+        let close = driver.close_file(file).unwrap();
+        drive(&mut driver, close).unwrap();
+    }
+    let close = driver.close_directory(directory).unwrap();
+    drive(&mut driver, close).unwrap();
+    volume.unmount();
+    volume.mount();
+    assert_eq!(fs::read(scratch.join("renamed")).unwrap(), bytes);
+    assert!(!scratch.join("data").exists());
+    assert_eq!(fs::read(scratch.join("all")).unwrap(), bytes);
+    assert_eq!(fs::read(scratch.join("through")).unwrap(), bytes);
+    assert!(!scratch.join("lost").exists());
+}
+
+/// On ext4, preallocation, hole punching, and each sync give the results of the table, also
+/// across a crash.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "mounts a volume on a loop device, which only root can do"]
+fn on_ext4_space_and_syncs_give_the_results_of_the_table() {
+    on_volume(FileSystem::Ext4, qualified);
+}
+
+/// On xfs, preallocation, hole punching, and each sync give the results of the table, also
+/// across a crash.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "mounts a volume on a loop device, which only root can do"]
+fn on_xfs_space_and_syncs_give_the_results_of_the_table() {
+    on_volume(FileSystem::Xfs, qualified);
+}
+
+/// On APFS, preallocation, hole punching, and each sync give the results of the table.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "attaches a disk image"]
+fn on_apfs_space_and_syncs_give_the_results_of_the_table() {
+    on_volume(FileSystem::Apfs, qualified);
+}
+
+/// On HFS+, preallocation and each sync give the results of the table, and a hole punch refuses
+/// with `Unsupported`.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "attaches a disk image"]
+fn on_hfs_space_and_syncs_give_the_results_of_the_table() {
+    on_volume(FileSystem::Hfs, hfs);
+}
+
+/// On NTFS, preallocation, hole punching, and each sync give the results of the table, and a
+/// directory sync gives `Unsupported`.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "attaches a virtual disk, which only an administrator can do"]
+fn on_ntfs_space_and_syncs_give_the_results_of_the_table() {
+    on_volume(FileSystem::Ntfs, qualified);
+}
+
+/// On ReFS, preallocation, hole punching, and each sync give the results of the table, and a
+/// directory sync gives `Unsupported`.
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "attaches a virtual disk, which only an administrator can do"]
+fn on_refs_space_and_syncs_give_the_results_of_the_table() {
+    on_volume(FileSystem::Refs, qualified);
+}
+
+/// On exFAT, a hole punch refuses with `Unsupported`, and preallocation and each sync give the
+/// results of the table.
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "mounts a volume on a loop device, which only root can do"
+)]
+#[cfg_attr(target_os = "macos", ignore = "attaches a disk image")]
+#[cfg_attr(
+    target_os = "windows",
+    ignore = "attaches a virtual disk, which only an administrator can do"
+)]
+fn on_exfat_a_hole_punch_refuses_with_unsupported_and_each_sync_gives_the_result_of_the_table() {
+    on_volume(FileSystem::ExFat, exfat);
 }

@@ -195,6 +195,29 @@ pub enum Route {
     Unsupported,
 }
 
+/// The calls that make the writes of a file durable on a backend ([`Report::durability`]). The end
+/// of a write tells only that the kernel has the bytes: durable contents and durable creates,
+/// renames, and unlinks are separate results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Durability {
+    /// Linux: `fdatasync` for [`SyncMode::Data`](super::SyncMode::Data), `fsync` for
+    /// [`SyncMode::All`](super::SyncMode::All) and for a directory, and `RWF_DSYNC` for a
+    /// [`WriteMode::DataSync`](super::WriteMode::DataSync) write. The sync of a directory makes its
+    /// creates, renames, and unlinks durable on each file system, as its `fsync` gives them.
+    Fsync,
+    /// macOS: `F_FULLFSYNC` for each sync and each data-sync write, which also writes the cache of
+    /// the device to its media. No path makes a plain `fsync`, which leaves the bytes in that cache.
+    /// The sync of a directory runs only on APFS and HFS+, and on each other file system it gives
+    /// `Unsupported` with no sync.
+    FullFsync,
+    /// Windows: `FlushFileBuffers` for each sync, which on [`Backend::IoRing`] is a flush entry with
+    /// `FILE_FLUSH_DEFAULT`, the same call in the SDK. A data-sync write goes through the
+    /// write-through handle of its file (`FILE_FLAG_WRITE_THROUGH`). The sync of a directory gives
+    /// `Unsupported` at once ([`Route::Unsupported`]).
+    FlushFileBuffers,
+}
+
 /// Each call, in the order of the report.
 const CALLS: [Call; 9] = [
     Call::Bind,
@@ -245,8 +268,8 @@ pub enum Shot {
 }
 
 /// What a driver found and applied when it started. The report does not change after
-/// [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each call and the
-/// helper threads.
+/// [`Driver::new`](super::Driver::new). Its `Debug` form also gives the route of each call, the
+/// durability calls, and the helper threads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     requested: Option<Backend>,
@@ -368,6 +391,16 @@ impl Report {
         }
     }
 
+    /// The calls that make the writes of a file durable on this backend.
+    #[must_use]
+    pub const fn durability(&self) -> Durability {
+        match self.backend {
+            Backend::IoUring | Backend::Epoll => Durability::Fsync,
+            Backend::Kqueue => Durability::FullFsync,
+            Backend::Iocp | Backend::IoRing => Durability::FlushFileBuffers,
+        }
+    }
+
     /// The threads that the driver starts: none, on each backend. A call on
     /// [`Route::BlockingService`] runs on a thread of the service that
     /// [`Driver::use_blocking`](super::Driver::use_blocking) gives, which the caller owns.
@@ -413,6 +446,7 @@ impl fmt::Debug for Report {
             .field("required", &self.required)
             .field("probed", &self.probed)
             .field("routes", &Routes(self))
+            .field("durability", &self.durability())
             .field("helper_threads", &self.helper_threads())
             .field("rearms_wake", &self.rearms_wake)
             .field("files", &self.files)

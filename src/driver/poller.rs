@@ -1384,7 +1384,8 @@ pub(crate) fn run_file(sqe: &Sqe) -> i32 {
 /// one call, as Linux moves at most about 2 GiB, and the rest stays for the next call. Durable
 /// contents need `F_FULLFSYNC`: a plain `fsync` of macOS leaves the bytes in the cache of the
 /// device. So each sync, of a file or a directory, and each durable write is `F_FULLFSYNC`, and a
-/// file system with no such command gives `ENOTSUP`, never a weaker sync.
+/// file system with no such command gives `ENOTSUP`, never a weaker sync. The sync of a directory
+/// runs only on a file system of [`NAMESPACES`].
 #[cfg(target_os = "macos")]
 #[expect(
     unsafe_code,
@@ -1409,7 +1410,7 @@ pub(crate) fn run_file(sqe: &Sqe) -> i32 {
             ring::IORING_OP_WRITEV => {
                 counted(sys::pwritev(fd, memory.cast(), count, offset)).and_then(|written| synced(fd, written, durable))
             }
-            ring::IORING_OP_FSYNC => synced(fd, 0, true),
+            ring::IORING_OP_FSYNC => namespace(fd).and_then(|()| synced(fd, 0, true)),
             ring::IORING_OP_FALLOCATE if sqe.len & ring::FALLOC_FL_PUNCH_HOLE != 0 => punch(fd, sqe.off, sqe.addr),
             ring::IORING_OP_FALLOCATE => allocate(fd, sqe.off, sqe.addr, sqe.len & ring::FALLOC_FL_KEEP_SIZE == 0),
             ring::IORING_OP_FTRUNCATE => status(sys::ftruncate(fd, offset)),
@@ -1438,6 +1439,30 @@ fn synced(fd: RawFd, written: i32, durable: bool) -> Result<i32, i32> {
     }
     // SAFETY: the command takes no argument.
     supported(unsafe { sys::fcntl(fd, sys::F_FULLFSYNC) }).map(|_| written)
+}
+
+/// The file systems of macOS whose sync of a directory makes its creates, renames, and unlinks
+/// durable: APFS and HFS+, which journal them (selected on 2026-11-26, the user). No source states
+/// it for another file system, such as exFAT, where `F_FULLFSYNC` of a directory also succeeds.
+#[cfg(target_os = "macos")]
+const NAMESPACES: [&[u8]; 2] = [b"apfs", b"hfs"];
+
+/// Gives `ENOTSUP` when `fd` is a directory on a file system that is not in [`NAMESPACES`], so the
+/// job makes no sync there. A file, and a directory of such a file system, give `Ok`.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "the calls write only the structures of this function")]
+fn namespace(fd: RawFd) -> Result<(), i32> {
+    let mut stat = sys::Stat::default();
+    // SAFETY: the call writes only `stat`, which is a `struct stat`.
+    status(unsafe { sys::fstat(fd, &raw mut stat) })?;
+    if stat.st_mode & sys::S_IFMT != sys::S_IFDIR {
+        return Ok(());
+    }
+    let mut statfs = sys::Statfs::new();
+    // SAFETY: the call writes only `statfs`, which is a `struct statfs`.
+    status(unsafe { sys::fstatfs(fd, &raw mut statfs) })?;
+    let name = statfs.f_fstypename.split(|&byte| byte == 0).next().unwrap_or_default();
+    NAMESPACES.contains(&name).ok_or(sys::ENOTSUP)
 }
 
 /// The result of a command of `fcntl` that a file system can lack: it then gives `ENOTTY`, and

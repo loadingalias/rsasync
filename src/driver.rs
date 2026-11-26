@@ -134,7 +134,7 @@ use crate::uring::{BufferRing, Cqe, Sqe};
 use crate::uring::{Ring, SetupError};
 use queue::Queue;
 
-pub use capability::{Backend, Call, Feature, Features, Files, Report, Route, Shot};
+pub use capability::{Backend, Call, Durability, Feature, Features, Files, Report, Route, Shot};
 pub use control::{Control, ControlError, Delivery, OperationId};
 #[cfg(target_os = "windows")]
 pub use file::NvmePath;
