@@ -23,6 +23,8 @@ Each operation gives an `Operation` future. Turn the driver until the future is 
 | `Driver::shutdown_write(&mut stream)` | The write half | `io::Result<()>`. See [Half-close](#half-close) | `Refused<()>` |
 | `Driver::close(stream)` | Takes the stream | `Closed` | `Refused<TcpStream>`, with the stream |
 | `Driver::close_listener(listener)` | Takes the listener | `Closed` | `Refused<TcpListener>`, with the listener |
+| `Driver::release_stream(stream)` (Unix) | Takes the stream | `OwnedFd`, at once, with no close. See [Give a connection to another worker](#give-a-connection-to-another-worker) | `Refused<TcpStream>`, with the stream |
+| `Driver::adopt_stream(fd)` (Unix) | Takes the descriptor | `TcpStream`, at once | `Refused<OwnedFd>`, with the descriptor |
 | `Operation::cancel(&self)` | Nothing | The future gives its output later, as usual | None |
 | `Driver::set_options(&socket, options)` | Nothing | `io::Result<()>`, at once. See [Socket options](#socket-options) | None |
 | `Driver::options(&socket)` | Nothing | `io::Result<TcpOptions>`, at once | None |
@@ -31,7 +33,8 @@ The future of `bind` and `connect` gives an error of the system, for example `Co
 when no listener has the port, or `OutOfMemory` when each resource slot of the driver is in use.
 
 A refusal gives a `Reason`: `Operations` (each operation slot is in use), `Queue` (the submission
-queue stays full), `Resource` (the driver does not own the socket), or `Buffers`.
+queue stays full), `Resource` (the driver does not own the socket), or `Buffers`. A release gives
+`Busy`, and an adopt gives `NotTcp`, `Resources`, or `Register`.
 
 `TcpStream::split` gives the read half and the write half, so that a receive and a send can run at
 one time. A receive and a send take the stream or its half: `driver.recv(&mut stream, ...)` and
@@ -214,6 +217,7 @@ same as on the driver.
 | `stream.shutdown_write()` | `Driver::shutdown_write` |
 | `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
 | `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
+| `stream.into_fd()`, `TcpStream::adopt(fd)` | `Driver::release_stream`, `Driver::adopt_stream` |
 
 `stream.split()` gives a `rsasync::local::ReadHalf` and a `WriteHalf`, so a receive and a
 send run at one time. `recv_selected()` waits with no buffer and gives a buffer from the provided
@@ -266,6 +270,27 @@ The local types differ from the driver types in two points:
   the `block_on` of the resource does nothing, because that `block_on` closed the socket.
 
 For one listener on each worker, see [Bind one socket on each worker](runtime.md#bind-one-socket-on-each-worker).
+
+## Give a connection to another worker
+
+One acceptor can give each connection to another worker, for example on a platform with no
+reuse-port group. The acceptor accepts, calls `stream.into_fd()`, and sends the `OwnedFd` to the
+worker, for example in the factory of [`handle.spawn_on`](runtime.md#spawn-on-a-worker). There,
+`TcpStream::adopt(fd)` makes a stream whose home is that worker.
+
+- `into_fd` gives the descriptor with no close only when the stream has no state: no operation
+  runs or waits, and no bytes, error, report, or multishot receive stays from an earlier
+  operation. An accepted stream that ran no operation has no state. Else the call refuses with
+  `Reason::Busy` and gives the stream back. So bytes that a dropped receive took stay with the
+  stream.
+- `adopt` takes only a connected TCP socket. It refuses a UDP socket, a listener, a Unix-domain
+  socket, or a socket with no peer, with `Reason::NotTcp`, and gives the descriptor back. It sets
+  `O_NONBLOCK` of the open file description.
+- On epoll and kqueue, the release removes the registration of the descriptor, and the adopt
+  registers it with the poller of the new home.
+
+The example of `rsasync::local::TcpStream::into_fd` accepts on the `block_on` owner, and worker 0
+echoes one message on the connection.
 
 ## Use TCP from a movable task
 

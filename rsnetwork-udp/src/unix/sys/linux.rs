@@ -107,6 +107,8 @@ pub const SHUT_WR: c_int = 1;
 pub const SOL_SOCKET: c_int = 1;
 /// `SO_REUSEADDR`: a listener can bind an address whose earlier connections still wait.
 pub const SO_REUSEADDR: c_int = 2;
+/// `SO_TYPE`: the type of the socket, such as [`SOCK_STREAM`]. It can only be read.
+pub const SO_TYPE: c_int = 3;
 /// `SO_SNDBUF`: the send buffer size. Linux doubles the value that it takes, for its own
 /// bookkeeping, and gives the doubled value back.
 pub const SO_SNDBUF: c_int = 7;
@@ -196,6 +198,8 @@ unsafe extern "C" {
     pub fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *mut c_void, optlen: *mut u32) -> c_int;
     /// `int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`.
     pub fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    /// `int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`.
+    pub fn getpeername(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
     /// `int socket(int domain, int type, int protocol)`.
     pub fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
     /// `int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.

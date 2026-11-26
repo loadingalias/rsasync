@@ -179,15 +179,21 @@ impl<R> Homed<R> {
         self,
         close: impl FnOnce(&mut Driver, R) -> Result<driver::Operation<'static, T>, Refused<R>>,
     ) -> Result<Operation<'static, T>, Refused<Self>> {
+        self.end(close).map(Operation::home)
+    }
+
+    /// Ends the resource with `end`, which takes it from the driver: a close, or a release of its
+    /// descriptor. A refusal gives the resource back with its home, so its drop still closes it.
+    fn end<T>(self, end: impl FnOnce(&mut Driver, R) -> Result<T, Refused<R>>) -> Result<T, Refused<Self>> {
         let Self {
             resource,
             cleanup,
             _home,
         } = self;
-        match submit(resource, close) {
-            Ok(close) => {
+        match submit(resource, end) {
+            Ok(ended) => {
                 drop(DropGuard::dismiss(cleanup));
-                Ok(Operation::home(close))
+                Ok(ended)
             }
             Err(refused) => Err(rewrap(refused, |resource| Self {
                 resource,

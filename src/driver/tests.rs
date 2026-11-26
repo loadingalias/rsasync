@@ -1216,6 +1216,75 @@ pub(in crate::driver) fn a_dropped_receive_leaves_its_bytes_to_the_next_receives
     assert_eq!(driver.copied(), u64::try_from(kept).unwrap());
 }
 
+/// A stream that one driver accepted and released runs on a second driver that adopts it, as one
+/// acceptor gives each connection to another worker: the bytes cross it in order both ways. The
+/// release refuses while a dropped receive left its bytes with the stream, so they stay with the
+/// connection. An adopt refuses each descriptor that is not a connected TCP socket, and gives it
+/// back.
+#[cfg(unix)]
+pub(in crate::driver) fn a_stream_that_one_driver_releases_runs_on_the_driver_that_adopts_it(backend: Backend) {
+    let mut acceptor = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
+    let mut worker = suite::driver(Config::new().delivery(Delivery::Controlled), backend);
+    let (stream, mut peer) = connected(&mut acceptor, "127.0.0.1:0");
+    let fd = acceptor
+        .release_stream(stream)
+        .expect("an accepted stream has no state");
+    let mut stream = worker
+        .adopt_stream(fd)
+        .expect("the descriptor is a connected TCP socket");
+
+    peer.write_all(&numbered(0, 1000)).unwrap();
+    let mut received = Vec::new();
+    while received.len() < 1000 {
+        let receive = worker
+            .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
+            .unwrap();
+        let (count, buffer) = drive(&mut worker, receive).unwrap();
+        assert!(count.unwrap() > 0, "the stream ended after {} bytes", received.len());
+        received.extend_from_slice(buffer.bytes());
+    }
+    assert_eq!(received, numbered(0, 1000));
+    let send = worker.send(&mut stream, Lease::from(numbered(1000, 1000))).unwrap();
+    assert_eq!(drive(&mut worker, send).unwrap().0.unwrap(), 1000);
+    let mut echoed = [0; 1000];
+    peer.read_exact(&mut echoed).unwrap();
+    assert_eq!(echoed[..], numbered(1000, 1000));
+
+    // A receive whose future drops after its bytes came leaves them with the stream.
+    peer.write_all(&numbered(2000, 10)).unwrap();
+    let receive = worker
+        .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
+        .unwrap();
+    let id = hold(&mut worker, &receive);
+    assert_eq!(posted(&mut worker, id).unwrap(), 10);
+    drop(receive);
+    let refused = worker.release_stream(stream).expect_err("the stream keeps the bytes");
+    assert_eq!(refused.reason(), Reason::Busy);
+    let mut stream = refused.into_inner();
+    let receive = worker
+        .recv(&mut stream, Backing::from(Vec::with_capacity(4096)))
+        .unwrap();
+    let (count, buffer) = drive(&mut worker, receive).unwrap();
+    assert_eq!((count.unwrap(), buffer.bytes()), (10, &numbered(2000, 10)[..]));
+
+    // Each descriptor fails one check: the type, the peer, and the address family.
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.connect(udp.local_addr().unwrap()).unwrap();
+    let udp = OwnedFd::from(udp);
+    let listener = OwnedFd::from(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+    let (local, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+    for fd in [udp, listener, OwnedFd::from(local)] {
+        let raw = fd.as_raw_fd();
+        let refused = worker
+            .adopt_stream(fd)
+            .expect_err("the descriptor is not a connected TCP socket");
+        assert_eq!(
+            (refused.reason(), refused.into_inner().as_raw_fd()),
+            (Reason::NotTcp, raw)
+        );
+    }
+}
+
 /// `ECONNRESET` (`include/uapi/asm-generic/errno.h`, and `sys/errno.h` of macOS).
 #[cfg(target_os = "linux")]
 const ECONNRESET: i32 = 104;

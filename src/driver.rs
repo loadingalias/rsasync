@@ -706,6 +706,15 @@ pub enum Reason {
     /// The descriptor is not a pipe or a FIFO.
     #[cfg(unix)]
     NotPipe,
+    /// The descriptor is not a connected TCP socket: for example a UDP socket, a listener, a
+    /// Unix-domain socket, or a socket with no peer.
+    #[cfg(unix)]
+    NotTcp,
+    /// The stream has an operation that runs or waits, or a state that a later operation or its
+    /// close takes: bytes, an error, or a report that a dropped operation left, or a multishot
+    /// receive.
+    #[cfg(unix)]
+    Busy,
     /// The pipe end does not have the direction of the adoption: a read end for a writer, or a
     /// write end for a reader.
     #[cfg(unix)]

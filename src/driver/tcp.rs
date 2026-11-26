@@ -977,6 +977,22 @@ impl Directions {
         needs
     }
 
+    /// The directions have no operation that runs or waits, and no state that a later operation or
+    /// the close takes. `runs` tells whether an operation still runs.
+    #[cfg(unix)]
+    fn idle(&self, runs: impl Fn(OpId) -> bool) -> bool {
+        let free = |direction: &Direction| direction.current.is_none_or(|id| !runs(id)) && direction.first.is_none();
+        free(&self.read)
+            && free(&self.write)
+            && matches!(self.sent, Sent::Ok | Sent::Reported)
+            && self.closing.is_none()
+            && !self.pending
+            && self.armed.is_none()
+            && self.shelved.is_empty()
+            && self.ended.is_none()
+            && self.kept.is_none()
+    }
+
     /// The consumer of the operation `id` of `kind` took its result: the direction forgets it, so
     /// the next operation does not look at it. A send result that a future took reports each byte
     /// up to its end.
@@ -1789,6 +1805,55 @@ impl Driver {
         let held = |lease| Held::with_payload(Payload::Lease(lease));
         let completion = self.begin(writer.as_mut().resource, Kind::Send, lease, held)?;
         Ok(Operation::new(completion, sent))
+    }
+
+    /// Takes `fd`, a connected TCP socket, as a stream of this driver: for example a connection
+    /// that another driver accepted and gave with [`Driver::release_stream`]. The driver sets
+    /// `O_NONBLOCK` of its open file description, as it does for each socket that it makes.
+    ///
+    /// # Errors
+    ///
+    /// A refusal, with `fd`, that gives [`Reason::NotTcp`] for a descriptor that is not a
+    /// connected TCP socket, [`Reason::Resources`], or [`Reason::Register`] on epoll and kqueue.
+    #[cfg(unix)]
+    pub fn adopt_stream(&mut self, fd: std::os::fd::OwnedFd) -> Result<TcpStream, Refused<std::os::fd::OwnedFd>> {
+        let stream = int(borrow(&fd), sys::SOL_SOCKET, sys::SO_TYPE).is_ok_and(|kind| kind == sys::SOCK_STREAM);
+        let tcp = local_address(&fd).is_some_and(|(address, len)| address.to_socket_addr(len).is_some());
+        if !(stream && tcp && peer_address(&fd).is_some() && super::pipe::set_nonblocking(borrow(&fd), true)) {
+            return Err(Refused {
+                reason: Reason::NotTcp,
+                value: fd,
+            });
+        }
+        let resource = self
+            .adopt(fd, Medium::Stream)
+            .map_err(|(reason, value)| Refused { reason, value })?;
+        Ok(TcpStream::new(resource))
+    }
+
+    /// Gives the descriptor of `stream`, with no close, and frees its slot: for example to give a
+    /// connection that this driver accepted to another driver, which takes it with
+    /// [`Driver::adopt_stream`]. The stream must have no state: no operation runs or waits, and no
+    /// bytes, error, report, or multishot receive stays from an earlier operation. A stream that
+    /// ran no operation, such as an accepted one, has none.
+    ///
+    /// # Errors
+    ///
+    /// A refusal, with the stream, that gives [`Reason::Busy`] while the stream has a state, or
+    /// [`Reason::Resource`] for a stream of another driver.
+    #[cfg(unix)]
+    pub fn release_stream(&mut self, stream: TcpStream) -> Result<std::os::fd::OwnedFd, Refused<TcpStream>> {
+        let resource = stream.read.resource;
+        let table = &self.table;
+        let reason = match self.resources.get(resource) {
+            Some(owned) if owned.directions.idle(|id| table.runs(id)) => None,
+            Some(_) => Some(Reason::Busy),
+            None => Some(Reason::Resource),
+        };
+        match reason.map_or_else(|| self.resources.release(resource).ok_or(Reason::Resource), Err) {
+            Ok(fd) => Ok(fd),
+            Err(reason) => Err(Refused { reason, value: stream }),
+        }
     }
 
     /// Closes `stream`. The close cancels each operation that runs on the stream, a dropped send
@@ -2785,15 +2850,30 @@ fn int(socket: Borrowed<'_>, level: c_int, name: c_int) -> io::Result<c_int> {
 
 /// The local address of `socket`, and its length.
 #[cfg(unix)]
+pub(super) fn local_address(socket: impl std::os::fd::AsFd) -> Option<(SockAddrStorage, u32)> {
+    address(socket, sys::getsockname)
+}
+
+/// The address of the peer of `socket`, and its length, or `None` when the socket has no peer.
+#[cfg(unix)]
+fn peer_address(socket: impl std::os::fd::AsFd) -> Option<(SockAddrStorage, u32)> {
+    address(socket, sys::getpeername)
+}
+
+/// The address of `socket` that `name` gives, `getsockname` or `getpeername`, and its length.
+#[cfg(unix)]
 #[expect(
     unsafe_code,
     reason = "the kernel writes the address into storage that lives during the call"
 )]
-pub(super) fn local_address(socket: impl std::os::fd::AsFd) -> Option<(SockAddrStorage, u32)> {
+fn address(
+    socket: impl std::os::fd::AsFd,
+    name: unsafe extern "C" fn(c_int, *mut c_void, *mut u32) -> c_int,
+) -> Option<(SockAddrStorage, u32)> {
     let (mut address, mut len) = (SockAddrStorage::EMPTY, SockAddrStorage::LEN);
     // SAFETY: the kernel writes at most `len` bytes into `address`, which has room for `LEN` bytes
     // and lives during the call, and the length into `len`.
-    let result = unsafe { sys::getsockname(socket.as_fd().as_raw_fd(), (&raw mut address).cast(), &raw mut len) };
+    let result = unsafe { name(socket.as_fd().as_raw_fd(), (&raw mut address).cast(), &raw mut len) };
     (result == 0).then_some((address, len))
 }
 

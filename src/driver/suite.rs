@@ -366,6 +366,9 @@ mod law {
         tests => a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds,
         tests => a_dropped_partial_vectored_send_fails_the_write_direction_with_its_count,
         tests => two_dropped_sends_and_a_third_send_run_in_start_order,
+        // One acceptor gives a connection to another driver.
+        #[cfg(unix)]
+        tests => a_stream_that_one_driver_releases_runs_on_the_driver_that_adopts_it,
         // A send that waits in the driver at close and at teardown.
         #[cfg(target_os = "linux")]
         tests => close_ends_a_waiting_send_unsent_and_releases_its_lease_once,

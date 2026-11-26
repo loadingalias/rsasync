@@ -6,6 +6,7 @@
 
 use core::net::SocketAddr;
 use std::io;
+use std::os::fd::OwnedFd;
 
 use super::{Home, Homed, Operation, ReadHalf, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
@@ -133,6 +134,74 @@ impl TcpStream {
         Ok(Operation::home(connect.with_output(|result, held, connect| {
             driver::connected(result, held).map(|stream| stream.map(|stream| Self::new(stream, connect)))
         })))
+    }
+
+    /// Takes `fd`, a connected TCP socket, as a stream whose home is the driver of this thread, as
+    /// [`Driver::adopt_stream`] does: for example a connection that another worker accepted and
+    /// gave with [`TcpStream::into_fd`].
+    ///
+    /// # Errors
+    ///
+    /// A refusal, with `fd`, with the reason of [`Driver::adopt_stream`], or `Reason::NoDriver`
+    /// when no driver runs on this thread.
+    pub fn adopt(fd: OwnedFd) -> Result<Self, Refused<OwnedFd>> {
+        submit(fd, |driver, fd| {
+            let stream = driver.adopt_stream(fd)?;
+            let cleanup = driver.cleanup(stream.resource());
+            Ok(Self {
+                inner: Homed::new(stream, cleanup),
+            })
+        })
+    }
+
+    /// Gives the descriptor of the stream, with no close, as [`Driver::release_stream`] does: for
+    /// example to give a connection that this worker accepted to another worker, which takes it
+    /// with [`TcpStream::adopt`]. An accepted stream that ran no operation has no state, so its
+    /// release succeeds.
+    ///
+    /// ```
+    /// use rsasync::buffer::{Backing, Buffer as _, Lease};
+    /// use rsasync::driver::TcpOptions;
+    /// use rsasync::local::{TcpListener, TcpStream};
+    /// use rsasync::runtime::{Runtime, WorkerId};
+    /// use rsasync::task::Outcome;
+    ///
+    /// let runtime = Runtime::builder().local_workers(1).build()?;
+    /// let mut handle = runtime.handle()?;
+    /// runtime.block_on(async move {
+    ///     let mut listener = TcpListener::bind("127.0.0.1:0".parse()?, TcpOptions::default())?.await??;
+    ///     let connect = TcpStream::connect(listener.local_addr(), TcpOptions::default())?;
+    ///     let (accepted, _peer) = listener.accept()?.await??;
+    ///     let mut client = connect.await??;
+    ///
+    ///     // The acceptor gives the connection to worker 0, which echoes one message.
+    ///     let fd = accepted.into_fd()?;
+    ///     let echo = handle.spawn_on(WorkerId::new(0), move || async move {
+    ///         let mut stream = TcpStream::adopt(fd).ok()?;
+    ///         let (received, buffer) = stream.recv(Backing::from(Vec::with_capacity(64))).ok()?.await.ok()?;
+    ///         let bytes = buffer.bytes()[..received.ok()?].to_vec();
+    ///         let (sent, _lease) = stream.send(Lease::from(bytes)).ok()?.await.ok()?;
+    ///         sent.ok()
+    ///     })?;
+    ///
+    ///     client.send(Lease::from(b"ping".to_vec()))?.await?.0?;
+    ///     let (received, buffer) = client.recv(Backing::from(Vec::with_capacity(64)))?.await?;
+    ///     assert_eq!(&buffer.bytes()[..received?], b"ping");
+    ///     assert!(matches!(echo.join().await, Outcome::Completed(Some(4))));
+    ///     client.close()?.await?;
+    ///     Ok::<(), Box<dyn std::error::Error>>(())
+    /// })??;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// A refusal, with the stream, with the reason of [`Driver::release_stream`], or
+    /// `Reason::NoDriver` when no driver runs on this thread.
+    pub fn into_fd(self) -> Result<OwnedFd, Refused<Self>> {
+        self.inner
+            .end(Driver::release_stream)
+            .map_err(|refused| rewrap(refused, |inner| Self { inner }))
     }
 
     /// The read half and the write half, so that a receive and a send run at one time.

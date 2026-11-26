@@ -95,6 +95,8 @@ pub const SHUT_WR: c_int = 1;
 pub const SOL_SOCKET: c_int = 0xffff;
 /// `SO_REUSEADDR`: a listener can bind an address whose earlier connections still wait.
 pub const SO_REUSEADDR: c_int = 0x0004;
+/// `SO_TYPE`: the type of the socket, such as [`SOCK_STREAM`]. It can only be read.
+pub const SO_TYPE: c_int = 0x1008;
 /// `SO_KEEPALIVE`: the stack probes an idle connection.
 pub const SO_KEEPALIVE: c_int = 0x0008;
 /// `SO_REUSEPORT`: sockets can bind the same address and port.
@@ -165,6 +167,8 @@ unsafe extern "C" {
     pub fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: *mut c_void, optlen: *mut u32) -> c_int;
     /// `int getsockname(int, struct sockaddr *restrict, socklen_t *restrict)`.
     pub fn getsockname(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
+    /// `int getpeername(int, struct sockaddr *restrict, socklen_t *restrict)`.
+    pub fn getpeername(sockfd: c_int, addr: *mut c_void, addrlen: *mut u32) -> c_int;
     /// `int socket(int, int, int)`.
     pub fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
     /// `int bind(int, const struct sockaddr *, socklen_t)`.
