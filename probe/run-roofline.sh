@@ -19,12 +19,20 @@
 #
 # No case polls the device or runs a kernel thread that polls the ring.
 #
-# Each run prints one JSON line. `cpu_all_s` is the busy time of each CPU of the host in the run,
-# from `/proc/stat` (user, nice, system, irq, softirq, and steal), so it holds the interrupts and
-# each kernel thread. `cpu_process_s` is the user and system time of the process and its threads.
-# The summary subtracts the busy time of the idle host from `cpu_all_s`. The order of the cases
-# rotates from round to round. `PROBE_CASES`, `PROBE_DEPTHS`, `PROBE_ROUNDS`, and `PROBE_SECONDS`
-# select a partial rerun.
+# Each run prints one JSON line, with three measures of its CPU:
+# - `cpu_loop_s`: the user and system time of the I/O loop alone. fio gives it for its job, the
+#   probe gives it for its process from the first read to the last one, and for `t/io_uring` it is
+#   the time of the process. The scheduler measures it, so it is exact.
+# - `cpu_process_s`: the user and system time of the process and its threads, with its start.
+# - `cpu_all_s`: the busy time of each CPU of the host in the run, from `/proc/stat` (user, nice,
+#   system, irq, softirq, and steal), so it holds each kernel thread. The kernel samples it at its
+#   tick, and the summary subtracts the busy time of the idle host.
+#
+# The script waits for a quiet host, and it measures the idle host before each depth. The order of
+# the cases rotates from round to round. After the summary, one short run of each case at each
+# depth counts the events of the CPU for each read under `perf stat`: the kernel entries, the
+# context switches, the interrupts, and the reads that go to a worker thread of io_uring.
+# `PROBE_CASES`, `PROBE_DEPTHS`, `PROBE_ROUNDS`, and `PROBE_SECONDS` select a partial rerun.
 set -euo pipefail
 
 target="${PROBE_TARGET:?set PROBE_TARGET to the target of the run}"
@@ -115,17 +123,22 @@ output = subprocess.run(sys.argv[5:], stdout=subprocess.PIPE, check=True).stdout
 elapsed = time.monotonic() - start
 used = spent(resource.getrusage(resource.RUSAGE_CHILDREN)) - used
 after = cpus()
+# The CPU that was most busy other than the CPU of the run: a host that is not quiet shows here.
+others = {name: (busy(after[name]) - busy(before[name])) / tick for name in after if name not in ("cpu", "cpu" + cpu)}
+other = max(others, key=others.get)
 line = {"case": case, "depth": depth, "round": round_, "elapsed_s": round(elapsed, 3),
         "cpu_process_s": round(used, 3),
         "cpu_all_s": (busy(after["cpu"]) - busy(before["cpu"])) / tick,
         "cpu_irq_s": (after["cpu"][5] + after["cpu"][6] - before["cpu"][5] - before["cpu"][6]) / tick,
-        "cpu_pinned_s": (busy(after["cpu" + cpu]) - busy(before["cpu" + cpu])) / tick}
+        "cpu_pinned_s": (busy(after["cpu" + cpu]) - busy(before["cpu" + cpu])) / tick,
+        "cpu_other": [other, others[other]]}
 if case.startswith("fio"):
     job = json.loads(output)["jobs"][0]
     read, percentile = job["read"], job["read"]["lat_ns"]["percentile"]
     line.update(ios=read["total_ios"], run_s=read["runtime"] / 1000,
                 p50_ns=percentile["50.000000"], p99_ns=percentile["99.000000"],
-                p999_ns=percentile["99.900000"], fio_usr_pct=job["usr_cpu"], fio_sys_pct=job["sys_cpu"])
+                p999_ns=percentile["99.900000"],
+                cpu_loop_s=round((job["usr_cpu"] + job["sys_cpu"]) / 100 * read["runtime"] / 1000, 3))
 elif case.startswith("tio"):
     # The tool prints the reads of each second but the last one, so the count of the run is the
     # mean rate for the whole time.
@@ -133,14 +146,15 @@ elif case.startswith("tio"):
     rates = [float(number) * scale[unit] for number, unit in re.findall(r"^IOPS=([0-9.]+)([KM]?),", output, re.M)]
     if not rates:
         sys.exit("t/io_uring printed no rate:\n" + output)
-    line.update(ios=round(sum(rates) / len(rates) * elapsed), run_s=round(elapsed, 3), seconds_printed=len(rates))
+    line.update(ios=round(sum(rates) / len(rates) * elapsed), run_s=round(elapsed, 3), seconds_printed=len(rates),
+                cpu_loop_s=round(used, 3))
 elif case == "idle":
     line.update(ios=0, run_s=round(elapsed, 3))
 else:
     probe = json.loads(output)
     line.update(ios=probe["count"], run_s=probe["elapsed_ns"] / 1e9, p50_ns=probe["latency_ns"]["p50"],
                 p99_ns=probe["latency_ns"]["p99"], p999_ns=probe["latency_ns"]["p999"],
-                probe_cpu_s=probe["cpu_ns"] / 1e9, turns=probe["turns"], waits=probe["waits"],
+                cpu_loop_s=probe["cpu_ns"] / 1e9, turns=probe["turns"], waits=probe["waits"],
                 switches=probe["switches"])
 print(json.dumps(line, separators=(",", ":")), flush=True)
 PY
@@ -158,7 +172,7 @@ for run in runs:
     if run["case"] != "idle":
         groups[(run["depth"], run["case"])].append(run)
 print(f"idle host: {floor * 100:.2f}% of one CPU busy")
-print("depth case      rounds     IOPS  cpu/io us (all)  cpu/io us (process)   p50 us   p99 us  p999 us")
+print("depth case      rounds     IOPS  cpu/io us (loop)  cpu/io us (all)   p50 us   p99 us  p999 us")
 table = {}
 for (depth, case), group in sorted(groups.items()):
     ios = sum(run["ios"] for run in group)
@@ -166,20 +180,34 @@ for (depth, case), group in sorted(groups.items()):
     mean = lambda key: sum(run[key] for run in group) / len(group) / 1e3 if key in group[0] else float("nan")
     row = {"iops": sum(run["ios"] / run["run_s"] for run in group) / len(group),
            "all": sum(run["cpu_all_s"] - floor * run["elapsed_s"] for run in group) / ios * 1e6,
-           "process": sum(run["cpu_process_s"] for run in group) / ios * 1e6,
+           "loop": sum(run["cpu_loop_s"] for run in group) / ios * 1e6,
            "p50": mean("p50_ns"), "p99": mean("p99_ns"), "p999": mean("p999_ns")}
     table[(depth, case)] = row
-    print(f"{depth:5} {case:9} {len(group):6} {row['iops']:8.0f} {row['all']:16.3f} {row['process']:20.3f}"
+    print(f"{depth:5} {case:9} {len(group):6} {row['iops']:8.0f} {row['loop']:17.3f} {row['all']:16.3f}"
           f" {row['p50']:8.1f} {row['p99']:8.1f} {row['p999']:8.1f}")
-print("depth  turn against    R cpu/io (all)  R cpu/io (process)  added p50 us  added p99 us")
+print("depth  turn against    R cpu/io (loop)  R cpu/io (all)  added p50 us  added p99 us")
 for (depth, case), row in sorted(table.items()):
     ours = table.get((depth, "turn"))
     if case == "turn" or ours is None:
         continue
     latency = case.startswith("fio")
     added = lambda key: f"{ours[key] - row[key]:12.1f}" if latency else f"{'':>12}"
-    print(f"{depth:5}  {case:14} {ours['all'] / row['all']:15.2f} {ours['process'] / row['process']:19.2f}"
-          f"  {added('p50')}  {added('p99')}")
+    ratio = lambda key: ours[key] / row[key] if row[key] > 0 else float("nan")
+    print(f"{depth:5}  {case:14} {ratio('loop'):16.2f} {ratio('all'):15.2f}  {added('p50')}  {added('p99')}")
+PY
+
+# The events of one run for each read: `events.py <JSON line of the run> <file of perf stat -x,>`.
+cat > ~/events.py <<'PY'
+import json, sys
+
+run = json.loads(sys.argv[1])
+each = []
+for line in open(sys.argv[2]):
+    # A line of `perf stat -x,`: the count, the unit, and the event.
+    fields = line.strip().split(",")
+    if len(fields) > 2 and fields[0].isdigit():
+        each.append("%s=%.3f" % (fields[2].split(":")[-1], int(fields[0]) / run["ios"]))
+print("%s depth %d: %d reads, for each read: %s" % (run["case"], run["depth"], run["ios"], " ".join(each)))
 PY
 
 # Runs case `$1` at depth `$2` in round `$3`, with `$4` reads for the probe.
@@ -210,17 +238,32 @@ run() {
     python3 ~/measure.py "$case" "$depth" "$round" "$CPU" "$@"
 }
 
+echo "== quiet"
+# The services of the start of the host end, and no timer of the package tools starts a job.
+cloud-init status --wait > /dev/null 2>&1 || true
+sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer man-db.timer fwupd-refresh.timer \
+    unattended-upgrades.service snapd.service snapd.socket 2> /dev/null || true
+# Wait until all CPUs together are busy for less than 1% of one CPU in 5 s, for 3 minutes at most.
+for attempt in $(seq 1 36); do
+    busy="$(python3 ~/measure.py idle 0 0 "$CPU" sleep 5 | python3 -c 'import json, sys; print(json.loads(sys.stdin.readline())["cpu_all_s"])')"
+    echo "attempt $attempt: $busy s busy in 5 s"
+    if python3 -c "import sys; sys.exit(0 if $busy < 0.05 else 1)"; then break; fi
+done
+
 echo "== runs"
 runs=~/runs.jsonl
 : > "$runs"
-python3 ~/measure.py idle 0 0 "$CPU" sleep 20 | tee -a "$runs"
 read -ra cases <<< "$CASES"
+declare -A counts
 for depth in $DEPTHS; do
+    python3 ~/measure.py idle 0 0 "$CPU" sleep 15 | tee -a "$runs"
     # The reads of the probe for one run: the rate of fio at this depth, for the time of a run.
     count="$(SECONDS_EACH=5 run fio "$depth" 0 0 | python3 -c '
 import json, sys
 run = json.loads(sys.stdin.readline())
-print(round(run["ios"] / run["run_s"] * int(sys.argv[1])))' "$SECONDS_EACH")"
+print(round(run["ios"] / run["run_s"]))')"
+    counts[$depth]="$count"
+    count=$((count * SECONDS_EACH))
     for round in $(seq 1 "$ROUNDS"); do
         for index in "${!cases[@]}"; do
             case="${cases[$(((index + round) % ${#cases[@]}))]}"
@@ -230,8 +273,30 @@ print(round(run["ios"] / run["run_s"] * int(sys.argv[1])))' "$SECONDS_EACH")"
         done
     done
 done
-python3 ~/measure.py idle 0 0 "$CPU" sleep 20 | tee -a "$runs"
+python3 ~/measure.py idle 0 0 "$CPU" sleep 15 | tee -a "$runs"
 
 echo "== summary"
 python3 ~/summary.py < "$runs"
+
+# The events of the CPU for each read, in runs of 5 s that give no timing: a tracepoint slows the
+# event that it counts.
+echo "== events"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -qq -y linux-tools-aws > /dev/null 2>&1 || true
+events=""
+for event in syscalls:sys_enter_io_uring_enter sched:sched_switch irq:irq_handler_entry \
+    io_uring:io_uring_submit_req io_uring:io_uring_complete io_uring:io_uring_queue_async_work; do
+    sudo perf stat -e "$event" -- true > /dev/null 2>&1 && events="$events${events:+,}$event"
+done
+echo "events: ${events:-none}"
+if [ -n "$events" ]; then
+    for depth in $DEPTHS; do
+        for case in $CASES; do
+            if [ "$case" = tiobatch ] && [ "$depth" -lt 4 ]; then continue; fi
+            line="$(sudo perf stat -C "$CPU" -x, -o /tmp/events.csv -e "$events" -- sudo -u ubuntu bash -c \
+                "$(declare -f run); CPU=$CPU SECONDS_EACH=5 size=$size file=$file HOME=$HOME \
+                 run $case $depth 0 $((${counts[$depth]} * 5))")"
+            python3 ~/events.py "$line" /tmp/events.csv
+        done
+    done
+fi
 EOF
