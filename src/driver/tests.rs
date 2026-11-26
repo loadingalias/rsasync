@@ -1123,13 +1123,18 @@ fn waits<F: Future + Unpin>(driver: &mut Driver, future: &mut F) -> bool {
 /// not read, and gives the count that went. The loopback can deliver the segments of a send after
 /// its return: on macOS each time, and on Linux under load. The window of the peer then fills after
 /// the send, and the send buffer has room again. Each next send of 4 MiB takes that room, until one
-/// send finds no room for 200 ms. Its cancel then ends it with no byte sent. The socket buffers
-/// hold at most 8 MiB on each side (`kern.ipc.maxsockbuf` of macOS, and the `tcp_wmem` and
-/// `tcp_rmem` maxima of Linux), so `SENDS_MAX` sends of 4 MiB are more than they hold.
+/// send finds no room for 200 ms. Its cancel then ends it with no byte sent. A send that waits
+/// wakes only when the socket has much room again, so less room can be there after its wait: one
+/// more send takes it with its first attempt, and the fill ends when that send also finds no room
+/// for 200 ms. The socket buffers hold at most 8 MiB on each side (`kern.ipc.maxsockbuf` of macOS,
+/// and the `tcp_wmem` and `tcp_rmem` maxima of Linux), so `SENDS_MAX` sends of 4 MiB are more than
+/// they hold.
 #[cfg(unix)]
 fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
     const SENDS_MAX: usize = 64;
     let mut filled = 0;
+    // The send before this one waited for 200 ms and sent no byte.
+    let mut full = false;
     'fill: for _ in 0..SENDS_MAX {
         let mut send = driver
             .send(stream, Lease::from(numbered(filled, 4 << 20)))
@@ -1139,6 +1144,7 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
             driver.turn().expect("a turn of the test driver works");
             if let Poll::Ready(output) = Pin::new(&mut send).poll(&mut Context::from_waker(Waker::noop())) {
                 filled += output.expect("the driver runs").0.expect("the send works");
+                full = false;
                 continue 'fill;
             }
             thread::sleep(core::time::Duration::from_millis(1));
@@ -1146,10 +1152,16 @@ fn fill(driver: &mut Driver, stream: &mut TcpStream) -> usize {
         send.cancel();
         match drive(driver, send).expect("the driver runs").0 {
             // Room came at the end of the wait, before the cancel.
-            Ok(sent) => filled += sent,
+            Ok(sent) => {
+                filled += sent;
+                full = false;
+            }
             Err(error) => {
                 assert_eq!(error.raw_os_error(), Some(ECANCELED), "the send failed");
-                return filled;
+                if full {
+                    return filled;
+                }
+                full = true;
             }
         }
     }
