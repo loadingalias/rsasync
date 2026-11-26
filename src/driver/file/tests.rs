@@ -250,12 +250,12 @@ fn kernel() -> (u32, u32) {
     (next(), next())
 }
 
-/// The status of this thread, at a path that another thread can read.
+/// The directory of this thread in `/proc`, at a path that another thread can read.
 #[cfg(target_os = "linux")]
-fn thread_status() -> PathBuf {
+fn this_thread() -> PathBuf {
     let link = fs::read_link("/proc/thread-self").expect("Linux names the thread");
     let thread = link.file_name().expect("the link ends with the thread");
-    Path::new("/proc/self/task").join(thread).join("status")
+    Path::new("/proc/self/task").join(thread)
 }
 
 /// The sleeps in the kernel of the thread of `status`: its voluntary context switches.
@@ -269,28 +269,47 @@ fn sleeps(status: &Path) -> u64 {
         .expect("the status counts the voluntary context switches")
 }
 
-/// Waits in `driver`, and gives the sleeps of the wait in the kernel. Another thread wakes the
-/// wait when it has slept `slept` times, or after `at_most`, so the count does not depend on the
-/// speed of the host. The wait must end at that wake, not before it.
+/// Waits in `driver`, and gives the sleeps of the wait in the kernel. Another thread counts them
+/// from the time that the waiting thread is in `io_uring_enter`, so a sleep outside the system
+/// call, such as a fault on a page of the code under memory pressure, does not enter the count.
+/// It wakes the wait when it has counted `slept` sleeps, or after `at_most`, so the count does not
+/// depend on the speed of the host. The wait must end at that wake, not before it.
 #[cfg(target_os = "linux")]
 fn sleeps_of_a_wait(driver: &mut Driver, slept: u64, at_most: Duration) -> u64 {
-    let status = thread_status();
-    let before = sleeps(&status);
+    let thread = this_thread();
     let woken = Arc::new(AtomicBool::new(false));
     let waker = {
-        let (status, woken, wake) = (status.clone(), Arc::clone(&woken), driver.wake_handle());
+        let (woken, wake) = (Arc::clone(&woken), driver.wake_handle());
         std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            while sleeps(&status) - before < slept && start.elapsed() < at_most {
+            // The first field is the system call, and 426 is `io_uring_enter` on each Linux target.
+            // The waker must wake the wait, so it records an error and does not panic.
+            let (call, start) = (thread.join("syscall"), std::time::Instant::now());
+            let mut last = alloc::string::String::new();
+            while start.elapsed() < Duration::from_secs(60) {
+                last = fs::read_to_string(&call).unwrap_or_else(|error| alloc::format!("{error}"));
+                if last.starts_with("426 ") {
+                    break;
+                }
                 std::thread::sleep(Duration::from_micros(100));
             }
+            let entered = last.starts_with("426 ");
+            let (status, start) = (thread.join("status"), std::time::Instant::now());
+            let before = sleeps(&status);
+            while entered && sleeps(&status) - before < slept && start.elapsed() < at_most {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            let counted = sleeps(&status) - before;
             woken.store(true, Ordering::SeqCst);
             wake.wake();
+            entered.then_some(counted).ok_or(last)
         })
     };
     driver.wait().expect("the wait of the test driver works");
-    let (ended_at_its_wake, slept) = (woken.load(Ordering::SeqCst), sleeps(&status) - before);
-    waker.join().expect("the waker ends");
+    let ended_at_its_wake = woken.load(Ordering::SeqCst);
+    let slept = waker
+        .join()
+        .expect("the waker ends")
+        .unwrap_or_else(|last| panic!("the waiting thread was in no io_uring_enter within 60 s: {last:?}"));
     assert!(
         ended_at_its_wake,
         "the wait ended after {slept} sleeps, before its wake"
