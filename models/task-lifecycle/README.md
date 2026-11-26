@@ -470,6 +470,42 @@ The model does not cover these items. Each one is outside the task, or a later t
 
 ## Evidence record
 
+All 31 profiles pass for reductions 17 and 18 of R409, at Git revision `49d1ec5`
+(`sha256:260207786690f103472b8486d51d354b0635ab27006bb48e50b0f2068ce6a54a`, 32 files). The
+checkers were TLC 1.8.0+bc1b506bdcad and Apalache 0.63.0 on each host.
+
+On a Mac (10 cores, 16 GiB, Darwin 27.2.0, Temurin JRE 21.0.13.1+2, 2026-11-25), the 30 profiles
+other than `Slots3` pass in 156 seconds of checker time:
+
+| Profile | Distinct states | Before R409 | Seconds |
+| --- | --- | --- | --- |
+| `TaskLifecycle.cfg` | 168,895 | 425,220 | 13.80 |
+| `TaskLifecycle.Gens3.cfg` | 411,771 | 1,017,966 | 39.42 |
+| `TaskLifecycle.Workers3.cfg` | 703,666 | 2,212,365 | 82.36 |
+
+All 16 known-bad variants violate their named property, and all 11 witnesses reach their named
+target. Before the full `Slots3` run, a 10-minute sample on that Mac found 7,161,960 distinct
+states at depth 21, with a queue of 1,706,158 states that still grew.
+
+`Slots3` passes on one EC2 c8g.4xlarge (16 vCPUs, 32 GiB) of the target
+`aws-linux-arm64-ubuntu2604`: image `ami-098ede342a5440ac0`, Ubuntu 26.04, Linux 7.0.0-1018-aws,
+aarch64, dev-machines run `20261126T005047Z-65673` (2026-11-25), from a clone of a Git bundle of
+`49d1ec5` with a clean tree (`models/remote.sh`). The search found 17,655,206 distinct states
+(200,035,585 generated) at depth 40, with 0 states left on the queue and no error, in 13 minutes
+52 seconds. Its check of the progress properties took 13 minutes 59 seconds. `cargo xtask model`
+gave `ok in 1674.03s`: 27 minutes 53 seconds, inside the one hour of
+[Large profiles](../../docs/content/design-models.md#large-profiles). The JRE was Temurin
+21.0.13+9, the Linux aarch64 build, which matched its published SHA-256. The record of the run
+names the profile closure `sha256:228daa837e9d1ac8079f1f85be6f04044dd4f775eb12b084d6ff55b20e3ae4dc`.
+After the run, `dev-machine status rsasync aws-linux-arm64-ubuntu2604` reports no AWS instance or
+EBS volume.
+
+The starvation variant of R401 fails under the reductions: a steal that can poll a newer task and
+move an older one, in a scratch copy of `49d1ec5`, violates `OwedWakeDelivered` in the declared
+profile (175,423 distinct states, on that Mac).
+
+The record of the model before R409 follows.
+
 All 31 profiles pass for the R401 change of `Steal`
 (`sha256:52cff6cf0c1d8930755ad24a1e3e255feae931810939108cc5428d4d29f03924`, 32 files). On a Mac (10
 cores, 16 GiB, 2026-11-22), 30 profiles pass in 10 minutes 35 seconds: the declared profile
@@ -487,8 +523,8 @@ which matched its published SHA-256), TLC 1.8.0+bc1b506bdcad, and Apalache 0.63.
 the run directory, with no TLC state cache, has the SHA-256
 `8ef8875dcb993df984d3613d766cdbc5263d869d7a33bcc267ec375898ae5e88`. After the run,
 `dev-machine status rsasync aws-linux-arm64-ubuntu2604-memory` reports no AWS instance or EBS
-volume. This profile takes more than the one hour of [Large
-profiles](../../docs/content/design-models.md#large-profiles).
+volume. That run took more than the one hour of [Large
+profiles](../../docs/content/design-models.md#large-profiles), which R409 corrected.
 
 The record of the model before R401 follows.
 

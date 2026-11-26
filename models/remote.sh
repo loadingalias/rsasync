@@ -59,7 +59,7 @@ tar -xzf "/tmp/$file" -C "$opt/temurin-jre/$jre" --strip-components=1
 rm -rf ~/model
 git clone -q ~/source.bundle ~/model
 cd ~/model
-git checkout -q --detach "$REVISION"
+git -c advice.detachedHead=false checkout -q --detach "$REVISION"
 echo "== revision $(git rev-parse HEAD)"
 status=0
 cargo xtask model "$@" || status=$?

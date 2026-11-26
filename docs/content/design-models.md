@@ -119,19 +119,19 @@ model proves, or an inductive proof. Each such change needs a known-bad variant 
 under it. A smaller bound must still reach each failure that the model names, and it needs a
 profile with that bound raised by one.
 
-The task-lifecycle gate has 31 profiles. Its 27 fault and witness checks take about 17 seconds of
-checker time on a quiet EC2 c8g.4xlarge, and its declared profile about 24 seconds. Its largest
-profile has this result on an EC2 m8g.4xlarge (16 vCPUs, 64 GiB, 2026-11-23):
+The task-lifecycle gate has 31 profiles. Its 30 profiles other than `Slots3` take about 156
+seconds of checker time on a Mac with 10 cores. Its largest profile has this result on a quiet EC2
+c8g.4xlarge (16 vCPUs, 32 GiB, 2026-11-25):
 
 | Profile | Distinct states | Time |
 | --- | --- | --- |
-| `TaskLifecycle.Slots3.cfg` | 47,785,001 | 81.7 minutes |
+| `TaskLifecycle.Slots3.cfg` | 17,655,206 | 27.9 minutes |
 
-This profile takes more than the limit of one hour. Its check of the progress properties needs a
-Java heap above 4 GiB: TLC takes a quarter of the memory of the host by default, so use a host
-with 64 GiB, for example `aws-linux-arm64-ubuntu2604-memory`. A dev-machines run of it needs a
-lease of about two hours, for example `DEV_MACHINE_MAX_LEASE_MINUTES=120`, because setup and
-collection come on top of the check. The [model evidence record](../../models/task-lifecycle/README.md#evidence-record)
+Before two reductions of the model, this profile had 47,785,001 distinct states and took 81.7
+minutes. The model README gives each reduction with its soundness argument. A host with 32 GiB
+has enough memory for the check of its progress properties: TLC takes a quarter of the memory of
+the host for its heap by default. A dev-machines run of it needs a lease of about one hour,
+because setup and collection come on top of the check. The [model evidence record](../../models/task-lifecycle/README.md#evidence-record)
 gives every positive profile and its host. The model does not check a shutdown request during
 block_on, join handles and their outcomes, a task with more than one event, operations and I/O,
 or durations. Its [limits](../../models/task-lifecycle/README.md#limits) give the full list.
