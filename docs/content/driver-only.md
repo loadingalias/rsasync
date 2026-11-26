@@ -368,12 +368,13 @@ back.
 
 ### One multishot receive for each stream
 
-With `Config::receives(Shot::Multi)`, an io_uring driver keeps one multishot receive in the read
-direction of each TCP stream. The first `recv_selected` arms it with one submission. Then the
-kernel fills a slot each time that bytes come, and the receive stays armed. The driver gives each
-filled slot to the receive that waits, or keeps it for the next receive, in order. So a receive in
-steady state submits nothing. `Report::receives()` gives the form in use. It is `Shot::Single` on
-epoll, kqueue, and IOCP, which submit one receive for each call.
+An io_uring driver keeps one multishot receive in the read direction of each TCP stream. This is
+the default, `Config::receives(Shot::Multi)`. The first `recv_selected` arms it with one
+submission. Then the kernel fills a slot each time that bytes come, and the receive stays armed.
+The driver gives each filled slot to the receive that waits, or keeps it for the next receive, in
+order. So a receive in steady state submits nothing. `Report::receives()` gives the form in use.
+It is `Shot::Single` on epoll, kqueue, and IOCP, which submit one receive for each call, and on
+io_uring with `Config::receives(Shot::Single)`.
 
 - A receive that drops loses no byte: the next receive gets the slots that the multishot receive
   filled after the drop, with no submission.
@@ -391,8 +392,11 @@ epoll, kqueue, and IOCP, which submit one receive for each call.
   The slots that the stream keeps go back to the pool at the close.
 - A pipe and a datagram socket use one submission for each receive.
 
-The default is `Shot::Single` until a measurement on the thread-per-core TCP cell selects the
-default.
+`Shot::Multi` is the default, because the measurement on the thread-per-core TCP cell selected
+it. On two EC2 c8g.4xlarge with Linux 7.0 (2026-11-25), an echo server with four workers served
+450,000 requests of 1 KiB each second on 10,000 connections. With the multishot receive, a request
+used 6.6% less CPU than with one submission for each receive, and it had one submission in place
+of two. The p99 was 275 µs against 14 ms, because no worker was at its CPU limit.
 
 `Driver::close` closes a stream, and `Driver::close_listener` closes a listener. Each one cancels the
 operations that run on the socket, and its future is ready after the kernel ends each one: see
@@ -411,7 +415,7 @@ operations that run on the socket, and its future is ready after the kernel ends
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
 | `delivery` | `Delivery::Native` | How the driver gives each completion to its operation. Under `Delivery::Controlled`, `Driver::control()` lets a test hold, fail, or repeat a completion: see [Test your code under controlled completions](controlled-delivery.md) |
 | `files` | `Files::Plain` | The descriptor that each operation of a resource names. See [Registered files](#registered-files) |
-| `receives` | `Shot::Single` | How a receive of a stream into a selected slot runs. See [One multishot receive for each stream](#one-multishot-receive-for-each-stream) |
+| `receives` | `Shot::Multi` | How a receive of a stream into a selected slot runs. See [One multishot receive for each stream](#one-multishot-receive-for-each-stream) |
 
 A limit of 0, other than `children`, gives `Error::Config`.
 

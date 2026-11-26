@@ -46,8 +46,8 @@
 //!
 //! The body of a case stays beside the code of its surface, and this index gives each body its
 //! tests: `<suite>::kernel::<case>`, `<suite>::controlled::<case>`, `<suite>::epoll::<case>`, and
-//! `<suite>::registered::<case>`, io_uring with its file table, and `<suite>::multishot::<case>`,
-//! io_uring with the multishot receive of each stream, on Linux, `<suite>::kqueue::<case>` and `<suite>::controlled::<case>` on macOS, and
+//! `<suite>::registered::<case>`, io_uring with its file table, and `<suite>::single::<case>`,
+//! io_uring with one submission for each receive of a stream, on Linux, `<suite>::kqueue::<case>` and `<suite>::controlled::<case>` on macOS, and
 //! `<suite>::iocp::<case>`, `<suite>::controlled::<case>`, and, for a file case,
 //! `<suite>::io_ring::<case>` on Windows. A case runs once, as `<suite>::once::<case>`, when the
 //! seam can change none of its inputs: a refusal makes no completion, and a signal reaches its
@@ -203,10 +203,10 @@ pub(super) enum Backend {
     /// gives the ring no table, so the cases there check that the setting keeps each contract.
     #[cfg(target_os = "linux")]
     Registered,
-    /// The io_uring ring with the multishot receive of each stream (`Shot::Multi`): a receive into
-    /// a selected buffer of a stream takes the buffers of one multishot receive of its direction.
+    /// The io_uring ring with one submission for each receive of a stream (`Shot::Single`). The
+    /// default is one multishot receive for each stream, which `Kernel` runs.
     #[cfg(target_os = "linux")]
-    Multishot,
+    Single,
     /// The completion port, where each socket that passes the installed-provider check skips the
     /// packet of a call that ends at once: the return of that call is its terminal event. Each file
     /// operation with no overlapped form runs on a blocking service of the case.
@@ -255,14 +255,14 @@ pub(super) fn driver(config: Config, backend: Backend) -> Driver {
         Backend::Controlled => (super::Backend::IoUring, config.delivery(Delivery::Controlled)),
         Backend::Epoll => (super::Backend::Epoll, config),
         Backend::Registered => (super::Backend::IoUring, config.files(super::Files::Registered)),
-        Backend::Multishot => (super::Backend::IoUring, config.receives(super::Shot::Multi)),
+        Backend::Single => (super::Backend::IoUring, config.receives(super::Shot::Single)),
     };
     let mut driver = super::tests::driver(config.backend(selected));
     if backend == Backend::Registered {
         assert_eq!(driver.report().files(), super::tests::registered_files());
     }
-    if backend == Backend::Multishot {
-        assert_eq!(driver.report().receives(), super::Shot::Multi);
+    if backend == Backend::Single {
+        assert_eq!(driver.report().receives(), super::Shot::Single);
     }
     if backend == Backend::Epoll {
         driver.use_blocking(service().submitter());
@@ -298,7 +298,7 @@ macro_rules! cases {
         cases!(@backend controlled, all(), Controlled; $($files)* $($others)*);
         cases!(@backend epoll, target_os = "linux", Epoll; $($files)* $($others)*);
         cases!(@backend registered, target_os = "linux", Registered; $($files)* $($others)*);
-        cases!(@backend multishot, target_os = "linux", Multishot; $($files)* $($others)*);
+        cases!(@backend single, target_os = "linux", Single; $($files)* $($others)*);
         cases!(@backend iocp, target_os = "windows", Iocp; $($files)* $($others)*);
         cases!(@backend io_ring, target_os = "windows", IoRing; $($files)*);
         cases!(@backend kqueue, target_os = "macos", Kqueue; $($files)* $($others)*);

@@ -218,9 +218,9 @@ same as on the driver.
 `stream.split()` gives a `rsasync::local::ReadHalf` and a `WriteHalf`, so a receive and a
 send run at one time. `recv_selected()` waits with no buffer and gives a buffer from the provided
 buffers of the driver of the owner when the bytes come. Each worker and each `block_on` has these
-buffers by [`receive_buffers`](runtime.md#start-a-runtime). With
-`Config::receives(Shot::Multi)`, the receives of a stream take the buffers of one multishot
-receive: see [Driver-only use](driver-only.md#one-multishot-receive-for-each-stream).
+buffers by [`receive_buffers`](runtime.md#start-a-runtime). On io_uring, the receives of a stream
+take the buffers of one multishot receive by default: see
+[Driver-only use](driver-only.md#one-multishot-receive-for-each-stream).
 
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};

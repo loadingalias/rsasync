@@ -210,7 +210,7 @@ impl Config {
             backend: None,
             delivery: Delivery::Native,
             files: Files::Plain,
-            receives: Shot::Single,
+            receives: Shot::Multi,
         }
     }
 
@@ -283,8 +283,9 @@ impl Config {
         Self { files, ..self }
     }
 
-    /// How the receives of a stream into kernel-selected buffers run: [`Shot::Single`], the
-    /// default, or [`Shot::Multi`], one multishot receive for each stream on io_uring.
+    /// How the receives of a stream into kernel-selected buffers run: [`Shot::Multi`], the
+    /// default, one multishot receive for each stream on io_uring, or [`Shot::Single`], one
+    /// submission for each receive.
     /// [`Report::receives`] gives the form in use.
     #[must_use]
     pub const fn receives(self, receives: Shot) -> Self {

@@ -230,7 +230,6 @@ pub enum Files {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Shot {
     /// One submission for each receive.
-    #[default]
     Single,
     /// One multishot receive for each stream, on io_uring: the first receive arms it, and it stays
     /// armed in the read direction of the stream. The kernel takes a provided buffer for each
@@ -239,7 +238,9 @@ pub enum Shot {
     /// a dropped receive loses no byte. A direction that keeps [`KEPT_BUFFERS`](super::KEPT_BUFFERS)
     /// buffers ends its multishot receive, and the next receive that finds none arms it again. A
     /// pipe, a receive into the caller's buffer that finds no armed receive, and each other backend
-    /// use one submission for each receive.
+    /// use one submission for each receive. It is the default: on the thread-per-core TCP cell it
+    /// uses less CPU for each request than [`Shot::Single`].
+    #[default]
     Multi,
 }
 
