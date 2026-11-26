@@ -84,8 +84,9 @@ impl Opening {
         })
     }
 
-    /// The open of the directory at `path`, or `None` for a path with a NUL unit. The handle has
-    /// write access, which `FlushFileBuffers` of the directory needs ([`namespace`]).
+    /// The open of the directory at `path`, or `None` for a path with a NUL unit. The open asks for
+    /// write access too, which `FlushFileBuffers` of the directory needs ([`namespace`]), and
+    /// takes read access only when the system refuses it ([`open`]).
     pub(super) fn directory(path: &Path) -> Option<Self> {
         Some(Self {
             path: wide(path)?,
@@ -264,11 +265,12 @@ fn pointer<T>(address: u64) -> *mut T {
 /// handle, or the negative error. A directory gives `ERROR_DIRECTORY` when the path is not one.
 #[expect(unsafe_code, reason = "the calls read the path and give new handles")]
 fn open(opening: &mut Opening) -> i32 {
+    let directory = opening.flags & sys::FILE_FLAG_BACKUP_SEMANTICS != 0;
     // SAFETY: the path is a NUL-terminated UTF-16 string, and the call names no other memory.
-    let raw = unsafe {
+    let create = |access| unsafe {
         sys::CreateFileW(
             opening.path.as_ptr(),
-            opening.access,
+            access,
             sys::FILE_SHARE_ALL,
             ptr::null_mut(),
             opening.disposition,
@@ -276,6 +278,12 @@ fn open(opening: &mut Opening) -> i32 {
             ptr::null_mut(),
         )
     };
+    let mut raw = create(opening.access);
+    // A directory that its user may read but not write opens with read access only. Its sync then
+    // gives the refusal of the flush, `ERROR_ACCESS_DENIED`.
+    if raw.addr() == sys::INVALID_HANDLE_VALUE && directory {
+        raw = create(sys::GENERIC_READ);
+    }
     if raw.addr() == sys::INVALID_HANDLE_VALUE {
         return last_error();
     }
@@ -284,7 +292,6 @@ fn open(opening: &mut Opening) -> i32 {
     let Some(result) = number(raw) else {
         return -ERROR_TOO_MANY_OPEN_FILES;
     };
-    let directory = opening.flags & sys::FILE_FLAG_BACKUP_SEMANTICS != 0;
     match standard(raw) {
         Ok(info) if directory && info.directory == 0 => return -ERROR_DIRECTORY,
         Ok(_) => {}

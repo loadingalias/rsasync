@@ -252,9 +252,13 @@ On Windows, `Driver::sync_directory` is `FlushFileBuffers` of the directory, as 
 flush of a directory makes the directory structure durable on NTFS only, and a power-loss test kept
 each name that the flush made durable ([File systems](#file-systems)). On each other file system,
 such as ReFS or exFAT, the sync gives `Unsupported` with no flush. The flush needs write access, so
-a directory open on Windows asks for it. The open of a file with writes makes the write-through
-handle, so that a `WriteMode::DataSync` write is one overlapped call, or one entry of the ring on
-IoRing.
+a directory open on Windows asks for read and write access, and takes read access only when the
+system refuses write access. The sync of a directory that you may read but not write then gives
+`PermissionDenied`, the refusal of the flush, and the driver makes no weaker flush. On Linux and
+macOS, a directory opens with read access only, which is all that its sync needs.
+
+On Windows, the open of a file with writes makes the write-through handle, so that a
+`WriteMode::DataSync` write is one overlapped call, or one entry of the ring on IoRing.
 
 A sync covers the writes that ended before it. Start it after their futures are ready.
 

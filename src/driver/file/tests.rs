@@ -474,6 +474,73 @@ pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backen
     drive(&mut driver, close).unwrap();
 }
 
+/// Takes the write access of each user to the directory at its path until its drop: mode 0555 on
+/// Linux and macOS, and a deny of the rights to add a file and a directory for each user on
+/// Windows (`icacls`).
+struct ReadOnly(PathBuf);
+
+impl ReadOnly {
+    fn new(path: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        #[cfg(target_os = "windows")]
+        icacls(path, &["/deny", "*S-1-1-0:(WD,AD)"]);
+        Self(path.to_path_buf())
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            drop(fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755)));
+        }
+        #[cfg(target_os = "windows")]
+        icacls(&self.0, &["/remove:d", "*S-1-1-0"]);
+    }
+}
+
+/// Changes the access control list of `path` with `icacls`.
+#[cfg(target_os = "windows")]
+fn icacls(path: &Path, args: &[&str]) {
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success(), "icacls gave {status}");
+}
+
+/// A directory that its user may read but not write still opens. Its sync gives `Ok` on Linux and
+/// macOS, whose sync of a directory needs no write access. On Windows, the flush of a directory
+/// needs write access, so the sync gives the refusal of the flush, `PermissionDenied`, and the
+/// driver makes no weaker flush.
+pub(in crate::driver) fn a_directory_with_read_access_only_opens_and_its_sync_gives_the_result_of_its_system(
+    backend: Backend,
+) {
+    let scratch = Scratch::new("read-only");
+    let path = scratch.join("directory");
+    fs::create_dir(&path).unwrap();
+    let read_only = ReadOnly::new(&path);
+    let mut driver = suite::driver(Config::new(), backend);
+    let open = driver.open_directory(&path).unwrap();
+    let directory = drive(&mut driver, open).unwrap().unwrap();
+    let sync = driver.sync_directory(&directory).unwrap();
+    let synced = drive(&mut driver, sync).unwrap();
+    #[cfg(unix)]
+    synced.unwrap();
+    #[cfg(target_os = "windows")]
+    assert_eq!(synced.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    let close = driver.close_directory(directory).unwrap();
+    drive(&mut driver, close).unwrap();
+    drop(read_only);
+}
+
 /// A preallocation keeps or extends the length as asked, and the file system allocates its blocks.
 pub(in crate::driver) fn a_preallocation_keeps_or_extends_the_length_and_allocates_its_blocks(backend: Backend) {
     const MIB: u64 = 1 << 20;

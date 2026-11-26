@@ -526,6 +526,7 @@ mod operation {
             file::tests => an_unaligned_hole_reads_as_zeros_and_the_bytes_around_it_stay,
             file::tests => a_write_after_the_end_of_an_extending_allocation_keeps_each_byte,
             file::tests => a_rename_an_unlink_and_a_directory_sync_complete,
+            file::tests => a_directory_with_read_access_only_opens_and_its_sync_gives_the_result_of_its_system,
             file::tests => a_file_of_another_driver_refuses_before_each_other_check,
             #[cfg(target_os = "windows")]
             file::tests => the_nvme_report_of_a_file_follows_the_driver_of_its_disk,
