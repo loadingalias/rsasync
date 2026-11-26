@@ -476,7 +476,9 @@ pub(in crate::driver) fn a_rename_an_unlink_and_a_directory_sync_complete(backen
 
 /// Takes the write access of each user to the directory at its path until its drop: mode 0555 on
 /// Linux and macOS, and a deny of the rights to add a file and a directory for each user on
-/// Windows (`icacls`).
+/// Windows (`icacls`). On Windows, the test process also gives up its backup and restore
+/// privileges, which an elevated session can hold enabled, because with them an open with
+/// `FILE_FLAG_BACKUP_SEMANTICS` passes each access check.
 struct ReadOnly(PathBuf);
 
 impl ReadOnly {
@@ -487,8 +489,77 @@ impl ReadOnly {
             fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
         }
         #[cfg(target_os = "windows")]
-        icacls(path, &["/deny", "*S-1-1-0:(WD,AD)"]);
+        {
+            icacls(path, &["/deny", "*S-1-1-0:(WD,AD)"]);
+            give_up_privileges(&["SeBackupPrivilege", "SeRestorePrivilege"]);
+        }
         Self(path.to_path_buf())
+    }
+}
+
+/// Disables each privilege of `names` in the token of the test process. Each test runs in its own
+/// process, so no other test sees the change.
+#[cfg(target_os = "windows")]
+#[expect(
+    unsafe_code,
+    reason = "the calls read and write only the structures of this function"
+)]
+fn give_up_privileges(names: &[&str]) {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use super::super::iocp::sys;
+
+    /// `TOKEN_PRIVILEGES` with one `LUID_AND_ATTRIBUTES` (`winnt.h`).
+    #[repr(C)]
+    struct Privileges {
+        count: u32,
+        luid: [u32; 2],
+        attributes: u32,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut [u32; 2]) -> i32;
+        fn AdjustTokenPrivileges(
+            token: sys::Handle,
+            disable_all: i32,
+            state: *const Privileges,
+            len: u32,
+            previous: *mut Privileges,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    /// `TOKEN_ADJUST_PRIVILEGES` and `TOKEN_QUERY` (`winnt.h`).
+    const ACCESS: u32 = 0x20 | 0x8;
+    let mut token: sys::Handle = core::ptr::null_mut();
+    // SAFETY: the pseudo handle of the process needs no close, and the call writes only `token`.
+    let opened = unsafe { sys::OpenProcessToken(sys::GetCurrentProcess(), ACCESS, &raw mut token) };
+    assert_ne!(opened, 0);
+    // SAFETY: the call gave a new handle that nothing else owns.
+    let _token =
+        unsafe { <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(token) };
+    for name in names {
+        let wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain([0]).collect();
+        let mut state = Privileges {
+            count: 1,
+            luid: [0; 2],
+            attributes: 0,
+        };
+        // SAFETY: `wide` ends with a NUL unit, and the call writes only the identifier of `state`.
+        let found = unsafe { LookupPrivilegeValueW(core::ptr::null(), wide.as_ptr(), &raw mut state.luid) };
+        assert_ne!(found, 0);
+        // SAFETY: the call reads `state` and writes no previous state.
+        let adjusted = unsafe {
+            AdjustTokenPrivileges(
+                token,
+                0,
+                &raw const state,
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        };
+        assert_ne!(adjusted, 0, "{}", io::Error::last_os_error());
     }
 }
 

@@ -86,7 +86,7 @@ impl Opening {
 
     /// The open of the directory at `path`, or `None` for a path with a NUL unit. The open asks for
     /// write access too, which `FlushFileBuffers` of the directory needs ([`namespace`]), and
-    /// takes read access only when the system refuses it ([`open`]).
+    /// takes read access only when the system denies it with `ERROR_ACCESS_DENIED` ([`open`]).
     pub(super) fn directory(path: &Path) -> Option<Self> {
         Some(Self {
             path: wide(path)?,
@@ -280,8 +280,9 @@ fn open(opening: &mut Opening) -> i32 {
     };
     let mut raw = create(opening.access);
     // A directory that its user may read but not write opens with read access only. Its sync then
-    // gives the refusal of the flush, `ERROR_ACCESS_DENIED`.
-    if raw.addr() == sys::INVALID_HANDLE_VALUE && directory {
+    // gives the refusal of the flush, `ERROR_ACCESS_DENIED`. Each other error of the open is the
+    // error of the open.
+    if raw.addr() == sys::INVALID_HANDLE_VALUE && directory && last_error() == -sys::ERROR_ACCESS_DENIED {
         raw = create(sys::GENERIC_READ);
     }
     if raw.addr() == sys::INVALID_HANDLE_VALUE {
