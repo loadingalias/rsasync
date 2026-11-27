@@ -853,12 +853,12 @@ enum Armed {
 #[cfg(all(feature = "local", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct Sending {
+    /// The waiter of the future, which the terminal event wakes.
+    waiter: super::home::Waiter,
     /// The lease that the kernel reads. The record holds a send while it holds the lease.
     lease: Option<Lease>,
     /// The result of the terminal event, until the take.
     result: Option<i32>,
-    /// The waiter of the future, which the terminal event wakes.
-    waiter: super::home::Waiter,
     /// The terminal event did not come.
     runs: bool,
     /// A future has interest in the result.
@@ -869,8 +869,9 @@ struct Sending {
 
 /// The directions of a stream or a listener, at the home.
 ///
-/// The order of the fields is stated: a local receive and a local send of a stream read the fields
-/// before `kept`, and the discriminant of `kept`. The large kept result comes after them.
+/// The order of the fields is stated: a local receive and a local send of the record of a stream
+/// read only the fields before `read`, while `operated` is false. The state of the operations of
+/// the table comes after them.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(super) struct Directions {
@@ -885,6 +886,11 @@ pub(super) struct Directions {
     /// next poll ([`Driver::poll_record`]).
     #[cfg(all(feature = "local", target_os = "linux"))]
     reading: bool,
+    sent: Sent,
+    /// An operation of the table started on the resource, its close started, or a send of the
+    /// record took the abandoned rule. Before that, `read`, `write`, `kept`, `unreported`, and
+    /// `closing` hold nothing, so the record does not read them.
+    operated: bool,
     /// The terminal result of the last multishot receive, after `shelved`: the end of the stream,
     /// or an error.
     ended: Option<i32>,
@@ -893,11 +899,10 @@ pub(super) struct Directions {
     /// The waiter of the local receive that waits, which a completion of `armed` wakes.
     #[cfg(all(feature = "local", target_os = "linux"))]
     reader: super::home::Waiter,
-    sent: Sent,
-    read: Direction,
-    write: Direction,
     #[cfg(all(feature = "local", target_os = "linux"))]
     sending: Sending,
+    read: Direction,
+    write: Direction,
     kept: Option<Kept>,
     /// The bytes that dropped sends sent, since the end of the last send whose result a future
     /// took, or since the last report.
@@ -1014,7 +1019,8 @@ impl Directions {
             self.abandon_record_send(result);
             super::home::Waiter::None
         };
-        (self.needs_home(), waiter)
+        // With no operation and no close, nothing waits for the send.
+        (self.operated && self.needs_home(), waiter)
     }
 
     /// The abandoned rule for the send of the record, which ended with `result`: its lease drops,
@@ -1023,6 +1029,8 @@ impl Directions {
     #[cfg(all(feature = "local", target_os = "linux"))]
     fn abandon_record_send(&mut self, result: i32) {
         let Sending { lease, cancelled, .. } = core::mem::take(&mut self.sending);
+        // The rule can make the direction owe a count.
+        self.operated = true;
         if let Some(lease) = lease {
             let held = Held {
                 cancelled,
@@ -1065,7 +1073,7 @@ impl Directions {
         let lease = core::mem::take(sending).lease?;
         // A send result that a future took reports each byte up to its end, as at
         // [`Directions::taken`].
-        if self.sent == Sent::Ok {
+        if self.operated && self.sent == Sent::Ok {
             self.unreported = 0;
         }
         Some(Poll::Ready((count(result), lease)))
@@ -2080,6 +2088,7 @@ impl Driver {
                 value,
             });
         };
+        owned.directions.operated = true;
         // A send of the record whose future was forgotten ends its interest, as `forgo` does.
         #[cfg(all(feature = "local", target_os = "linux"))]
         if kind.writes() && owned.directions.sending.interest {
@@ -2165,6 +2174,8 @@ impl Driver {
             && !(kind.writes() && directions.record_holds())
             && !(matches!(kind, Kind::Recv | Kind::Selected)
                 && (directions.receives_here() || multi && kind == Kind::Selected));
+        // The state of the operations of the resource can hold this one from now on.
+        directions.operated = true;
         let Some(direction) = directions
             .direction(kind)
             .filter(|direction| clear && direction.current.is_none() && direction.first.is_none() && queue.room() > 0)
@@ -2390,9 +2401,10 @@ impl Driver {
             && self.resources.get(resource).is_some_and(|owned| {
                 let directions = &owned.directions;
                 owned.medium == Medium::Stream
-                    && directions.read.first.is_none()
-                    && directions.read.current.is_none_or(|current| !table.runs(current))
-                    && directions.kept.is_none()
+                    && (!directions.operated
+                        || directions.read.first.is_none()
+                            && directions.read.current.is_none_or(|current| !table.runs(current))
+                            && directions.kept.is_none())
             }))
     }
 
@@ -2485,10 +2497,11 @@ impl Driver {
         }
         let free = owned.medium == Medium::Stream
             && directions.sent == Sent::Ok
-            && directions.closing.is_none()
             && directions.sending.lease.is_none()
-            && directions.write.first.is_none()
-            && directions.write.current.is_none_or(|current| !table.runs(current));
+            && (!directions.operated
+                || directions.closing.is_none()
+                    && directions.write.first.is_none()
+                    && directions.write.current.is_none_or(|current| !table.runs(current)));
         let (Some(fd), place) = (owned.number(), owned.place(resource)) else {
             return Err(lease);
         };
@@ -2988,6 +3001,7 @@ impl Driver {
     fn start_close(&mut self, resource: Resource, closing: Closing) {
         if let Some(owned) = self.resources.get(resource) {
             owned.directions.closing = Some(closing);
+            owned.directions.operated = true;
         }
         for kind in [Kind::Recv, Kind::Send] {
             // An operation that waits never ran, so it ends now; a send that waits too.
