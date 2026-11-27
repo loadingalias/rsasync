@@ -8,7 +8,7 @@ use core::net::SocketAddr;
 use std::io;
 use std::os::fd::OwnedFd;
 
-use super::{Home, Homed, Operation, ReadHalf, Receive, Transmit, WriteHalf, call, rewrap, submit};
+use super::{Each, Home, Homed, Operation, ReadHalf, Receive, Transmit, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Closed, Completion, Driver, Refused, Regions, TcpOptions};
 
@@ -252,7 +252,51 @@ impl TcpStream {
     ///
     /// As for [`TcpStream::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
-        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease)
+        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease, Each::Send)
+    }
+
+    /// Sends each byte of `lease`, as [`Driver::send_all`](crate::driver::Driver::send_all) does,
+    /// in as many sends of the kernel as it takes. The future gives the length of the lease, and
+    /// the lease. A drop of the future does not stop the send: it runs on until each byte went or
+    /// the send failed, and a failure fails the write direction, so the next send gives the count.
+    /// So a protocol can start the send of a response and receive the next request while it runs:
+    ///
+    /// ```
+    /// use rsasync::buffer::{Backing, Buffer as _, Lease};
+    /// use rsasync::driver::TcpOptions;
+    /// use rsasync::local::{TcpListener, TcpStream};
+    /// use rsasync::runtime::Runtime;
+    ///
+    /// let runtime = Runtime::builder().build()?;
+    /// runtime.block_on(async {
+    ///     let mut listener = TcpListener::bind("127.0.0.1:0".parse()?, TcpOptions::default())?.await??;
+    ///     let connect = TcpStream::connect(listener.local_addr(), TcpOptions::default())?;
+    ///     let (mut server, _peer) = listener.accept()?.await??;
+    ///     let mut client = connect.await??;
+    ///     let (mut read, mut write) = server.split();
+    ///
+    ///     // The server sends the response to the first request, and receives the second request while
+    ///     // the send runs. It then takes the result of the send, which ended.
+    ///     client.send_all(Lease::from(b"one".to_vec()))?.await?.0?;
+    ///     let request = read.recv_selected()?.await??;
+    ///     let send = write.send_all(Lease::from(request))?;
+    ///     client.send_all(Lease::from(b"two".to_vec()))?.await?.0?;
+    ///     let next = read.recv_selected()?.await??;
+    ///     let (sent, _lease) = send.await?;
+    ///     assert_eq!((sent?, next.bytes()), (3, &b"two"[..]));
+    ///
+    ///     let (received, buffer) = client.recv(Backing::from(Vec::with_capacity(64)))?.await?;
+    ///     assert_eq!(&buffer.bytes()[..received?], b"one");
+    ///     Ok::<(), Box<dyn std::error::Error>>(())
+    /// })??;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::recv`], with the lease.
+    pub fn send_all(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
+        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease, Each::Byte)
     }
 
     /// Sends the bytes of `regions` in order, in one operation, as

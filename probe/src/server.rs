@@ -26,7 +26,7 @@ use std::time::Instant;
 use rsasync::buffer::{Backing, Buffer as _, Lease, Pool};
 use rsasync::capacity::Budget;
 use rsasync::driver::{Config, Files, Shot, TcpOptions};
-use rsasync::local::{TcpListener, TcpStream};
+use rsasync::local::{ReadHalf, TcpListener, TcpStream};
 use rsasync::movable;
 use rsasync::runtime::{Handle, Placement, ReceiveBuffers, Runtime, Selection, WorkerId};
 use rsasync::task::{self, Outcome};
@@ -232,29 +232,39 @@ async fn serve(_worker: WorkerId, mut listener: TcpListener, selected: bool) -> 
 }
 
 /// Sends back each byte that `stream` receives into a provided buffer, until the end of its stream.
+/// The send of each response runs while the task waits for the next request, and the task takes
+/// its result after that request: a send that ended by then gives it with no wake of the task, and
+/// a peer that reads slowly holds the echo back by one response.
 async fn echo_selected(mut stream: TcpStream) {
     let (mut read, mut write) = stream.split();
-    loop {
-        let Ok(receive) = read.recv_selected() else { break };
-        let buffer = match receive.await {
-            Ok(Ok(buffer)) => buffer,
-            // No provided buffer is free: the bytes stay in the socket, and a buffer comes back
-            // after a send of another task.
-            Ok(Err(error)) if error.raw_os_error() == Some(ENOBUFS) => {
-                yield_once().await;
-                continue;
-            }
-            _ => break,
-        };
-        if buffer.bytes().is_empty() {
+    let mut request = receive_selected(&mut read).await;
+    while let Some(buffer) = request {
+        let Ok(send) = write.send_all(Lease::from(buffer)) else {
             break;
-        }
-        if send_all(&mut write, Lease::from(buffer)).await.is_err() {
+        };
+        request = receive_selected(&mut read).await;
+        if !matches!(send.await, Ok((Ok(_), _))) {
             break;
         }
     }
     if let Ok(close) = stream.close() {
         let _closed = close.await;
+    }
+}
+
+/// The next request of `read`, in a provided buffer, or `None` at the end of the stream or at an
+/// error.
+async fn receive_selected(read: &mut ReadHalf<'_>) -> Option<Backing> {
+    loop {
+        let receive = read.recv_selected().ok()?;
+        match receive.await {
+            Ok(Ok(buffer)) if buffer.bytes().is_empty() => return None,
+            Ok(Ok(buffer)) => return Some(buffer),
+            // No provided buffer is free: the bytes stay in the socket, and a buffer comes back
+            // after a send of another task.
+            Ok(Err(error)) if error.raw_os_error() == Some(ENOBUFS) => yield_once().await,
+            _ => return None,
+        }
     }
 }
 

@@ -336,6 +336,15 @@ pub struct Transmit<'a> {
     _home: Home,
 }
 
+/// What a [`Transmit`] sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Each {
+    /// One send of the kernel, which can send part of the lease.
+    Send,
+    /// Each byte of the lease, in as many sends of the kernel as it takes.
+    Byte,
+}
+
 /// How a [`Transmit`] sends.
 #[derive(Debug)]
 enum Sending<'a> {
@@ -346,11 +355,25 @@ enum Sending<'a> {
 }
 
 impl<'a> Transmit<'a> {
-    /// A send of `lease` on `writer`, the write half of the stream of `home`.
-    fn start(writer: &'a mut driver::WriteHalf, home: &'a Cleanup, lease: Lease) -> Result<Self, Refused<Lease>> {
-        let form = submit(lease, |driver, lease| match driver.send_record(writer, lease) {
+    /// A send of `lease` on `writer`, the write half of the stream of `home`: of each byte of the
+    /// lease with `all`, and else one send of the kernel.
+    fn start(
+        writer: &'a mut driver::WriteHalf,
+        home: &'a Cleanup,
+        lease: Lease,
+        all: Each,
+    ) -> Result<Self, Refused<Lease>> {
+        let kind = match all {
+            Each::Send => driver::Kind::Send,
+            Each::Byte => driver::Kind::SendAll,
+        };
+        let form = submit(lease, |driver, lease| match driver.send_record(writer, lease, kind) {
             Ok(()) => Ok(Sending::Record { home, done: false }),
-            Err(lease) => driver.send(writer, lease).map(Sending::Operation),
+            Err(lease) => match all {
+                Each::Send => driver.send(writer, lease),
+                Each::Byte => driver.send_all(writer, lease),
+            }
+            .map(Sending::Operation),
         })?;
         Ok(Self {
             form,
@@ -471,7 +494,16 @@ impl WriteHalf<'_> {
     ///
     /// As for [`TcpStream::send`].
     pub fn send(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
-        Transmit::start(self.write, self.home, lease)
+        Transmit::start(self.write, self.home, lease, Each::Send)
+    }
+
+    /// Sends each byte of `lease`, as [`TcpStream::send_all`] does.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TcpStream::send`].
+    pub fn send_all(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
+        Transmit::start(self.write, self.home, lease, Each::Byte)
     }
 
     /// Sends the bytes of `regions` in order, as [`TcpStream::send_vectored`] does.

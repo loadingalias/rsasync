@@ -278,7 +278,12 @@ for a send with no interest. `TakeOver` and `CloseDone` are `start_close` and `c
 which end the interest of the send of the record, cancel it, and wait for its terminal event. A
 drop or a cancel in a turn of the driver posts its mark in the close word of the stream
 (`home::Mark`), which the next turn takes: the entry path of reduction 1. A local selected receive
-with the multishot receive is outside the model (Limits).
+with the multishot receive is outside the model (Limits). A send of each byte (`Kind::SendAll`,
+`Driver::send_all`, and the `all` send of a record) is one operation whose kernel completions
+before its last are no terminal events: a completion that sent part of the bytes goes again with
+the rest (`tcp::sent_part`, `Driver::resend`), as the items of a multishot accept do. Its terminal
+event gives each byte, or part of them with a failure or a cancel, which are the `full` and `part`
+progress of the model, so its rules are those of a send.
 
 The backends. The R507 column names the IOCP transitions (`src/driver/iocp.rs`), and the
 R503, R505, and R520 column names the transitions of the readiness poller (`src/driver/poller.rs`),

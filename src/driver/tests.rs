@@ -1441,6 +1441,73 @@ pub(in crate::driver) fn a_dropped_partial_send_fails_the_write_direction_and_re
     }
 }
 
+/// A send of each byte of a lease that is larger than the buffers of the socket sends each byte, in
+/// as many sends of the kernel as it takes: the future gives the length of the lease. A send of
+/// each byte whose future drops at once runs on and sends each byte too, and the next send follows
+/// it with no failure. The peer reads each byte in order.
+pub(in crate::driver) fn a_send_of_each_byte_sends_each_byte_also_after_its_drop(backend: Backend) {
+    const LEN: usize = 16 << 20;
+    let mut driver = suite::driver(Config::new(), backend);
+    let (mut stream, mut peer) = connected(&mut driver, "127.0.0.1:0");
+    let reader = thread::spawn(move || {
+        let mut received = alloc::vec![0; 2 * LEN + 4];
+        peer.read_exact(&mut received).unwrap();
+        received
+    });
+    let send = driver.send_all(&mut stream, Lease::from(numbered(0, LEN))).unwrap();
+    assert_eq!(drive(&mut driver, send).unwrap().0.unwrap(), LEN);
+    drop(driver.send_all(&mut stream, Lease::from(numbered(LEN, LEN))).unwrap());
+    let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
+    assert_eq!(drive(&mut driver, next).unwrap().0.unwrap(), 4);
+    let received = reader.join().unwrap();
+    assert!(received[..2 * LEN] == numbered(0, 2 * LEN), "the peer read other bytes");
+    assert_eq!(&received[2 * LEN..], b"next");
+    driver.teardown().unwrap();
+}
+
+/// A send of each byte that a reset of the connection ends after some bytes gives the exact count
+/// of the bytes that went, in a [`WriteFailed`]. When its future dropped, the write direction fails,
+/// and the next send gives that count.
+#[cfg(unix)]
+pub(in crate::driver) fn a_send_of_each_byte_that_a_reset_ends_gives_the_count_of_the_bytes_that_went(
+    backend: Backend,
+) {
+    let mut driver = suite::driver(Config::new(), backend);
+    for dropped in [false, true] {
+        let (mut stream, peer) = connected(&mut driver, "127.0.0.1:0");
+        let send = driver
+            .send_all(&mut stream, Lease::from(numbered(0, 64 << 20)))
+            .unwrap();
+        let send = if dropped {
+            drop(send);
+            None
+        } else {
+            Some(send)
+        };
+        // The first sends fill the buffers of both sockets, and then the send waits for room. A
+        // close with unread bytes resets the connection.
+        for _ in 0..10 {
+            driver.turn().unwrap();
+        }
+        thread::sleep(core::time::Duration::from_millis(100));
+        drop(peer);
+        let failed = match send {
+            Some(send) => drive(&mut driver, send).unwrap().0.unwrap_err(),
+            None => {
+                let next = driver.send(&mut stream, Lease::from(b"next".to_vec())).unwrap();
+                drive(&mut driver, next).unwrap().0.unwrap_err()
+            }
+        };
+        let Some(SendCount::Sent(went)) = WriteFailed::of(&failed).map(WriteFailed::sent) else {
+            panic!("the send gives the count of the bytes that went: {failed}");
+        };
+        assert!(0 < went && went < 64 << 20, "the send sent all or nothing: {went}");
+        let close = driver.close(stream).unwrap();
+        drive(&mut driver, close).unwrap();
+    }
+    driver.teardown().unwrap();
+}
+
 /// A send whose future drops and that sends all its bytes reports nothing, and the next send
 /// succeeds after it.
 pub(in crate::driver) fn a_dropped_send_that_sends_all_its_bytes_reports_nothing_and_the_next_send_succeeds(

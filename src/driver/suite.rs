@@ -347,6 +347,9 @@ mod law {
         }
         // Short I/O.
         tests => a_dropped_partial_send_fails_the_write_direction_and_reports_its_count_once,
+        tests => a_send_of_each_byte_sends_each_byte_also_after_its_drop,
+        #[cfg(unix)]
+        tests => a_send_of_each_byte_that_a_reset_ends_gives_the_count_of_the_bytes_that_went,
         tests => a_vectored_send_gives_its_exact_progress_across_regions,
         // Failed I/O.
         tests => a_connect_to_a_port_with_no_listener_is_refused,

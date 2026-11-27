@@ -366,6 +366,34 @@ fn a_cancelled_or_dropped_local_send_keeps_the_order_of_the_stream() {
         .unwrap();
 }
 
+/// A send of each byte of a local stream sends a lease that is larger than the buffers of the
+/// socket in as many sends of the kernel as it takes. A send of each byte whose future drops at once
+/// runs on, and the next send follows it: the peer reads each byte in order.
+#[test]
+fn a_local_send_of_each_byte_sends_each_byte_also_after_its_drop() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let mut listener = TcpListener::bind(loopback(), TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            let (mut stream, _peer) = listener.accept().unwrap().await.unwrap().unwrap();
+            let (_read, mut write) = stream.split();
+            let reader = drain(peer, 2 * FILL + 4);
+            let (sent, _lease) = write.send_all(Lease::from(vec![7; FILL])).unwrap().await.unwrap();
+            assert_eq!(sent.unwrap(), FILL);
+            drop(write.send_all(Lease::from(vec![8; FILL])).unwrap());
+            let next = write.send(Lease::from(b"next".to_vec())).unwrap();
+            assert_eq!(next.await.unwrap().0.unwrap(), 4);
+            let (total, last) = reader.join().unwrap();
+            assert_eq!((total, &last[last.len() - 5..]), (2 * FILL + 4, &b"\x08next"[..]));
+        })
+        .unwrap();
+}
+
 /// A local send that drops after it sent only part of its bytes fails the write direction: the next
 /// send gives the count of the bytes that went, and the peer reads exactly those bytes.
 #[test]

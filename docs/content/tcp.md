@@ -19,6 +19,7 @@ Each operation gives an `Operation` future. Turn the driver until the future is 
 | `Driver::recv(&mut stream, backing)` | The read half | `(io::Result<usize>, Backing)`: the count, and the buffer with the bytes after its earlier bytes | `Refused<Backing>`, with the buffer |
 | `Driver::recv_selected(&mut stream)` | The read half | `io::Result<Backing>`: the buffer that the kernel selected from the pool of `Driver::provide`, with the bytes | `Refused<()>`, also with `Reason::Buffers` when the driver has no pool |
 | `Driver::send(&mut stream, lease)` | The write half | `(io::Result<usize>, Lease)`: the count, and the lease | `Refused<Lease>`, with the lease |
+| `Driver::send_all(&mut stream, lease)` | The write half | `(io::Result<usize>, Lease)`: the length of the lease, and the lease. See [Send each byte](#send-each-byte) | `Refused<Lease>`, with the lease |
 | `Driver::send_vectored(&mut stream, regions)` | The write half | `(io::Result<usize>, Regions)`: the count across the regions, and the regions. See [Send several regions](#send-several-regions) | `Refused<Regions>`, with the regions |
 | `Driver::shutdown_write(&mut stream)` | The write half | `io::Result<()>`. See [Half-close](#half-close) | `Refused<()>` |
 | `Driver::close(stream)` | Takes the stream | `Closed` | `Refused<TcpStream>`, with the stream |
@@ -73,6 +74,55 @@ Linux takes a buffer size of at most `net.core.wmem_max` (send) or `net.core.rme
 (receive), and it doubles the value for its own bookkeeping. So `options` gives twice the value
 that you set, when that value is not above the limit. Other kernels may not double the value; the
 driver runs only on Linux now.
+
+## Send each byte
+
+One `send` is one send of the kernel, which can send only part of the lease, for example when the
+send buffer of the socket is full. `send_all` sends each byte of the lease, in as many sends of the
+kernel as it takes, and the driver sends the rest itself. Its future gives the length of the lease.
+
+- After `cancel()`, the future gives the count of the bytes that went before the cancel took
+  effect, or `ECANCELED` if none went.
+- If the stream fails after some bytes, for example at a reset of the peer, the future gives a
+  `WriteFailed` with the exact count of the bytes that went. If no byte went, it gives the error of
+  the kernel.
+- A drop of the future does not stop the send. It runs on until each byte went or it failed, and
+  the next send of the stream starts after it. If it fails, the write direction fails, and the next
+  send gives the count, as [A failed write direction](#a-failed-write-direction) tells.
+
+So a protocol can start the send of a response and receive the next request while the send runs.
+It then takes the result of the send, which has ended by then, with no wait. On a local stream:
+
+<!-- The same text as the doctest of `rsasync::local::TcpStream::send_all`. Edit both. -->
+```rust
+use rsasync::buffer::{Backing, Buffer as _, Lease};
+use rsasync::driver::TcpOptions;
+use rsasync::local::{TcpListener, TcpStream};
+use rsasync::runtime::Runtime;
+
+let runtime = Runtime::builder().build()?;
+runtime.block_on(async {
+    let mut listener = TcpListener::bind("127.0.0.1:0".parse()?, TcpOptions::default())?.await??;
+    let connect = TcpStream::connect(listener.local_addr(), TcpOptions::default())?;
+    let (mut server, _peer) = listener.accept()?.await??;
+    let mut client = connect.await??;
+    let (mut read, mut write) = server.split();
+
+    // The server sends the response to the first request, and receives the second request while
+    // the send runs. It then takes the result of the send, which ended.
+    client.send_all(Lease::from(b"one".to_vec()))?.await?.0?;
+    let request = read.recv_selected()?.await??;
+    let send = write.send_all(Lease::from(request))?;
+    client.send_all(Lease::from(b"two".to_vec()))?.await?.0?;
+    let next = read.recv_selected()?.await??;
+    let (sent, _lease) = send.await?;
+    assert_eq!((sent?, next.bytes()), (3, &b"two"[..]));
+
+    let (received, buffer) = client.recv(Backing::from(Vec::with_capacity(64)))?.await?;
+    assert_eq!(&buffer.bytes()[..received?], b"one");
+    Ok::<(), Box<dyn std::error::Error>>(())
+})??;
+```
 
 ## Send several regions
 
@@ -136,7 +186,7 @@ No byte and no connection is lost. These rules apply:
 | Operation | Its future drops or is forgotten | `Operation::cancel` |
 | --- | --- | --- |
 | Receive | The driver asks the kernel to cancel. The bytes that the receive got before the cancel took effect stay with the stream, in the receive's own buffer. The next receive gives them before it submits: `recv` copies as many as fit its buffer, and the stream keeps the rest; `recv_selected` gives that buffer. An error of the receive also stays, and the next receive gives it. Close releases the bytes that no receive took. A dropped `recv_selected` asks for no cancel when the stream has a [multishot receive](driver-only.md#one-multishot-receive-for-each-stream) (`Shot::Multi`, the default on io_uring) or is a [movable stream](#use-tcp-from-a-movable-task): the next `recv_selected` takes its bytes with no submission. So a protocol can drop a selected receive at the end of each call and lose nothing. With `Shot::Single`, the drop asks for a cancel, and the next receive submits again | The future gives the original buffer with the bytes that came before the cancel took effect, with no copy, or `ECANCELED` |
-| Send, vectored send, and half-close | The operation is not cancelled. If a send sends all its bytes, it reports nothing. If it fails, sends only part of its bytes, or was cancelled, the write direction fails: see below | The future gives the lease or the regions with the exact count, or `ECANCELED`. The direction stays usable. On Windows, a cancel of a send that runs in the kernel aborts the connection: see [IOCP backend](iocp.md#differences-from-linux) |
+| Send, send of each byte, vectored send, and half-close | The operation is not cancelled, and a send of each byte sends each byte. If a send sends all its bytes, it reports nothing. If it fails, sends only part of its bytes, or was cancelled, the write direction fails: see below | The future gives the lease or the regions with the exact count, or `ECANCELED`. The direction stays usable. On Windows, a cancel of a send that runs in the kernel aborts the connection: see [IOCP backend](iocp.md#differences-from-linux) |
 | Accept | The driver asks the kernel to cancel. A connection that the accept took before the cancel took effect stays with the listener, and the next accept gives it, with its peer address, before it submits. Close of the listener closes it | The future gives the connection that the accept took before the cancel took effect, or `ECANCELED` |
 | Connect | The driver asks the kernel to cancel. A connection that completes after the drop is closed at its end, so no descriptor stays open, and the peer reads the end of the stream | The future gives the stream that the connect made before the cancel took effect, or `ECANCELED` |
 | Bind | The driver asks the kernel to cancel, and it closes the listener that the bind made | The future gives the listener that the bind made before the cancel took effect, or `ECANCELED` |
@@ -213,7 +263,7 @@ same as on the driver.
 | `listener.accept()` | `Driver::accept` |
 | `TcpStream::connect(address, options)` | `Driver::connect` |
 | `stream.recv(backing)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send_vectored` |
-| `stream.send(lease)` | `Driver::send`. The future is a `rsasync::local::Transmit` |
+| `stream.send(lease)`, `stream.send_all(lease)` | `Driver::send`, `Driver::send_all`. The future is a `rsasync::local::Transmit` |
 | `stream.recv_selected()` | `Driver::recv_selected`, into the provided buffers of the owner. The future is a `rsasync::local::Receive` |
 | `stream.shutdown_write()` | `Driver::shutdown_write` |
 | `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
@@ -240,7 +290,7 @@ filled. When no buffer waits, the driver keeps the waker of the poll with the st
   result, the `Receive` is an operation of `Driver::recv_selected`, with the rules of
   [Dropped, forgotten, and cancelled operations](#dropped-forgotten-and-cancelled-operations).
 
-The future of `send(lease)` is a `rsasync::local::Transmit`, with `cancel()` and the output
+The future of `send(lease)` and of `send_all(lease)` is a `rsasync::local::Transmit`, with `cancel()` and the output
 `(io::Result<usize>, Lease)`. On io_uring, a `Transmit` is no operation of the driver, so it holds
 no operation slot: the driver keeps the lease with the stream until the kernel ends the send, and
 that completion wakes the future. The rules of a send stay the same:

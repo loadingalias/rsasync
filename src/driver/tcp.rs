@@ -859,12 +859,17 @@ struct Sending {
     lease: Option<Lease>,
     /// The result of the terminal event, until the take.
     result: Option<i32>,
+    /// The bytes that the earlier sends of the kernel of a send of each byte sent.
+    went: usize,
     /// The terminal event did not come.
     runs: bool,
     /// A future has interest in the result.
     interest: bool,
     /// The driver asked the kernel to cancel the send.
     cancelled: bool,
+    /// The send sends each byte of the lease, in as many sends of the kernel as it takes
+    /// ([`Kind::SendAll`]).
+    all: bool,
 }
 
 /// The directions of a stream or a listener, at the home.
@@ -887,13 +892,19 @@ pub(super) struct Directions {
     #[cfg(all(feature = "local", target_os = "linux"))]
     reading: bool,
     sent: Sent,
-    /// An operation of the table started on the resource, its close started, or a send of the
-    /// record took the abandoned rule. Before that, `read`, `write`, `kept`, `unreported`, and
-    /// `closing` hold nothing, so the record does not read them.
+    /// An operation of the table started on the resource, or its close started. Before that,
+    /// `read`, `write`, `kept`, and `closing` hold nothing, so the record does not read them.
     operated: bool,
+    /// The send of each byte of the write direction sent only part of its bytes, and its rest goes
+    /// again at the next attend ([`Driver::resend`]): the operation that runs, or the send of the
+    /// record.
+    again: bool,
     /// The terminal result of the last multishot receive, after `shelved`: the end of the stream,
     /// or an error.
     ended: Option<i32>,
+    /// The bytes that dropped sends sent, since the end of the last send whose result a future
+    /// took, or since the last report.
+    unreported: usize,
     /// The buffers that `armed` filled and no receive took, after `kept`.
     shelved: Shelved,
     /// The waiter of the local receive that waits, which a completion of `armed` wakes.
@@ -904,9 +915,6 @@ pub(super) struct Directions {
     read: Direction,
     write: Direction,
     kept: Option<Kept>,
-    /// The bytes that dropped sends sent, since the end of the last send whose result a future
-    /// took, or since the last report.
-    unreported: usize,
     /// The close that waits for the operations of the resource.
     closing: Option<Closing>,
 }
@@ -938,7 +946,9 @@ impl Directions {
             Kind::Recv | Kind::Selected | Kind::Accept | Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => {
                 Some(&mut self.read)
             }
-            Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
+            Kind::Send | Kind::SendAll | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => {
+                Some(&mut self.write)
+            }
             Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
             Kind::File(_) => None,
             #[cfg(unix)]
@@ -988,6 +998,16 @@ impl Directions {
         core::mem::take(&mut self.reader)
     }
 
+    /// The send of each byte of the write direction goes again with its rest. Gives whether the
+    /// resource now needs the home, and it is not in the pending list yet. A `true` puts it there:
+    /// the caller pushes it.
+    pub(super) fn send_again(&mut self) -> bool {
+        self.again = true;
+        let needs = !self.pending;
+        self.pending = true;
+        needs
+    }
+
     /// Whether the record of the stream holds a send whose terminal event did not come
     /// ([`Driver::send_record`]).
     const fn record_sends(&self) -> bool {
@@ -1005,12 +1025,26 @@ impl Directions {
         }
     }
 
-    /// The terminal event of the send of the record, with `result`. A future with interest takes
-    /// the result later, and the caller wakes the waiter that this gives. Else the abandoned rule
-    /// applies now, and the lease drops. Gives also whether the resource needs the home now, as
-    /// [`Directions::needs_home`] does: the caller then pushes it.
+    /// The completion of the send of the record, with `result`. At its terminal event, a future
+    /// with interest takes the result later, and the caller wakes the waiter that this gives. Else
+    /// the abandoned rule applies now, and the lease drops. Gives also whether the resource needs
+    /// the home now, as [`Directions::needs_home`] does: the caller then pushes it.
+    ///
+    /// A send of each byte that sent a byte and has bytes left, with no cancel, goes again: the
+    /// waiter is then `None`, the send runs on, and the resource needs the home.
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(super) fn record_sent(&mut self, result: i32) -> (bool, super::home::Waiter) {
+    pub(super) fn record_sent(&mut self, mut result: i32) -> (bool, Option<super::home::Waiter>) {
+        if self.sending.all
+            && let Ok(went) = usize::try_from(result)
+        {
+            let sending = &mut self.sending;
+            sending.went = sending.went.saturating_add(went);
+            result = 0;
+            let len = sending.lease.as_ref().map_or(0, |lease| lease.initialized());
+            if went > 0 && sending.went < len && !sending.cancelled {
+                return (self.send_again(), None);
+            }
+        }
         self.sending.runs = false;
         let waiter = if self.sending.interest {
             self.sending.result = Some(result);
@@ -1020,7 +1054,7 @@ impl Directions {
             super::home::Waiter::None
         };
         // With no operation and no close, nothing waits for the send.
-        (self.operated && self.needs_home(), waiter)
+        (self.operated && self.needs_home(), Some(waiter))
     }
 
     /// The abandoned rule for the send of the record, which ended with `result`: its lease drops,
@@ -1028,15 +1062,20 @@ impl Directions {
     /// direction fail ([`Directions::abandon`]).
     #[cfg(all(feature = "local", target_os = "linux"))]
     fn abandon_record_send(&mut self, result: i32) {
-        let Sending { lease, cancelled, .. } = core::mem::take(&mut self.sending);
-        // The rule can make the direction owe a count.
-        self.operated = true;
+        let Sending {
+            lease,
+            cancelled,
+            went,
+            all,
+            ..
+        } = core::mem::take(&mut self.sending);
         if let Some(lease) = lease {
             let held = Held {
                 cancelled,
+                copied: went,
                 ..Held::with_payload(Payload::Lease(lease))
             };
-            self.abandon(Kind::Send, result, held);
+            self.abandon(if all { Kind::SendAll } else { Kind::Send }, result, held);
         }
     }
 
@@ -1070,13 +1109,14 @@ impl Directions {
             sending.waiter.set(task, waker);
             return Some(Poll::Pending);
         };
-        let lease = core::mem::take(sending).lease?;
+        let Sending { lease, went, all, .. } = core::mem::take(sending);
         // A send result that a future took reports each byte up to its end, as at
         // [`Directions::taken`].
-        if self.operated && self.sent == Sent::Ok {
+        if self.sent == Sent::Ok {
             self.unreported = 0;
         }
-        Some(Poll::Ready((count(result), lease)))
+        let sent = if all { all_count(result, went) } else { count(result) };
+        Some(Poll::Ready((sent, lease?)))
     }
 
     /// Ends the records of the stream at the drop of the driver, and gives their waiters, which the
@@ -1180,7 +1220,7 @@ impl Directions {
         {
             direction.current = None;
         }
-        if matches!(kind, Kind::Send | Kind::Vectored) && self.sent == Sent::Ok {
+        if matches!(kind, Kind::Send | Kind::SendAll | Kind::Vectored) && self.sent == Sent::Ok {
             self.unreported = 0;
         }
     }
@@ -1211,7 +1251,7 @@ impl Directions {
                     self.kept = Some(Kept::Error(result));
                 }
             }
-            Kind::Send | Kind::Vectored | Kind::Shutdown => {
+            Kind::Send | Kind::SendAll | Kind::Vectored | Kind::Shutdown => {
                 if let Some(failed) = held.failed {
                     // The future did not take the failure: the next send gives it.
                     match failed.sent {
@@ -1228,7 +1268,12 @@ impl Directions {
                 if kind == Kind::Shutdown {
                     return;
                 }
-                let sent = usize::try_from(result).unwrap_or(0);
+                // A send of each byte that a cancel or a failure ended counts the bytes that went.
+                let sent = if kind == Kind::SendAll {
+                    held.copied
+                } else {
+                    usize::try_from(result).unwrap_or(0)
+                };
                 let len = match &held.payload {
                     Payload::Lease(lease) => lease.initialized(),
                     Payload::Regions(regions) => regions.total(),
@@ -1240,7 +1285,8 @@ impl Directions {
                     self.sent = Sent::Lost;
                     return;
                 }
-                if (result < 0 || sent < len || held.cancelled) && self.sent == Sent::Ok {
+                let short = sent < len || kind != Kind::SendAll && (result < 0 || held.cancelled);
+                if short && self.sent == Sent::Ok {
                     self.sent = Sent::Owe;
                 }
             }
@@ -1391,7 +1437,7 @@ impl Directions {
                 Some(count)
             }
             (Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch, Some(Kept::Error(error))) => Some(error),
-            (Kind::Send | Kind::Vectored | Kind::Shutdown, kept) => {
+            (Kind::Send | Kind::SendAll | Kind::Vectored | Kind::Shutdown, kept) => {
                 self.kept = kept;
                 match self.sent {
                     Sent::Ok => None,
@@ -1424,7 +1470,7 @@ impl Directions {
                     || self.armed != Armed::No
             }
             Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
-            Kind::Send | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
+            Kind::Send | Kind::SendAll | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
             Kind::RecvFrom | Kind::RecvSelectedFrom | Kind::RecvBatch => matches!(
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
@@ -1538,6 +1584,48 @@ pub(crate) fn sent(result: i32, held: &mut Held) -> Option<(io::Result<usize>, L
         .failed
         .map_or_else(|| count(result), |failed| Err(io::Error::other(failed)));
     Some((sent, held.payload.take_lease()?))
+}
+
+/// The output of a send of each byte ([`Kind::SendAll`]): the count of the bytes that went, or the
+/// failure of the write direction, and the lease.
+pub(crate) fn sent_all(result: i32, held: &mut Held) -> Option<(io::Result<usize>, Lease)> {
+    let sent = held.failed.map_or_else(
+        || all_count(result, held.copied),
+        |failed| Err(io::Error::other(failed)),
+    );
+    Some((sent, held.payload.take_lease()?))
+}
+
+/// The output of a send of each byte that ended with `result` after `went` bytes: the count of the
+/// bytes, which is each byte when `result` is 0, or the count that a cancel left. A failure after
+/// some bytes gives [`WriteFailed`] with their count, and else the error of the kernel.
+fn all_count(result: i32, went: usize) -> io::Result<usize> {
+    if result >= 0 || went > 0 && result == -ECANCELED {
+        Ok(went)
+    } else if went > 0 {
+        Err(io::Error::other(WriteFailed {
+            sent: SendCount::Sent(went),
+        }))
+    } else {
+        count(result)
+    }
+}
+
+/// The completion of one send of the kernel of a send of each byte, with `event`: the bytes that
+/// went join `held.copied`. Gives `true` when bytes remain, the send sent a byte, and no cancel
+/// came: the send then goes again with the rest. Else `event` gets the result of the end: 0 when
+/// the kernel sent, or its error.
+pub(super) fn sent_part(held: &mut Held, event: &mut super::Event) -> bool {
+    let Ok(went) = usize::try_from(event.result) else {
+        return false;
+    };
+    held.copied = held.copied.saturating_add(went);
+    event.result = 0;
+    let len = match &held.payload {
+        Payload::Lease(lease) => lease.initialized(),
+        _ => 0,
+    };
+    went > 0 && held.copied < len && !held.cancelled
 }
 
 /// The output of a bind: the listener and its local address.
@@ -1944,6 +2032,27 @@ impl Driver {
         let held = |lease| Held::with_payload(Payload::Lease(lease));
         let completion = self.begin(writer.as_mut().resource, Kind::Send, lease, held)?;
         Ok(Operation::new(completion, sent))
+    }
+
+    /// Sends each byte of `lease`, in as many sends of the kernel as it takes: a send that sent only
+    /// part of its bytes goes again with the rest. The future gives the count of the bytes, which
+    /// is the length of the lease, and the lease. After a cancel it gives the count of the bytes
+    /// that went, or `ECANCELED`. A failure after some bytes gives a [`WriteFailed`] with their
+    /// count, and a failure before them the error of the kernel. A drop of the future does not
+    /// cancel the send: it runs on until each byte went or the send failed, and a failure then
+    /// fails the write direction, so the next send gives the count (see [`TcpStream`]).
+    ///
+    /// # Errors
+    ///
+    /// A refusal, with the lease, when the driver has no room for the operation.
+    pub fn send_all<'a, W: AsMut<WriteHalf>>(
+        &mut self,
+        writer: &'a mut W,
+        lease: Lease,
+    ) -> Result<Operation<'a, (io::Result<usize>, Lease)>, Refused<Lease>> {
+        let held = |lease| Held::with_payload(Payload::Lease(lease));
+        let completion = self.begin(writer.as_mut().resource, Kind::SendAll, lease, held)?;
+        Ok(Operation::new(completion, sent_all))
     }
 
     /// Takes `fd`, a connected TCP socket, as a stream of this driver: for example a connection
@@ -2475,13 +2584,14 @@ impl Driver {
         waiter
     }
 
-    /// Starts the send of `lease` of a local stream in the record of the stream, with no operation
-    /// ([`Driver::poll_send`]): on io_uring, when `writer` is a stream socket whose write direction
-    /// runs, keeps waiting, and owes no operation and no report, and whose record holds no send
-    /// that runs. A send of the record whose future was forgotten ends its interest first. Gives
-    /// `lease` back when the send needs an operation of [`Driver::send`].
+    /// Starts the send of `lease` of a local stream, of `kind` ([`Kind::Send`] or
+    /// [`Kind::SendAll`]), in the record of the stream, with no operation ([`Driver::poll_send`]):
+    /// on io_uring, when `writer` is a stream socket whose write direction runs, keeps waiting, and
+    /// owes no operation and no report, and whose record holds no send that runs. A send of the
+    /// record whose future was forgotten ends its interest first. Gives `lease` back when the send
+    /// needs an operation of [`Driver::send`] or [`Driver::send_all`].
     #[cfg(all(feature = "local", target_os = "linux"))]
-    pub(crate) fn send_record(&mut self, writer: &WriteHalf, lease: Lease) -> Result<(), Lease> {
+    pub(crate) fn send_record(&mut self, writer: &WriteHalf, lease: Lease, kind: Kind) -> Result<(), Lease> {
         let resource = writer.resource;
         if !matches!(self.queue, super::queue::Queue::Ring(_)) {
             return Err(lease);
@@ -2522,6 +2632,7 @@ impl Driver {
                 lease: Some(lease),
                 runs: true,
                 interest: true,
+                all: kind == Kind::SendAll,
                 ..Sending::default()
             };
         }
@@ -2879,6 +2990,96 @@ impl Driver {
         true
     }
 
+    /// Pushes again the rest of the send of each byte of the write direction of `resource` that
+    /// sent only part of its bytes ([`Directions::send_again`]): the send of the record, or the
+    /// operation that runs. An operation that a cancel reached meanwhile ends now, with the bytes
+    /// that went. Gives `false`, and keeps the resource pending, when the queue has no room.
+    fn resend(&mut self, resource: Resource) -> bool {
+        let Some(owned) = self.resources.get(resource) else {
+            return true;
+        };
+        if !core::mem::take(&mut owned.directions.again) {
+            return true;
+        }
+        let (Some(fd), pipe, place) = (owned.number(), owned.medium == Medium::Pipe, owned.place(resource)) else {
+            return true;
+        };
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        let record = owned.directions.record_sends();
+        #[cfg(not(all(feature = "local", target_os = "linux")))]
+        let record = false;
+        // A cancel that came between two sends of the kernel ends the send now, with the bytes
+        // that went.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if record && owned.directions.sending.cancelled {
+            let (needs, waiter) = owned.directions.record_sent(-ECANCELED);
+            if let Some(waiter) = waiter {
+                self.consumers.wake_waiter(waiter);
+                self.resources.in_flight -= 1;
+            }
+            if needs {
+                self.pending.push(resource);
+            }
+            return true;
+        }
+        let current = owned.directions.write.current;
+        if !record && let Some(id) = current {
+            let mut cancelled = false;
+            self.hold(id, |held| cancelled = held.cancelled);
+            if cancelled {
+                self.complete_now(id, 0);
+                return true;
+            }
+        }
+        if !self.room(1) {
+            if let Some(owned) = self.resources.get(resource) {
+                owned.directions.again = true;
+                if !owned.directions.pending {
+                    owned.directions.pending = true;
+                    self.pending.push(resource);
+                }
+            }
+            return false;
+        }
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if record {
+            let Some(owned) = self.resources.get(resource) else {
+                return true;
+            };
+            let sending = &owned.directions.sending;
+            let rest = sending
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.bytes().get(sending.went..))
+                .unwrap_or_default();
+            let (bytes, len) = (rest.as_ptr(), u32::try_from(rest.len()).unwrap_or(u32::MAX));
+            let sqe = Sqe::send(fd, bytes, len).with_user_data(resource.record(super::Half::Write));
+            let sqe = place.map_or(sqe, |place| sqe.fixed_file(fd, place));
+            // SAFETY: the entry names the rest of the bytes of the lease, which the record keeps
+            // until the terminal event, and the descriptor of `resource`, which stays open until
+            // its close, after that event. The queue has room.
+            #[expect(unsafe_code, reason = "the kernel reads the bytes of the lease")]
+            let pushed = unsafe { self.queue.push(&sqe, None) }.is_ok();
+            assert!(pushed, "the queue has room for the entry");
+            return true;
+        }
+        if let Some(id) = current {
+            let group = self.selected.as_ref().map_or(0, |selected| selected.ring.group());
+            let slot_len = self.selected.as_ref().map_or(0, |selected| selected.len as usize);
+            // SAFETY: the entry names the rest of the lease in the resources of `id`, which the
+            // home keeps until its terminal event, and the descriptor of `resource`, which stays
+            // open until its close, after each of its operations ends. The queue has room.
+            #[expect(unsafe_code, reason = "the kernel reads the bytes of the lease")]
+            unsafe {
+                self.push(id, |held| {
+                    let sqe = submission(held, Kind::SendAll, fd, pipe, group, slot_len);
+                    place.map_or(sqe, |place| sqe.fixed_file(fd, place))
+                });
+            }
+        }
+        true
+    }
+
     /// Starts each operation that waits for an operation that ended, and ends each close whose
     /// resource has no running operation.
     pub(super) fn attend(&mut self) {
@@ -2888,6 +3089,9 @@ impl Driver {
             };
             owned.directions.pending = false;
             self.attend_armed(resource);
+            if !self.resend(resource) {
+                return;
+            }
             for kind in [Kind::Recv, Kind::Send] {
                 let table = &self.table;
                 let Some(owned) = self.resources.get(resource) else {
@@ -3103,8 +3307,11 @@ pub(super) fn submission(held: &mut Held, kind: Kind, fd: i32, pipe: bool, group
         }
         (Kind::Selected, _, _) if pipe => Sqe::read_selected(fd, group),
         (Kind::Selected, _, _) => Sqe::recv_selected(fd, group),
-        (Kind::Send, Payload::Lease(lease), _) => {
-            let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
+        (Kind::Send | Kind::SendAll, Payload::Lease(lease), _) => {
+            // A send of each byte sends the bytes that its earlier sends did not.
+            let rest = if kind == Kind::SendAll { held.copied } else { 0 };
+            let bytes = lease.bytes().get(rest..).unwrap_or_default();
+            let (bytes, len) = (bytes.as_ptr(), u32::try_from(bytes.len()).unwrap_or(u32::MAX));
             if pipe {
                 Sqe::write(fd, bytes, len)
             } else {

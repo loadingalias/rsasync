@@ -8,7 +8,7 @@
 use std::io;
 use std::path::Path;
 
-use super::{Home, Homed, Operation, ReadHalf, Transmit, WriteHalf, call, rewrap, submit};
+use super::{Each, Home, Homed, Operation, ReadHalf, Transmit, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Closed, Completion, Driver, Peer, Refused, Regions, Stale};
 
@@ -144,7 +144,20 @@ impl IpcStream {
     ///
     /// As for [`IpcStream::recv`], with the lease.
     pub fn send(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
-        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease)
+        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease, Each::Send)
+    }
+
+    /// Sends each byte of `lease`, as [`Driver::send_all`](crate::driver::Driver::send_all) does,
+    /// in as many sends of the kernel as it takes. The future gives the length of the lease, and
+    /// the lease. A drop of the future does not stop the send: it runs on until each byte went or
+    /// the send failed, and a failure fails the write direction, so the next send gives the count.
+    /// So a protocol can drop the future at once and receive the next request.
+    ///
+    /// # Errors
+    ///
+    /// As for [`IpcStream::recv`], with the lease.
+    pub fn send_all(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
+        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease, Each::Byte)
     }
 
     /// Sends the bytes of `regions` in order, in one operation, as [`Driver::send_vectored`] does.

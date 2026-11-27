@@ -449,7 +449,8 @@ pub(crate) struct Held {
     pub(crate) cancelled: bool,
     /// An error of the home that the future gives in place of the result of the kernel.
     pub(crate) error: Option<io::ErrorKind>,
-    /// The bytes that a receive copied from the data that an abandoned receive left.
+    /// The bytes that a receive copied from the data that an abandoned receive left, or the bytes
+    /// that the earlier sends of the kernel of a send of each byte sent ([`Kind::SendAll`]).
     pub(crate) copied: usize,
     /// A send on a failed direction gives this error, with no submission.
     pub(crate) failed: Option<WriteFailed>,
@@ -592,6 +593,10 @@ pub(crate) enum Kind {
     Selected,
     /// A send of the lease.
     Send,
+    /// A send of each byte of the lease, in as many sends of the kernel as it takes: a send that
+    /// sent only part of its bytes goes again with the rest (`Held::copied` counts the bytes that
+    /// went), until each byte went, the send failed, or a cancel took effect.
+    SendAll,
     /// A send of the regions, in order.
     Vectored,
     /// A shutdown of the write side of a stream.
@@ -633,7 +638,7 @@ impl Kind {
     pub(crate) const fn writes(self) -> bool {
         matches!(
             self,
-            Self::Send | Self::Vectored | Self::Shutdown | Self::SendTo | Self::SendBatch
+            Self::Send | Self::SendAll | Self::Vectored | Self::Shutdown | Self::SendTo | Self::SendBatch
         )
     }
 
@@ -2407,6 +2412,8 @@ impl Driver {
                 }
                 _ => {}
             }
+            // A send of each byte between two of its sends ends at its next start.
+            self.hold(id, |held| held.cancelled = true);
             push_cancel(&mut self.queue, id)?;
             cancelled = cancelled.saturating_add(1);
         }
@@ -2792,7 +2799,7 @@ impl Driver {
                 continue;
             }
             // The terminal completion of the send of a record wakes the future, or the abandoned
-            // rule applies to it.
+            // rule applies to it. A part of a send of each byte goes again after the harvest.
             #[cfg(all(feature = "local", target_os = "linux"))]
             if let Some((resource, Half::Write)) = resources.of_record(cqe.user_data) {
                 if let Some(owned) = resources.get(resource) {
@@ -2800,8 +2807,10 @@ impl Driver {
                     if needs {
                         pending.push(resource);
                     }
-                    consumers.wake_waiter(waiter);
-                    resources.in_flight -= 1;
+                    if let Some(waiter) = waiter {
+                        consumers.wake_waiter(waiter);
+                        resources.in_flight -= 1;
+                    }
                 }
                 continue;
             }
@@ -2849,6 +2858,34 @@ impl Driver {
                         (event.more, event.result) = udp::batch_completion(held, cqe.res, buffer);
                     }
                 });
+            }
+            // A send of each byte that sent only part of its bytes goes again with the rest, after
+            // the harvest: the table does not see this completion. Its last one ends it.
+            if let Some(id) = op
+                && let Some(Tag {
+                    kind: Kind::SendAll,
+                    resource,
+                    ..
+                }) = tagged
+                && table.runs(id)
+                && let Some(slot) = shared.entries.get(id.index() as usize)
+            {
+                let mut again = false;
+                slot.update(id, |held| {
+                    if let Some(held) = held {
+                        again = tcp::sent_part(held, &mut event);
+                    }
+                });
+                if again {
+                    if let Some(resource) = resource
+                        && resources
+                            .get(resource)
+                            .is_some_and(|owned| owned.directions.send_again())
+                    {
+                        pending.push(resource);
+                    }
+                    continue;
+                }
             }
             let outcome = table.complete(cqe.user_data, event);
             let (id, abandoned, tag) = match (outcome, op) {
@@ -2944,6 +2981,7 @@ fn finish(
         Kind::File(op) => file::finish(held, op, cqe.res, abandoned, resources),
         Kind::Other
         | Kind::Send
+        | Kind::SendAll
         | Kind::Vectored
         | Kind::Shutdown
         | Kind::Close
