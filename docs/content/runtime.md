@@ -311,14 +311,23 @@ worker that is pinned to one core cannot leave that core when it is busy.
 | `Placement` | What each worker gets | Use it when |
 | --- | --- | --- |
 | `Domain` (default) | The CPUs that share one last-level cache. The workers spread over the domains in proportion to their physical cores, and the kernel chooses the core in the domain. On a host with one domain, no binding | The process shares the host, or you do not know |
-| `Dedicated` | One CPU: one CPU of each physical core first, and the SMT siblings last, spread over the NUMA nodes and then over the cache domains of each node | The process owns the host, or a CPU set, for example on dedicated hardware or with exclusive CPUs |
+| `Dedicated` | One CPU: one CPU of each physical core first, and the SMT siblings last, spread over the NUMA nodes and then over the cache domains of each node. The CPUs of the network interrupts come last | The process owns the host, or a CPU set, for example on dedicated hardware or with exclusive CPUs |
 | `Exact(cpus)` | CPU `cpus[i]` for worker `i` | You plan the CPUs yourself, for example with `isolcpus` |
 | `Unpinned` | No binding | The kernel places each thread |
 
 A wrong pin on a shared host gives a tail latency with no bound, and two processes can pin onto the
 same CPUs. A missing pin on a dedicated host costs only the cache warmth of one core and the
-alignment with the interrupts of a network card. So the default does not pin. On a host that the
+alignment with the interrupts of a network device. So the default does not pin. On a host that the
 process owns, select `Dedicated` one time, in the configuration of that deployment.
+
+`Dedicated` gives a worker a CPU where an interrupt of a network device fires only when the other
+CPUs of the process do not hold each worker. On such a CPU, the interrupts and the network work
+that they start take time from the worker, so under load that worker reaches its limit first. The
+plan reads these CPUs one time, at the start: the effective affinity
+(`/proc/irq/<n>/effective_affinity_list`) of each interrupt of the PCI device of each interface in
+`/sys/class/net`. A host that shows no such interrupt, for example a container with its own network
+namespace, gives no CPUs to leave out, and `Dedicated` uses each CPU in its usual order. To pin a
+worker to such a CPU, name it in `Exact`.
 
 `Selection::Permissive` runs each worker whose placement falls back unpinned, and its report gives
 the `Fallback`. `Selection::Strict` refuses a plan that falls back with
@@ -367,7 +376,8 @@ is a fact of the plan, not of the load: the workers then compete only when both 
 tables and its driver after its binding, so their memory is on that node.
 
 `runtime.report().host()` gives the facts that the plan used: `online()`, `allowed()`,
-`isolated()`, `cores()`, `domains()`, `nodes()`, and `quota()`. A fact that the host did not give is
+`isolated()`, `cores()`, `domains()`, `nodes()`, `quota()`, and `network_interrupts()`, the CPUs
+where an interrupt of a network device fires. A fact that the host did not give is
 `None`, or `Quota::Unknown`, which is not the same as no limit. More CPUs than cores means SMT.
 `host.shows_dedication()` is true when the operator gave the process fewer CPUs than are online and
 no cgroup limits its CPU time, as in a Kubernetes pod with exclusive CPUs, or under `taskset`.

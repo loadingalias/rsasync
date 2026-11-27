@@ -132,6 +132,12 @@ spawn, the release, and the wake also run on epoll. No host with two NUMA nodes 
 domains ran them, so the spread of `Domain` and `Dedicated` over nodes and domains has only the
 test of the plan on the facts of such a host.
 
+The discovery of the CPUs of the network interrupts (`Host::network_interrupts`) has run on one
+host: the Linux VM of Docker Desktop on macOS (aarch64, musl), with the host network, where the
+virtio network device has one line interrupt on CPU 0. `Dedicated` then gave two workers CPUs 1
+and 2. The MSI and MSI-X interrupts of a PCI network device have only the test of the plan on given
+facts.
+
 The movable workers and the [movable TCP types](tcp.md#use-tcp-from-a-movable-task),
 `rsasync::movable`, run on io_uring only. The same runs passed their tests on each of the four
 hosts. The pool tests check a steal by an idle worker, a spawn from another thread while the queue

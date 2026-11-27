@@ -165,6 +165,8 @@ pub(crate) fn run(plan: &Plan) -> Result<(), String> {
     }
     let runtime = builder.build().map_err(|failure| format!("start: {failure:?}"))?;
     let mut output = std::io::stdout().lock();
+    let interrupts = runtime.report().host().network_interrupts();
+    writeln!(output, "network interrupts on {interrupts:?}").map_err(|error| format!("output: {error}"))?;
     for (index, worker) in runtime.report().workers().iter().enumerate() {
         writeln!(
             output,

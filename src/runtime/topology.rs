@@ -1,5 +1,6 @@
 //! The facts of the host that the placement uses, from the CPU set of the process
-//! (`sched_getaffinity`), `/sys/devices/system`, and the CPU limit of the cgroup.
+//! (`sched_getaffinity`), `/sys/devices/system`, the CPU limit of the cgroup, and the interrupts of
+//! the network devices (`/sys/class/net` and `/proc/irq`).
 //!
 //! A fact that the host does not give stays unknown, and the report says so: an unknown fact is
 //! not the same as no limit. Each read is one small file, and the discovery reads the file of a
@@ -9,6 +10,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::AllocError;
+use core::ffi::CStr;
 use core::fmt;
 use std::io::{self, Read as _, Write as _};
 
@@ -26,9 +28,16 @@ const CACHE_INDEXES: u32 = 16;
 /// The most levels of the cgroup tree that the discovery reads for the CPU limit.
 const CGROUP_DEPTH: usize = 64;
 
-/// The most bytes of a path of `/sys` that the discovery makes. The longest, the shared CPU list
-/// of a cache index, has about 64.
+/// The most bytes of a path of `/sys` that the discovery makes, with its 0 byte. The longest, the
+/// shared CPU list of a cache index, has about 64.
 const PATH_BYTES: usize = 96;
+
+/// The most network interfaces that the discovery reads.
+const INTERFACES: u32 = 4096;
+
+/// The most interrupts of one network device that the discovery reads: the most MSI-X vectors of
+/// one PCI function.
+const VECTORS: u32 = 2048;
 
 /// The CPU limit of the cgroup of the process (`cpu.max` of cgroup v2), the smallest on its path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +64,7 @@ pub struct Host {
     /// For each CPU index: its NUMA node.
     pub(super) node: Box<[Option<u32>]>,
     pub(super) quota: Quota,
+    pub(super) network_interrupts: Option<CpuSet>,
 }
 
 impl Host {
@@ -105,6 +115,18 @@ impl Host {
     #[must_use]
     pub const fn quota(&self) -> Quota {
         self.quota
+    }
+
+    /// The CPUs where an interrupt of a network device fires: the effective affinity
+    /// (`/proc/irq/<n>/effective_affinity_list`) of each interrupt of the PCI device of each network
+    /// interface, its MSI and MSI-X interrupts, or with none, its line interrupt.
+    /// [`Placement::Dedicated`] takes these CPUs last. `None` if the host showed no such interrupt,
+    /// for example in a container with its own network namespace.
+    ///
+    /// [`Placement::Dedicated`]: super::Placement::Dedicated
+    #[must_use]
+    pub const fn network_interrupts(&self) -> Option<&CpuSet> {
+        self.network_interrupts.as_ref()
     }
 
     /// Whether the facts show a CPU set that the process owns: the operator gave the process fewer
@@ -245,6 +267,7 @@ pub(super) fn discover() -> Result<Host, AllocError> {
         domain,
         node,
         quota: quota(&mut buffer)?,
+        network_interrupts: network_interrupts(&mut buffer)?,
     })
 }
 
@@ -284,6 +307,48 @@ fn last_level_cache(buffer: &mut Vec<u8>, cpu: u32) -> Result<Option<CpuSet>, Al
     };
     let path = format_args!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}/shared_cpu_list");
     Ok(read_at(buffer, path)?.and_then(cpu_list))
+}
+
+/// The CPUs of each interrupt of a network device, or `None` if no interrupt gave its CPUs, or a list
+/// of a directory failed or passed its limit. The interrupts of a PCI device are its MSI and MSI-X
+/// interrupts (`msi_irqs`), or with none, its line interrupt (`irq`, 0 for none). A virtio device
+/// has neither, and the PCI device that carries it is its parent.
+fn network_interrupts(buffer: &mut Vec<u8>) -> Result<Option<CpuSet>, AllocError> {
+    let mut cpus: Option<CpuSet> = None;
+    let mut complete = true;
+    let listed = list(format_args!("/sys/class/net"), INTERFACES, |interface| {
+        let virtio = read_at(buffer, format_args!("/sys/class/net/{interface}/device/modalias"))?
+            .is_some_and(|alias| alias.starts_with("virtio:"));
+        let parent = if virtio { "/.." } else { "" };
+        let path = format_args!("/sys/class/net/{interface}/device{parent}/msi_irqs");
+        let listed = list(path, VECTORS, |irq| match irq.parse() {
+            Ok(irq) => fires(buffer, irq, &mut cpus),
+            Err(_) => Ok(()),
+        })?;
+        if listed == Listed::Missing
+            && let Some(irq) = read_at(buffer, format_args!("/sys/class/net/{interface}/device{parent}/irq"))?
+                .and_then(|irq| irq.parse().ok())
+                .filter(|irq| *irq != 0)
+        {
+            fires(buffer, irq, &mut cpus)?;
+        }
+        // An interface with no device, such as the loopback, has no list.
+        complete &= listed != Listed::Failed;
+        Ok(())
+    })?;
+    Ok(cpus.filter(|_| complete && listed == Listed::Complete))
+}
+
+/// Adds the CPUs where interrupt `irq` fires to `cpus`, if the host gives them.
+fn fires(buffer: &mut Vec<u8>, irq: u32, cpus: &mut Option<CpuSet>) -> Result<(), AllocError> {
+    let path = format_args!("/proc/irq/{irq}/effective_affinity_list");
+    if let Some(fires) = read_at(buffer, path)?.and_then(cpu_list) {
+        let cpus = cpus.get_or_insert_default();
+        for cpu in fires.iter() {
+            cpus.insert(cpu);
+        }
+    }
+    Ok(())
 }
 
 /// The smallest CPU limit on the cgroup v2 path of the process.
@@ -367,18 +432,65 @@ fn read<'a>(buffer: &'a mut Vec<u8>, path: &str) -> Result<Option<&'a str>, Allo
     Ok(core::str::from_utf8(buffer).ok().map(str::trim))
 }
 
-/// [`read`] of the path that `path` writes, which the discovery writes on the stack. A path longer
-/// than `PATH_BYTES` gives `None`.
+/// [`read`] of the path that `path` writes. A path longer than `PATH_BYTES` gives `None`.
 fn read_at<'a>(buffer: &'a mut Vec<u8>, path: fmt::Arguments<'_>) -> Result<Option<&'a str>, AllocError> {
+    at(path, |path| path.to_str().map_or(Ok(None), |path| read(buffer, path))).unwrap_or(Ok(None))
+}
+
+/// `with` of the path that `path` writes, which the discovery writes on the stack with its 0 byte,
+/// or `None` if it is longer than `PATH_BYTES`.
+fn at<T>(path: fmt::Arguments<'_>, with: impl FnOnce(&CStr) -> T) -> Option<T> {
     let mut bytes = [0; PATH_BYTES];
-    let mut cursor = io::Cursor::new(&mut bytes[..]);
-    if cursor.write_fmt(path).is_err() {
-        return Ok(None);
-    }
-    let len = usize::try_from(cursor.position()).unwrap_or(PATH_BYTES);
-    match core::str::from_utf8(&bytes[..len]) {
-        Ok(path) => read(buffer, path),
-        Err(_) => Ok(None),
+    // The last byte stays 0, so the path ends at its first 0 byte.
+    io::Cursor::new(&mut bytes[..PATH_BYTES - 1]).write_fmt(path).ok()?;
+    CStr::from_bytes_until_nul(&bytes).ok().map(with)
+}
+
+/// What [`list`] read of a directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Listed {
+    /// The path is missing, or it is not a directory.
+    Missing,
+    /// The open or a read failed for another cause, or the directory had more entries than its
+    /// limit.
+    Failed,
+    /// Each entry.
+    Complete,
+}
+
+/// Gives `each` the name of each entry of the directory at `path`, other than `.` and `..`, up to
+/// `limit` entries. A name that is not text counts toward the limit, and `each` does not get it.
+fn list(
+    path: fmt::Arguments<'_>,
+    limit: u32,
+    mut each: impl FnMut(&str) -> Result<(), AllocError>,
+) -> Result<Listed, AllocError> {
+    let mut directory = match at(path, sys::Directory::open) {
+        Some(Ok(directory)) => directory,
+        Some(Err(error)) if !matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+            return Ok(Listed::Failed);
+        }
+        _ => return Ok(Listed::Missing),
+    };
+    let mut entries = 0;
+    // Each pass reads one entry. `limit` bounds the entries other than `.` and `..`, which come one
+    // time each.
+    loop {
+        let name = match directory.next() {
+            Ok(Some(name)) => name,
+            Ok(None) => return Ok(Listed::Complete),
+            Err(_) => return Ok(Listed::Failed),
+        };
+        if name == c"." || name == c".." {
+            continue;
+        }
+        if entries == limit {
+            return Ok(Listed::Failed);
+        }
+        entries += 1;
+        if let Ok(name) = name.to_str() {
+            each(name)?;
+        }
     }
 }
 

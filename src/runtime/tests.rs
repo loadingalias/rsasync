@@ -374,11 +374,44 @@ fn two_node_host() -> Host {
         domain: (0..16).map(|cpu| Some(cpu % 8 / 2 * 2)).collect(),
         node: (0..16).map(|cpu| Some(cpu % 8 / 4)).collect(),
         quota: Quota::None,
+        network_interrupts: None,
+    }
+}
+
+/// [`two_node_host`] with the interrupts of a network device on CPUs 0, 4, and 5, and on CPU 20,
+/// which is not in the CPU set of the process.
+fn network_host() -> Host {
+    let mut network = CpuSet::new();
+    for cpu in [0, 4, 5, 20] {
+        network.insert(cpu);
+    }
+    Host {
+        network_interrupts: Some(network),
+        ..two_node_host()
     }
 }
 
 fn cpus(set: &CpuSet) -> Vec<u32> {
     set.iter().collect()
+}
+
+/// `Dedicated` gives a worker a CPU where an interrupt of a network device fires only when the
+/// other CPUs of the process do not hold each worker, and never a CPU outside that set.
+#[test]
+fn dedicated_placement_takes_the_cpus_of_network_interrupts_last() {
+    let host = network_host();
+    let order = |workers| -> Vec<u32> {
+        placement::resolve(&Placement::Dedicated, Selection::Strict, workers, &host)
+            .unwrap()
+            .iter()
+            .map(|plan| plan.resolved().unwrap().iter().next().unwrap())
+            .collect()
+    };
+    let network = [0, 4, 5];
+    assert!(order(13).iter().all(|cpu| !network.contains(cpu)));
+    let mut last = order(16).split_off(13);
+    last.sort_unstable();
+    assert_eq!(last, network);
 }
 
 /// `Dedicated` takes one CPU of each physical core first, in turn over the nodes and then over the
@@ -736,15 +769,19 @@ fn a_start_that_the_allocator_refuses_gives_allocation() {
     }
 }
 
-/// Each refusal of the allocator in the plans of `Dedicated` and of `Domain` gives
-/// `Cause::Allocation`, and keeps no memory.
+/// Each refusal of the allocator in the plans of `Dedicated`, with and without network CPUs, and of
+/// `Domain` gives `Cause::Allocation`, and keeps no memory.
 #[test]
 fn a_plan_that_the_allocator_refuses_gives_allocation() {
     use crate::table::tests::allocations::each_refusal;
 
-    let host = two_node_host();
-    for (placement, workers) in [(Placement::Dedicated, 16), (Placement::Domain, 6)] {
-        let refusals = each_refusal(|| placement::resolve(&placement, Selection::Strict, workers, &host));
+    let (host, network) = (two_node_host(), network_host());
+    for (placement, workers, host) in [
+        (Placement::Dedicated, 16, &host),
+        (Placement::Dedicated, 16, &network),
+        (Placement::Domain, 6, &host),
+    ] {
+        let refusals = each_refusal(|| placement::resolve(&placement, Selection::Strict, workers, host));
         assert!(!refusals.is_empty());
         for (cause, held) in refusals {
             assert_matches!(cause, Cause::Allocation);

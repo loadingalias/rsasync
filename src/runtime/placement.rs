@@ -90,6 +90,15 @@ impl CpuSet {
         }
         Self { words }
     }
+
+    /// The CPUs of this set that `other` does not have.
+    fn without(&self, other: &Self) -> Self {
+        let mut words = self.words;
+        for (word, other) in words.iter_mut().zip(other.words) {
+            *word &= !other;
+        }
+        Self { words }
+    }
 }
 
 impl Default for CpuSet {
@@ -132,8 +141,10 @@ pub enum Placement {
     /// no cache facts, the NUMA nodes are the domains.
     Domain,
     /// Pins each worker to one CPU: one CPU of each physical core first, and the SMT siblings
-    /// last, spread over the NUMA nodes and then over the cache domains of each node. Use it for a
-    /// host, or a CPU set, that the process owns: a pinned worker cannot leave a busy core.
+    /// last, spread over the NUMA nodes and then over the cache domains of each node. The CPUs
+    /// where an interrupt of a network device fires ([`Host::network_interrupts`]) come after each
+    /// other CPU, so a worker gets one only when the other CPUs do not hold each worker. Use it for
+    /// a host, or a CPU set, that the process owns: a pinned worker cannot leave a busy core.
     Dedicated,
     /// Pins worker `i` to CPU `cpus[i]`.
     Exact(Box<[u32]>),
@@ -483,13 +494,29 @@ fn domain(host: &Host, count: usize, plans: &mut Vec<Placed>) -> Result<(), Allo
     Ok(())
 }
 
-/// The CPUs of `Dedicated` in the order of the workers: one CPU of each physical core, spread over
-/// the nodes and then over the domains of each node, and then the next sibling of each core in the
-/// same order.
+/// The CPUs of `Dedicated` in the order of the workers: the CPUs of the process where no interrupt
+/// of a network device fires, and then the CPUs where one fires, each part in the order of
+/// [`spread`]. On a network CPU, the interrupts and the network work that they start take time
+/// from the worker.
 fn dedicated(host: &Host) -> Result<Vec<u32>, AllocError> {
     let Some(allowed) = &host.allowed else {
         return Ok(Vec::new());
     };
+    let network = host
+        .network_interrupts
+        .as_ref()
+        .map_or_else(CpuSet::new, |cpus| cpus.and(allowed));
+    let mut order = spread(host, &allowed.without(&network))?;
+    let last = spread(host, &network)?;
+    order.try_reserve_exact(last.len()).map_err(|_| AllocError)?;
+    order.extend(last);
+    Ok(order)
+}
+
+/// The CPUs of `allowed` in the order of the workers: one CPU of each physical core, spread over
+/// the nodes and then over the domains of each node, and then the next sibling of each core in the
+/// same order.
+fn spread(host: &Host, allowed: &CpuSet) -> Result<Vec<u32>, AllocError> {
     let mut nodes: Vec<Node> = Vec::new();
     let mut seen = CpuSet::new();
     for cpu in allowed.iter() {
