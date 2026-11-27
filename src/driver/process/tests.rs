@@ -1,6 +1,7 @@
 //! Each test runs in a process of its own (nextest), so the children, the threads, and the signal
 //! state of one test do not reach another.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::assert_matches;
@@ -25,7 +26,7 @@ use std::time::Instant;
 use super::super::suite::{self, Backend};
 #[cfg(target_os = "linux")]
 use super::super::tests::driver;
-use super::super::tests::{drive, numbered};
+use super::super::tests::{Bound, drive, numbered};
 #[cfg(target_os = "linux")]
 use super::super::{Call, Route};
 use super::super::{Config, Driver, PipeReader, Reason, Signal};
@@ -526,13 +527,20 @@ pub(in crate::driver) fn the_caller_writes_the_input_while_both_outputs_drain(ba
     let mut err = pin!(receive_all(&driver, &mut stderr));
     let (mut wrote, mut output, mut error) = (false, None, None);
     let mut cx = Context::from_waker(Waker::noop());
+    let bound = Bound::new();
     while !wrote || output.is_none() || error.is_none() {
         let more = driver.borrow_mut().turn().expect("a turn works").more();
         wrote = wrote || poll_ready(write.as_mut(), &mut cx).is_some();
         output = output.or_else(|| poll_ready(out.as_mut(), &mut cx));
         error = error.or_else(|| poll_ready(err.as_mut(), &mut cx));
         if !more && !(wrote && output.is_some() && error.is_some()) {
-            driver.borrow_mut().wait().expect("a wait works");
+            bound.wait(&mut driver.borrow_mut(), || {
+                format!(
+                    "the write ({wrote}) and the receives of stdout ({}) and stderr ({})",
+                    output.is_some(),
+                    error.is_some()
+                )
+            });
         }
     }
     assert!(output.as_ref() == Some(&input), "the output is the input");

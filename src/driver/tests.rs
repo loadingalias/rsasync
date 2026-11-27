@@ -1,3 +1,6 @@
+use alloc::borrow::ToOwned as _;
+use alloc::format;
+use alloc::string::String;
 #[cfg(unix)]
 use alloc::task::Wake;
 use core::alloc::Layout;
@@ -207,9 +210,50 @@ pub(super) fn hold<T>(driver: &mut Driver, operation: &Operation<'_, T>) -> Oper
     id
 }
 
+/// The longest time that a test loop waits for the driver. It is below the limit of 30 s of
+/// nextest, so a hang fails with the operation that did not end, not with no message.
+const WAIT_MAX: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// The bound of the waits of one test loop: `WAIT_MAX` after its creation.
+pub(super) struct Bound {
+    clock: crate::clock::NativeClock,
+    deadline: crate::time::Deadline,
+}
+
+impl Bound {
+    pub(super) fn new() -> Self {
+        let clock = deadline_clock();
+        Self {
+            clock,
+            deadline: deadline_after(clock, WAIT_MAX),
+        }
+    }
+
+    /// Waits as [`Driver::wait`] does, but at most until the bound. At the bound, the test fails
+    /// with `what`, the operation that the loop waits for, and the state of the queue: a ready
+    /// completion that the wait did not see, or none.
+    pub(super) fn wait(&self, driver: &mut Driver, what: impl FnOnce() -> String) {
+        driver
+            .wait_until(self.deadline, self.clock)
+            .expect("the wait of the test driver works");
+        let reached = self
+            .deadline
+            .is_reached(self.clock.now())
+            .expect("the deadline is an instant of its clock");
+        assert!(
+            !reached,
+            "the driver did not end {} in {WAIT_MAX:?}: {} entries not submitted, a completion ready: {}",
+            what(),
+            driver.queue.unsubmitted(),
+            driver.queue.ready()
+        );
+    }
+}
+
 /// Turns `driver` until its control keeps a completion of `id`, and gives the result of the first
 /// one. The hold stays.
 pub(super) fn held(driver: &mut Driver, id: OperationId) -> io::Result<u32> {
+    let bound = Bound::new();
     loop {
         // The turn takes the completion into the control, so the look comes before each wait.
         let more = driver.turn().expect("a turn of the test driver works").more();
@@ -223,7 +267,7 @@ pub(super) fn held(driver: &mut Driver, id: OperationId) -> io::Result<u32> {
             return result;
         }
         if !more {
-            driver.wait().expect("the wait of the test driver works");
+            bound.wait(driver, || format!("the held completion of {id:?}"));
         }
     }
 }
@@ -242,13 +286,14 @@ pub(super) fn posted(driver: &mut Driver, id: OperationId) -> io::Result<u32> {
 
 /// Turns the driver until a turn gives a completion to its operation.
 fn drive_until_completed(driver: &mut Driver) {
+    let bound = Bound::new();
     loop {
         let turn = driver.turn().expect("a turn of the test driver works");
         if turn.completed() > 0 {
             return;
         }
         if !turn.more() {
-            driver.wait().expect("the wait of the test driver works");
+            bound.wait(driver, || "a completion of its operation".to_owned());
         }
     }
 }
@@ -550,13 +595,14 @@ fn a_poll_after_ready_panics() {
 /// once after each turn, so it never polls a future that gave its output.
 pub(super) fn drive<F: Future + Unpin>(driver: &mut Driver, mut future: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
+    let bound = Bound::new();
     loop {
         let more = driver.turn().expect("a turn of the test driver works").more();
         if let Poll::Ready(output) = Pin::new(&mut future).poll(&mut cx) {
             return output;
         }
         if !more {
-            driver.wait().expect("the wait of the test driver works");
+            bound.wait(driver, || format!("the future {}", core::any::type_name::<F>()));
         }
     }
 }
@@ -1729,6 +1775,7 @@ pub(in crate::driver) fn idle_connections_with_a_waiting_selecting_receive_hold_
 /// Turns the driver until no operation runs and no event can come, for at most 1000 turns.
 #[cfg(unix)]
 fn settle(driver: &mut Driver) {
+    let bound = Bound::new();
     for _ in 0..1000 {
         if !driver.table.busy() {
             break;
@@ -1736,7 +1783,7 @@ fn settle(driver: &mut Driver) {
         let more = driver.turn().expect("a turn of the test driver works").more();
         // A wait with no operation in flight would wait for an event that cannot come.
         if !more && driver.table.busy() {
-            driver.wait().expect("the wait of the test driver works");
+            bound.wait(driver, || "each running operation".to_owned());
         }
     }
     assert!(!driver.table.busy(), "an operation still runs after 1000 turns");
