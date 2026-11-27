@@ -122,7 +122,9 @@ fn a_local_stream_receives_into_the_provided_buffers_of_its_owner() {
 
 /// A receive that the root submits and polls, and that a task then awaits, wakes that task at its
 /// completion: the wake goes to the latest waker, not to the task that submitted. A wake of the
-/// root only would leave the task pending, and the join would never end.
+/// root only would leave the task pending, and the join would never end. A selected receive with
+/// the multishot receive of its stream keeps its waiter in the record of the stream, with the
+/// same rule.
 #[test]
 fn a_receive_that_another_task_awaits_wakes_that_task() {
     let runtime = Runtime::builder().build().unwrap();
@@ -143,6 +145,50 @@ fn a_receive_that_another_task_awaits_wakes_that_task() {
                 panic!("the task that awaits the receive completes");
             };
             assert_eq!((received.unwrap(), bytes.bytes()), (1, &b"x"[..]));
+
+            let (_listener, server, mut client) = pair().await;
+            let server = Box::leak(Box::new(server));
+            let mut receive = server.recv_selected().unwrap();
+            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut receive).poll(cx).is_pending())).await;
+            assert!(polled, "no byte came before the send");
+            let waiter = task::spawn_local(receive).unwrap();
+            yield_once().await;
+            let (sent, _lease) = client.send(Lease::from(b"y".to_vec())).unwrap().await.unwrap();
+            assert_eq!(sent.unwrap(), 1);
+            let task::Outcome::Completed(Ok(Ok(bytes))) = waiter.join().await else {
+                panic!("the task that awaits the selected receive completes");
+            };
+            assert_eq!(bytes.bytes(), b"y");
+        })
+        .unwrap();
+}
+
+/// A selected receive of a local stream that drops while it waits loses no byte, and a cancel ends
+/// the wait of a receive that has no bytes with `ECANCELED`. The next receives get the later bytes
+/// in order.
+#[test]
+fn a_dropped_or_cancelled_selected_receive_of_a_local_stream_loses_no_byte() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let (_listener, mut server, mut client) = pair().await;
+            let (mut read, _write) = server.split();
+            let mut receive = read.recv_selected().unwrap();
+            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut receive).poll(cx).is_pending())).await;
+            assert!(polled, "no byte came before the send");
+            drop(receive);
+            let mut receive = read.recv_selected().unwrap();
+            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut receive).poll(cx).is_pending())).await;
+            assert!(polled, "no byte came before the send");
+            receive.cancel();
+            let cancelled = receive.await.unwrap().unwrap_err();
+            assert_eq!(cancelled.raw_os_error(), Some(crate::driver::ECANCELED));
+            for bytes in [&b"first"[..], b"second"] {
+                let (sent, _lease) = client.send(Lease::from(bytes.to_vec())).unwrap().await.unwrap();
+                assert_eq!(sent.unwrap(), bytes.len());
+                let received = read.recv_selected().unwrap().await.unwrap().unwrap();
+                assert_eq!(received.bytes(), bytes);
+            }
         })
         .unwrap();
 }
@@ -285,20 +331,29 @@ fn a_stream_after_its_block_on_refuses_and_gives_its_buffer_back() {
 }
 
 /// A receive that a `block_on` started ends with `Ended` at a poll outside that owner, and does not
-/// wait: no turn of its driver comes there, so a wait would never end.
+/// wait: no turn of its driver comes there, so a wait would never end. A selected receive with the
+/// multishot receive of its stream does the same.
 #[test]
 fn a_receive_polled_outside_its_owner_ends_and_does_not_wait() {
     let runtime = Runtime::builder().build().unwrap();
-    let (_listener, _client, mut receive) = runtime
+    let (_listener, _client, mut receive, mut selected) = runtime
         .block_on(async {
             let (listener, server, client) = pair().await;
-            // The receive needs a stream that outlives `block_on`.
+            // The receives need streams that outlive `block_on`.
             let server = Box::leak(Box::new(server));
-            (listener, client, server.recv(buffer()).unwrap())
+            let (read, _write) = Box::leak(Box::new(pair().await.1)).split();
+            let read = Box::leak(Box::new(read));
+            (
+                listener,
+                client,
+                server.recv(buffer()).unwrap(),
+                read.recv_selected().unwrap(),
+            )
         })
         .unwrap();
-    let polled = Pin::new(&mut receive).poll(&mut core::task::Context::from_waker(core::task::Waker::noop()));
-    assert_matches!(polled, Poll::Ready(Err(_)));
+    let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+    assert_matches!(Pin::new(&mut receive).poll(&mut cx), Poll::Ready(Err(_)));
+    assert_matches!(Pin::new(&mut selected).poll(&mut cx), Poll::Ready(Err(_)));
 }
 
 /// A stream that drops while its owner runs closes, so its peer reads the end of the stream before

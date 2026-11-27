@@ -213,7 +213,7 @@ same as on the driver.
 | `listener.accept()` | `Driver::accept` |
 | `TcpStream::connect(address, options)` | `Driver::connect` |
 | `stream.recv(backing)`, `stream.send(lease)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send`, `Driver::send_vectored` |
-| `stream.recv_selected()` | `Driver::recv_selected`, into the provided buffers of the owner |
+| `stream.recv_selected()` | `Driver::recv_selected`, into the provided buffers of the owner. The future is a `rsasync::local::Receive` |
 | `stream.shutdown_write()` | `Driver::shutdown_write` |
 | `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
 | `stream.close()`, `listener.close()` | `Driver::close`, `Driver::close_listener` |
@@ -225,6 +225,19 @@ buffers of the driver of the owner when the bytes come. Each worker and each `bl
 buffers by [`receive_buffers`](runtime.md#start-a-runtime). On io_uring, the receives of a stream
 take the buffers of one multishot receive by default: see
 [Driver-only use](driver-only.md#one-multishot-receive-for-each-stream).
+
+The future of `recv_selected()` is a `rsasync::local::Receive`, with `cancel()` and the output
+`io::Result<Backing>`. With the multishot receive, a `Receive` is no operation of the driver, so it
+holds no operation slot. Its poll takes the next buffer that the multishot receive of the stream
+filled. When no buffer waits, the driver keeps the waker of the poll with the stream:
+
+- A drop of the future loses no byte. The next `recv_selected()` takes the buffers that came after
+  the drop.
+- `cancel()` ends the wait. The future then gives a buffer or the end of the stream that came
+  before the cancel, or the error `ECANCELED` (`io::Error::raw_os_error`).
+- With `Shot::Single`, or after an earlier receive of the stream that still runs or left a
+  result, the `Receive` is an operation of `Driver::recv_selected`, with the rules of
+  [Dropped, forgotten, and cancelled operations](#dropped-forgotten-and-cancelled-operations).
 
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};
@@ -254,7 +267,7 @@ runtime.block_on(async {
 The local types differ from the driver types in two points:
 
 - They are not `Send`, so a resource stays on the thread of its home. The future of each call,
-  `rsasync::local::Operation`, is not `Send` either, so the resource starts on that thread and each
+  `rsasync::local::Operation` or `rsasync::local::Receive`, is not `Send` either, so the resource starts on that thread and each
   operation ends there. The driver takes the result in place and wakes the task that polls the
   future. A poll outside the owner of the home gives `Ended`, and the drop of the future then ends
   the operation as a drop does. A local call

@@ -21,7 +21,8 @@
 //! ```
 //!
 //! Each call has the meaning of its [`driver`] call, and gives an [`Operation`] future with the
-//! outputs of the driver. The future is not `Send`, so it ends on the thread of its home:
+//! outputs of the driver, or a [`Receive`] for a receive into a selected buffer. The future is not
+//! `Send`, so it ends on the thread of its home:
 //!
 //! - The call gives `Err(Refused)` before the wait, with what the caller gave, such as the buffer
 //!   of a receive. [`Reason::NoDriver`] says that no driver runs on this thread for the call, and
@@ -59,6 +60,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use core::cell::Cell;
 use core::fmt;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -69,7 +71,7 @@ use std::io;
 
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Cleanup, Driver, Reason, Refused, Regions};
-use crate::task::with_driver;
+use crate::task::{with_driver, with_driver_task};
 
 pub mod file;
 pub mod ipc;
@@ -204,11 +206,138 @@ impl<R> Homed<R> {
     }
 }
 
+/// The future of a receive into a buffer that the kernel selects, of a [`TcpStream`] or a
+/// [`ReadHalf`]. It has the meaning of the [`Operation`] of
+/// [`Driver::recv_selected`](crate::driver::Driver::recv_selected), and it stays on the thread of
+/// its home.
+///
+/// When the driver keeps one multishot receive for each stream
+/// ([`Shot::Multi`](crate::driver::Shot::Multi), the default on io_uring), the receive is no
+/// operation of the driver. Its poll takes the next buffer that the multishot receive of the stream
+/// filled, and else the record of the stream keeps its waiter. A drop of the future loses no byte:
+/// the next receive takes the buffers that came after it. [`Receive::cancel`] ends the wait.
+#[derive(Debug)]
+pub struct Receive<'a> {
+    form: Form<'a>,
+    _home: Home,
+}
+
+/// How a [`Receive`] receives.
+#[derive(Debug)]
+enum Form<'a> {
+    /// It takes the buffers of the multishot receive of the stream of `home`, with no operation.
+    Record {
+        home: &'a Cleanup,
+        cancelled: Cell<bool>,
+        /// The record of the stream can hold the waiter of the receive.
+        waits: Cell<bool>,
+        done: bool,
+    },
+    /// An operation of the driver: the driver has no multishot receive, or the read direction
+    /// keeps an earlier operation or its result.
+    Operation(driver::Operation<'a, io::Result<Backing>>),
+}
+
+impl<'a> Receive<'a> {
+    /// A receive of `reader`, the read half of the stream of `home`.
+    fn start(reader: &'a mut driver::ReadHalf, home: &'a Cleanup) -> Result<Self, Refused<()>> {
+        let form = submit((), |driver, ()| {
+            if driver.by_record(reader)? {
+                return Ok(Form::Record {
+                    home,
+                    cancelled: Cell::new(false),
+                    waits: Cell::new(false),
+                    done: false,
+                });
+            }
+            driver.recv_selected(reader).map(Form::Operation)
+        })?;
+        Ok(Self {
+            form,
+            _home: PhantomData,
+        })
+    }
+
+    /// Asks the driver to cancel the receive, as [`Operation::cancel`] does. The future then gives
+    /// a buffer or the end of the stream that came before the cancel, or `ECANCELED`.
+    pub fn cancel(&self) {
+        match &self.form {
+            Form::Operation(operation) => operation.cancel(),
+            Form::Record {
+                home, cancelled, waits, ..
+            } => {
+                cancelled.set(true);
+                if waits.replace(false) {
+                    end_wait(home, true);
+                }
+            }
+        }
+    }
+}
+
+impl Future for Receive<'_> {
+    type Output = Result<io::Result<Backing>, driver::Ended>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.form {
+            Form::Operation(operation) => Pin::new(operation).poll(cx),
+            Form::Record {
+                home,
+                cancelled,
+                waits,
+                done,
+            } => {
+                assert!(!*done, "a `Receive` was polled after it gave `Ready`");
+                let (resource, cancelled) = (home.resource(), cancelled.get());
+                crate::coop::poll(cx, |cx| {
+                    let polled = with_driver_task(cx.waker(), (), |driver, task, ()| {
+                        driver.poll_record(resource, cancelled, task, cx.waker())
+                    });
+                    match polled {
+                        Ok(Some(Poll::Pending)) => {
+                            waits.set(true);
+                            Poll::Pending
+                        }
+                        Ok(Some(Poll::Ready(output))) => {
+                            waits.set(false);
+                            *done = true;
+                            Poll::Ready(Ok(output))
+                        }
+                        Ok(None) | Err(()) => Poll::Ready(Err(driver::Ended)),
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl Drop for Receive<'_> {
+    fn drop(&mut self) {
+        if let Form::Record { home, waits, .. } = &self.form
+            && waits.get()
+        {
+            end_wait(home, false);
+        }
+    }
+}
+
+/// Ends the wait of the receive of the stream of `home` in the record of the stream, and wakes its
+/// waiter when `wake`. In a turn of the driver, the home records it, and the next turn ends it
+/// and wakes the waiter.
+fn end_wait(home: &Cleanup, wake: bool) {
+    match with_driver(home.resource(), |driver, resource| driver.end_reading(resource)) {
+        Ok(waiter) if wake => waiter.wake(),
+        Ok(_) => {}
+        Err(_) => home.post_reader(),
+    }
+}
+
 /// The read half of a stream of this module, a [`TcpStream`] or an [`IpcStream`]: its receives
 /// borrow it.
 #[derive(Debug)]
 pub struct ReadHalf<'a> {
     read: &'a mut driver::ReadHalf,
+    home: &'a Cleanup,
     _home: Home,
 }
 
@@ -230,9 +359,8 @@ impl ReadHalf<'_> {
     /// # Errors
     ///
     /// As for [`TcpStream::recv_selected`].
-    pub fn recv_selected(&mut self) -> Result<Operation<'_, io::Result<Backing>>, Refused<()>> {
-        let read = &mut *self.read;
-        submit((), |driver, ()| driver.recv_selected(read)).map(Operation::home)
+    pub fn recv_selected(&mut self) -> Result<Receive<'_>, Refused<()>> {
+        Receive::start(self.read, self.home)
     }
 }
 

@@ -184,7 +184,7 @@ impl Chain {
                         tail.completion.cancel();
                     }
                 }
-                self.flow.abandon(kind, result, held, &mut tcp::Shelf::default());
+                self.flow.abandon(kind, result, held);
             }
         }
         self.before.iter().all(Option::is_none)

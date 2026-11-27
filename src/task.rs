@@ -518,6 +518,13 @@ fn with_owner<V, R>(value: V, f: impl FnOnce(&Local, V) -> R) -> Result<R, V> {
     Ok(f(unsafe { &*owner }, value))
 }
 
+/// Wakes `task` of the owner of this thread, as a completion of a home operation does after a turn.
+/// A task of another generation, or a thread with no owner, changes nothing.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn wake_local(task: crate::driver::LocalTask) {
+    with_owner(task, |local, task| local.wake_local(task)).unwrap_or(());
+}
+
 /// [`with_driver`], which also gives `f` the task that the owner polls when `waker` is that task's
 /// own waker, so a home operation can wake the task with no clone of the waker.
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]

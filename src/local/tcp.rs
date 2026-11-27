@@ -8,7 +8,7 @@ use core::net::SocketAddr;
 use std::io;
 use std::os::fd::OwnedFd;
 
-use super::{Home, Homed, Operation, ReadHalf, WriteHalf, call, rewrap, submit};
+use super::{Home, Homed, Operation, ReadHalf, Receive, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Closed, Completion, Driver, Refused, Regions, TcpOptions};
 
@@ -210,6 +210,7 @@ impl TcpStream {
         (
             ReadHalf {
                 read,
+                home: &self.inner.cleanup,
                 _home: Home::default(),
             },
             WriteHalf {
@@ -240,9 +241,8 @@ impl TcpStream {
     /// # Errors
     ///
     /// As for [`TcpStream::recv`], and `Reason::Buffers` when the worker has no provided buffers.
-    pub fn recv_selected(&mut self) -> Result<Operation<'_, io::Result<Backing>>, Refused<()>> {
-        let stream = &mut self.inner.resource;
-        submit((), |driver, ()| driver.recv_selected(stream)).map(Operation::home)
+    pub fn recv_selected(&mut self) -> Result<Receive<'_>, Refused<()>> {
+        Receive::start(self.inner.resource.as_mut(), &self.inner.cleanup)
     }
 
     /// Sends the bytes of `lease`, as [`Driver::send`](crate::driver::Driver::send) does.

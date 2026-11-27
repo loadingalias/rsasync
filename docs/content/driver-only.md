@@ -372,7 +372,8 @@ An io_uring driver keeps one multishot receive in the read direction of each TCP
 the default, `Config::receives(Shot::Multi)`. The first `recv_selected` arms it with one
 submission. Then the kernel fills a slot each time that bytes come, and the receive stays armed.
 The driver gives each filled slot to the receive that waits, or keeps it for the next receive, in
-order. So a receive in steady state submits nothing. `Report::receives()` gives the form in use.
+order. So a receive in steady state submits nothing. The multishot receive holds no operation slot
+of `Config::operations`. `Report::receives()` gives the form in use.
 It is `Shot::Single` on epoll, kqueue, and IOCP, which submit one receive for each call, and on
 io_uring with `Config::receives(Shot::Single)`.
 
@@ -410,14 +411,15 @@ operations that run on the socket, and its future is ready after the kernel ends
 | --- | --- | --- |
 | `submissions` | 64 | Entries of the submission queue. The kernel rounds up to a power of two |
 | `operations` | 256 | Operations that can run at one time. A submission beyond them is refused with the reason, and its resources come back. The driver allocates one slot for each when it starts. On a 64-bit target, the state of an operation in its slot takes at most 576 bytes, not counting its buffers |
-| `resources` | 256 | Descriptors that the driver can own at one time |
+| `resources` | 256 | Descriptors that the driver can own at one time: at most 2^29 |
 | `children` | 64 | Child processes that the driver can own at one time. Each child also holds an operation slot until its status is taken or its handle drops. 0 refuses each spawn |
 | `completions_per_turn` | 64 | The most completions that one turn gives to their futures |
 | `delivery` | `Delivery::Native` | How the driver gives each completion to its operation. Under `Delivery::Controlled`, `Driver::control()` lets a test hold, fail, or repeat a completion: see [Test your code under controlled completions](controlled-delivery.md) |
 | `files` | `Files::Plain` | The descriptor that each operation of a resource names. See [Registered files](#registered-files) |
 | `receives` | `Shot::Multi` | How a receive of a stream into a selected slot runs. See [One multishot receive for each stream](#one-multishot-receive-for-each-stream) |
 
-A limit of 0, other than `children`, gives `Error::Config`.
+A limit of 0, other than `children`, gives `Error::Config`, and so does a `resources` limit above
+2^29.
 
 ## Registered files
 

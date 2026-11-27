@@ -16,12 +16,17 @@ use crate::sync::{Arc, try_arc};
 use crate::table::OpId;
 use crate::uring::Sqe;
 
-/// The mark of a word of [`Closes`] that holds a record, above the generation of its resource.
+/// The mark of a word of [`Closes`] that holds a close, above the generation of its resource.
 const POSTED: u64 = 1 << 32;
 
-/// The closes that the drops of local resources record when they cannot reach the driver: one word
-/// for each resource slot, 0 or the generation of its resource with [`POSTED`]. The driver makes
-/// the words at its start, so a record needs no free slot.
+/// The mark of a word of [`Closes`] that holds the end of the wait of a local receive of its stream
+/// ([`Cleanup::post_reader`]).
+const READER: u64 = 1 << 33;
+
+/// The closes that the drops of local resources record when they cannot reach the driver, and the
+/// ends of the waits of their local receives: one word for each resource slot, 0 or the generation
+/// of its resource with [`POSTED`], [`READER`], or both. The driver makes the words at its start,
+/// so a record needs no free slot.
 pub(super) struct Closes {
     posted: AtomicBool,
     words: Box<[AtomicU64]>,
@@ -50,9 +55,10 @@ pub(crate) struct LocalTask {
     pub(crate) generation: u64,
 }
 
-/// The waiter of a home operation ([`Consumer::Home`](super::Consumer::Home)).
+/// The waiter of a home operation ([`Consumer::Home`](super::Consumer::Home)), or of a local receive
+/// of a stream that waits for its multishot receive with no operation.
 #[derive(Debug, Default)]
-enum Waiter {
+pub(crate) enum Waiter {
     /// No consumer waits.
     #[default]
     None,
@@ -62,9 +68,32 @@ enum Waiter {
     Waker(core::task::Waker),
 }
 
+impl Waiter {
+    /// Records `task` when the waker of the poll is the task's own waker, and else a clone of
+    /// `waker`, unless the waiter wakes it already.
+    pub(super) fn set(&mut self, task: Option<LocalTask>, waker: &core::task::Waker) {
+        match (task, &*self) {
+            (Some(task), _) => *self = Self::Task(task),
+            (None, Self::Waker(old)) if old.will_wake(waker) => {}
+            (None, _) => *self = Self::Waker(waker.clone()),
+        }
+    }
+
+    /// Wakes the waiter now, outside a turn of its driver: a task goes to the ready queue of the
+    /// owner of this thread.
+    pub(crate) fn wake(self) {
+        match self {
+            Self::Task(task) => crate::task::wake_local(task),
+            Self::Waker(waker) => waker.wake(),
+            Self::None => {}
+        }
+    }
+}
+
 /// The consumers of the home operations of a driver: a waiter for each operation slot, and the
 /// tasks that the completions of a turn woke, which the owner takes after the turn. The driver
-/// makes both at its start, so a wake needs no allocation: an operation wakes at most one task.
+/// makes both at its start, so a wake needs no allocation: an operation, and the local receive of a
+/// stream, each wake at most one task.
 pub(super) struct Consumers {
     /// A local type calls the driver: each operation that starts has its consumer at the home.
     pub(super) calls: bool,
@@ -73,35 +102,36 @@ pub(super) struct Consumers {
 }
 
 impl Consumers {
-    /// No waiter, for `operations` slots.
-    pub(super) fn new(operations: u32) -> Result<Self, AllocError> {
+    /// No waiter, for `operations` operation slots and `resources` resource slots.
+    pub(super) fn new(operations: u32, resources: u32) -> Result<Self, AllocError> {
         Ok(Self {
             calls: false,
             waiters: items(operations, |_| Waiter::None)?,
-            woken: room(operations as usize)?,
+            woken: room(operations as usize + resources as usize)?,
         })
     }
 
-    /// Records the waiter of the home operation `id`: `task` when the waker of the poll is the
-    /// task's own waker, and else a clone of `waker`, unless the waiter wakes it already.
+    /// Records the waiter of the home operation `id` ([`Waiter::set`]).
     pub(super) fn wait(&mut self, id: OpId, task: Option<LocalTask>, waker: &core::task::Waker) {
-        let Some(waiter) = self.waiters.get_mut(id.index() as usize) else {
-            return;
-        };
-        match (task, &*waiter) {
-            (Some(task), _) => *waiter = Waiter::Task(task),
-            (None, Waiter::Waker(old)) if old.will_wake(waker) => {}
-            (None, _) => *waiter = Waiter::Waker(waker.clone()),
+        if let Some(waiter) = self.waiters.get_mut(id.index() as usize) {
+            waiter.set(task, waker);
         }
     }
 
-    /// Wakes the waiter of the home operation `id`, which ended: a task goes to the list that the
-    /// owner takes, and another waker wakes now.
+    /// Wakes the waiter of the home operation `id`, which ended.
     pub(super) fn wake(&mut self, id: OpId) {
-        match self.waiters.get_mut(id.index() as usize).map(core::mem::take) {
-            // The list has room for each operation slot, and each slot has one waiter.
-            Some(Waiter::Task(task)) if self.woken.len() < self.woken.capacity() => self.woken.push(task),
-            Some(Waiter::Waker(waker)) => waker.wake(),
+        if let Some(waiter) = self.waiters.get_mut(id.index() as usize).map(core::mem::take) {
+            self.wake_waiter(waiter);
+        }
+    }
+
+    /// Wakes `waiter`: a task goes to the list that the owner takes, and another waker wakes now.
+    pub(super) fn wake_waiter(&mut self, waiter: Waiter) {
+        match waiter {
+            // The list has room for each operation slot and each resource slot, and each one has
+            // one waiter.
+            Waiter::Task(task) if self.woken.len() < self.woken.capacity() => self.woken.push(task),
+            Waiter::Waker(waker) => waker.wake(),
             _ => {}
         }
     }
@@ -143,6 +173,25 @@ impl Cleanup {
         let closes = &self.shared.closes;
         if let Some(word) = closes.words.get(self.resource.index as usize) {
             word.store(POSTED | u64::from(self.resource.generation), Ordering::Relaxed);
+            closes.posted.store(true, Ordering::Release);
+        }
+    }
+
+    /// The resource of the home.
+    pub(crate) const fn resource(&self) -> Resource {
+        self.resource
+    }
+
+    /// Records at the home the end of the wait of the local receive of the stream, when the receive
+    /// cannot reach the driver, in a turn of the driver: the next turn ends the wait and wakes its
+    /// waiter ([`Driver::end_reading`]).
+    pub(crate) fn post_reader(&self) {
+        let closes = &self.shared.closes;
+        if let Some(word) = closes.words.get(self.resource.index as usize) {
+            // A close of the resource that waits in the word keeps its mark. The next turn takes
+            // each word before a new resource can take the slot, so the word holds no other
+            // generation.
+            word.fetch_or(READER | u64::from(self.resource.generation), Ordering::Relaxed);
             closes.posted.store(true, Ordering::Release);
         }
     }
@@ -254,7 +303,8 @@ impl Driver {
         Ok(())
     }
 
-    /// Starts each close that a drop recorded ([`Cleanup::post`]).
+    /// Starts each close that a drop recorded ([`Cleanup::post`]), and ends each wait of a local
+    /// receive that a receive recorded ([`Cleanup::post_reader`]).
     pub(super) fn take_closes(&mut self) {
         // A load first: a turn with no record changes no shared line.
         if !self.shared.closes.posted.load(Ordering::Relaxed)
@@ -269,13 +319,17 @@ impl Driver {
                 .words
                 .get(index)
                 .map_or(0, |word| word.swap(0, Ordering::Relaxed));
-            // A word with no record gives `POSTED`, which does not fit a generation.
-            if let Ok(generation) = u32::try_from(word ^ POSTED) {
-                self.close_dropped_resource(Resource {
-                    driver: self.resources.driver,
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    generation,
-                });
+            let resource = Resource {
+                driver: self.resources.driver,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                generation: u32::try_from(word & u64::from(u32::MAX)).unwrap_or_default(),
+            };
+            // A close ends the wait of a receive too.
+            if word & POSTED != 0 {
+                self.close_dropped_resource(resource);
+            } else if word & READER != 0 {
+                let waiter = self.end_reading(resource);
+                self.consumers.wake_waiter(waiter);
             }
         }
     }

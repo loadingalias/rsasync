@@ -105,6 +105,7 @@ impl IpcStream {
         (
             ReadHalf {
                 read,
+                home: &self.inner.cleanup,
                 _home: Home::default(),
             },
             WriteHalf {

@@ -834,14 +834,49 @@ enum Sent {
     Lost,
 }
 
+/// The multishot receive of the read direction of a stream ([`Shot::Multi`](super::Shot::Multi)).
+/// Its completions name the resource slot of the stream ([`Resource::record`]), so it holds no
+/// operation slot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Armed {
+    /// No multishot receive runs.
+    #[default]
+    No,
+    /// It runs.
+    Runs,
+    /// It runs, and the driver asked the kernel to cancel it.
+    Ending,
+}
+
 /// The directions of a stream or a listener, at the home.
 ///
-/// The order of the fields is stated: a receive or a send reads the directions and the state of
-/// the sends, and the large kept result is last.
+/// The order of the fields is stated: a local receive of the buffers of the multishot receive
+/// reads only the fields before `kept`, and the discriminant of `kept`. The large kept result
+/// comes before the write direction.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(super) struct Directions {
+    armed: Armed,
+    /// The current receive waits for a buffer of `armed`, or for its end, with no submission.
+    awaiting: bool,
+    /// `armed` filled no buffer yet.
+    fresh: bool,
+    /// The resource is in the pending list of the driver.
+    pending: bool,
+    /// A local receive waits for a buffer of `armed`, or for its end, with no operation, until its
+    /// next poll ([`Driver::poll_record`]).
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    reading: bool,
+    /// The terminal result of the last multishot receive, after `shelved`: the end of the stream,
+    /// or an error.
+    ended: Option<i32>,
+    /// The buffers that `armed` filled and no receive took, after `kept`.
+    shelved: Shelved,
+    /// The waiter of the local receive that waits, which a completion of `armed` wakes.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    reader: super::home::Waiter,
     read: Direction,
+    kept: Option<Kept>,
     write: Direction,
     sent: Sent,
     /// The bytes that dropped sends sent, since the end of the last send whose result a future
@@ -849,20 +884,6 @@ pub(super) struct Directions {
     unreported: usize,
     /// The close that waits for the operations of the resource.
     closing: Option<Closing>,
-    /// The resource is in the pending list of the driver.
-    pending: bool,
-    /// The multishot receive of the read direction ([`Shot::Multi`](super::Shot::Multi)).
-    armed: Option<OpId>,
-    /// The current receive waits for a buffer of `armed`, or for its end, with no submission.
-    awaiting: bool,
-    /// `armed` filled no buffer yet.
-    fresh: bool,
-    /// The buffers that `armed` filled and no receive took, after `kept`.
-    shelved: Shelved,
-    /// The terminal result of the last multishot receive, after `shelved`: the end of the stream,
-    /// or an error.
-    ended: Option<i32>,
-    kept: Option<Kept>,
 }
 
 /// Who waits for the close of a resource.
@@ -893,23 +914,53 @@ impl Directions {
                 Some(&mut self.read)
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown | Kind::SendTo | Kind::SendBatch => Some(&mut self.write),
-            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::Multishot => None,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind => None,
             Kind::File(_) => None,
             #[cfg(unix)]
             Kind::Spawn(_) | Kind::Exit(_) => None,
         }
     }
 
-    /// Puts `buffer`, which the multishot receive filled, after the shelved buffers. Gives whether
-    /// the resource now needs the home, because a receive waits or the direction keeps its most
-    /// buffers, and it is not in the pending list yet. A `true` puts it there: the caller pushes
-    /// it.
-    pub(super) fn shelve(&mut self, buffer: Backing, shelf: &mut Shelf) -> bool {
-        shelf.put(&mut self.shelved, buffer, false);
-        self.fresh = false;
-        let needs = (self.awaiting || self.shelved.len >= super::KEPT_BUFFERS) && !self.pending;
+    /// Takes a completion of the multishot receive of the read direction, with `buffer` when it
+    /// filled one, which goes after the shelved buffers. A completion with no `more` ends the
+    /// receive with `result`. Gives whether the resource now needs the home, because a receive
+    /// waits, the receive ended, or the direction keeps its most buffers, and it is not in the
+    /// pending list yet. A `true` puts it there: the caller pushes it.
+    pub(super) fn received(&mut self, buffer: Option<Backing>, result: i32, more: bool, shelf: &mut Shelf) -> bool {
+        let filled = buffer.is_some();
+        if let Some(buffer) = buffer {
+            shelf.put(&mut self.shelved, buffer, false);
+        }
+        // The end of the stream or the error follows the buffers that the direction keeps. An
+        // empty ring ends no stream: a receive that waits gets it only when the receive filled no
+        // buffer, and else arms again, so a buffer that came back after the end is used. A
+        // cancel, at the bound or at a close, gives nothing.
+        if !more {
+            self.armed = Armed::No;
+            if !filled && result <= 0 && result != -ECANCELED && (result != -ENOBUFS || self.waits() && self.fresh) {
+                self.ended = Some(result);
+            }
+        }
+        self.fresh &= !filled;
+        let needs = (self.awaiting || !more || self.shelved.len >= super::KEPT_BUFFERS) && !self.pending;
         self.pending |= needs;
         needs
+    }
+
+    /// Whether a receive waits for the multishot receive: an operation, or a local receive.
+    const fn waits(&self) -> bool {
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if self.reading {
+            return true;
+        }
+        self.awaiting
+    }
+
+    /// Takes the waiter of the local receive that waits, for a wake. The receive waits until its
+    /// next poll.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn take_reader(&mut self) -> super::home::Waiter {
+        core::mem::take(&mut self.reader)
     }
 
     /// Gives each buffer that the direction keeps on `shelf` back to its pool.
@@ -919,8 +970,8 @@ impl Directions {
 
     /// Whether a receive of the read direction has a result here, or waits for the multishot
     /// receive: so it needs no submission, and the usual start does not apply.
-    const fn receives_here(&self) -> bool {
-        self.armed.is_some() || !self.shelved.is_empty() || self.ended.is_some()
+    fn receives_here(&self) -> bool {
+        self.armed != Armed::No || !self.shelved.is_empty() || self.ended.is_some()
     }
 
     /// The listener keeps a connection that no accept took.
@@ -971,7 +1022,7 @@ impl Directions {
         let waits = self.read.first.is_some()
             || self.write.first.is_some()
             || self.closing.is_some()
-            || (self.awaiting && self.armed.is_none());
+            || (self.awaiting && self.armed == Armed::No);
         let needs = waits && !self.pending;
         self.pending |= needs;
         needs
@@ -987,7 +1038,7 @@ impl Directions {
             && matches!(self.sent, Sent::Ok | Sent::Reported)
             && self.closing.is_none()
             && !self.pending
-            && self.armed.is_none()
+            && self.armed == Armed::No
             && self.shelved.is_empty()
             && self.ended.is_none()
             && self.kept.is_none()
@@ -1011,7 +1062,7 @@ impl Directions {
     /// interest, with its resources `held`. Received bytes, the error of a receive, and an accepted
     /// connection stay for the next operation of the direction. A send that failed, sent only part
     /// of its bytes, or was cancelled makes the write direction fail.
-    pub(super) fn abandon(&mut self, kind: Kind, result: i32, held: Held, shelf: &mut Shelf) {
+    pub(super) fn abandon(&mut self, kind: Kind, result: i32, held: Held) {
         match kind {
             Kind::Recv | Kind::Selected => {
                 let buffer = held.loan.map(WriteLoan::into_inner);
@@ -1031,21 +1082,6 @@ impl Directions {
                     self.kept = Some(Kept::Bytes { buffer, start });
                 } else if result < 0 && result != -ECANCELED && result != -ENOBUFS {
                     self.kept = Some(Kept::Error(result));
-                }
-            }
-            // The multishot receive ended. Its last buffer, the end of the stream, or its error
-            // follows the buffers that the direction keeps. An empty ring ends no stream: a receive
-            // that waits gets it only when the receive filled no buffer, and else arms again, so
-            // a buffer that came back after the end is used. A cancel, at the bound or at a close,
-            // gives nothing.
-            Kind::Multishot => {
-                self.armed = None;
-                if let (Ok(count), Some(loan)) = (usize::try_from(result), held.loan)
-                    && count > 0
-                {
-                    shelf.put(&mut self.shelved, loan.into_inner(), false);
-                } else if result <= 0 && result != -ECANCELED && (result != -ENOBUFS || self.awaiting && self.fresh) {
-                    self.ended = Some(result);
                 }
             }
             Kind::Send | Kind::Vectored | Kind::Shutdown => {
@@ -1147,16 +1183,8 @@ impl Directions {
             // The kept result of an abandoned receive comes first, then the shelved buffers of the
             // multishot receive, in order, then its end.
             (Kind::Selected, None) if !self.shelved.is_empty() => {
-                let (mut buffer, start) = shelf.take(&mut self.shelved)?;
-                let len = buffer.initialized() - start;
-                if start > 0 {
-                    buffer.bytes_mut().copy_within(start.., 0);
-                    buffer.truncate(len);
-                    *copied = copied.saturating_add(len as u64);
-                }
-                held.copied = if start > 0 { len } else { 0 };
-                held.loan = Some(WriteLoan::new(buffer));
-                Some(i32::try_from(len).unwrap_or(i32::MAX))
+                let (buffer, start) = shelf.take(&mut self.shelved)?;
+                Some(select(held, buffer, start, copied))
             }
             (Kind::Recv, None) if !self.shelved.is_empty() => {
                 let (buffer, start) = shelf.first(&self.shelved)?;
@@ -1186,17 +1214,7 @@ impl Directions {
                 // The kept bytes came from one kernel result, so their count fits an `i32`.
                 Some(i32::try_from(count).unwrap_or(i32::MAX))
             }
-            (Kind::Selected, Some(Kept::Bytes { mut buffer, start })) => {
-                let len = buffer.initialized() - start;
-                if start > 0 {
-                    buffer.bytes_mut().copy_within(start.., 0);
-                    buffer.truncate(len);
-                    *copied = copied.saturating_add(len as u64);
-                }
-                held.copied = if start > 0 { len } else { 0 };
-                held.loan = Some(WriteLoan::new(buffer));
-                Some(i32::try_from(len).unwrap_or(i32::MAX))
-            }
+            (Kind::Selected, Some(Kept::Bytes { buffer, start })) => Some(select(held, buffer, start, copied)),
             (Kind::Recv | Kind::Selected, Some(Kept::Error(error))) => Some(error),
             (Kind::RecvFrom, Some(Kept::Datagram { buffer, received })) => {
                 let (result, count) = deliver_copy(held, &buffer, received);
@@ -1276,7 +1294,7 @@ impl Directions {
                 matches!(self.kept, Some(Kept::Bytes { .. } | Kept::Error(_)))
                     || !self.shelved.is_empty()
                     || self.ended.is_some()
-                    || self.armed.is_some()
+                    || self.armed != Armed::No
             }
             Kind::Accept => matches!(self.kept, Some(Kept::Connection { .. })),
             Kind::Send | Kind::Vectored | Kind::Shutdown => self.sent != Sent::Ok,
@@ -1284,13 +1302,7 @@ impl Directions {
                 self.kept,
                 Some(Kept::Datagram { .. } | Kept::Arrivals(_) | Kept::Error(_))
             ),
-            Kind::Other
-            | Kind::Close
-            | Kind::Connect
-            | Kind::Bind
-            | Kind::SendTo
-            | Kind::SendBatch
-            | Kind::Multishot => false,
+            Kind::Other | Kind::Close | Kind::Connect | Kind::Bind | Kind::SendTo | Kind::SendBatch => false,
             Kind::File(_) => false,
             #[cfg(unix)]
             Kind::Spawn(_) | Kind::Exit(_) => false,
@@ -1330,8 +1342,8 @@ pub(super) fn abandon(resources: &mut Resources, tag: Tag, result: i32, mut held
     {
         *connection = held.accepted.take().and_then(|stream| resources.release(stream));
     }
-    if let Some((owned, shelf)) = resources.with_shelf(resource) {
-        owned.directions.abandon(tag.kind, result, held, shelf);
+    if let Some(owned) = resources.get(resource) {
+        owned.directions.abandon(tag.kind, result, held);
     }
 }
 
@@ -2227,6 +2239,103 @@ impl Driver {
         })
     }
 
+    /// Whether a local receive of `reader` into a selected buffer takes the buffers of the multishot
+    /// receive of its stream, with no operation ([`Driver::poll_record`]): the driver keeps one
+    /// multishot receive for each stream, `reader` is a stream socket, and its read direction runs,
+    /// keeps waiting, and keeps the result of no operation. Else the receive is an operation of
+    /// [`Driver::recv_selected`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Driver::recv_selected`].
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn by_record(&mut self, reader: &ReadHalf) -> Result<bool, Refused<()>> {
+        let resource = reader.resource;
+        self.own(resource, ())?;
+        if self.selected.is_none() {
+            return Err(Refused {
+                reason: Reason::Buffers,
+                value: (),
+            });
+        }
+        let (multi, table) = (self.report.receives() == Shot::Multi, &self.table);
+        Ok(multi
+            && self.resources.get(resource).is_some_and(|owned| {
+                let directions = &owned.directions;
+                owned.medium == Medium::Stream
+                    && directions.read.first.is_none()
+                    && directions.read.current.is_none_or(|current| !table.runs(current))
+                    && directions.kept.is_none()
+            }))
+    }
+
+    /// The poll of a local receive of `resource` that takes the buffers of its multishot receive
+    /// ([`Driver::by_record`]). It takes the first shelved buffer, the end of the stream or the
+    /// error of the multishot receive, or `ECANCELED` when it is `cancelled`. Else the receive
+    /// waits: the record of the stream keeps the waiter, `task` or `waker`, which the next
+    /// completion wakes, and the multishot receive arms when it does not run. Gives `None` for a
+    /// resource that this driver does not own.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn poll_record(
+        &mut self,
+        resource: Resource,
+        cancelled: bool,
+        task: Option<super::home::LocalTask>,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<io::Result<Backing>>> {
+        use core::task::Poll;
+        let (owned, shelf) = self.resources.with_shelf(resource)?;
+        let directions = &mut owned.directions;
+        let output = if let Some((buffer, start)) = shelf.take(&mut directions.shelved) {
+            let (buffer, moved) = from_start(buffer, start);
+            self.copied = self.copied.saturating_add(moved as u64);
+            Some(Ok(buffer))
+        } else if let Some(result) = directions.ended.take() {
+            // An empty `Vec` allocates nothing.
+            Some(count(result).map(|_| Backing::from(Vec::new())))
+        } else if cancelled {
+            Some(Err(io::Error::from_raw_os_error(ECANCELED)))
+        } else {
+            None
+        };
+        if let Some(output) = output {
+            directions.reading = false;
+            directions.reader = super::home::Waiter::None;
+            return Some(Poll::Ready(output));
+        }
+        directions.reading = true;
+        directions.reader.set(task, waker);
+        if directions.armed == Armed::No {
+            let (fd, place) = (owned.number(), owned.place(resource));
+            // With a full queue, the next poll arms it, after the turn submits.
+            if !fd.is_some_and(|fd| self.arm(resource, fd, place)) {
+                waker.wake_by_ref();
+            }
+        }
+        Some(Poll::Pending)
+    }
+
+    /// The local receive of `resource` that waits for the buffers of its multishot receive ends its
+    /// wait, because it dropped or a cancel ended it. Gives its waiter, which the caller wakes for
+    /// a cancel. A direction that keeps its most buffers then ends its multishot receive.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn end_reading(&mut self, resource: Resource) -> super::home::Waiter {
+        let Some(owned) = self.resources.get(resource) else {
+            return super::home::Waiter::None;
+        };
+        let directions = &mut owned.directions;
+        directions.reading = false;
+        let (waiter, full) = (
+            directions.take_reader(),
+            directions.shelved.len >= super::KEPT_BUFFERS && !directions.awaiting,
+        );
+        // A failed cancel asks again at the next buffer, which keeps the direction full.
+        if full {
+            drop(self.cancel_armed(resource));
+        }
+        waiter
+    }
+
     /// The operation `id` has no future any more: the caller started the next operation in its
     /// direction. Its interest ends, as at a drop of its future.
     fn forgo(&mut self, id: OpId) {
@@ -2309,15 +2418,19 @@ impl Driver {
         // are copied.
         if receive
             && let Some(owned) = self.resources.get(resource)
-            && let Some(armed) = owned.directions.armed
+            && owned.directions.armed != Armed::No
         {
             owned.directions.awaiting = true;
+            // After a failed cancel, the receive copies the next buffer.
             if kind == Kind::Recv {
-                self.cancel(armed);
+                drop(self.cancel_armed(resource));
             }
             return true;
         }
         if kind == Kind::Selected && !pipe && self.report.receives() == Shot::Multi && self.arm(resource, fd, place) {
+            if let Some(owned) = self.resources.get(resource) {
+                owned.directions.awaiting = true;
+            }
             return true;
         }
         // macOS has no segmentation offload: a send with a segment size ends with no call.
@@ -2355,10 +2468,10 @@ impl Driver {
         true
     }
 
-    /// Arms the multishot receive of the read direction of the stream `resource`, whose current
-    /// receive then waits for its first buffer. No future consumes the multishot receive: its
-    /// direction keeps each buffer, until its terminal completion. Gives `false`, and changes
-    /// nothing, when the driver has no provided buffers, or the table or the queue has no room.
+    /// Arms the multishot receive of the read direction of the stream `resource`. No operation
+    /// holds it: each completion names the resource slot, and the direction keeps each buffer,
+    /// until the terminal completion. Gives `false`, and changes nothing, when the driver has no
+    /// provided buffers or the queue has no room.
     fn arm(&mut self, resource: Resource, fd: i32, place: Option<u32>) -> bool {
         let Some(group) = self.selected.as_ref().map(|selected| selected.ring.group()) else {
             return false;
@@ -2366,35 +2479,63 @@ impl Driver {
         if !self.room(1) {
             return false;
         }
-        let Ok(id) = self
-            .table
-            .begin(Tag::new(Some(resource), Kind::Multishot), Shape::Multishot)
-        else {
-            return false;
-        };
-        let Some(slot) = self.shared.entries.get(id.index() as usize) else {
-            self.table.withdraw(id);
-            return false;
-        };
-        slot.start(id, Held::default(), |_| ());
-        // No future has interest: the terminal completion goes to the abandoned rule.
-        let ended = self.table.end_interest(id);
-        assert!(ended.is_none(), "a new operation runs");
+        let sqe = Sqe::recv_multishot(fd, group).with_user_data(resource.record());
+        let sqe = place.map_or(sqe, |place| sqe.fixed_file(fd, place));
         // SAFETY: the entry names no memory, and the descriptor of `resource`, which stays open
         // until its close, after the terminal completion of the receive. The queue has room.
         #[expect(unsafe_code, reason = "the kernel uses the descriptor of the resource")]
-        unsafe {
-            self.push(id, |_| {
-                let sqe = Sqe::recv_multishot(fd, group);
-                place.map_or(sqe, |place| sqe.fixed_file(fd, place))
-            });
-        }
+        let pushed = unsafe { self.queue.push(&sqe, None) }.is_ok();
+        assert!(pushed, "the queue has room for the entry");
         if let Some(owned) = self.resources.get(resource) {
-            owned.directions.armed = Some(id);
-            owned.directions.awaiting = true;
+            owned.directions.armed = Armed::Runs;
             owned.directions.fresh = true;
         }
+        self.resources.armed += 1;
         true
+    }
+
+    /// Asks the kernel to cancel the multishot receive of `resource`, once.
+    ///
+    /// # Errors
+    ///
+    /// The error of the submission when the queue stays full: the receive runs on.
+    pub(super) fn cancel_armed(&mut self, resource: Resource) -> io::Result<()> {
+        if self
+            .resources
+            .get(resource)
+            .is_none_or(|owned| owned.directions.armed != Armed::Runs)
+        {
+            return Ok(());
+        }
+        let cancel = Sqe::cancel(resource.record(), super::RECORD_CANCEL);
+        // SAFETY: a cancel names no memory.
+        #[expect(unsafe_code, reason = "a cancel names no memory")]
+        unsafe { super::push_now(&mut self.queue, &cancel) }?;
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.armed = Armed::Ending;
+        }
+        Ok(())
+    }
+
+    /// Asks again to cancel the multishot receive of each stream that closes, after a cancel found
+    /// the queue full ([`Driver::start_close`]).
+    pub(super) fn recancel(&mut self) {
+        for index in 0..self.resources.slots.len() {
+            let Some(owned) = self.resources.slots.get(index) else {
+                continue;
+            };
+            if owned.directions.closing.is_some() && owned.directions.armed == Armed::Runs {
+                let resource = Resource {
+                    driver: self.resources.driver,
+                    index: u32::try_from(index).unwrap_or(u32::MAX),
+                    generation: owned.generation,
+                };
+                if self.cancel_armed(resource).is_err() {
+                    self.resources.recancel = true;
+                    return;
+                }
+            }
+        }
     }
 
     /// Ends the receive of `resource` that waits for the multishot receive of its stream, with no
@@ -2542,7 +2683,7 @@ impl Driver {
         };
         let directions = &owned.directions;
         let (awaiting, current, armed) = (directions.awaiting, directions.read.current, directions.armed);
-        let full = directions.shelved.len >= super::KEPT_BUFFERS;
+        let (waits, full) = (directions.waits(), directions.shelved.len >= super::KEPT_BUFFERS);
         let waiting = current
             .filter(|&current| awaiting && self.table.runs(current))
             .and_then(|current| Some((current, self.table.resources(current)?.kind)));
@@ -2557,11 +2698,9 @@ impl Driver {
             }
             self.wait_first(resource, kind, current);
         }
-        if let Some(armed) = armed
-            && !awaiting
-            && full
-        {
-            self.cancel(armed);
+        // A failed cancel asks again at the next buffer, which keeps the direction full.
+        if armed == Armed::Runs && !waits && full {
+            drop(self.cancel_armed(resource));
         }
     }
 
@@ -2632,9 +2771,9 @@ impl Driver {
                 }
             }
         }
-        let armed = self.resources.get(resource).and_then(|owned| owned.directions.armed);
-        if let Some(armed) = armed {
-            self.cancel(armed);
+        // A full queue asks again at the next turn.
+        if self.cancel_armed(resource).is_err() {
+            self.resources.recancel = true;
         }
         self.close_if_idle(resource);
         // A close can release a resource that the pending list holds, so the list is empty
@@ -2653,10 +2792,11 @@ impl Driver {
         let Some(closing) = directions.closing else {
             return;
         };
-        let runs = [directions.read.current, directions.write.current, directions.armed]
+        let runs = [directions.read.current, directions.write.current]
             .into_iter()
             .flatten()
             .any(|operation| table.runs(operation))
+            || directions.armed != Armed::No
             || directions.read.first.is_some()
             || directions.write.first.is_some()
             || running(owned);
@@ -2741,6 +2881,30 @@ pub(super) fn submission(held: &mut Held, kind: Kind, fd: i32, pipe: bool, group
         }
         _ => Sqe::nop(),
     }
+}
+
+/// `buffer` with its bytes from `start` moved to its start, and the count of the bytes that moved:
+/// none when `start` is 0. A receive into the caller's buffer copied the bytes before `start`.
+fn from_start(mut buffer: Backing, start: usize) -> (Backing, usize) {
+    if start == 0 {
+        return (buffer, 0);
+    }
+    let len = buffer.initialized() - start;
+    buffer.bytes_mut().copy_within(start.., 0);
+    buffer.truncate(len);
+    (buffer, len)
+}
+
+/// Gives a selected receive, with its resources `held`, `buffer` with its bytes from `start`, and
+/// adds the bytes that move to `copied`. Gives the count of the bytes of the buffer.
+fn select(held: &mut Held, buffer: Backing, start: usize, copied: &mut u64) -> i32 {
+    let (buffer, moved) = from_start(buffer, start);
+    *copied = copied.saturating_add(moved as u64);
+    held.copied = moved;
+    let len = buffer.initialized();
+    held.loan = Some(WriteLoan::new(buffer));
+    // The bytes came from one kernel result, so their count fits an `i32`.
+    i32::try_from(len).unwrap_or(i32::MAX)
 }
 
 /// Gives the kept datagram of `buffer` with `received` to the receive of `held`, copied into its

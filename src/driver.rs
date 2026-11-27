@@ -126,9 +126,7 @@ use rsnetwork_udp::SockAddrStorage;
 use crate::buffer::{Backing, BufferMut as _, Lease, Pool, WriteLoan};
 use crate::memory::{items, room};
 use crate::sync::{Arc, try_arc};
-#[cfg(target_os = "linux")]
-use crate::table::CONTROL;
-use crate::table::{Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
+use crate::table::{CONTROL, Ended as Done, Event, MAX_SLOTS, OpId, Outcome, Request, Requests, Shape, Table, Taken};
 use crate::uring::{BufferRing, Cqe, Sqe};
 #[cfg(target_os = "linux")]
 use crate::uring::{Ring, SetupError};
@@ -292,7 +290,7 @@ impl Config {
         Self { receives, ..self }
     }
 
-    /// The resources, such as descriptors, that the driver can own at one time.
+    /// The resources, such as descriptors, that the driver can own at one time: at most 2^29.
     #[must_use]
     pub const fn resources(self, resources: u32) -> Self {
         Self { resources, ..self }
@@ -592,10 +590,6 @@ pub(crate) enum Kind {
     Recv,
     /// A receive into a buffer that the kernel selects, which becomes the loan.
     Selected,
-    /// The multishot receive of the read direction of a stream ([`Shot::Multi`]): one completion
-    /// for each provided buffer that it fills, which its direction keeps for the receives. No
-    /// future consumes it.
-    Multishot,
     /// A send of the lease.
     Send,
     /// A send of the regions, in order.
@@ -954,26 +948,35 @@ pub(crate) struct Resource {
     generation: u32,
 }
 
+impl Resource {
+    /// The user data of the multishot receive of the stream of this resource.
+    const fn record(self) -> u64 {
+        RECORD | (self.index as u64) << 32 | self.generation as u64
+    }
+}
+
 /// One descriptor slot of the driver.
 ///
 /// The order of the fields is stated: each look checks the generation and the descriptor, and a
-/// receive or a send uses the medium and its direction, so these come first.
+/// receive or a send uses the medium and its direction, so these come first. A slot starts at a
+/// cache line, so the fields of a local receive of the buffers of a multishot receive are in its
+/// first two lines ([`tcp::Directions`]).
 #[derive(Debug, Default)]
-#[repr(C)]
+#[repr(C, align(64))]
 struct Owned {
     generation: u32,
     fd: Option<Handle>,
-    /// The next free slot after this free slot, or `NO_SLOT`.
-    next_free: u32,
     /// The descriptor is in the place of this slot in the file table of the ring.
     #[cfg(target_os = "linux")]
     registered: bool,
     /// What the descriptor is, which selects the calls of its operations.
     medium: Medium,
-    /// The operations of a file that run, which its close waits for.
-    running: u32,
     /// The directions of a stream or a listener, and what they keep.
     directions: tcp::Directions,
+    /// The next free slot after this free slot, or `NO_SLOT`.
+    next_free: u32,
+    /// The operations of a file that run, which its close waits for.
+    running: u32,
     /// The last operation of the file that runs alone on it (`file::Op::Alone`), on macOS and
     /// Windows, while the table says that it runs.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1082,6 +1085,11 @@ struct Resources {
     fail_registration: bool,
     /// The buffers that the multishot receives of the streams keep for their next receives.
     shelf: tcp::Shelf,
+    /// The multishot receives of the streams that run: a completion of each one can still come.
+    armed: u32,
+    /// A cancel of the multishot receive of a stream that closes found the queue full, so the next
+    /// turn asks again ([`Driver::recancel`]).
+    recancel: bool,
 }
 
 /// No resource slot: the end of the free list.
@@ -1112,6 +1120,8 @@ impl Resources {
             registrar,
             fail_registration: false,
             shelf: tcp::Shelf::default(),
+            armed: 0,
+            recancel: false,
         })
     }
 
@@ -1276,13 +1286,20 @@ impl Resources {
             .filter(|slot| resource.driver == driver && slot.generation == resource.generation && slot.used())
     }
 
-    /// Puts `buffer`, which the multishot receive of `resource` filled, after the buffers that its
-    /// read direction keeps. Gives whether the resource needs the home now, because a receive
-    /// waits or the direction keeps its most buffers. A `true` puts it in the pending list: the
-    /// caller pushes it.
-    fn shelve(&mut self, resource: Resource, buffer: Backing) -> bool {
-        self.with_shelf(resource)
-            .is_some_and(|(owned, shelf)| owned.directions.shelve(buffer, shelf))
+    /// The resource whose multishot receive has the user data `user_data`, when it is a record.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the generation is the low 32 bits of the user data, and the index fits in 29 bits"
+    )]
+    const fn of_record(&self, user_data: u64) -> Option<Resource> {
+        if user_data & RECORD_MASK != RECORD {
+            return None;
+        }
+        Some(Resource {
+            driver: self.driver,
+            index: (user_data >> 32) as u32 & (MAX_RESOURCES - 1),
+            generation: user_data as u32,
+        })
     }
 
     /// The slot of `resource`, as [`Resources::get`] gives it, and the shelf of the buffers that
@@ -1372,6 +1389,21 @@ pub const KEPT_BUFFERS: u32 = 4;
 /// The user data of the poll of the wake descriptor that a wait keeps in the ring.
 #[cfg(target_os = "linux")]
 const WAKE: u64 = CONTROL;
+
+/// The user data of the multishot receive of a stream: this tag, the index of the resource slot of
+/// the stream in bits 32 to 60, and the generation of its resource ([`Resource::record`]).
+const RECORD: u64 = CONTROL | 1 << 61;
+
+/// The bits of the user data that tell a record from the other control completions.
+const RECORD_MASK: u64 = 0b111 << 61;
+
+/// The user data of the result of a cancel of a multishot receive. The harvest ignores it: the
+/// terminal completion of the receive ends it.
+const RECORD_CANCEL: u64 = CONTROL | 2;
+
+/// The most resource slots of a driver: the index of a slot has 29 bits of the user data of a
+/// record.
+const MAX_RESOURCES: u32 = 1 << 29;
 
 /// The longest entry of the kernel in a wait while a file operation runs on the ring. The kernel
 /// selects the idle state of the CPU from the time to its next timer, so the CPU then enters no
@@ -1668,6 +1700,7 @@ impl Driver {
         if config.operations == 0
             || config.operations > MAX_SLOTS
             || config.resources == 0
+            || config.resources > MAX_RESOURCES
             || config.completions_per_turn == 0
         {
             return Err(Error::Config);
@@ -1942,7 +1975,7 @@ impl Driver {
             #[cfg(all(feature = "movable", target_os = "linux"))]
             following: room(config.operations as usize).map_err(refused)?,
             #[cfg(feature = "local")]
-            consumers: home::Consumers::new(config.operations).map_err(refused)?,
+            consumers: home::Consumers::new(config.operations, config.resources).map_err(refused)?,
             control: None,
             #[cfg(all(feature = "local", target_os = "linux"))]
             dropped_sent: 0,
@@ -1973,10 +2006,10 @@ impl Driver {
         self.dropped_sent
     }
 
-    /// Whether an operation of the driver runs, so that a completion can still come.
-    #[cfg(all(feature = "local", target_os = "linux"))]
+    /// Whether an operation of the driver or the multishot receive of a stream runs, so that a
+    /// completion can still come.
     pub(crate) fn busy(&self) -> bool {
-        self.table.busy()
+        self.table.busy() || self.resources.armed > 0
     }
 
     /// The [`Control`] of a driver under [`Delivery::Controlled`], or `None` under native
@@ -2326,6 +2359,7 @@ impl Driver {
             }
             // A receive that waits for the multishot receive of its stream has no submission.
             self.end_awaiting(resource);
+            self.cancel_armed(resource)?;
         }
         let mut cancelled = 0_u32;
         #[cfg(unix)]
@@ -2346,15 +2380,12 @@ impl Driver {
                 _ => {}
             }
             push_cancel(&mut self.queue, id)?;
-            // The multishot receive of a stream is no operation of the caller.
-            if self.table.resources(id).is_none_or(|tag| tag.kind != Kind::Multishot) {
-                cancelled = cancelled.saturating_add(1);
-            }
+            cancelled = cancelled.saturating_add(1);
         }
-        while self.table.busy() {
+        while self.busy() {
             self.take_requests();
             self.poll_jobs();
-            if !self.table.busy() {
+            if !self.busy() {
                 break;
             }
             // The wait also ends when a job of the blocking service ends, because the job wakes
@@ -2461,7 +2492,7 @@ impl Driver {
         held: impl FnOnce(P) -> Result<Held, (Reason, P)>,
     ) -> Result<OpId, (Reason, P)> {
         // The table counts the completions of a batch until its last one.
-        let shape = if tag.kind.batch() || tag.kind == Kind::Multishot {
+        let shape = if tag.kind.batch() {
             Shape::Multishot
         } else {
             Shape::Single
@@ -2613,6 +2644,9 @@ impl Driver {
         }
         #[cfg(all(feature = "local", target_os = "linux"))]
         self.take_closes();
+        if mem::take(&mut self.resources.recancel) {
+            self.recancel();
+        }
         self.attend();
     }
 
@@ -2708,6 +2742,27 @@ impl Driver {
         for cqe in native.iter_mut().flatten().chain(kept.iter_mut().flatten()) {
             completed += 1;
             let mut event = cqe.event();
+            // A completion of the multishot receive of a stream goes to the record of the stream,
+            // with no operation slot: its buffer goes to the shelf, and the local receive that
+            // waits wakes. The operation that waits takes it after the harvest, and a full shelf
+            // ends the multishot receive there.
+            if let Some(resource) = resources.of_record(cqe.user_data) {
+                let buffer = cqe
+                    .buffer()
+                    .zip(selected.as_mut())
+                    .and_then(|(bid, selected)| selected.filled(bid, cqe.res));
+                if let Some((owned, shelf)) = resources.with_shelf(resource) {
+                    if owned.directions.received(buffer, cqe.res, event.more, shelf) {
+                        pending.push(resource);
+                    }
+                    #[cfg(all(feature = "local", target_os = "linux"))]
+                    consumers.wake_waiter(owned.directions.take_reader());
+                    if !event.more {
+                        resources.armed -= 1;
+                    }
+                }
+                continue;
+            }
             // One look at the slot gives the tag of the operation, for each step below.
             let op = OpId::from_user_data(cqe.user_data);
             let tagged = op.and_then(|id| table.resources(id).copied());
@@ -2753,24 +2808,6 @@ impl Driver {
                     }
                 });
             }
-            // A buffer of a multishot receive goes to the shelf of its stream. A receive that waits
-            // takes it after the harvest, and a full shelf ends the multishot receive there.
-            if let Some(id) = op
-                && let Some(Tag {
-                    kind: Kind::Multishot,
-                    resource: Some(resource),
-                    ..
-                }) = tagged
-                && event.more
-                && table.runs(id)
-                && let Some(buffer) = cqe
-                    .buffer()
-                    .zip(selected.as_mut())
-                    .and_then(|(bid, selected)| selected.filled(bid, cqe.res))
-                && resources.shelve(resource, buffer)
-            {
-                pending.push(resource);
-            }
             let outcome = table.complete(cqe.user_data, event);
             let (id, abandoned, tag) = match (outcome, op) {
                 // The poll of the wake descriptor ended: the next wait polls it again. When
@@ -2802,8 +2839,8 @@ impl Driver {
                     None => continue,
                 },
                 (Outcome::Abandoned(Done { resources: tag, .. }), Some(id)) => (id, true, tag),
-                // No driver operation is multishot yet. The other outcomes, such as a wake message
-                // that `ARRIVED`, change nothing.
+                // The other outcomes, such as a wake message that `ARRIVED` or the result of the
+                // cancel of a multishot receive (`RECORD_CANCEL`), change nothing.
                 _ => continue,
             };
             let Some(slot) = shared.entries.get(id.index() as usize) else {
@@ -2933,7 +2970,7 @@ fn finish(
                 }
             }
         }
-        Kind::Selected | Kind::Multishot => {
+        Kind::Selected => {
             if let Some(buffer) = cqe
                 .buffer()
                 .zip(selected)
@@ -3063,12 +3100,19 @@ impl Drop for Driver {
         // The kernel uses nothing of an operation that waits for its start, so it leaks nothing.
         #[cfg(all(feature = "movable", target_os = "linux"))]
         self.end_following();
-        let busy = self.table.busy();
+        let busy = self.busy();
         for entry in &self.shared.entries {
             entry.close();
         }
         #[cfg(all(feature = "local", target_os = "linux"))]
-        self.consumers.end();
+        {
+            self.consumers.end();
+            for owned in &mut self.resources.slots {
+                if let home::Waiter::Waker(waker) = owned.directions.take_reader() {
+                    waker.wake();
+                }
+            }
+        }
         #[cfg(unix)]
         signal::end(&self.signals);
         if let Some(selected) = self.selected.take() {

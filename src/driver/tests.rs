@@ -1777,16 +1777,16 @@ pub(in crate::driver) fn idle_connections_with_a_waiting_selecting_receive_hold_
 fn settle(driver: &mut Driver) {
     let bound = Bound::new();
     for _ in 0..1000 {
-        if !driver.table.busy() {
+        if !driver.busy() {
             break;
         }
         let more = driver.turn().expect("a turn of the test driver works").more();
         // A wait with no operation in flight would wait for an event that cannot come.
-        if !more && driver.table.busy() {
+        if !more && driver.busy() {
             bound.wait(driver, || "each running operation".to_owned());
         }
     }
-    assert!(!driver.table.busy(), "an operation still runs after 1000 turns");
+    assert!(!driver.busy(), "an operation still runs after 1000 turns");
 }
 
 /// The descriptors that this process has open: Linux lists them in `/proc/self/fd`, and macOS in
