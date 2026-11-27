@@ -848,11 +848,29 @@ enum Armed {
     Ending,
 }
 
+/// The send of a local stream in its record, with no operation ([`Driver::send_record`]): from its
+/// start to the take of its result, or to its terminal event when no future has interest.
+#[cfg(all(feature = "local", target_os = "linux"))]
+#[derive(Debug, Default)]
+struct Sending {
+    /// The lease that the kernel reads. The record holds a send while it holds the lease.
+    lease: Option<Lease>,
+    /// The result of the terminal event, until the take.
+    result: Option<i32>,
+    /// The waiter of the future, which the terminal event wakes.
+    waiter: super::home::Waiter,
+    /// The terminal event did not come.
+    runs: bool,
+    /// A future has interest in the result.
+    interest: bool,
+    /// The driver asked the kernel to cancel the send.
+    cancelled: bool,
+}
+
 /// The directions of a stream or a listener, at the home.
 ///
-/// The order of the fields is stated: a local receive of the buffers of the multishot receive
-/// reads only the fields before `kept`, and the discriminant of `kept`. The large kept result
-/// comes before the write direction.
+/// The order of the fields is stated: a local receive and a local send of a stream read the fields
+/// before `kept`, and the discriminant of `kept`. The large kept result comes after them.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(super) struct Directions {
@@ -875,10 +893,12 @@ pub(super) struct Directions {
     /// The waiter of the local receive that waits, which a completion of `armed` wakes.
     #[cfg(all(feature = "local", target_os = "linux"))]
     reader: super::home::Waiter,
-    read: Direction,
-    kept: Option<Kept>,
-    write: Direction,
     sent: Sent,
+    read: Direction,
+    write: Direction,
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    sending: Sending,
+    kept: Option<Kept>,
     /// The bytes that dropped sends sent, since the end of the last send whose result a future
     /// took, or since the last report.
     unreported: usize,
@@ -963,6 +983,104 @@ impl Directions {
         core::mem::take(&mut self.reader)
     }
 
+    /// Whether the record of the stream holds a send whose terminal event did not come
+    /// ([`Driver::send_record`]).
+    const fn record_sends(&self) -> bool {
+        cfg_select! {
+            all(feature = "local", target_os = "linux") => self.sending.runs,
+            _ => false,
+        }
+    }
+
+    /// Whether the record of the stream holds a send: it runs, or no future took its result.
+    const fn record_holds(&self) -> bool {
+        cfg_select! {
+            all(feature = "local", target_os = "linux") => self.sending.lease.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The terminal event of the send of the record, with `result`. A future with interest takes
+    /// the result later, and the caller wakes the waiter that this gives. Else the abandoned rule
+    /// applies now, and the lease drops. Gives also whether the resource needs the home now, as
+    /// [`Directions::needs_home`] does: the caller then pushes it.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn record_sent(&mut self, result: i32) -> (bool, super::home::Waiter) {
+        self.sending.runs = false;
+        let waiter = if self.sending.interest {
+            self.sending.result = Some(result);
+            core::mem::take(&mut self.sending.waiter)
+        } else {
+            self.abandon_record_send(result);
+            super::home::Waiter::None
+        };
+        (self.needs_home(), waiter)
+    }
+
+    /// The abandoned rule for the send of the record, which ended with `result`: its lease drops,
+    /// and a send that failed, sent only part of its bytes, or was cancelled makes the write
+    /// direction fail ([`Directions::abandon`]).
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    fn abandon_record_send(&mut self, result: i32) {
+        let Sending { lease, cancelled, .. } = core::mem::take(&mut self.sending);
+        if let Some(lease) = lease {
+            let held = Held {
+                cancelled,
+                ..Held::with_payload(Payload::Lease(lease))
+            };
+            self.abandon(Kind::Send, result, held);
+        }
+    }
+
+    /// The future of the send of the record ended its interest: it dropped, a later send of the
+    /// direction started after a forget, or the stream closes. A send that ended takes the
+    /// abandoned rule now, and one that runs takes it at its terminal event.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    fn forgo_send(&mut self) {
+        match self.sending.result {
+            Some(result) => self.abandon_record_send(result),
+            None => {
+                self.sending.interest = false;
+                self.sending.waiter = super::home::Waiter::None;
+            }
+        }
+    }
+
+    /// The take of the result of the send of the record, with its lease, after its terminal event.
+    /// Before it, the record keeps the waiter, `task` or `waker`. Gives `None` when the record
+    /// holds no send.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    fn take_send(
+        &mut self,
+        task: Option<super::home::LocalTask>,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<(io::Result<usize>, Lease)>> {
+        use core::task::Poll;
+        let sending = &mut self.sending;
+        sending.lease.as_ref()?;
+        let Some(result) = sending.result else {
+            sending.waiter.set(task, waker);
+            return Some(Poll::Pending);
+        };
+        let lease = core::mem::take(sending).lease?;
+        // A send result that a future took reports each byte up to its end, as at
+        // [`Directions::taken`].
+        if self.sent == Sent::Ok {
+            self.unreported = 0;
+        }
+        Some(Poll::Ready((count(result), lease)))
+    }
+
+    /// Ends the records of the stream at the drop of the driver, and gives their waiters, which the
+    /// caller wakes. The lease of a send that runs leaks, because the kernel can still read it.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(super) fn end_records(&mut self) -> [super::home::Waiter; 2] {
+        if self.sending.runs {
+            let _leaked = core::mem::ManuallyDrop::new(self.sending.lease.take());
+        }
+        [self.take_reader(), core::mem::take(&mut self.sending.waiter)]
+    }
+
     /// Gives each buffer that the direction keeps on `shelf` back to its pool.
     pub(super) fn unshelve(&mut self, shelf: &mut Shelf) {
         shelf.clear(&mut self.shelved);
@@ -1039,6 +1157,7 @@ impl Directions {
             && self.closing.is_none()
             && !self.pending
             && self.armed == Armed::No
+            && !self.record_holds()
             && self.shelved.is_empty()
             && self.ended.is_none()
             && self.kept.is_none()
@@ -1961,7 +2080,14 @@ impl Driver {
                 value,
             });
         };
+        // A send of the record whose future was forgotten ends its interest, as `forgo` does.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if kind.writes() && owned.directions.sending.interest {
+            owned.directions.forgo_send();
+        }
         let has_result = owned.directions.has_result(kind);
+        // An operation of the write direction waits for the send of the record that runs.
+        let record = kind.writes() && owned.directions.record_sends();
         let Some(direction) = owned.directions.direction(kind) else {
             return Err(Refused {
                 reason: Reason::Resource,
@@ -1969,7 +2095,7 @@ impl Driver {
             });
         };
         direction.current = direction.current.filter(|&id| table.runs(id));
-        let now = direction.current.is_none() && direction.first.is_none();
+        let now = direction.current.is_none() && direction.first.is_none() && !record;
         let tag = Tag::new(Some(resource), kind);
         // An operation that waits, or that has its result here, pushes no entry now.
         let pushed = if now && !has_result { entries } else { 0 };
@@ -2036,6 +2162,7 @@ impl Driver {
         let directions = &mut owned.directions;
         let clear = directions.kept.is_none()
             && directions.sent == Sent::Ok
+            && !(kind.writes() && directions.record_holds())
             && !(matches!(kind, Kind::Recv | Kind::Selected)
                 && (directions.receives_here() || multi && kind == Kind::Selected));
         let Some(direction) = directions
@@ -2336,6 +2463,106 @@ impl Driver {
         waiter
     }
 
+    /// Starts the send of `lease` of a local stream in the record of the stream, with no operation
+    /// ([`Driver::poll_send`]): on io_uring, when `writer` is a stream socket whose write direction
+    /// runs, keeps waiting, and owes no operation and no report, and whose record holds no send
+    /// that runs. A send of the record whose future was forgotten ends its interest first. Gives
+    /// `lease` back when the send needs an operation of [`Driver::send`].
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn send_record(&mut self, writer: &WriteHalf, lease: Lease) -> Result<(), Lease> {
+        let resource = writer.resource;
+        if !matches!(self.queue, super::queue::Queue::Ring(_)) {
+            return Err(lease);
+        }
+        let table = &self.table;
+        let Some(owned) = self.resources.get(resource) else {
+            return Err(lease);
+        };
+        let directions = &mut owned.directions;
+        // Only a forgotten future can have interest here: the borrow of the half ended.
+        if directions.sending.interest {
+            directions.forgo_send();
+        }
+        let free = owned.medium == Medium::Stream
+            && directions.sent == Sent::Ok
+            && directions.closing.is_none()
+            && directions.sending.lease.is_none()
+            && directions.write.first.is_none()
+            && directions.write.current.is_none_or(|current| !table.runs(current));
+        let (Some(fd), place) = (owned.number(), owned.place(resource)) else {
+            return Err(lease);
+        };
+        if !free || !self.room(1) {
+            return Err(lease);
+        }
+        let (bytes, len) = (lease.as_ptr(), u32::try_from(lease.initialized()).unwrap_or(u32::MAX));
+        let sqe = Sqe::send(fd, bytes, len).with_user_data(resource.record(super::Half::Write));
+        let sqe = place.map_or(sqe, |place| sqe.fixed_file(fd, place));
+        // SAFETY: the entry names the bytes of the lease, which the record keeps until the terminal
+        // event, also after the drop of the future, and the descriptor of `resource`, which stays
+        // open until its close, after that event. The queue has room.
+        #[expect(unsafe_code, reason = "the kernel reads the bytes of the lease")]
+        let pushed = unsafe { self.queue.push(&sqe, None) }.is_ok();
+        assert!(pushed, "the queue has room for the entry");
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.sending = Sending {
+                lease: Some(lease),
+                runs: true,
+                interest: true,
+                ..Sending::default()
+            };
+        }
+        self.resources.in_flight += 1;
+        Ok(())
+    }
+
+    /// The poll of the send of the record of `resource` ([`Driver::send_record`]): it takes the
+    /// count of sent bytes and the lease after the terminal event, and else the record keeps the
+    /// waiter, `task` or `waker`. Gives `None` when this driver owns no such send.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn poll_send(
+        &mut self,
+        resource: Resource,
+        task: Option<super::home::LocalTask>,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<(io::Result<usize>, Lease)>> {
+        self.resources.get(resource)?.directions.take_send(task, waker)
+    }
+
+    /// The future of the send of the record of `resource` dropped: its interest ends, and the send
+    /// runs on. The abandoned rule applies at its terminal event.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn end_send(&mut self, resource: Resource) {
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.forgo_send();
+        }
+    }
+
+    /// Asks the kernel to cancel the send of the record of `resource`, once. The future keeps its
+    /// interest, and its result gives the exact progress.
+    ///
+    /// # Errors
+    ///
+    /// The error of the submission when the queue stays full: the send runs on.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn cancel_record_send(&mut self, resource: Resource) -> io::Result<()> {
+        if self
+            .resources
+            .get(resource)
+            .is_none_or(|owned| !owned.directions.sending.runs || owned.directions.sending.cancelled)
+        {
+            return Ok(());
+        }
+        let cancel = Sqe::cancel(resource.record(super::Half::Write), super::RECORD_CANCEL);
+        // SAFETY: a cancel names no memory.
+        #[expect(unsafe_code, reason = "a cancel names no memory")]
+        unsafe { super::push_now(&mut self.queue, &cancel) }?;
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.sending.cancelled = true;
+        }
+        Ok(())
+    }
+
     /// The operation `id` has no future any more: the caller started the next operation in its
     /// direction. Its interest ends, as at a drop of its future.
     fn forgo(&mut self, id: OpId) {
@@ -2479,7 +2706,7 @@ impl Driver {
         if !self.room(1) {
             return false;
         }
-        let sqe = Sqe::recv_multishot(fd, group).with_user_data(resource.record());
+        let sqe = Sqe::recv_multishot(fd, group).with_user_data(resource.record(super::Half::Read));
         let sqe = place.map_or(sqe, |place| sqe.fixed_file(fd, place));
         // SAFETY: the entry names no memory, and the descriptor of `resource`, which stays open
         // until its close, after the terminal completion of the receive. The queue has room.
@@ -2490,7 +2717,7 @@ impl Driver {
             owned.directions.armed = Armed::Runs;
             owned.directions.fresh = true;
         }
-        self.resources.armed += 1;
+        self.resources.in_flight += 1;
         true
     }
 
@@ -2507,7 +2734,7 @@ impl Driver {
         {
             return Ok(());
         }
-        let cancel = Sqe::cancel(resource.record(), super::RECORD_CANCEL);
+        let cancel = Sqe::cancel(resource.record(super::Half::Read), super::RECORD_CANCEL);
         // SAFETY: a cancel names no memory.
         #[expect(unsafe_code, reason = "a cancel names no memory")]
         unsafe { super::push_now(&mut self.queue, &cancel) }?;
@@ -2517,20 +2744,24 @@ impl Driver {
         Ok(())
     }
 
-    /// Asks again to cancel the multishot receive of each stream that closes, after a cancel found
-    /// the queue full ([`Driver::start_close`]).
+    /// Asks again to cancel the multishot receive and the send of the record of each stream that
+    /// closes, after a cancel found the queue full ([`Driver::start_close`]).
     pub(super) fn recancel(&mut self) {
         for index in 0..self.resources.slots.len() {
             let Some(owned) = self.resources.slots.get(index) else {
                 continue;
             };
-            if owned.directions.closing.is_some() && owned.directions.armed == Armed::Runs {
+            if owned.directions.closing.is_some() {
                 let resource = Resource {
                     driver: self.resources.driver,
                     index: u32::try_from(index).unwrap_or(u32::MAX),
                     generation: owned.generation,
                 };
-                if self.cancel_armed(resource).is_err() {
+                #[cfg(all(feature = "local", target_os = "linux"))]
+                let sends = self.cancel_record_send(resource).is_ok();
+                #[cfg(not(all(feature = "local", target_os = "linux")))]
+                let sends = true;
+                if self.cancel_armed(resource).is_err() || !sends {
                     self.resources.recancel = true;
                     return;
                 }
@@ -2646,13 +2877,16 @@ impl Driver {
             self.attend_armed(resource);
             for kind in [Kind::Recv, Kind::Send] {
                 let table = &self.table;
-                let runs = self
-                    .resources
-                    .get(resource)
-                    .and_then(|owned| owned.directions.direction(kind))
+                let Some(owned) = self.resources.get(resource) else {
+                    continue;
+                };
+                let record = kind == Kind::Send && owned.directions.record_sends();
+                let runs = owned
+                    .directions
+                    .direction(kind)
                     .and_then(|direction| direction.current)
                     .is_some_and(|current| table.runs(current));
-                if runs {
+                if runs || record {
                     continue;
                 }
                 while let Some(id) = self.dequeue(resource, kind) {
@@ -2771,8 +3005,18 @@ impl Driver {
                 }
             }
         }
+        // The close takes the result of the send of the record, and cancels it when it runs, a
+        // dropped send too.
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        if let Some(owned) = self.resources.get(resource) {
+            owned.directions.forgo_send();
+        }
+        #[cfg(all(feature = "local", target_os = "linux"))]
+        let sends = self.cancel_record_send(resource).is_ok();
+        #[cfg(not(all(feature = "local", target_os = "linux")))]
+        let sends = true;
         // A full queue asks again at the next turn.
-        if self.cancel_armed(resource).is_err() {
+        if self.cancel_armed(resource).is_err() || !sends {
             self.resources.recancel = true;
         }
         self.close_if_idle(resource);
@@ -2797,6 +3041,7 @@ impl Driver {
             .flatten()
             .any(|operation| table.runs(operation))
             || directions.armed != Armed::No
+            || directions.record_sends()
             || directions.read.first.is_some()
             || directions.write.first.is_some()
             || running(owned);

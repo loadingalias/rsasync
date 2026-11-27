@@ -19,14 +19,23 @@ use crate::uring::Sqe;
 /// The mark of a word of [`Closes`] that holds a close, above the generation of its resource.
 const POSTED: u64 = 1 << 32;
 
-/// The mark of a word of [`Closes`] that holds the end of the wait of a local receive of its stream
-/// ([`Cleanup::post_reader`]).
-const READER: u64 = 1 << 33;
+/// A mark of a word of [`Closes`] other than a close, above the generation of its resource: what a
+/// future of the record of the stream did in a turn of the driver ([`Cleanup::post_mark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub(crate) enum Mark {
+    /// The local receive ended its wait.
+    Reader = 1 << 33,
+    /// The future of the send dropped.
+    SendDropped = 1 << 34,
+    /// The future of the send asked for a cancel.
+    SendCancelled = 1 << 35,
+}
 
 /// The closes that the drops of local resources record when they cannot reach the driver, and the
-/// ends of the waits of their local receives: one word for each resource slot, 0 or the generation
-/// of its resource with [`POSTED`], [`READER`], or both. The driver makes the words at its start,
-/// so a record needs no free slot.
+/// marks of the futures of their records: one word for each resource slot, 0 or the generation of
+/// its resource with [`POSTED`], marks, or both. The driver makes the words at its start, so a
+/// record needs no free slot.
 pub(super) struct Closes {
     posted: AtomicBool,
     words: Box<[AtomicU64]>,
@@ -182,16 +191,15 @@ impl Cleanup {
         self.resource
     }
 
-    /// Records at the home the end of the wait of the local receive of the stream, when the receive
-    /// cannot reach the driver, in a turn of the driver: the next turn ends the wait and wakes its
-    /// waiter ([`Driver::end_reading`]).
-    pub(crate) fn post_reader(&self) {
+    /// Records `mark` at the home, when a future of the record of the stream cannot reach the
+    /// driver, in a turn of the driver: the next turn applies it ([`Driver::take_closes`]).
+    pub(crate) fn post_mark(&self, mark: Mark) {
         let closes = &self.shared.closes;
         if let Some(word) = closes.words.get(self.resource.index as usize) {
             // A close of the resource that waits in the word keeps its mark. The next turn takes
             // each word before a new resource can take the slot, so the word holds no other
             // generation.
-            word.fetch_or(READER | u64::from(self.resource.generation), Ordering::Relaxed);
+            word.fetch_or(mark as u64 | u64::from(self.resource.generation), Ordering::Relaxed);
             closes.posted.store(true, Ordering::Release);
         }
     }
@@ -303,8 +311,8 @@ impl Driver {
         Ok(())
     }
 
-    /// Starts each close that a drop recorded ([`Cleanup::post`]), and ends each wait of a local
-    /// receive that a receive recorded ([`Cleanup::post_reader`]).
+    /// Starts each close that a drop recorded ([`Cleanup::post`]), and applies each mark of a future
+    /// of a record ([`Cleanup::post_mark`]).
     pub(super) fn take_closes(&mut self) {
         // A load first: a turn with no record changes no shared line.
         if !self.shared.closes.posted.load(Ordering::Relaxed)
@@ -324,12 +332,28 @@ impl Driver {
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 generation: u32::try_from(word & u64::from(u32::MAX)).unwrap_or_default(),
             };
-            // A close ends the wait of a receive too.
+            // A close ends the wait of a receive and the interest of a send too.
             if word & POSTED != 0 {
                 self.close_dropped_resource(resource);
-            } else if word & READER != 0 {
+                continue;
+            }
+            if word & Mark::Reader as u64 != 0 {
                 let waiter = self.end_reading(resource);
                 self.consumers.wake_waiter(waiter);
+            }
+            // A full queue asks again at the next turn.
+            if word & Mark::SendCancelled as u64 != 0
+                && self.cancel_record_send(resource).is_err()
+                && let Some(word) = self.shared.closes.words.get(index)
+            {
+                word.fetch_or(
+                    Mark::SendCancelled as u64 | u64::from(resource.generation),
+                    Ordering::Relaxed,
+                );
+                self.shared.closes.posted.store(true, Ordering::Release);
+            }
+            if word & Mark::SendDropped as u64 != 0 {
+                self.end_send(resource);
             }
         }
     }

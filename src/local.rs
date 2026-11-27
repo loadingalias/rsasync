@@ -21,8 +21,8 @@
 //! ```
 //!
 //! Each call has the meaning of its [`driver`] call, and gives an [`Operation`] future with the
-//! outputs of the driver, or a [`Receive`] for a receive into a selected buffer. The future is not
-//! `Send`, so it ends on the thread of its home:
+//! outputs of the driver, a [`Receive`] for a receive into a selected buffer, or a [`Transmit`]
+//! for a send of a stream. The future is not `Send`, so it ends on the thread of its home:
 //!
 //! - The call gives `Err(Refused)` before the wait, with what the caller gave, such as the buffer
 //!   of a receive. [`Reason::NoDriver`] says that no driver runs on this thread for the call, and
@@ -321,6 +321,97 @@ impl Drop for Receive<'_> {
     }
 }
 
+/// The future of a send of the bytes of a lease, of a [`TcpStream`], an [`IpcStream`], or a
+/// [`WriteHalf`]. It has the meaning of the [`Operation`] of
+/// [`Driver::send`](crate::driver::Driver::send), and it stays on the thread of its home.
+///
+/// On io_uring, the send is no operation of the driver: the record of the stream keeps the lease
+/// until the terminal event of the send, and the completion wakes the future. A drop of the future
+/// does not cancel the send, which runs on, and [`Transmit::cancel`] asks the kernel to cancel it.
+/// A send of a direction that failed, a send on epoll, and a send while the record holds a dropped
+/// send that runs are operations of the driver.
+#[derive(Debug)]
+pub struct Transmit<'a> {
+    form: Sending<'a>,
+    _home: Home,
+}
+
+/// How a [`Transmit`] sends.
+#[derive(Debug)]
+enum Sending<'a> {
+    /// The record of the stream of `home` holds the send, with no operation.
+    Record { home: &'a Cleanup, done: bool },
+    /// An operation of the driver.
+    Operation(driver::Operation<'a, (io::Result<usize>, Lease)>),
+}
+
+impl<'a> Transmit<'a> {
+    /// A send of `lease` on `writer`, the write half of the stream of `home`.
+    fn start(writer: &'a mut driver::WriteHalf, home: &'a Cleanup, lease: Lease) -> Result<Self, Refused<Lease>> {
+        let form = submit(lease, |driver, lease| match driver.send_record(writer, lease) {
+            Ok(()) => Ok(Sending::Record { home, done: false }),
+            Err(lease) => driver.send(writer, lease).map(Sending::Operation),
+        })?;
+        Ok(Self {
+            form,
+            _home: PhantomData,
+        })
+    }
+
+    /// Asks the driver to cancel the send, as [`Operation::cancel`] does. The future then gives the
+    /// exact count of the bytes that went before the cancel took effect, or `ECANCELED`.
+    pub fn cancel(&self) {
+        match &self.form {
+            Sending::Operation(operation) => operation.cancel(),
+            Sending::Record { home, done: false } => {
+                let cancel = with_driver(home.resource(), |driver, resource| driver.cancel_record_send(resource));
+                // In a turn of the driver, or with a full queue, the next turn asks.
+                if !matches!(cancel, Ok(Ok(()))) {
+                    home.post_mark(driver::Mark::SendCancelled);
+                }
+            }
+            Sending::Record { done: true, .. } => {}
+        }
+    }
+}
+
+impl Future for Transmit<'_> {
+    type Output = Result<(io::Result<usize>, Lease), driver::Ended>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.form {
+            Sending::Operation(operation) => Pin::new(operation).poll(cx),
+            Sending::Record { home, done } => {
+                assert!(!*done, "a `Transmit` was polled after it gave `Ready`");
+                let resource = home.resource();
+                crate::coop::poll(cx, |cx| {
+                    let polled = with_driver_task(cx.waker(), (), |driver, task, ()| {
+                        driver.poll_send(resource, task, cx.waker())
+                    });
+                    match polled {
+                        Ok(Some(Poll::Pending)) => Poll::Pending,
+                        Ok(Some(Poll::Ready(output))) => {
+                            *done = true;
+                            Poll::Ready(Ok(output))
+                        }
+                        Ok(None) | Err(()) => Poll::Ready(Err(driver::Ended)),
+                    }
+                })
+            }
+        }
+    }
+}
+
+impl Drop for Transmit<'_> {
+    fn drop(&mut self) {
+        if let Sending::Record { home, done: false } = &self.form
+            && with_driver(home.resource(), |driver, resource| driver.end_send(resource)).is_err()
+        {
+            home.post_mark(driver::Mark::SendDropped);
+        }
+    }
+}
+
 /// Ends the wait of the receive of the stream of `home` in the record of the stream, and wakes its
 /// waiter when `wake`. In a turn of the driver, the home records it, and the next turn ends it
 /// and wakes the waiter.
@@ -328,7 +419,7 @@ fn end_wait(home: &Cleanup, wake: bool) {
     match with_driver(home.resource(), |driver, resource| driver.end_reading(resource)) {
         Ok(waiter) if wake => waiter.wake(),
         Ok(_) => {}
-        Err(_) => home.post_reader(),
+        Err(_) => home.post_mark(driver::Mark::Reader),
     }
 }
 
@@ -369,6 +460,7 @@ impl ReadHalf<'_> {
 #[derive(Debug)]
 pub struct WriteHalf<'a> {
     write: &'a mut driver::WriteHalf,
+    home: &'a Cleanup,
     _home: Home,
 }
 
@@ -378,9 +470,8 @@ impl WriteHalf<'_> {
     /// # Errors
     ///
     /// As for [`TcpStream::send`].
-    pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
-        let write = &mut *self.write;
-        submit(lease, |driver, lease| driver.send(write, lease)).map(Operation::home)
+    pub fn send(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
+        Transmit::start(self.write, self.home, lease)
     }
 
     /// Sends the bytes of `regions` in order, as [`TcpStream::send_vectored`] does.

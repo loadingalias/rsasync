@@ -165,7 +165,7 @@ pub(crate) use {
 use crate::completion::Entry;
 pub(crate) use completion::Completion;
 #[cfg(all(feature = "local", target_os = "linux"))]
-pub(crate) use home::{Cleanup, Home, MESSAGES};
+pub(crate) use home::{Cleanup, Home, MESSAGES, Mark};
 // The operations of the movable I/O types, and their outputs.
 #[cfg(all(feature = "movable", target_os = "linux"))]
 pub(crate) use plain::{
@@ -290,7 +290,7 @@ impl Config {
         Self { receives, ..self }
     }
 
-    /// The resources, such as descriptors, that the driver can own at one time: at most 2^29.
+    /// The resources, such as descriptors, that the driver can own at one time: at most 2^28.
     #[must_use]
     pub const fn resources(self, resources: u32) -> Self {
         Self { resources, ..self }
@@ -949,9 +949,13 @@ pub(crate) struct Resource {
 }
 
 impl Resource {
-    /// The user data of the multishot receive of the stream of this resource.
-    const fn record(self) -> u64 {
-        RECORD | (self.index as u64) << 32 | self.generation as u64
+    /// The user data of the completions of `half` of the record of the stream of this resource.
+    const fn record(self, half: Half) -> u64 {
+        let write = match half {
+            Half::Read => 0,
+            Half::Write => RECORD_WRITE,
+        };
+        RECORD | write | (self.index as u64) << 32 | self.generation as u64
     }
 }
 
@@ -1085,10 +1089,11 @@ struct Resources {
     fail_registration: bool,
     /// The buffers that the multishot receives of the streams keep for their next receives.
     shelf: tcp::Shelf,
-    /// The multishot receives of the streams that run: a completion of each one can still come.
-    armed: u32,
-    /// A cancel of the multishot receive of a stream that closes found the queue full, so the next
-    /// turn asks again ([`Driver::recancel`]).
+    /// The multishot receives and the sends of the records of the streams that run: a completion
+    /// of each one can still come.
+    in_flight: u32,
+    /// A cancel of a completion of the record of a stream that closes found the queue full, so the
+    /// next turn asks again ([`Driver::recancel`]).
     recancel: bool,
 }
 
@@ -1120,7 +1125,7 @@ impl Resources {
             registrar,
             fail_registration: false,
             shelf: tcp::Shelf::default(),
-            armed: 0,
+            in_flight: 0,
             recancel: false,
         })
     }
@@ -1286,20 +1291,27 @@ impl Resources {
             .filter(|slot| resource.driver == driver && slot.generation == resource.generation && slot.used())
     }
 
-    /// The resource whose multishot receive has the user data `user_data`, when it is a record.
+    /// The resource and the half of the record whose completion has the user data `user_data`,
+    /// when it is a record.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the generation is the low 32 bits of the user data, and the index fits in 29 bits"
+        reason = "the generation is the low 32 bits of the user data, and the index fits in 28 bits"
     )]
-    const fn of_record(&self, user_data: u64) -> Option<Resource> {
+    const fn of_record(&self, user_data: u64) -> Option<(Resource, Half)> {
         if user_data & RECORD_MASK != RECORD {
             return None;
         }
-        Some(Resource {
+        let resource = Resource {
             driver: self.driver,
             index: (user_data >> 32) as u32 & (MAX_RESOURCES - 1),
             generation: user_data as u32,
-        })
+        };
+        let half = if user_data & RECORD_WRITE == 0 {
+            Half::Read
+        } else {
+            Half::Write
+        };
+        Some((resource, half))
     }
 
     /// The slot of `resource`, as [`Resources::get`] gives it, and the shelf of the buffers that
@@ -1390,20 +1402,34 @@ pub const KEPT_BUFFERS: u32 = 4;
 #[cfg(target_os = "linux")]
 const WAKE: u64 = CONTROL;
 
-/// The user data of the multishot receive of a stream: this tag, the index of the resource slot of
-/// the stream in bits 32 to 60, and the generation of its resource ([`Resource::record`]).
+/// The user data of a completion of the record of a stream: this tag, the half of the stream in
+/// bit 60 ([`RECORD_WRITE`]), the index of its resource slot in bits 32 to 59, and the generation
+/// of its resource ([`Resource::record`]).
 const RECORD: u64 = CONTROL | 1 << 61;
+
+/// The bit of the user data of a record that names the write half: the send of the record. With
+/// no bit, the completion is of the multishot receive of the read half.
+const RECORD_WRITE: u64 = 1 << 60;
 
 /// The bits of the user data that tell a record from the other control completions.
 const RECORD_MASK: u64 = 0b111 << 61;
 
-/// The user data of the result of a cancel of a multishot receive. The harvest ignores it: the
-/// terminal completion of the receive ends it.
+/// The user data of the result of a cancel of a completion of a record. The harvest ignores it: the
+/// terminal completion of the target ends it.
 const RECORD_CANCEL: u64 = CONTROL | 2;
 
-/// The most resource slots of a driver: the index of a slot has 29 bits of the user data of a
+/// The most resource slots of a driver: the index of a slot has 28 bits of the user data of a
 /// record.
-const MAX_RESOURCES: u32 = 1 << 29;
+const MAX_RESOURCES: u32 = 1 << 28;
+
+/// A half of a stream, whose record has a completion of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Half {
+    /// The multishot receive.
+    Read,
+    /// The send of a local stream.
+    Write,
+}
 
 /// The longest entry of the kernel in a wait while a file operation runs on the ring. The kernel
 /// selects the idle state of the CPU from the time to its next timer, so the CPU then enters no
@@ -2009,7 +2035,7 @@ impl Driver {
     /// Whether an operation of the driver or the multishot receive of a stream runs, so that a
     /// completion can still come.
     pub(crate) fn busy(&self) -> bool {
-        self.table.busy() || self.resources.armed > 0
+        self.table.busy() || self.resources.in_flight > 0
     }
 
     /// The [`Control`] of a driver under [`Delivery::Controlled`], or `None` under native
@@ -2360,6 +2386,8 @@ impl Driver {
             // A receive that waits for the multishot receive of its stream has no submission.
             self.end_awaiting(resource);
             self.cancel_armed(resource)?;
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            self.cancel_record_send(resource)?;
         }
         let mut cancelled = 0_u32;
         #[cfg(unix)]
@@ -2746,7 +2774,7 @@ impl Driver {
             // with no operation slot: its buffer goes to the shelf, and the local receive that
             // waits wakes. The operation that waits takes it after the harvest, and a full shelf
             // ends the multishot receive there.
-            if let Some(resource) = resources.of_record(cqe.user_data) {
+            if let Some((resource, Half::Read)) = resources.of_record(cqe.user_data) {
                 let buffer = cqe
                     .buffer()
                     .zip(selected.as_mut())
@@ -2758,8 +2786,22 @@ impl Driver {
                     #[cfg(all(feature = "local", target_os = "linux"))]
                     consumers.wake_waiter(owned.directions.take_reader());
                     if !event.more {
-                        resources.armed -= 1;
+                        resources.in_flight -= 1;
                     }
+                }
+                continue;
+            }
+            // The terminal completion of the send of a record wakes the future, or the abandoned
+            // rule applies to it.
+            #[cfg(all(feature = "local", target_os = "linux"))]
+            if let Some((resource, Half::Write)) = resources.of_record(cqe.user_data) {
+                if let Some(owned) = resources.get(resource) {
+                    let (needs, waiter) = owned.directions.record_sent(cqe.res);
+                    if needs {
+                        pending.push(resource);
+                    }
+                    consumers.wake_waiter(waiter);
+                    resources.in_flight -= 1;
                 }
                 continue;
             }
@@ -3108,8 +3150,11 @@ impl Drop for Driver {
         {
             self.consumers.end();
             for owned in &mut self.resources.slots {
-                if let home::Waiter::Waker(waker) = owned.directions.take_reader() {
-                    waker.wake();
+                // The kernel can still read the lease of a send that runs, so it leaks.
+                for waiter in owned.directions.end_records() {
+                    if let home::Waiter::Waker(waker) = waiter {
+                        waker.wake();
+                    }
                 }
             }
         }

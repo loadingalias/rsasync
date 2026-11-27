@@ -212,7 +212,8 @@ same as on the driver.
 | `TcpListener::bind(address, options)` | `Driver::bind` |
 | `listener.accept()` | `Driver::accept` |
 | `TcpStream::connect(address, options)` | `Driver::connect` |
-| `stream.recv(backing)`, `stream.send(lease)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send`, `Driver::send_vectored` |
+| `stream.recv(backing)`, `stream.send_vectored(regions)` | `Driver::recv`, `Driver::send_vectored` |
+| `stream.send(lease)` | `Driver::send`. The future is a `rsasync::local::Transmit` |
 | `stream.recv_selected()` | `Driver::recv_selected`, into the provided buffers of the owner. The future is a `rsasync::local::Receive` |
 | `stream.shutdown_write()` | `Driver::shutdown_write` |
 | `options()`, `set_options(options)` | `Driver::options`, `Driver::set_options` |
@@ -238,6 +239,19 @@ filled. When no buffer waits, the driver keeps the waker of the poll with the st
 - With `Shot::Single`, or after an earlier receive of the stream that still runs or left a
   result, the `Receive` is an operation of `Driver::recv_selected`, with the rules of
   [Dropped, forgotten, and cancelled operations](#dropped-forgotten-and-cancelled-operations).
+
+The future of `send(lease)` is a `rsasync::local::Transmit`, with `cancel()` and the output
+`(io::Result<usize>, Lease)`. On io_uring, a `Transmit` is no operation of the driver, so it holds
+no operation slot: the driver keeps the lease with the stream until the kernel ends the send, and
+that completion wakes the future. The rules of a send stay the same:
+
+- A drop of the future does not cancel the send, which runs on. The next send of the stream
+  starts after it ends. If the dropped send sent only part of its bytes, the write direction fails,
+  as [A failed write direction](#a-failed-write-direction) tells.
+- `cancel()` asks the kernel to cancel the send. The future then gives the exact count of the
+  bytes that went, or the error `ECANCELED`, and the stream can send again.
+- On epoll, after a failed write direction, or while a dropped send still runs, the `Transmit` is
+  an operation of `Driver::send`.
 
 ```rust
 use rsasync::buffer::{Backing, Buffer as _, Lease};
@@ -267,7 +281,7 @@ runtime.block_on(async {
 The local types differ from the driver types in two points:
 
 - They are not `Send`, so a resource stays on the thread of its home. The future of each call,
-  `rsasync::local::Operation` or `rsasync::local::Receive`, is not `Send` either, so the resource starts on that thread and each
+  `rsasync::local::Operation`, `rsasync::local::Receive`, or `rsasync::local::Transmit`, is not `Send` either, so the resource starts on that thread and each
   operation ends there. The driver takes the result in place and wakes the task that polls the
   future. A poll outside the owner of the home gives `Ended`, and the drop of the future then ends
   the operation as a drop does. A local call

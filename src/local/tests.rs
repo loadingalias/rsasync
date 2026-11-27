@@ -30,7 +30,7 @@ use crate::capacity::Budget;
 use crate::channel::oneshot;
 use crate::driver::{
     ChildOptions, Config, Datagram, End, Escalation, OpenOptions, Reason, SendCount, Shot, Signal, Stale, SyncMode,
-    TcpOptions, UdpOptions, WriteMode,
+    TcpOptions, UdpOptions, WriteFailed, WriteMode,
 };
 use crate::runtime::{GroupError, Runtime, WorkerId};
 use crate::task;
@@ -302,6 +302,98 @@ fn a_close_cancels_a_dropped_send_to_a_peer_that_never_reads_and_ends() {
     assert_eq!(sent, SendCount::Sent(0));
 }
 
+/// Reads from `peer` on a new thread until the end of the stream or `until` bytes, and gives the
+/// count of the bytes and the last 16.
+fn drain(mut peer: std::net::TcpStream, until: usize) -> thread::JoinHandle<(usize, Vec<u8>)> {
+    thread::spawn(move || {
+        let (mut chunk, mut total, mut last) = (vec![0; 1 << 16], 0, Vec::new());
+        while total < until {
+            let read = peer.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            total += read;
+            last.extend_from_slice(&chunk[..read]);
+            last.drain(..last.len().saturating_sub(16));
+        }
+        (total, last)
+    })
+}
+
+/// A cancel of a local send that waits in the kernel ends it with `ECANCELED` and sends no byte of
+/// it, and the stream sends on. A send that drops while it waits runs on, and the next send follows
+/// it: the peer reads the bytes of both, in order.
+#[test]
+fn a_cancelled_or_dropped_local_send_keeps_the_order_of_the_stream() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let mut listener = TcpListener::bind(loopback(), TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            let (mut stream, _peer) = listener.accept().unwrap().await.unwrap().unwrap();
+            let (_read, mut write) = stream.split();
+            let (mut sent, mut waits) = (0, None);
+            for _ in 0..16 {
+                let mut send = write.send(Lease::from(vec![7; FILL])).unwrap();
+                until_window_closes(&peer).await;
+                match poll_fn(|cx| Poll::Ready(Pin::new(&mut send).poll(cx))).await {
+                    Poll::Ready(output) => sent += output.unwrap().0.unwrap(),
+                    Poll::Pending => {
+                        waits = Some(send);
+                        break;
+                    }
+                }
+            }
+            let send = waits.expect("a send waits in the kernel");
+            send.cancel();
+            let (cancelled, _lease) = send.await.unwrap();
+            assert_eq!(cancelled.unwrap_err().raw_os_error(), Some(crate::driver::ECANCELED));
+
+            let mut dropped = write.send(Lease::from(b"dropped:".to_vec())).unwrap();
+            let polled = poll_fn(|cx| Poll::Ready(Pin::new(&mut dropped).poll(cx).is_pending())).await;
+            assert!(polled, "the send waits for room");
+            drop(dropped);
+            let next = write.send(Lease::from(b"next".to_vec())).unwrap();
+            let reader = drain(peer, sent + 12);
+            assert_eq!(next.await.unwrap().0.unwrap(), 4);
+            let (total, last) = reader.join().unwrap();
+            assert_eq!((total, &last[last.len() - 12..]), (sent + 12, &b"dropped:next"[..]));
+        })
+        .unwrap();
+}
+
+/// A local send that drops after it sent only part of its bytes fails the write direction: the next
+/// send gives the count of the bytes that went, and the peer reads exactly those bytes.
+#[test]
+fn a_dropped_partial_local_send_fails_the_write_direction_with_its_count() {
+    let runtime = Runtime::builder().build().unwrap();
+    runtime
+        .block_on(async {
+            let mut listener = TcpListener::bind(loopback(), TcpOptions::default())
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
+            let (mut stream, _peer) = listener.accept().unwrap().await.unwrap().unwrap();
+            drop(stream.send(Lease::from(vec![7; FILL])).unwrap());
+            let (next, _lease) = stream.send(Lease::from(b"next".to_vec())).unwrap().await.unwrap();
+            let failed = next.unwrap_err();
+            let Some(SendCount::Sent(sent)) = WriteFailed::of(&failed).map(WriteFailed::sent) else {
+                panic!("the next send gives the count of the dropped send: {failed}");
+            };
+            assert!(0 < sent && sent < FILL, "the dropped send sent all or nothing: {sent}");
+            let reader = drain(peer, usize::MAX);
+            stream.close().unwrap().await.unwrap();
+            assert_eq!(reader.join().unwrap().0, sent);
+        })
+        .unwrap();
+}
+
 /// A stream that leaves its `block_on` refuses each call and gives the buffer back: with no owner
 /// on the thread with `Reason::NoDriver`, and in the next `block_on`, whose driver has its own
 /// stream in the same slot, with `Reason::Resource`. An option read with no owner gives an error
@@ -332,28 +424,30 @@ fn a_stream_after_its_block_on_refuses_and_gives_its_buffer_back() {
 
 /// A receive that a `block_on` started ends with `Ended` at a poll outside that owner, and does not
 /// wait: no turn of its driver comes there, so a wait would never end. A selected receive with the
-/// multishot receive of its stream does the same.
+/// multishot receive of its stream and a send of a stream, which use its record, do the same.
 #[test]
 fn a_receive_polled_outside_its_owner_ends_and_does_not_wait() {
     let runtime = Runtime::builder().build().unwrap();
-    let (_listener, _client, mut receive, mut selected) = runtime
+    let (_listener, _client, mut receive, mut selected, mut send) = runtime
         .block_on(async {
             let (listener, server, client) = pair().await;
             // The receives need streams that outlive `block_on`.
             let server = Box::leak(Box::new(server));
-            let (read, _write) = Box::leak(Box::new(pair().await.1)).split();
-            let read = Box::leak(Box::new(read));
+            let (read, write) = Box::leak(Box::new(pair().await.1)).split();
+            let (read, write) = (Box::leak(Box::new(read)), Box::leak(Box::new(write)));
             (
                 listener,
                 client,
                 server.recv(buffer()).unwrap(),
                 read.recv_selected().unwrap(),
+                write.send(Lease::from(b"x".to_vec())).unwrap(),
             )
         })
         .unwrap();
     let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
     assert_matches!(Pin::new(&mut receive).poll(&mut cx), Poll::Ready(Err(_)));
     assert_matches!(Pin::new(&mut selected).poll(&mut cx), Poll::Ready(Err(_)));
+    assert_matches!(Pin::new(&mut send).poll(&mut cx), Poll::Ready(Err(_)));
 }
 
 /// A stream that drops while its owner runs closes, so its peer reads the end of the stream before

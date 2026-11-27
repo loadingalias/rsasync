@@ -8,7 +8,7 @@ use core::net::SocketAddr;
 use std::io;
 use std::os::fd::OwnedFd;
 
-use super::{Home, Homed, Operation, ReadHalf, Receive, WriteHalf, call, rewrap, submit};
+use super::{Home, Homed, Operation, ReadHalf, Receive, Transmit, WriteHalf, call, rewrap, submit};
 use crate::buffer::{Backing, Lease};
 use crate::driver::{self, Closed, Completion, Driver, Refused, Regions, TcpOptions};
 
@@ -215,6 +215,7 @@ impl TcpStream {
             },
             WriteHalf {
                 write,
+                home: &self.inner.cleanup,
                 _home: Home::default(),
             },
         )
@@ -250,9 +251,8 @@ impl TcpStream {
     /// # Errors
     ///
     /// As for [`TcpStream::recv`], with the lease.
-    pub fn send(&mut self, lease: Lease) -> Result<Operation<'_, (io::Result<usize>, Lease)>, Refused<Lease>> {
-        let stream = &mut self.inner.resource;
-        submit(lease, |driver, lease| driver.send(stream, lease)).map(Operation::home)
+    pub fn send(&mut self, lease: Lease) -> Result<Transmit<'_>, Refused<Lease>> {
+        Transmit::start(self.inner.resource.as_mut(), &self.inner.cleanup, lease)
     }
 
     /// Sends the bytes of `regions` in order, in one operation, as

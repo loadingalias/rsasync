@@ -261,8 +261,24 @@ which R520 and R521 extend for their backends. R603 adds its transitions when it
 | `Notice(g)` | Terminal-event table: the zero-copy notice of send `g` releases its own buffer and charge, once. After the last notice of detached debt, the descriptor closes | The kernel posts the notice and the home of `g` harvests it in one step | R603 | — | — | — |
 | `Shutdown` | Startup, Shutdown, and Failures: shutdown closes ingress, and grace expiry escalates | The request and grace expiry are one step | — | — | — | — |
 | `EndTask` | Startup, Shutdown, and Failures: the task returns, or grace expiry cancels it. Its futures drop. Driver Topology: close first cancels each outstanding operation, a dropped send included. Each held slot and each pending notice gets the home of its submission | One step for the drops and the closes | — | Driver-only: `Driver::teardown` cancels each running operation by its own user data | Driver-only: `Driver::teardown` first ends each operation that waits, with `ECANCELED` | `Driver::teardown` waits for each spawn job, kills each child with `End::Kill`, and cancels the exit operation of each child with `End::Keep`, which `Teardown::kept` counts |
-| `Exit` | Driver Topology: a worker with live operations or pending notices cannot exit until they reach terminal release. Startup, Shutdown, and Failures: no worker exits while a task of the runtime remains. `block_on` returns only after each operation that its driver homes reaches terminal release (selected on 2026-11-11) | One step | — | Driver-only: `Driver::teardown` drives until `Table::busy` is false, then closes each resource. The worker exit is R304 and R305. The return of `block_on` is `RingOwner::block_on` (`src/task/ring.rs`): it returns when its tasks end and does not yet drive its driver to terminal release (found on 2026-11-17). R305 makes that side true | — | — |
+| `Exit` | Driver Topology: a worker with live operations or pending notices cannot exit until they reach terminal release. Startup, Shutdown, and Failures: no worker exits while a task of the runtime remains. `block_on` returns only after each operation that its driver homes reaches terminal release (selected on 2026-11-11) | One step | — | Driver-only: `Driver::teardown` drives until `Driver::busy` is false: no operation of the table and no completion of a record runs. Then it closes each resource. The worker exit is R304 and R305. The return of `block_on` is `RingOwner::block_on` (`src/task/ring.rs`): it returns when its tasks end and does not yet drive its driver to terminal release (found on 2026-11-17). R305 makes that side true | — | — |
 | `Terminated` | None. The end state stutters, so deadlock checking stays on | One step | — | — | — | — |
+
+The record of a local stream (R317, mechanism 3 of Cost of a Request on a Local Worker). On
+io_uring, a local send of a stream (`local::Transmit`) is no operation of the table. The record of
+the stream holds its lease, its result, and its waiter (`tcp::Sending`), and the user data of its
+entry names the record (`Resource::record`). The actions keep their rules, at these transitions:
+`BeginTx` is `Driver::send_record`, which takes the record only when the direction runs, keeps
+waiting, and owes nothing, and else gives the send to `Driver::send`. An operation of the write
+direction waits behind a send of the record that runs (`begin` and `attend`). `Claim` is
+`Directions::take_send`. `Cancel` is `Driver::cancel_record_send`, once. `Drop` is
+`Driver::end_send`, and `Forget` is the `forgo_send` of the next send of the direction. `Complete`
+is the harvest of the record (`Directions::record_sent`), with the abandoned rule of `Kind::Send`
+for a send with no interest. `TakeOver` and `CloseDone` are `start_close` and `close_if_idle`,
+which end the interest of the send of the record, cancel it, and wait for its terminal event. A
+drop or a cancel in a turn of the driver posts its mark in the close word of the stream
+(`home::Mark`), which the next turn takes: the entry path of reduction 1. A local selected receive
+with the multishot receive is outside the model (Limits).
 
 The backends. The R507 column names the IOCP transitions (`src/driver/iocp.rs`), and the
 R503, R505, and R520 column names the transitions of the readiness poller (`src/driver/poller.rs`),
