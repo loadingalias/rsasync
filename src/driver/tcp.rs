@@ -746,7 +746,7 @@ impl Shelf {
     /// The first buffer of `list`, with the bytes that a receive took from its start.
     fn first(&self, list: &Shelved) -> Option<(&Backing, usize)> {
         let buffer = self.places.get(list.first as usize)?.buffer.as_ref()?;
-        Some((buffer, list.start))
+        Some((buffer, list.start as usize))
     }
 
     /// Takes the first buffer of `list`, with the bytes that a receive took from its start.
@@ -754,7 +754,7 @@ impl Shelf {
         let place = list.first;
         let slot = self.places.get_mut(place as usize)?;
         let buffer = slot.buffer.take()?;
-        let start = list.start;
+        let start = list.start as usize;
         list.first = slot.next;
         if list.first == NO_PLACE {
             list.last = NO_PLACE;
@@ -778,8 +778,9 @@ pub(super) struct Shelved {
     first: u32,
     last: u32,
     len: u32,
-    /// The bytes of the first buffer that a receive into the caller's buffer copied.
-    start: usize,
+    /// The bytes of the first buffer that a receive into the caller's buffer copied. A shelved
+    /// buffer holds the bytes of one result of the kernel, so they fit a `u32`.
+    start: u32,
 }
 
 impl Default for Shelved {
@@ -796,6 +797,41 @@ impl Default for Shelved {
 impl Shelved {
     const fn is_empty(&self) -> bool {
         self.first == NO_PLACE
+    }
+}
+
+/// A terminal result of the kernel, or none, in 4 bytes, so that the record of a stream keeps its
+/// hot fields in two cache lines. No result of the kernel is `i32::MIN`: a count is at least 0, and
+/// an error is a negated `errno`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Terminal(i32);
+
+impl Terminal {
+    /// No result.
+    const NONE: Self = Self(i32::MIN);
+
+    /// The result `result` of the kernel.
+    fn of(result: i32) -> Self {
+        assert_ne!(result, i32::MIN, "no result of the kernel is i32::MIN");
+        Self(result)
+    }
+
+    const fn get(self) -> Option<i32> {
+        if self.0 == i32::MIN { None } else { Some(self.0) }
+    }
+
+    const fn is_some(self) -> bool {
+        self.0 != i32::MIN
+    }
+
+    const fn take(&mut self) -> Option<i32> {
+        core::mem::replace(self, Self::NONE).get()
+    }
+}
+
+impl Default for Terminal {
+    fn default() -> Self {
+        Self::NONE
     }
 }
 
@@ -849,20 +885,17 @@ enum Armed {
 }
 
 /// The send of a local stream in its record, with no operation ([`Driver::send_record`]): from its
-/// start to the take of its result, or to its terminal event when no future has interest.
+/// start to the take of its result, or to its terminal event when no future has interest. It runs
+/// while it holds the lease and no result. Its waiter is [`Directions::sender`], in a later line.
 #[cfg(all(feature = "local", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct Sending {
-    /// The waiter of the future, which the terminal event wakes.
-    waiter: super::home::Waiter,
     /// The lease that the kernel reads. The record holds a send while it holds the lease.
     lease: Option<Lease>,
-    /// The result of the terminal event, until the take.
-    result: Option<i32>,
     /// The bytes that the earlier sends of the kernel of a send of each byte sent.
     went: usize,
-    /// The terminal event did not come.
-    runs: bool,
+    /// The result of the terminal event, until the take.
+    result: Terminal,
     /// A future has interest in the result.
     interest: bool,
     /// The driver asked the kernel to cancel the send.
@@ -870,13 +903,24 @@ struct Sending {
     /// The send sends each byte of the lease, in as many sends of the kernel as it takes
     /// ([`Kind::SendAll`]).
     all: bool,
+    /// A poll found no result and set [`Directions::sender`], which the terminal event wakes.
+    waits: bool,
+}
+
+#[cfg(all(feature = "local", target_os = "linux"))]
+impl Sending {
+    /// The terminal event of the send did not come.
+    const fn runs(&self) -> bool {
+        self.lease.is_some() && !self.result.is_some()
+    }
 }
 
 /// The directions of a stream or a listener, at the home.
 ///
 /// The order of the fields is stated: a local receive and a local send of the record of a stream
-/// read only the fields before `read`, while `operated` is false. The state of the operations of
-/// the table comes after them.
+/// read only the fields before `sender`, while `operated` is false, and the slot of the stream has
+/// them in its first two cache lines. `sender` and `unreported` are read only behind a flag. The
+/// state of the operations of the table comes after them.
 #[derive(Debug, Default)]
 #[repr(C)]
 pub(super) struct Directions {
@@ -899,12 +943,11 @@ pub(super) struct Directions {
     /// again at the next attend ([`Driver::resend`]): the operation that runs, or the send of the
     /// record.
     again: bool,
+    /// `unreported` is above 0.
+    counted: bool,
     /// The terminal result of the last multishot receive, after `shelved`: the end of the stream,
     /// or an error.
-    ended: Option<i32>,
-    /// The bytes that dropped sends sent, since the end of the last send whose result a future
-    /// took, or since the last report.
-    unreported: usize,
+    ended: Terminal,
     /// The buffers that `armed` filled and no receive took, after `kept`.
     shelved: Shelved,
     /// The waiter of the local receive that waits, which a completion of `armed` wakes.
@@ -912,6 +955,12 @@ pub(super) struct Directions {
     reader: super::home::Waiter,
     #[cfg(all(feature = "local", target_os = "linux"))]
     sending: Sending,
+    /// The waiter of the future of the send of the record, while `sending.waits`.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    sender: super::home::Waiter,
+    /// The bytes that dropped sends sent, since the end of the last send whose result a future
+    /// took, or since the last report.
+    unreported: usize,
     read: Direction,
     write: Direction,
     kept: Option<Kept>,
@@ -973,7 +1022,7 @@ impl Directions {
         if !more {
             self.armed = Armed::No;
             if !filled && result <= 0 && result != -ECANCELED && (result != -ENOBUFS || self.waits() && self.fresh) {
-                self.ended = Some(result);
+                self.ended = Terminal::of(result);
             }
         }
         self.fresh &= !filled;
@@ -1012,7 +1061,7 @@ impl Directions {
     /// ([`Driver::send_record`]).
     const fn record_sends(&self) -> bool {
         cfg_select! {
-            all(feature = "local", target_os = "linux") => self.sending.runs,
+            all(feature = "local", target_os = "linux") => self.sending.runs(),
             _ => false,
         }
     }
@@ -1045,10 +1094,9 @@ impl Directions {
                 return (self.send_again(), None);
             }
         }
-        self.sending.runs = false;
         let waiter = if self.sending.interest {
-            self.sending.result = Some(result);
-            core::mem::take(&mut self.sending.waiter)
+            self.sending.result = Terminal::of(result);
+            self.take_sender()
         } else {
             self.abandon_record_send(result);
             super::home::Waiter::None
@@ -1084,12 +1132,23 @@ impl Directions {
     /// abandoned rule now, and one that runs takes it at its terminal event.
     #[cfg(all(feature = "local", target_os = "linux"))]
     fn forgo_send(&mut self) {
-        match self.sending.result {
+        match self.sending.result.get() {
             Some(result) => self.abandon_record_send(result),
             None => {
                 self.sending.interest = false;
-                self.sending.waiter = super::home::Waiter::None;
+                drop(self.take_sender());
             }
+        }
+    }
+
+    /// Takes the waiter of the send of the record, if a poll set it. Else it reads no line of the
+    /// waiter.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    fn take_sender(&mut self) -> super::home::Waiter {
+        if core::mem::take(&mut self.sending.waits) {
+            core::mem::take(&mut self.sender)
+        } else {
+            super::home::Waiter::None
         }
     }
 
@@ -1103,17 +1162,17 @@ impl Directions {
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<(io::Result<usize>, Lease)>> {
         use core::task::Poll;
-        let sending = &mut self.sending;
-        sending.lease.as_ref()?;
-        let Some(result) = sending.result else {
-            sending.waiter.set(task, waker);
+        self.sending.lease.as_ref()?;
+        let Some(result) = self.sending.result.get() else {
+            self.sending.waits = true;
+            self.sender.set(task, waker);
             return Some(Poll::Pending);
         };
-        let Sending { lease, went, all, .. } = core::mem::take(sending);
+        let Sending { lease, went, all, .. } = core::mem::take(&mut self.sending);
         // A send result that a future took reports each byte up to its end, as at
         // [`Directions::taken`].
         if self.sent == Sent::Ok {
-            self.unreported = 0;
+            self.clear_unreported();
         }
         let sent = if all { all_count(result, went) } else { count(result) };
         Some(Poll::Ready((sent, lease?)))
@@ -1123,10 +1182,10 @@ impl Directions {
     /// caller wakes. The lease of a send that runs leaks, because the kernel can still read it.
     #[cfg(all(feature = "local", target_os = "linux"))]
     pub(super) fn end_records(&mut self) -> [super::home::Waiter; 2] {
-        if self.sending.runs {
+        if self.sending.runs() {
             let _leaked = core::mem::ManuallyDrop::new(self.sending.lease.take());
         }
-        [self.take_reader(), core::mem::take(&mut self.sending.waiter)]
+        [self.take_reader(), self.take_sender()]
     }
 
     /// Gives each buffer that the direction keeps on `shelf` back to its pool.
@@ -1169,7 +1228,7 @@ impl Directions {
     #[cfg(all(feature = "movable", target_os = "linux"))]
     pub(super) fn inherit(&mut self, earlier: &mut Self, kind: Kind) {
         if kind.writes() {
-            (self.sent, self.unreported) = (earlier.sent, earlier.unreported);
+            (self.sent, self.unreported, self.counted) = (earlier.sent, earlier.unreported, earlier.counted);
         } else {
             self.kept = earlier.kept.take();
         }
@@ -1207,7 +1266,7 @@ impl Directions {
             && self.armed == Armed::No
             && !self.record_holds()
             && self.shelved.is_empty()
-            && self.ended.is_none()
+            && !self.ended.is_some()
             && self.kept.is_none()
     }
 
@@ -1221,6 +1280,20 @@ impl Directions {
             direction.current = None;
         }
         if matches!(kind, Kind::Send | Kind::SendAll | Kind::Vectored) && self.sent == Sent::Ok {
+            self.clear_unreported();
+        }
+    }
+
+    /// Adds `sent` to the bytes that dropped sends sent.
+    fn count_unreported(&mut self, sent: usize) {
+        self.unreported = self.unreported.saturating_add(sent);
+        self.counted |= sent > 0;
+    }
+
+    /// Forgets the bytes that dropped sends sent. With no such byte, it reads no line of
+    /// `unreported`.
+    fn clear_unreported(&mut self) {
+        if core::mem::take(&mut self.counted) {
             self.unreported = 0;
         }
     }
@@ -1238,10 +1311,14 @@ impl Directions {
                 {
                     // The receive copied its bytes from the kept buffer, which still holds them.
                     *start -= held.copied;
-                } else if held.copied > 0 && kind == Kind::Recv && self.shelved.start >= held.copied {
+                } else if let Ok(copied) = u32::try_from(held.copied)
+                    && copied > 0
+                    && kind == Kind::Recv
+                    && self.shelved.start >= copied
+                {
                     // The receive copied its bytes from the first shelved buffer, which still
                     // holds them: a later buffer starts with no copied byte.
-                    self.shelved.start -= held.copied;
+                    self.shelved.start -= copied;
                 } else if let (Ok(received), Some(buffer)) = (usize::try_from(result), buffer)
                     && received > 0
                 {
@@ -1256,7 +1333,7 @@ impl Directions {
                     // The future did not take the failure: the next send gives it.
                     match failed.sent {
                         SendCount::Sent(sent) => {
-                            self.unreported = self.unreported.saturating_add(sent);
+                            self.count_unreported(sent);
                             self.sent = Sent::Owe;
                         }
                         #[cfg(target_os = "windows")]
@@ -1279,7 +1356,7 @@ impl Directions {
                     Payload::Regions(regions) => regions.total(),
                     _ => 0,
                 };
-                self.unreported = self.unreported.saturating_add(sent);
+                self.count_unreported(sent);
                 #[cfg(target_os = "windows")]
                 if result == -sys::WSAECONNABORTED {
                     self.sent = Sent::Lost;
@@ -1365,7 +1442,7 @@ impl Directions {
                 let count = held.loan.as_mut().map_or(0, |loan| loan.fill_from(bytes));
                 let rest = bytes.len() - count;
                 held.copied = count;
-                self.shelved.start += count;
+                self.shelved.start += u32::try_from(count).expect("a shelved buffer holds one result of the kernel");
                 if rest == 0 {
                     drop(shelf.take(&mut self.shelved));
                 }
@@ -1448,7 +1525,7 @@ impl Directions {
                     _ => {
                         held.failed = Some(WriteFailed { sent: self.count() });
                         self.sent = Sent::Reported;
-                        self.unreported = 0;
+                        self.clear_unreported();
                         Some(0)
                     }
                 }
@@ -2630,7 +2707,6 @@ impl Driver {
         if let Some(owned) = self.resources.get(resource) {
             owned.directions.sending = Sending {
                 lease: Some(lease),
-                runs: true,
                 interest: true,
                 all: kind == Kind::SendAll,
                 ..Sending::default()
@@ -2673,7 +2749,7 @@ impl Driver {
         if self
             .resources
             .get(resource)
-            .is_none_or(|owned| !owned.directions.sending.runs || owned.directions.sending.cancelled)
+            .is_none_or(|owned| !owned.directions.sending.runs() || owned.directions.sending.cancelled)
         {
             return Ok(());
         }

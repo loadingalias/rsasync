@@ -395,7 +395,9 @@ fn a_local_send_of_each_byte_sends_each_byte_also_after_its_drop() {
 }
 
 /// A local send that drops after it sent only part of its bytes fails the write direction: the next
-/// send gives the count of the bytes that went, and the peer reads exactly those bytes.
+/// send gives the count of the bytes that went, and the peer reads exactly those bytes after the
+/// bytes of the sends before it. The count has no byte of a dropped send before a send whose result
+/// the task took.
 #[test]
 fn a_dropped_partial_local_send_fails_the_write_direction_with_its_count() {
     let runtime = Runtime::builder().build().unwrap();
@@ -408,6 +410,9 @@ fn a_dropped_partial_local_send_fails_the_write_direction_with_its_count() {
                 .unwrap();
             let peer = std::net::TcpStream::connect(listener.local_addr()).unwrap();
             let (mut stream, _peer) = listener.accept().unwrap().await.unwrap().unwrap();
+            drop(stream.send(Lease::from(vec![5; 16])).unwrap());
+            let (taken, _lease) = stream.send(Lease::from(vec![6; 16])).unwrap().await.unwrap();
+            assert_eq!(taken.unwrap(), 16);
             drop(stream.send(Lease::from(vec![7; FILL])).unwrap());
             let (next, _lease) = stream.send(Lease::from(b"next".to_vec())).unwrap().await.unwrap();
             let failed = next.unwrap_err();
@@ -417,7 +422,7 @@ fn a_dropped_partial_local_send_fails_the_write_direction_with_its_count() {
             assert!(0 < sent && sent < FILL, "the dropped send sent all or nothing: {sent}");
             let reader = drain(peer, usize::MAX);
             stream.close().unwrap().await.unwrap();
-            assert_eq!(reader.join().unwrap().0, sent);
+            assert_eq!(reader.join().unwrap().0, 32 + sent);
         })
         .unwrap();
 }

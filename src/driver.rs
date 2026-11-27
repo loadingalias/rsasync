@@ -968,8 +968,8 @@ impl Resource {
 ///
 /// The order of the fields is stated: each look checks the generation and the descriptor, and a
 /// receive or a send uses the medium and its direction, so these come first. A slot starts at a
-/// cache line, so the fields of a local receive of the buffers of a multishot receive are in its
-/// first two lines ([`tcp::Directions`]).
+/// cache line, so the fields of a local receive and a local send of the record of a stream are in
+/// its first two lines ([`tcp::Directions`]).
 #[derive(Debug, Default)]
 #[repr(C, align(64))]
 struct Owned {
