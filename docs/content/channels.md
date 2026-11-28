@@ -288,8 +288,9 @@ swap of the stamp of its slot.
 
 `rsasync::channel::oneshot` moves one value from one sender to one receiver, such as a reply, a
 join result, or a startup outcome. `oneshot::channel(&budget)` gives a `Sender` and a `Receiver`.
-It charges its shared state to the budget before it allocates, and the charge ends when both
-endpoints drop. A refusal is `Refused::Budget`.
+It charges its shared state to the budget before it allocates. A refusal is `Refused::Budget`.
+A receive that gives the value or `Closed` frees the shared state before it returns, so the charge
+has ended then. Otherwise the charge ends when both endpoints drop.
 
 `Sender::send(value)` takes the sender, so it sends at most one value. It never waits: the channel
 has room for the one value. The receiver has the three forms of a receive: `try_recv`, the future

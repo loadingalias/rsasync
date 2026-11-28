@@ -691,10 +691,6 @@ fn a_factory_spawn_that_the_allocator_refuses_gives_its_factory_back() {
         .build()
         .unwrap();
     let mut handle = runtime.handle().unwrap();
-    // The worker releases the charge of its ready report after `build` returns, so the read of the
-    // budget waits for the first poll of a task.
-    let first = handle.spawn_on(WorkerId::new(0), || async {}).unwrap();
-    assert_matches!(first.join_blocking(), TaskOutcome::Completed(()));
     let before = budget.available();
     let refusals = each_refusal(|| {
         handle
@@ -723,16 +719,6 @@ fn a_placed_factory_spawn_keeps_no_charge_of_its_factory() {
         .unwrap();
     let mut handle = runtime.handle().unwrap();
     let (polled, first_poll) = mpsc::channel();
-    // The worker can release the charge of its ready report after `build` returns. The first poll
-    // of a task comes after that release, so the free units stay the same from there.
-    let barrier = polled.clone();
-    let _barrier = handle
-        .spawn_on(WorkerId::new(0), move || async move {
-            barrier.send(0).unwrap();
-            pending::<()>().await;
-        })
-        .unwrap();
-    assert_eq!(first_poll.recv().unwrap(), 0);
     let before = budget.available();
     let capture = [0_u8; CAPTURE];
     let _task = handle

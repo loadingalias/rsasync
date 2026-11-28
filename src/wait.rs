@@ -64,15 +64,15 @@ const REGISTERING: usize = 0b01;
 /// A publisher takes the waker.
 const WAKING: usize = 0b10;
 
-/// The waker of one waiter, or of no waiter.
-enum Wake {
+/// The waker of one waiter: a task, or a thread that parks.
+pub(crate) enum Wake {
     Task(Waker),
     #[cfg(feature = "std")]
     Thread(thread::Thread),
 }
 
 impl Wake {
-    fn wake(self) {
+    pub(crate) fn wake(self) {
         match self {
             Self::Task(waker) => waker.wake(),
             #[cfg(feature = "std")]
@@ -228,25 +228,6 @@ impl Waiter {
                 Poll::Ready(value)
             }
             None => Poll::Pending,
-        }
-    }
-
-    /// The handshake of a blocking wait: registers the current thread, rechecks, and parks until
-    /// `ready` gives the result. A wake that this wait does not use can make a later park of the
-    /// thread return at once, as the standard park permits.
-    #[cfg(feature = "std")]
-    pub(crate) fn wait<T>(&self, mut ready: impl FnMut() -> Option<T>) -> T {
-        loop {
-            if let Some(value) = ready() {
-                return value;
-            }
-            self.register_thread();
-            if let Some(value) = ready() {
-                self.cancel();
-                return value;
-            }
-            // A wake can come before the park: the park then returns at once.
-            thread::park();
         }
     }
 }

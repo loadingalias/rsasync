@@ -16,6 +16,8 @@
 //!
 //! let worker = thread::spawn(move || sender.send(7));
 //! assert_eq!(receiver.recv_blocking(), Ok(7));
+//! // The receive freed the channel before it returned, so the charge has ended.
+//! assert_eq!(budget.available(), 4096);
 //! assert!(worker.join().expect("the worker does not panic").is_ok());
 //! // The one value is taken, and no other can come.
 //! assert_eq!(receiver.recv_blocking(), Err(Closed));
@@ -34,56 +36,90 @@
 //! A drop of the sender with no send closes the channel: a receive then gives [`Closed`]. After
 //! the receiver took the value, a receive gives [`Closed`] too.
 //!
+//! A receive that gives the value or [`Closed`] frees the shared state of the channel before it
+//! returns, so the charge has ended then. Thus a join of a task finds the budget free.
+//!
 //! # Orderings
 //!
-//! One word, `state`, holds three flags: `VALUE`, `SENDER_GONE`, and `RECEIVER_GONE`. Each change
-//! of the word is a read-modify-write, so the changes have one total order, and each change reads
-//! the change before it. Thus the change that comes first in a race decides the owner of the
-//! value:
+//! One word, `state`, holds four flags: `VALUE`, `ENDED`, `STORED`, and `RECEIVER_GONE`. Each
+//! change of the word is a read-modify-write, so the changes have one total order, and each change
+//! reads the change before it. The endpoint that makes the last access frees the shared state, on
+//! its own thread:
 //!
-//! - A send against a drop of the receiver: the send writes the slot and then sets `VALUE` and
-//!   `SENDER_GONE`, and the drop sets `RECEIVER_GONE`. If the drop comes first, the send reads
-//!   `RECEIVER_GONE`, so no receiver saw the value, and the send takes it back. If the send comes
-//!   first, the drop reads `VALUE`, so the receiver owns the value and drops it.
-//! - The send sets the flags with `Release`, and the receiver reads them with `Acquire`, so the
-//!   write of the slot happens before its read. The drop of the receiver also reads with
-//!   `Acquire`. A send that takes its value back needs no `Acquire`: a drop of the receiver that
-//!   comes first reads no slot, and the send reads only its own write.
-//! - A send or a drop of the sender against a waiting receive: the sender first changes the word
-//!   and then wakes the waiter of the receiver. The wait handshake (`crate::wait`) registers the
-//!   waker before it rechecks the word, so the recheck sees the change, or the wake comes.
+//! - The sender ends with one change that sets `ENDED`, and `VALUE` after it wrote the slot. When
+//!   `STORED` is clear, that change is its last access.
+//! - When `STORED` is set, that change gives the waker cell to the sender. The sender takes the
+//!   waker and clears `STORED` with its last access. Then it wakes the waker, which it now holds.
+//! - The sender has left when `ENDED` is set and `STORED` is clear. A receive that sees it makes
+//!   the last access: it takes the value and frees the shared state.
+//! - The receiver holds the cell while `ENDED` and `STORED` are clear. It writes its waker, and
+//!   then sets `STORED` with a compare and exchange from the word that it read. The exchange fails
+//!   only on an end of the sender, which did not touch the cell. To change a stored waker, the
+//!   receiver first clears `STORED` with a compare and exchange.
+//! - A receive while the sender holds the cell wakes its own waker and tries again, because the
+//!   sender wakes the waker of an earlier poll. The sender holds the cell for a few instructions,
+//!   and it runs no waker in that time.
+//! - The drop of the receiver sets `RECEIVER_GONE`, and it frees when the sender has left. Else the
+//!   last change of the sender reads the flag, and the sender frees. A send then gives back the
+//!   value, which no receive saw.
+//! - The changes use `AcqRel` and the loads use `Acquire`. Thus each access of one endpoint
+//!   happens before a free by the other, the write of the slot before its read, and the write of
+//!   the waker before its take. The exchange that takes a stored waker back needs no order: only
+//!   the receiver wrote the cell, and the sender did not take it.
 
+use alloc::boxed::Box;
 use core::alloc::AllocError;
 use core::fmt;
 use core::future::Future;
-use core::mem::MaybeUninit;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::pin::Pin;
-#[cfg(feature = "local")]
 use core::ptr::NonNull;
 use core::task::{Context, Poll};
 
 use super::{Closed, Refused, SendError, TryRecvError};
 use crate::capacity::{Budget, Permit};
+#[cfg(feature = "std")]
+use crate::sync::thread;
 use crate::sync::{
-    Arc, UnsafeCell, arc_size,
+    UnsafeCell,
     atomic::{AtomicU32, Ordering},
-    try_arc,
+    hint,
 };
-use crate::wait::Waiter;
+use crate::wait::Wake;
 
-/// The slot holds the sent value.
+/// The slot holds the sent value. The sender sets it with `ENDED`.
 const VALUE: u32 = 1;
-/// The sender is gone: it sent its value, or it dropped with no send.
-const SENDER_GONE: u32 = 1 << 1;
+/// The sender ended: it sent its value, or it dropped with no send. While `STORED` is set too, it
+/// still takes the waker.
+const ENDED: u32 = 1 << 1;
 /// The receiver is gone.
 const RECEIVER_GONE: u32 = 1 << 2;
+/// The cell holds the waker of a waiting receive. The change that sets `ENDED` gives the cell to
+/// the sender.
+const STORED: u32 = 1 << 3;
+
+/// The sender made its last access in `state`: it ended, and it holds no waker.
+const fn left(state: u32) -> bool {
+    state & (ENDED | STORED) == ENDED
+}
 
 struct Shared<T> {
     state: AtomicU32,
-    /// The waiter of the receiver. The sender never waits.
-    waiter: Waiter,
+    /// The waker of a waiting receive. The flags of `state` give the cell to one endpoint at a
+    /// time.
+    waker: UnsafeCell<Option<Wake>>,
     slot: UnsafeCell<MaybeUninit<T>>,
     _charge: Permit,
+}
+
+/// What a waiting receive found when it stored its waker.
+enum Look {
+    /// The sender left, with this state.
+    Left(u32),
+    /// The cell holds the waker.
+    Stored,
+    /// The sender holds the cell, and wakes the waker of an earlier poll.
+    Held,
 }
 
 impl<T> Shared<T> {
@@ -109,26 +145,103 @@ impl<T> Shared<T> {
         self.slot.with(|slot| unsafe { (*slot).assume_init_read() })
     }
 
-    /// Shows the written value to the receiver and wakes it, and ends the sender. Gives the value
-    /// back when the receiver is gone.
+    /// Gives `f` the waker cell.
     ///
     /// # Safety
     ///
-    /// The sender wrote the slot, and it did not deliver it yet.
+    /// The flags of `state` give the cell to the caller.
     #[expect(
         unsafe_code,
-        reason = "before the delivery sets `VALUE`, and after a drop of the receiver, only the sender has the slot"
+        reason = "the flags of the state word give the caller the only access to the cell"
     )]
-    unsafe fn deliver(&self) -> Option<T> {
-        // Ordering: `Release` orders the write of the slot before the read of the receiver. The
-        // read below needs no `Acquire`: a drop of the receiver that comes first reads no slot.
-        if self.state.fetch_or(VALUE | SENDER_GONE, Ordering::Release) & RECEIVER_GONE != 0 {
-            // SAFETY: the receiver was gone before `VALUE`, so it never reads the slot.
-            return Some(unsafe { self.take() });
-        }
-        self.waiter.wake();
-        None
+    unsafe fn with_waker<R>(&self, f: impl FnOnce(&mut Option<Wake>) -> R) -> R {
+        // SAFETY: the caller holds the cell, so no other access to it runs.
+        self.waker.with_mut(|cell| f(unsafe { &mut *cell }))
     }
+
+    /// Stores the waker that `put` writes to the cell, for a waiting receive. Gives what the
+    /// receive found.
+    #[expect(unsafe_code, reason = "with `ENDED` and `STORED` clear, the cell is the receiver's")]
+    fn store(&self, put: impl FnOnce(&mut Option<Wake>)) -> Look {
+        // Ordering: `Acquire` reads the last access of the sender (module docs).
+        let mut state = self.state.load(Ordering::Acquire);
+        if state & (ENDED | STORED) == STORED {
+            // Take the cell back. Ordering: `Relaxed` on success (module docs). A failure reads an
+            // end of the sender, as the load does.
+            state = match self
+                .state
+                .compare_exchange(state, state & !STORED, Ordering::Relaxed, Ordering::Acquire)
+            {
+                Ok(_) => state & !STORED,
+                Err(now) => now,
+            };
+        }
+        if state & ENDED != 0 {
+            return if left(state) { Look::Left(state) } else { Look::Held };
+        }
+        // SAFETY: `ENDED` and `STORED` are clear, so the cell is the receiver's.
+        unsafe { self.with_waker(put) };
+        // Ordering: `Release` gives the waker to the end of the sender. The exchange fails only on
+        // an end of the sender that did not take the cell, and `Acquire` reads it.
+        match self
+            .state
+            .compare_exchange(state, state | STORED, Ordering::Release, Ordering::Acquire)
+        {
+            Ok(_) => Look::Stored,
+            Err(now) => Look::Left(now),
+        }
+    }
+}
+
+/// Ends the sender of `shared` with `ended`: `ENDED`, and `VALUE` when the slot holds a sent
+/// value. Wakes a stored waker after the last access. When the receiver is gone, frees the shared
+/// state, and gives back the value, which no receive saw.
+///
+/// # Safety
+///
+/// `shared` is the shared state of a sender that did not end, and the slot holds a value exactly
+/// when `ended` has `VALUE`.
+#[expect(
+    unsafe_code,
+    reason = "the state word gives the cell, and the last access, to one endpoint at a time"
+)]
+unsafe fn end<T>(shared: NonNull<Shared<T>>, ended: u32) -> Option<T> {
+    // SAFETY: the sender did not end, so the shared state lives.
+    let channel = unsafe { shared.as_ref() };
+    // Ordering: `AcqRel` (module docs).
+    let mut state = channel.state.fetch_or(ended, Ordering::AcqRel);
+    let mut waker = None;
+    if state & STORED != 0 {
+        // SAFETY: the change set `ENDED` while `STORED` was set, so it gave the cell to the sender.
+        waker = unsafe { channel.with_waker(Option::take) };
+        // Ordering: `AcqRel`, as above.
+        state = channel.state.fetch_and(!STORED, Ordering::AcqRel);
+    }
+    if state & RECEIVER_GONE == 0 {
+        // That change was the last access: the receiver frees the shared state.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        return None;
+    }
+    // The receiver dropped before the sender left, so it left the shared state to the sender.
+    drop(waker);
+    // SAFETY: the receiver is gone, and `VALUE` says that the slot holds the value.
+    let value = (ended & VALUE != 0).then(|| unsafe { channel.take() });
+    // SAFETY: the receiver is gone, and the slot is empty.
+    unsafe { free(shared) };
+    value
+}
+
+/// Frees the shared state `shared`, and so ends its charge. A waker in the cell drops with it.
+///
+/// # Safety
+///
+/// `shared` is from [`with_charge`], each other access to it ended, and the slot is empty.
+#[expect(unsafe_code, reason = "the caller makes the last access")]
+unsafe fn free<T>(shared: NonNull<Shared<T>>) {
+    // SAFETY: `with_charge` made `shared` with `Box::leak`, and no access follows.
+    drop(unsafe { Box::from_raw(shared.as_ptr()) });
 }
 
 /// A value that a sender wrote to its channel, and that the receiver does not see yet. The drop
@@ -137,30 +250,26 @@ impl<T> Shared<T> {
 /// sees the outcome only after the memory, the charge, and the slot of the task are free.
 #[cfg(feature = "local")]
 pub(crate) struct Staged {
-    /// The shared state of the channel, from `Arc::into_raw`, with no type.
+    /// The shared state of the channel, with no type.
     shared: NonNull<()>,
     /// [`deliver_staged`] of the type of the value.
     deliver: unsafe fn(NonNull<()>),
 }
 
-/// Delivers the written value of the shared state `shared` of a channel of `T`, as
-/// [`Shared::deliver`] does, drops it when the receiver is gone, and drops the reference of the
-/// sender.
+/// Ends the sender of the shared state `shared` of a channel of `T`, as a send does, and drops
+/// the value when the receiver is gone.
 ///
 /// # Safety
 ///
-/// `shared` is from `Arc::into_raw` of a channel of `T` whose slot the sender wrote, and this is the
-/// one delivery of it.
+/// `shared` is the shared state of a channel of `T` whose sender wrote its slot and did not end.
 #[cfg(feature = "local")]
 #[expect(
     unsafe_code,
-    reason = "the caller gives the reference of a sender that wrote its slot"
+    reason = "the caller gives the shared state of a sender that wrote its slot"
 )]
 unsafe fn deliver_staged<T>(shared: NonNull<()>) {
-    // SAFETY: see the contract: the reference is the sender's, of a channel of `T`.
-    let shared = unsafe { Arc::from_raw(shared.cast::<Shared<T>>().as_ptr().cast_const()) };
-    // SAFETY: the slot is written, and this is its one delivery.
-    drop(unsafe { shared.deliver() });
+    // SAFETY: see the contract.
+    drop(unsafe { end(shared.cast::<Shared<T>>(), ENDED | VALUE) });
 }
 
 #[cfg(feature = "local")]
@@ -180,14 +289,9 @@ impl fmt::Debug for Staged {
     }
 }
 
-#[expect(unsafe_code, reason = "the state word gives the slot to one endpoint at a time")]
-// SAFETY: the slot is the sender's until the send sets `VALUE`, and then the receiver's. If the
-// receiver was gone first, it stays the sender's (module docs). The value moves between threads,
-// so `T` is `Send`.
-unsafe impl<T: Send> Sync for Shared<T> {}
-
 /// Makes a one-shot channel. It charges the shared state to `budget`, at its size in memory, before
-/// it allocates. The charge ends when both endpoints drop.
+/// it allocates. The charge ends when a receive gives the value or [`Closed`], or when both
+/// endpoints drop.
 ///
 /// # Errors
 ///
@@ -200,31 +304,27 @@ pub fn channel<T>(budget: &Budget) -> Result<(Sender<T>, Receiver<T>), Refused> 
 }
 
 /// The size of the shared state of a one-shot channel of `T`, which its charge pays for.
-pub(crate) fn size<T>() -> usize {
-    arc_size::<Shared<T>>()
+pub(crate) const fn size<T>() -> usize {
+    size_of::<Shared<T>>()
 }
 
 /// Makes a one-shot channel whose shared state `charge` pays for. The caller reserved at least
 /// [`size`] units for it. A refusal of the allocator ends the charge.
 pub(crate) fn with_charge<T>(charge: Permit) -> Result<(Sender<T>, Receiver<T>), AllocError> {
-    let shared = try_arc(Shared {
+    let shared = NonNull::from(Box::leak(Box::try_new(Shared {
         state: AtomicU32::new(0),
-        waiter: Waiter::new(),
+        waker: UnsafeCell::new(None),
         slot: UnsafeCell::new(MaybeUninit::uninit()),
         _charge: charge,
-    })?;
-    let sender = Sender {
-        shared: Some(Arc::clone(&shared)),
-    };
-    let receiver = Receiver { shared, taken: false };
-    Ok((sender, receiver))
+    })?));
+    Ok((Sender { shared }, Receiver { shared: Some(shared) }))
 }
 
 /// The sending endpoint. Its drop with no send closes the channel: a receive then gives
 /// [`Closed`].
 pub struct Sender<T> {
-    /// The shared state, which the send takes, so that the drop after a send does nothing.
-    shared: Option<Arc<Shared<T>>>,
+    /// The shared state. A send or a stage ends the sender with no drop.
+    shared: NonNull<Shared<T>>,
 }
 
 impl<T> Sender<T> {
@@ -233,18 +333,14 @@ impl<T> Sender<T> {
     /// # Errors
     ///
     /// [`SendError`] with the value when the receiver is gone.
-    #[expect(
-        unsafe_code,
-        reason = "before the send sets `VALUE`, and after a drop of the receiver, only the sender has the slot"
-    )]
-    pub fn send(mut self, value: T) -> Result<(), SendError<T>> {
-        let Some(shared) = self.shared.take() else {
-            return Err(SendError(value));
-        };
-        // SAFETY: the slot is empty, and no receiver reads it before `VALUE`.
-        unsafe { shared.write(value) };
-        // SAFETY: the slot is written, and this is its one delivery.
-        match unsafe { shared.deliver() } {
+    #[expect(unsafe_code, reason = "before `ENDED`, only the sender has the slot")]
+    pub fn send(self, value: T) -> Result<(), SendError<T>> {
+        let shared = ManuallyDrop::new(self).shared;
+        // SAFETY: the sender did not end, so the shared state lives. The slot is empty, and no
+        // receive reads it before `ENDED`.
+        unsafe { shared.as_ref().write(value) };
+        // SAFETY: the sender did not end, and the slot holds the value.
+        match unsafe { end(shared, ENDED | VALUE) } {
             Some(value) => Err(SendError(value)),
             None => Ok(()),
         }
@@ -255,34 +351,25 @@ impl<T> Sender<T> {
 #[cfg(feature = "local")]
 impl<T: 'static> Sender<T> {
     /// Writes `value` to the slot, and ends the sender. The receiver sees the value at the drop of
-    /// the [`Staged`]. Gives the value back when the sender has no channel.
-    #[expect(
-        unsafe_code,
-        reason = "before the delivery sets `VALUE`, only the sender has the slot"
-    )]
-    pub(crate) fn stage(mut self, value: T) -> Result<Staged, T> {
-        let Some(shared) = self.shared.take() else {
-            return Err(value);
-        };
-        // SAFETY: the slot is empty, and no receiver reads it before `VALUE`.
-        unsafe { shared.write(value) };
-        // SAFETY: `Arc::into_raw` gives a pointer that is not null.
-        let shared = unsafe { NonNull::new_unchecked(Arc::into_raw(shared).cast_mut().cast()) };
-        Ok(Staged {
-            shared,
+    /// the [`Staged`].
+    #[expect(unsafe_code, reason = "before `ENDED`, only the sender has the slot")]
+    pub(crate) fn stage(self, value: T) -> Staged {
+        let shared = ManuallyDrop::new(self).shared;
+        // SAFETY: as in `send`.
+        unsafe { shared.as_ref().write(value) };
+        Staged {
+            shared: shared.cast(),
             deliver: deliver_staged::<T>,
-        })
+        }
     }
 }
 
 impl<T> Drop for Sender<T> {
+    #[expect(unsafe_code, reason = "a sender that drops did not end")]
     fn drop(&mut self) {
-        if let Some(shared) = self.shared.take() {
-            // Ordering: `Relaxed`: the change publishes no data, and the wake handshake orders it
-            // before the recheck of a waiting receiver.
-            shared.state.fetch_or(SENDER_GONE, Ordering::Relaxed);
-            shared.waiter.wake();
-        }
+        // SAFETY: a send and a stage end the sender with no drop, so it did not end, and the slot
+        // is empty.
+        unsafe { end(self.shared, ENDED) };
     }
 }
 
@@ -295,9 +382,9 @@ impl<T> fmt::Debug for Sender<T> {
 /// The receiving endpoint. Its drop drops a sent value that it did not take, and a later send
 /// gives its value back.
 pub struct Receiver<T> {
-    shared: Arc<Shared<T>>,
-    /// The receiver took the value.
-    taken: bool,
+    /// The shared state, until the receiver frees it: when it sees that the sender left, or at its
+    /// drop.
+    shared: Option<NonNull<Shared<T>>>,
 }
 
 impl<T> Receiver<T> {
@@ -307,8 +394,18 @@ impl<T> Receiver<T> {
     ///
     /// [`TryRecvError::Empty`] when no value is sent yet, and [`TryRecvError::Closed`] when the
     /// sender dropped with no send, or the receiver took the value.
+    #[expect(unsafe_code, reason = "the receiver did not free the shared state")]
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        receive(&self.shared, &mut self.taken)
+        let Some(shared) = self.shared else {
+            return Err(TryRecvError::Closed);
+        };
+        // SAFETY: the receiver did not free the shared state. Ordering: `Acquire` reads the last
+        // access of the sender (module docs).
+        let state = unsafe { shared.as_ref() }.state.load(Ordering::Acquire);
+        if left(state) {
+            return self.finish(shared, state).map_err(|Closed| TryRecvError::Closed);
+        }
+        Err(TryRecvError::Empty)
     }
 
     /// Gives a future that waits for the value. It gives [`Closed`] when the sender dropped with
@@ -323,70 +420,108 @@ impl<T> Receiver<T> {
     /// Waits on this thread for the value. It gives [`Closed`] when the sender dropped with no
     /// send, or the receiver took the value.
     #[cfg(feature = "std")]
+    #[expect(unsafe_code, reason = "the receiver did not free the shared state")]
     pub fn recv_blocking(&mut self) -> Result<T, Closed> {
-        let Self { shared, taken } = self;
-        shared.waiter.wait(|| ready(shared, taken))
+        let Some(shared) = self.shared else {
+            return Err(Closed);
+        };
+        loop {
+            // SAFETY: the receiver did not free the shared state.
+            match unsafe { shared.as_ref() }.store(|cell| *cell = Some(Wake::Thread(thread::current()))) {
+                Look::Left(state) => return self.finish(shared, state),
+                // A wake can come before the park: the park then returns at once.
+                Look::Stored => thread::park(),
+                // The sender ends in a few instructions.
+                Look::Held => hint::spin_loop(),
+            }
+        }
     }
 
     /// The handshake of a waiting receive, for a future that holds the receiver. After a
     /// `Pending`, the future calls [`Receiver::unwait`] if it drops before its result.
+    #[expect(unsafe_code, reason = "the receiver did not free the shared state")]
     pub(crate) fn poll_recv(&mut self, cx: &Context<'_>) -> Poll<Result<T, Closed>> {
-        let Self { shared, taken } = self;
-        shared.waiter.poll_wait(cx, || ready(shared, taken))
+        let Some(shared) = self.shared else {
+            return Poll::Ready(Err(Closed));
+        };
+        let waker = cx.waker();
+        // SAFETY: the receiver did not free the shared state.
+        let look = unsafe { shared.as_ref() }.store(|cell| match cell {
+            Some(Wake::Task(stored)) if stored.will_wake(waker) => {}
+            _ => *cell = Some(Wake::Task(waker.clone())),
+        });
+        match look {
+            Look::Left(state) => Poll::Ready(self.finish(shared, state)),
+            Look::Stored => Poll::Pending,
+            // The sender wakes the waker of an earlier poll, which can be of another task. Wake
+            // this one too, and give the sender time to end.
+            Look::Held => {
+                waker.wake_by_ref();
+                hint::spin_loop();
+                Poll::Pending
+            }
+        }
     }
 
-    /// Ends the interest of a waiting receive that gave `Pending`.
-    pub(crate) fn unwait(&self) {
-        self.shared.waiter.cancel();
+    /// Ends the interest of a waiting receive that gave `Pending`: takes its waker back.
+    #[expect(
+        unsafe_code,
+        reason = "the exchange that clears `STORED` gives the cell back to the receiver"
+    )]
+    pub(crate) fn unwait(&mut self) {
+        let Some(shared) = self.shared else {
+            return;
+        };
+        // SAFETY: the receiver did not free the shared state.
+        let channel = unsafe { shared.as_ref() };
+        // While the receiver lives and the sender did not end, the word holds `STORED` alone.
+        // Ordering: `Relaxed`, as for each take back (module docs). A failure takes nothing.
+        if channel
+            .state
+            .compare_exchange(STORED, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // SAFETY: the exchange cleared `STORED` with `ENDED` clear, so the cell is the
+            // receiver's.
+            drop(unsafe { channel.with_waker(Option::take) });
+        }
     }
-}
 
-/// Takes the value from `shared` for a receiver that took no value before, as `taken` tells.
-#[expect(
-    unsafe_code,
-    reason = "after `VALUE`, the slot holds the value, which only the receiver takes"
-)]
-fn receive<T>(shared: &Shared<T>, taken: &mut bool) -> Result<T, TryRecvError> {
-    if *taken {
-        return Err(TryRecvError::Closed);
-    }
-    // Ordering: `Acquire` reads the release of the send, so the write of the slot happens before
-    // its read.
-    let state = shared.state.load(Ordering::Acquire);
-    if state & VALUE != 0 {
-        *taken = true;
-        // SAFETY: the slot holds the sent value, and only the receiver takes it.
-        return Ok(unsafe { shared.take() });
-    }
-    Err(if state & SENDER_GONE != 0 {
-        TryRecvError::Closed
-    } else {
-        TryRecvError::Empty
-    })
-}
-
-/// The result of a waiting receive, or `None` while no value is sent and the sender lives.
-fn ready<T>(shared: &Shared<T>, taken: &mut bool) -> Option<Result<T, Closed>> {
-    match receive(shared, taken) {
-        Ok(value) => Some(Ok(value)),
-        Err(TryRecvError::Closed) => Some(Err(Closed)),
-        Err(TryRecvError::Empty) => None,
+    /// Takes the value that the sender left in `state`, or gives [`Closed`] when it left none,
+    /// and frees the shared state, which ends its charge.
+    #[expect(
+        unsafe_code,
+        reason = "after the sender left, only the receiver has the shared state"
+    )]
+    fn finish(&mut self, shared: NonNull<Shared<T>>, state: u32) -> Result<T, Closed> {
+        self.shared = None;
+        let value = if state & VALUE != 0 {
+            // SAFETY: the sender left with `VALUE`, so the slot holds the value, and only the
+            // receiver has it.
+            Ok(unsafe { shared.as_ref().take() })
+        } else {
+            Err(Closed)
+        };
+        // SAFETY: the sender left, this receiver makes no access after it, and the slot is empty.
+        unsafe { free(shared) };
+        value
     }
 }
 
 impl<T> Drop for Receiver<T> {
-    #[expect(
-        unsafe_code,
-        reason = "after a drop of the receiver, no receive follows, and a send reads the flag"
-    )]
+    #[expect(unsafe_code, reason = "the receiver did not free the shared state")]
     fn drop(&mut self) {
-        // Ordering: `Acquire` reads the release of the send, so the write of the slot happens
-        // before its drop here.
-        let state = self.shared.state.fetch_or(RECEIVER_GONE, Ordering::Acquire);
-        if state & VALUE != 0 && !self.taken {
-            // SAFETY: the send set `VALUE` before this change, so the slot holds the value, and
-            // the receiver owns it.
-            drop(unsafe { self.shared.take() });
+        let Some(shared) = self.shared else {
+            return;
+        };
+        // SAFETY: the receiver did not free the shared state. Ordering: `AcqRel` (module docs).
+        let state = unsafe { shared.as_ref() }
+            .state
+            .fetch_or(RECEIVER_GONE, Ordering::AcqRel);
+        if left(state) {
+            // The sender left, so the receiver frees the shared state, with a sent value that it
+            // did not take.
+            drop(self.finish(shared, state));
         }
     }
 }
@@ -396,6 +531,29 @@ impl<T> fmt::Debug for Receiver<T> {
         f.debug_struct("Receiver").finish_non_exhaustive()
     }
 }
+
+#[expect(
+    unsafe_code,
+    reason = "the state word gives the slot and the cell to one endpoint at a time"
+)]
+// SAFETY: the endpoints move the value and a waker between threads, so `T` is `Send`. A shared
+// endpoint gives no access to the shared state.
+unsafe impl<T: Send> Send for Sender<T> {}
+
+#[expect(unsafe_code, reason = "a shared sender gives no access to the shared state")]
+// SAFETY: as for `Send`.
+unsafe impl<T: Send> Sync for Sender<T> {}
+
+#[expect(
+    unsafe_code,
+    reason = "the state word gives the slot and the cell to one endpoint at a time"
+)]
+// SAFETY: as for the sender.
+unsafe impl<T: Send> Send for Receiver<T> {}
+
+#[expect(unsafe_code, reason = "a shared receiver gives no access to the shared state")]
+// SAFETY: as for the sender.
+unsafe impl<T: Send> Sync for Receiver<T> {}
 
 /// A waiting receive, from [`Receiver::recv`]. A drop of the future takes no value: a later
 /// receive takes it.

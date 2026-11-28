@@ -100,14 +100,3 @@ fn a_waker_that_enters_the_waiter_again_does_not_deadlock() {
     assert!(reenter.waiter.wake());
     assert_eq!(reenter.wakes.load(Ordering::Relaxed), 2);
 }
-
-#[cfg(feature = "std")]
-#[test]
-fn a_blocking_wait_returns_after_a_publication_from_another_thread() {
-    let shared = Arc::new((Waiter::new(), AtomicBool::new(false)));
-    let other = Arc::clone(&shared);
-    let waits = std::thread::spawn(move || other.0.wait(|| other.1.load(Ordering::Acquire).then_some(())));
-    shared.1.store(true, Ordering::Release);
-    shared.0.wake();
-    waits.join().unwrap();
-}

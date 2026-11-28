@@ -88,14 +88,7 @@ impl<F: Future> TaskCell<F> {
     {
         // SAFETY: the sender is not structurally pinned, and this moves only the sender.
         let sender = unsafe { &mut self.get_unchecked_mut().sender };
-        match sender.take().map(|sender| sender.stage(outcome)) {
-            Some(Ok(staged)) => Some(staged),
-            Some(Err(unjoined)) => {
-                discard(unjoined);
-                None
-            }
-            None => None,
-        }
+        sender.take().map(|sender| sender.stage(outcome))
     }
 }
 

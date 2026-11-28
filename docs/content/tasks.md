@@ -102,7 +102,8 @@ A `JoinHandle` observes the outcome of its task:
 - The outcome of a task stays in the channel of its join handle, charged to the budget, until the
   join takes it or the handle drops.
 - A join sees the outcome only after the owner freed the memory, the charge, and the slot of the
-  task. So a spawn after a join finds them free, also on an owner with one task slot.
+  task. The join frees the channel of the outcome before it returns. So a spawn after a join
+  finds all of them free, also on an owner with one task slot.
 - A join handle can move to another thread if the output can.
 
 `JoinHandle::cancel_handle` gives a `CancelHandle`, which works from each thread. Its `cancel`

@@ -126,24 +126,3 @@ fn a_publication_that_races_a_cancel_reaches_another_waiter() {
         assert!(one.get() >= 1);
     });
 }
-
-#[cfg(feature = "std")]
-#[test]
-fn a_blocking_wait_returns_after_a_publication_that_races_it() {
-    model(|| {
-        let shared = shared();
-        // The waiting thread is not the one that joins: the loom join breaks on an unpark that
-        // the wait did not use, which the standard join ignores.
-        let waits = {
-            let shared = Arc::clone(&shared);
-            loom::thread::spawn(move || {
-                shared
-                    .waiter
-                    .wait(|| shared.ready.load(Ordering::Relaxed).then_some(()))
-            })
-        };
-        shared.ready.store(true, Ordering::Relaxed);
-        shared.waiter.wake();
-        waits.join().unwrap();
-    });
-}
