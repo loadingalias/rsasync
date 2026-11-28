@@ -364,13 +364,20 @@ impl Drop for SlotRef {
     fn drop(&mut self) {
         {
             let shared = self.shared();
-            // Ordering: as for an `Arc`. `Release` orders each use of the slot by this owner before
-            // the drop of its count, and the `Acquire` fence of the last owner orders all of them
-            // before the return.
-            if shared.slots[self.index as usize].count.fetch_sub(1, Ordering::Release) != 1 {
-                return;
+            let count = &shared.slots[self.index as usize].count;
+            // Ordering: as for an `Arc`. A count of 1 under `Acquire` is this count alone: each
+            // other count dropped with `Release` before the load, and only a holder of a count can
+            // make one more, so the last count returns the slot with no read-modify-write, which
+            // would wait for each earlier store of this thread. The acquire of the slot sets the
+            // count again. Else `Release` orders each use of the slot by this owner before the drop
+            // of its count, and the `Acquire` fence of the last owner orders all of them before
+            // the return.
+            if count.load(Ordering::Acquire) != 1 {
+                if count.fetch_sub(1, Ordering::Release) != 1 {
+                    return;
+                }
+                fence(Ordering::Acquire);
             }
-            fence(Ordering::Acquire);
             shared.returned.push(&shared.slots, self.index);
         }
         // SAFETY: `Pool::acquire` took this reference with `Arc::into_raw`, and the slot kept it
