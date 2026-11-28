@@ -199,6 +199,12 @@ impl Shared {
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn set_ring(&self, home: Arc<driver::Home>) {
         self.home.ring.set(home);
+        // Ordering: `Release`, with no change of a value. Each later push and wake of the root reads
+        // the list or the flag through its read-modify-write, in the release sequence of these
+        // changes, so it sees the ring. Thus the takes of the owner need no `Release`, and they skip
+        // an empty list and a clear flag.
+        self.remote.fetch_or(0, Ordering::Release);
+        self.root.fetch_or(false, Ordering::Release);
     }
 
     /// Detaches the ring of the home when its owner ends: each later wake does nothing, and the
@@ -244,8 +250,8 @@ impl Shared {
             // Ordering: `Relaxed`: the release of the change of the head publishes the link.
             self.next[slot as usize].store(head, Ordering::Relaxed);
             // Ordering: `AcqRel`. `Release` publishes the link and the change of the slot word to
-            // the owner, which takes the list with `Acquire`. `Acquire` reads the release of that
-            // take, so a push after it sees a ring that the owner set before it.
+            // the owner, which takes the list with `Acquire`. `Acquire` reads the release of
+            // `set_ring` in the release sequence of the list, so the push sees the ring.
             match self
                 .remote
                 .compare_exchange_weak(head, slot, Ordering::AcqRel, Ordering::Relaxed)
@@ -288,9 +294,14 @@ impl Shared {
 
     /// Takes each slot of the remote-ready list, and gives it to `each`. Only the owner calls it.
     pub(super) fn harvest(&self, mut each: impl FnMut(u32)) {
-        // Ordering: `AcqRel`. `Acquire` reads the release of each push. `Release` orders a ring
-        // that the owner set before this take before each later push, which reads it.
-        let mut slot = self.remote.swap(END, Ordering::AcqRel);
+        // An empty list needs no read-modify-write, which waits for each earlier store of this
+        // thread. A push that the look misses found the list empty, so it signals the home, and
+        // the next turn takes it.
+        if !self.has_remote() {
+            return;
+        }
+        // Ordering: `Acquire` reads the release of each push. `set_ring` publishes the ring.
+        let mut slot = self.remote.swap(END, Ordering::Acquire);
         while slot != END {
             // Ordering: `Relaxed`: the swap above read the release of the push of this link. The
             // slot stays scheduled, so no push changes the link before its poll.
@@ -322,8 +333,8 @@ impl Shared {
     /// Wakes the root future of `block_on`. Only the wake that sets the flag signals the home.
     pub(super) fn wake_root(&self) {
         // Ordering: `AcqRel`. `Release` orders the event of the wake before the poll of the root,
-        // which takes the flag with `Acquire`. `Acquire` reads the release of that take, as a push
-        // reads the take of the list.
+        // which takes the flag with `Acquire`. `Acquire` reads the release of `set_ring`, as a push
+        // does, so the wake sees the ring.
         if !self.root.swap(true, Ordering::AcqRel) {
             self.signal();
         }
@@ -331,9 +342,10 @@ impl Shared {
 
     /// Takes the flag of the root future. Gives `true` if it was woken.
     pub(super) fn take_root(&self) -> bool {
-        // Ordering: `AcqRel`: `Acquire` reads the release of the wake, and `Release` orders a ring
-        // that the owner set before this take before each later wake.
-        self.root.swap(false, Ordering::AcqRel)
+        // A clear flag needs no read-modify-write. A wake that the look misses signals the home,
+        // as a push does. Ordering: `Acquire` reads the release of the wake. `set_ring` publishes
+        // the ring.
+        self.root_woken() && self.root.swap(false, Ordering::Acquire)
     }
 
     /// Whether the root future was woken, and no poll took the flag yet.

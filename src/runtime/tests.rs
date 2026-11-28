@@ -9,7 +9,7 @@ use core::future::pending;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Barrier, Mutex, mpsc};
 use std::thread;
 
 use super::topology::{Host, Quota};
@@ -1203,20 +1203,30 @@ fn a_shutdown_waits_for_the_running_compute_job_and_reports_the_jobs() {
         .unwrap();
     let handle = runtime.handle().unwrap();
     let compute = handle.compute().unwrap();
-    let (started, start) = mpsc::channel::<()>();
+    // The job runs, and the second job waits in the queue, before the test continues.
+    let both = Arc::new(Barrier::new(2));
+    let (submitter, job) = (compute.clone(), Arc::clone(&both));
     let mut running = compute
         .submit(move || {
-            started.send(()).unwrap();
-            thread::sleep(Duration::from_millis(100));
-            1
+            job.wait();
+            // The two jobs hold each job slot, so a submission is refused as full until the
+            // teardown stops the service. A fixed sleep ends before a slow stop of the workers.
+            loop {
+                match submitter.submit(|| ()) {
+                    Err(refused) if refused.reason == blocking::Reason::Full => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    other => return other.map(drop).map_err(|refused| refused.reason),
+                }
+            }
         })
         .unwrap();
     let mut queued = compute.submit(|| 2).unwrap();
-    start.recv().unwrap();
+    both.wait();
     let report = runtime.shutdown();
     let teardown = report.compute().unwrap();
     assert_eq!((teardown.running(), teardown.dropped()), (1, 1));
-    assert_eq!(running.wait_blocking().unwrap(), 1);
+    assert_eq!(running.wait_blocking().unwrap(), Err(blocking::Reason::Ended));
     assert_matches!(queued.wait_blocking(), Err(blocking::Failed::Ended));
 }
 

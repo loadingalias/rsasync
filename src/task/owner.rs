@@ -150,6 +150,17 @@ pub(super) fn discard<T>(value: T) {
     }
 }
 
+/// The memory of the task of a slot, which a wake and a turn ask the CPU to load before the poll.
+/// After the end of the task it can name freed memory: a prefetch reads nothing and never faults.
+#[derive(Clone, Copy)]
+struct Memory {
+    start: *const u8,
+    len: u32,
+}
+
+/// The most queued tasks whose memory a turn asks the CPU to load before it polls the first.
+const PREFETCHES: usize = 16;
+
 /// A live task in its slot.
 struct Entry {
     task: Pin<Box<dyn Task>>,
@@ -267,6 +278,9 @@ pub(super) struct Local {
     shared: Arc<Shared>,
     pub(super) budget: Budget,
     entries: Box<[Cell<Option<Entry>>]>,
+    /// The memory of the task of each slot, in a dense table: the entries are cold when the wake
+    /// comes.
+    memory: Box<[Cell<Memory>]>,
     free: RefCell<Vec<u32>>,
     /// The local ready queue. It holds at most one entry for each slot.
     queue: RefCell<VecDeque<u32>>,
@@ -334,8 +348,11 @@ impl Local {
         }
         // Each slot has a word, a link, an entry, a place in the free list, and a place in the
         // queue. Each place in the outbox is one pointer.
-        let slot_size =
-            size_of::<AtomicU64>() + size_of::<AtomicU32>() + size_of::<Cell<Option<Entry>>>() + 2 * size_of::<u32>();
+        let slot_size = size_of::<AtomicU64>()
+            + size_of::<AtomicU32>()
+            + size_of::<Cell<Option<Entry>>>()
+            + size_of::<Cell<Memory>>()
+            + 2 * size_of::<u32>();
         let size = slot_size
             .checked_mul(slots as usize)
             .and_then(|size| size.checked_add(arc_size::<Shared>() + arc_size::<Self>() + arc_size::<RootRef>()))
@@ -356,6 +373,13 @@ impl Local {
         let words = items(slots, |_| AtomicU64::new(0)).map_err(refused)?;
         let next = items(slots, |_| AtomicU32::new(0)).map_err(refused)?;
         let entries = items(slots, |_| Cell::new(None)).map_err(refused)?;
+        let memory = items(slots, |_| {
+            Cell::new(Memory {
+                start: core::ptr::null(),
+                len: 0,
+            })
+        })
+        .map_err(refused)?;
         let mut free = room(slots as usize).map_err(refused)?;
         free.extend((0..slots).rev());
         let queue = VecDeque::from(room(slots as usize).map_err(refused)?);
@@ -371,6 +395,7 @@ impl Local {
             shared,
             budget: budget.clone(),
             entries,
+            memory,
             free: RefCell::new(free),
             queue: RefCell::new(queue),
             #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -491,6 +516,10 @@ impl Local {
             },
         ));
         self.shared.start(slot);
+        self.memory[slot as usize].set(Memory {
+            start: (&raw const *task).cast(),
+            len: u32::try_from(size_of_val(&*task)).unwrap_or(u32::MAX),
+        });
         self.entries[slot as usize].set(Some(Entry { task, waker }));
         self.live.update(|live| live + 1);
         self.queue.borrow_mut().push_back(slot);
@@ -522,10 +551,9 @@ impl Local {
     /// queue, with no remote-ready list. A task of another generation does not change.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn wake_local(&self, task: crate::driver::LocalTask) {
-        // The next turn polls the task: its entry loads while the wake changes its word.
-        if let Some(entry) = self.entries.get(task.slot as usize) {
-            crate::prefetch::lines(entry, size_of::<Cell<Option<Entry>>>());
-        }
+        // The next turn polls the task: its entry and its memory load while the wake changes its
+        // word.
+        self.prefetch(task.slot);
         if self.shared.wake_idle(task.slot, task.generation) {
             // The queue has room for each slot, and the word gives each slot one entry.
             self.queue.borrow_mut().push_back(task.slot);
@@ -536,6 +564,15 @@ impl Local {
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// Asks the CPU to load the entry and the memory of the task in `slot`, which a poll reads next.
+    fn prefetch(&self, slot: u32) {
+        if let (Some(entry), Some(memory)) = (self.entries.get(slot as usize), self.memory.get(slot as usize)) {
+            crate::prefetch::lines(entry, size_of::<Cell<Option<Entry>>>());
+            let memory = memory.get();
+            crate::prefetch::lines(memory.start, memory.len as usize);
+        }
     }
 
     /// Whether a task waits in the local ready queue.
@@ -554,9 +591,6 @@ impl Local {
         let Some(mut entry) = self.entries[slot as usize].take() else {
             return;
         };
-        // The future of a task spans a few cache lines, which its poll reads one after another:
-        // they load together.
-        crate::prefetch::lines(&raw const *entry.task, size_of_val(&*entry.task));
         if self.shared.poll_start(slot) {
             let outcome = entry.task.as_mut().end(End::Cancelled);
             return self.finish(slot, entry, outcome);
@@ -612,6 +646,10 @@ impl Local {
     /// turn.
     fn turn(&self) -> bool {
         self.shared.harvest(|slot| self.queue.borrow_mut().push_back(slot));
+        // The tasks load while the turn polls the ones before them.
+        for &slot in self.queue.borrow().iter().take(PREFETCHES) {
+            self.prefetch(slot);
+        }
         let ready = self.queue.borrow().len();
         for _ in 0..ready {
             let Some(slot) = self.next_ready() else {
