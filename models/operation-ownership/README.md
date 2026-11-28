@@ -285,6 +285,14 @@ the rest (`tcp::sent_part`, `Driver::resend`), as the items of a multishot accep
 event gives each byte, or part of them with a failure or a cancel, which are the `full` and `part`
 progress of the model, so its rules are those of a send.
 
+A local operation (`local::Operation`, R325) has its consumer on its home thread. Its poll takes
+a ready result in its slot with plain loads and stores and frees the slot (`Entry::take_home`), or
+it keeps the waiter: the polled task itself when the waker is the own waker of that task
+(`Waiter::Task`). A completion then publishes the result with no wake, and the owner wakes that
+task after the turn with one change of the task word (`Local::wake_local`). The consumer and the
+home are one thread, so a take and a completion never overlap: those are a subset of the orders of
+`Claim`, `Repoll`, and `Complete`, and the rules hold.
+
 The backends. The R507 column names the IOCP transitions (`src/driver/iocp.rs`), and the
 R503, R505, and R520 column names the transitions of the readiness poller (`src/driver/poller.rs`),
 with the epoll selector on Linux and the kqueue selector on macOS. Each backend takes the submission
