@@ -24,7 +24,7 @@ use super::slot::{Home, RootRef, Shared, TaskRef};
 use super::waiting::List;
 use super::{CancelHandle, JoinHandle, Outcome, Panic, Reason, Refused, SpawnRefused, Target};
 use crate::capacity::{Budget, Permit};
-use crate::channel::oneshot;
+use crate::channel::oneshot::{self, Staged};
 use crate::clock::{NativeClock, Until};
 use crate::coop;
 use crate::memory::{items, room};
@@ -48,20 +48,26 @@ pub(super) enum End {
 }
 
 /// A spawned future and the sender of its outcome, behind one pointer.
+///
+/// A task that ends gives its outcome staged ([`Staged`]): its owner frees the memory, the charge,
+/// and the slot of the task, and then drops the outcome, which shows it to the join handle. So a
+/// spawn after a join finds the slot and the charge of the joined task free.
 pub(super) trait Task {
-    /// Polls the future. When it gives its output, drops the future, sends the output, and gives
-    /// `Ready`.
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()>;
+    /// Polls the future. When it gives its output, drops the future, and gives `Ready` with the
+    /// outcome, or with `None` when the task had ended.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Staged>>;
 
-    /// Ends the task with no output: drops the future, and then sends the outcome.
-    fn end(self: Pin<&mut Self>, end: End);
+    /// Ends the task with no output: drops the future, and gives the outcome.
+    fn end(self: Pin<&mut Self>, end: End) -> Option<Staged>;
 }
 
+/// The fields drop in their order: a cell that drops with its sender, at a failure of the owner,
+/// gives its charge back before its channel closes.
 pub(super) struct TaskCell<F: Future> {
     /// The future, pinned in the cell. It drops in place, at the end of the task.
     pub(super) future: Option<F>,
-    pub(super) sender: Option<oneshot::Sender<Outcome<F::Output>>>,
     pub(super) _charge: Permit,
+    pub(super) sender: Option<oneshot::Sender<Outcome<F::Output>>>,
 }
 
 impl<F: Future> TaskCell<F> {
@@ -73,40 +79,49 @@ impl<F: Future> TaskCell<F> {
         unsafe { self.map_unchecked_mut(|cell| &mut cell.future) }
     }
 
+    /// Stages `outcome` in the channel of the join handle. A join handle that dropped leaves the
+    /// outcome to the drop of the [`Staged`].
     #[expect(unsafe_code, reason = "the sender is not pinned: the cell moves it out")]
-    fn send(self: Pin<&mut Self>, outcome: Outcome<F::Output>) {
+    fn stage(self: Pin<&mut Self>, outcome: Outcome<F::Output>) -> Option<Staged>
+    where
+        F::Output: 'static,
+    {
         // SAFETY: the sender is not structurally pinned, and this moves only the sender.
         let sender = unsafe { &mut self.get_unchecked_mut().sender };
-        if let Some(sender) = sender.take()
-            && let Err(unjoined) = sender.send(outcome)
-        {
-            // A join handle that dropped leaves the outcome to this send.
-            discard(unjoined);
+        match sender.take().map(|sender| sender.stage(outcome)) {
+            Some(Ok(staged)) => Some(staged),
+            Some(Err(unjoined)) => {
+                discard(unjoined);
+                None
+            }
+            None => None,
         }
     }
 }
 
-impl<F: Future> Task for TaskCell<F> {
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+impl<F: Future> Task for TaskCell<F>
+where
+    F::Output: 'static,
+{
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Staged>> {
         let mut future = self.as_mut().future();
         let Some(running) = future.as_mut().as_pin_mut() else {
-            return Poll::Ready(());
+            return Poll::Ready(None);
         };
         let Poll::Ready(output) = running.poll(cx) else {
             return Poll::Pending;
         };
         // A panic of the drop of the future makes the task panicked, and its output drops.
-        match catch_unwind(AssertUnwindSafe(|| future.set(None))) {
-            Ok(()) => self.send(Outcome::Completed(output)),
+        Poll::Ready(match catch_unwind(AssertUnwindSafe(|| future.set(None))) {
+            Ok(()) => self.stage(Outcome::Completed(output)),
             Err(payload) => {
                 discard(output);
-                self.send(Outcome::Panicked(Panic(payload)));
+                self.stage(Outcome::Panicked(Panic(payload)))
             }
-        }
-        Poll::Ready(())
+        })
     }
 
-    fn end(mut self: Pin<&mut Self>, end: End) {
+    fn end(mut self: Pin<&mut Self>, end: End) -> Option<Staged> {
         // A panic of the drop of the future makes a cancelled task panicked. A task that panicked
         // already keeps the payload of its poll.
         let dropped = catch_unwind(AssertUnwindSafe(|| self.as_mut().future().set(None)));
@@ -120,7 +135,7 @@ impl<F: Future> Task for TaskCell<F> {
                 Outcome::Panicked(Panic(payload))
             }
         };
-        self.send(outcome);
+        self.stage(outcome)
     }
 }
 
@@ -543,8 +558,8 @@ impl Local {
         // they load together.
         crate::prefetch::lines(&raw const *entry.task, size_of_val(&*entry.task));
         if self.shared.poll_start(slot) {
-            entry.task.as_mut().end(End::Cancelled);
-            return self.finish(slot, entry);
+            let outcome = entry.task.as_mut().end(End::Cancelled);
+            return self.finish(slot, entry, outcome);
         }
         let Entry { task, waker } = &mut entry;
         #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -570,17 +585,17 @@ impl Local {
                     self.queue.borrow_mut().push_back(slot);
                 }
             }
-            Ok(Poll::Ready(())) => self.finish(slot, entry),
+            Ok(Poll::Ready(outcome)) => self.finish(slot, entry, outcome),
             Err(payload) => {
-                entry.task.as_mut().end(End::Panicked(payload));
-                self.finish(slot, entry);
+                let outcome = entry.task.as_mut().end(End::Panicked(payload));
+                self.finish(slot, entry, outcome);
             }
         }
     }
 
-    /// Ends the task in `slot`, after it sent its outcome: frees its storage, its charge, and its
-    /// slot, and wakes a waiting spawn.
-    fn finish(&self, slot: u32, entry: Entry) {
+    /// Ends the task in `slot`: frees its storage, its charge, and its slot, wakes a waiting spawn,
+    /// and then shows its `outcome` to its join handle.
+    fn finish(&self, slot: u32, entry: Entry, outcome: Option<Staged>) {
         self.shared.end(slot);
         drop(entry);
         // The slot is free before its reservation is, so each reservation finds a free slot.
@@ -588,6 +603,8 @@ impl Local {
         self.shared.release_slot();
         self.live.update(|live| live - 1);
         self.waiting.wake_first();
+        // A panic of the drop of an output that no join takes is contained.
+        discard(outcome);
     }
 
     /// One turn: takes the remote-ready list, and polls each task that was ready when the turn
@@ -694,11 +711,12 @@ impl Local {
         for (slot, entry) in (0..).zip(self.entries.iter()) {
             if let Some(entry) = entry.take() {
                 self.shared.end(slot);
-                // A panic of the drop of one future does not stop the drop of the others.
-                discard(entry);
+                // The slot is free before the drop closes the channel of the join handle.
                 self.free.borrow_mut().push(slot);
                 self.shared.release_slot();
                 self.live.update(|live| live - 1);
+                // A panic of the drop of one future does not stop the drop of the others.
+                discard(entry);
             }
         }
         self.closed.set(false);

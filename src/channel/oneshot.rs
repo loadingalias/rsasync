@@ -58,6 +58,8 @@ use core::fmt;
 use core::future::Future;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
+#[cfg(feature = "local")]
+use core::ptr::NonNull;
 use core::task::{Context, Poll};
 
 use super::{Closed, Refused, SendError, TryRecvError};
@@ -105,6 +107,76 @@ impl<T> Shared<T> {
     unsafe fn take(&self) -> T {
         // SAFETY: the slot holds the value, and only the caller has access to it.
         self.slot.with(|slot| unsafe { (*slot).assume_init_read() })
+    }
+
+    /// Shows the written value to the receiver and wakes it, and ends the sender. Gives the value
+    /// back when the receiver is gone.
+    ///
+    /// # Safety
+    ///
+    /// The sender wrote the slot, and it did not deliver it yet.
+    #[expect(
+        unsafe_code,
+        reason = "before the delivery sets `VALUE`, and after a drop of the receiver, only the sender has the slot"
+    )]
+    unsafe fn deliver(&self) -> Option<T> {
+        // Ordering: `Release` orders the write of the slot before the read of the receiver. The
+        // read below needs no `Acquire`: a drop of the receiver that comes first reads no slot.
+        if self.state.fetch_or(VALUE | SENDER_GONE, Ordering::Release) & RECEIVER_GONE != 0 {
+            // SAFETY: the receiver was gone before `VALUE`, so it never reads the slot.
+            return Some(unsafe { self.take() });
+        }
+        self.waiter.wake();
+        None
+    }
+}
+
+/// A value that a sender wrote to its channel, and that the receiver does not see yet. The drop
+/// shows the value to the receiver and wakes it, or drops the value when the receiver is gone, so
+/// the sender frees other resources first. The owner of a task stages its outcome so, and a join
+/// sees the outcome only after the memory, the charge, and the slot of the task are free.
+#[cfg(feature = "local")]
+pub(crate) struct Staged {
+    /// The shared state of the channel, from `Arc::into_raw`, with no type.
+    shared: NonNull<()>,
+    /// [`deliver_staged`] of the type of the value.
+    deliver: unsafe fn(NonNull<()>),
+}
+
+/// Delivers the written value of the shared state `shared` of a channel of `T`, as
+/// [`Shared::deliver`] does, drops it when the receiver is gone, and drops the reference of the
+/// sender.
+///
+/// # Safety
+///
+/// `shared` is from `Arc::into_raw` of a channel of `T` whose slot the sender wrote, and this is the
+/// one delivery of it.
+#[cfg(feature = "local")]
+#[expect(
+    unsafe_code,
+    reason = "the caller gives the reference of a sender that wrote its slot"
+)]
+unsafe fn deliver_staged<T>(shared: NonNull<()>) {
+    // SAFETY: see the contract: the reference is the sender's, of a channel of `T`.
+    let shared = unsafe { Arc::from_raw(shared.cast::<Shared<T>>().as_ptr().cast_const()) };
+    // SAFETY: the slot is written, and this is its one delivery.
+    drop(unsafe { shared.deliver() });
+}
+
+#[cfg(feature = "local")]
+impl Drop for Staged {
+    #[expect(unsafe_code, reason = "a `Staged` delivers its written value once, at its drop")]
+    fn drop(&mut self) {
+        // SAFETY: `stage` made `shared` and `deliver` from one channel whose slot it wrote, and
+        // only this drop delivers it.
+        unsafe { (self.deliver)(self.shared) };
+    }
+}
+
+#[cfg(feature = "local")]
+impl fmt::Debug for Staged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Staged").finish_non_exhaustive()
     }
 }
 
@@ -171,14 +243,35 @@ impl<T> Sender<T> {
         };
         // SAFETY: the slot is empty, and no receiver reads it before `VALUE`.
         unsafe { shared.write(value) };
-        // Ordering: `Release` orders the write of the slot before the read of the receiver. The
-        // read below needs no `Acquire`: a drop of the receiver that comes first reads no slot.
-        if shared.state.fetch_or(VALUE | SENDER_GONE, Ordering::Release) & RECEIVER_GONE != 0 {
-            // SAFETY: the receiver was gone before `VALUE`, so it never reads the slot.
-            return Err(SendError(unsafe { shared.take() }));
+        // SAFETY: the slot is written, and this is its one delivery.
+        match unsafe { shared.deliver() } {
+            Some(value) => Err(SendError(value)),
+            None => Ok(()),
         }
-        shared.waiter.wake();
-        Ok(())
+    }
+}
+
+// `T: 'static`: a `Staged` names no lifetime, so it must not outlive data that the value borrows.
+#[cfg(feature = "local")]
+impl<T: 'static> Sender<T> {
+    /// Writes `value` to the slot, and ends the sender. The receiver sees the value at the drop of
+    /// the [`Staged`]. Gives the value back when the sender has no channel.
+    #[expect(
+        unsafe_code,
+        reason = "before the delivery sets `VALUE`, only the sender has the slot"
+    )]
+    pub(crate) fn stage(mut self, value: T) -> Result<Staged, T> {
+        let Some(shared) = self.shared.take() else {
+            return Err(value);
+        };
+        // SAFETY: the slot is empty, and no receiver reads it before `VALUE`.
+        unsafe { shared.write(value) };
+        // SAFETY: `Arc::into_raw` gives a pointer that is not null.
+        let shared = unsafe { NonNull::new_unchecked(Arc::into_raw(shared).cast_mut().cast()) };
+        Ok(Staged {
+            shared,
+            deliver: deliver_staged::<T>,
+        })
     }
 }
 

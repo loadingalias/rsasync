@@ -254,13 +254,14 @@ where
 
 impl<Fa, F: Future> Drop for Spawn<Fa, F> {
     fn drop(&mut self) {
+        // The join sees `Cancelled` after the slot of the spawn is free.
+        if self.reserved {
+            self.remote.shared.release_slot();
+        }
         if let Some(sender) = self.sender.take()
             && let Err(unjoined) = sender.send(Outcome::Cancelled)
         {
             discard(unjoined);
-        }
-        if self.reserved {
-            self.remote.shared.release_slot();
         }
     }
 }

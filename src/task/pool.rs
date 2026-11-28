@@ -64,7 +64,7 @@ use super::owner::{End, Task, TaskCell, discard, init};
 use super::slot::{self, Shared as Home};
 use super::{CancelHandle, JoinHandle, Outcome, Reason, SpawnRefused, Target};
 use crate::capacity::{Budget, Permit};
-use crate::channel::oneshot;
+use crate::channel::oneshot::{self, Staged};
 use crate::memory::{items, room};
 use crate::sync::atomic::{self, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::sync::{Arc, arc_size, thread_local, try_arc};
@@ -898,8 +898,8 @@ impl Pool {
                 // Ordering: `Relaxed`: a count, which the join of the worker publishes.
                 self.cancelled.fetch_add(1, Ordering::Relaxed);
             }
-            movable.task.as_mut().end(End::Cancelled);
-            return self.finish(slot, movable);
+            let outcome = movable.task.as_mut().end(End::Cancelled);
+            return self.finish(slot, movable, outcome);
         }
         let Movable { task, waker } = &mut movable;
         let polled = catch_unwind(AssertUnwindSafe(|| {
@@ -916,22 +916,24 @@ impl Pool {
                     shared.queue(lane, slot);
                 }
             }
-            Ok(Poll::Ready(())) => self.finish(slot, movable),
+            Ok(Poll::Ready(outcome)) => self.finish(slot, movable, outcome),
             Err(payload) => {
-                movable.task.as_mut().end(End::Panicked(payload));
-                self.finish(slot, movable);
+                let outcome = movable.task.as_mut().end(End::Panicked(payload));
+                self.finish(slot, movable, outcome);
             }
         }
     }
 
-    /// Ends the task in `slot`, after it sent its outcome: frees its storage, its charge, and its
-    /// slot.
-    fn finish(&self, slot: u32, movable: Movable) {
+    /// Ends the task in `slot`: frees its storage, its charge, and its slot, and then shows its
+    /// `outcome` to its join handle.
+    fn finish(&self, slot: u32, movable: Movable, outcome: Option<Staged>) {
         slot::end(&self.shared.words[slot as usize]);
         discard(movable);
         // The slot is free before its reservation is, so each reservation finds a free slot.
         self.push_free(slot);
         self.release();
+        // A panic of the drop of an output that no join takes is contained.
+        discard(outcome);
     }
 }
 
