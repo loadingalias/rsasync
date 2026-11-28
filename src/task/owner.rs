@@ -146,8 +146,9 @@ pub(super) trait Park {
     type Error;
 
     /// Does the other work of the home with no wait. Gives `true` if work remains for the next
-    /// turn.
-    fn drive(&mut self, local: &Local) -> Result<bool, Self::Error>;
+    /// turn. With [`Next::Wait`], a home that waits in its driver leaves the pushed work to the
+    /// wait, which submits it.
+    fn drive(&mut self, local: &Local, next: Next) -> Result<bool, Self::Error>;
 
     /// Gives the failure of the home that a poll or a destructor stored, such as a driver that did
     /// not start at its first use. A home that cannot fail stores none.
@@ -159,13 +160,22 @@ pub(super) trait Park {
     fn park(&mut self, local: &Local, until: Option<Until>) -> Result<(), Self::Error>;
 }
 
+/// What the owner does after a drive of its home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Next {
+    /// It polls a ready task, fires a timer, or polls the root, so the drive submits now.
+    Work,
+    /// It has nothing ready, so it parks when the drive finds no work either.
+    Wait,
+}
+
 /// A home with no ring: it has no other work, and it parks its thread.
 pub(super) struct Thread;
 
 impl Park for Thread {
     type Error = !;
 
-    fn drive(&mut self, _local: &Local) -> Result<bool, Self::Error> {
+    fn drive(&mut self, _local: &Local, _next: Next) -> Result<bool, Self::Error> {
         Ok(false)
     }
 
@@ -497,6 +507,10 @@ impl Local {
     /// queue, with no remote-ready list. A task of another generation does not change.
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn wake_local(&self, task: crate::driver::LocalTask) {
+        // The next turn polls the task: its entry loads while the wake changes its word.
+        if let Some(entry) = self.entries.get(task.slot as usize) {
+            crate::prefetch::lines(entry, size_of::<Cell<Option<Entry>>>());
+        }
         if self.shared.wake_idle(task.slot, task.generation) {
             // The queue has room for each slot, and the word gives each slot one entry.
             self.queue.borrow_mut().push_back(task.slot);
@@ -507,6 +521,11 @@ impl Local {
     #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub(super) fn shared(&self) -> &Arc<Shared> {
         &self.shared
+    }
+
+    /// Whether a task waits in the local ready queue.
+    fn has_ready(&self) -> bool {
+        !self.queue.borrow().is_empty()
     }
 
     /// The scheduling choice: the next ready task, first in, first out.
@@ -520,6 +539,9 @@ impl Local {
         let Some(mut entry) = self.entries[slot as usize].take() else {
             return;
         };
+        // The future of a task spans a few cache lines, which its poll reads one after another:
+        // they load together.
+        crate::prefetch::lines(&raw const *entry.task, size_of_val(&*entry.task));
         if self.shared.poll_start(slot) {
             entry.task.as_mut().end(End::Cancelled);
             return self.finish(slot, entry);
@@ -569,7 +591,8 @@ impl Local {
     }
 
     /// One turn: takes the remote-ready list, and polls each task that was ready when the turn
-    /// started. Gives `false` if no task was ready.
+    /// started. Gives `false` if no task was ready. A task that a poll wakes waits for the next
+    /// turn.
     fn turn(&self) -> bool {
         self.shared.harvest(|slot| self.queue.borrow_mut().push_back(slot));
         let ready = self.queue.borrow().len();
@@ -580,6 +603,26 @@ impl Local {
             self.poll_slot(slot);
         }
         ready > 0
+    }
+
+    /// The end of a loop iteration: drives `home` when work is `owed` or ready, and else parks it
+    /// and drives it after the wait, so the next turn polls the tasks of its completions. Work is
+    /// ready when a timer is `due`, a task is in the local queue, or `woken` (the remote-ready list
+    /// or the root flag of the loop). With nothing ready, the drive enters no kernel, and the wait
+    /// submits the pushed work in its one entry. Gives whether a drive is owed for the next
+    /// iteration.
+    fn settle<P: Park>(&self, home: &mut P, due: bool, owed: bool, woken: impl Fn() -> bool) -> Result<bool, P::Error> {
+        let ready = due || self.has_ready() || woken();
+        let next = if ready { Next::Work } else { Next::Wait };
+        let more = if owed || ready { home.drive(self, next)? } else { false };
+        // The drive clears the wake descriptor. A push or a root wake that came before the clear is
+        // in the list or the flag, so this look after the drive sees it, and a later one signals
+        // the descriptor again.
+        if ready || more || woken() {
+            return Ok(more);
+        }
+        home.park(self, self.until())?;
+        home.drive(self, Next::Wait)
     }
 
     /// Gives the owner `timers`, driven on `clock`, in place of its storage before.
@@ -669,9 +712,13 @@ impl Local {
         let mut root = pin!(root);
         let mut cx = Context::from_waker(&self.root);
         let mut poll_root = true;
+        // A poll or a drive since the last drive can leave work for the home, such as a close that
+        // a drop recorded, so the home turns before the owner parks.
+        let mut owed = true;
         let output = loop {
             if poll_root || self.shared.take_root() {
                 poll_root = false;
+                owed = true;
                 let polled = coop::with_budget(self.poll_budget.get(), || root.as_mut().poll(&mut cx));
                 // A failure of the home in the poll ends the loop before a task polls or the
                 // cancel of the end, so each live task ends with `OwnerFailed`.
@@ -680,23 +727,19 @@ impl Local {
                     break output;
                 }
             }
-            let ran = self.turn();
+            owed |= self.turn();
             let due = self.fire_timers();
-            let more = home.drive(self)?;
-            if !ran && !due && !more && !self.shared.has_remote() && !self.shared.root_woken() {
-                home.park(self, self.until())?;
-            }
+            owed = self.settle(home, due, owed, || self.shared.has_remote() || self.shared.root_woken())?;
         };
         self.closed.set(true);
         self.cancelled.set(self.live.get());
         self.cancel_all();
+        owed = true;
         while self.live.get() > 0 {
-            let ran = self.turn();
+            owed |= self.turn();
             let due = self.fire_timers();
-            let more = home.drive(self)?;
-            if !ran && !due && !more && !self.shared.has_remote() {
-                home.park(self, self.until())?;
-            }
+            // The turn can end the last task, and then nothing would end the park.
+            owed = self.settle(home, due, owed, || self.shared.has_remote() || self.live.get() == 0)?;
         }
         self.closed.set(false);
         // The destructor of a cancelled task can fail the home, also after the last turn.

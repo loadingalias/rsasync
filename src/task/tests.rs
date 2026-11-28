@@ -568,7 +568,7 @@ struct Record {
 impl super::owner::Park for Record {
     type Error = !;
 
-    fn drive(&mut self, _local: &super::owner::Local) -> Result<bool, Self::Error> {
+    fn drive(&mut self, _local: &super::owner::Local, _next: super::owner::Next) -> Result<bool, Self::Error> {
         Ok(false)
     }
 

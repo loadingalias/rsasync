@@ -359,6 +359,16 @@ impl core::error::Error for Error {
     }
 }
 
+/// When a turn enters the kernel for its pushed entries and the deferred work of the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Enter {
+    /// In the turn: [`Driver::turn`].
+    Now,
+    /// In the wait that follows a turn with no work, which submits and waits in one entry.
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    AtWait,
+}
+
 /// What one [`Driver::turn`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Turn {
@@ -1321,6 +1331,14 @@ impl Resources {
 
     /// The slot of `resource`, as [`Resources::get`] gives it, and the shelf of the buffers that
     /// its directions keep.
+    /// Asks the CPU to load the first two cache lines of the slot of `resource`, which hold the
+    /// record of a stream ([`Owned`]).
+    fn prefetch(&self, resource: Resource) {
+        if let Some(slot) = self.slots.get(resource.index as usize) {
+            crate::prefetch::lines(slot, 128);
+        }
+    }
+
     fn with_shelf(&mut self, resource: Resource) -> Option<(&mut Owned, &mut tcp::Shelf)> {
         let driver = self.driver;
         let owned = self
@@ -1457,18 +1475,31 @@ struct Selected {
     ring: BufferRing,
     /// The buffer of each buffer identifier that the kernel ring holds.
     buffers: Vec<Option<Backing>>,
-    /// The identifiers with no buffer, which a refill fills from the pool.
+    /// The identifiers with no buffer, which a refill fills from the pool, the last one first.
     free: Vec<u16>,
     /// The capacity of each slot.
     len: u32,
+    /// The buffers that the kernel ring holds.
+    provided: u32,
+    /// The most buffers that the kernel ring holds: `RING_TURNS` turns of completions, and at
+    /// least `RING_MIN`. The kernel takes the buffers of the ring in order, so a ring of each free
+    /// slot gives the kernel and the driver a slot that they used last a whole pool ago, whose
+    /// memory left the cache. Each `ENOBUFS` doubles it, up to the whole pool.
+    depth: u32,
 }
+
+/// The turns of completions of free buffers that the kernel ring of a driver starts with.
+const RING_TURNS: u32 = 4;
+
+/// The fewest free buffers that the kernel ring of a driver holds, when the pool has them.
+const RING_MIN: u32 = 256;
 
 impl Selected {
     /// Takes each slot of `pool`, up to 32768, and gives each to a new provided ring of `ring`.
     /// It counts the other slots, which a refill gives to the ring. The shelf of the multishot
     /// receives has a place for each slot of the pool, and one for a buffer of a caller of each of
     /// the `streams` resource slots.
-    fn new(queue: &mut Queue, mut pool: Pool, streams: u32) -> io::Result<(Self, tcp::Shelf)> {
+    fn new(queue: &mut Queue, mut pool: Pool, streams: u32, per_turn: u32) -> io::Result<(Self, tcp::Shelf)> {
         let mut buffers = Vec::new();
         while buffers.len() < 1 << 15 {
             let Ok(backing) = pool.acquire() else { break };
@@ -1493,18 +1524,28 @@ impl Selected {
         // The memory comes before the buffer ring, so a refusal of the allocator provides nothing.
         let free = room(usize::from(count)).map_err(out_of_memory)?;
         let shelf = tcp::Shelf::new(slots.saturating_add(streams)).map_err(out_of_memory)?;
+        let depth = per_turn.saturating_mul(RING_TURNS).max(RING_MIN).min(u32::from(count));
         let mut selected = Self {
             ring: queue.provide(count.next_power_of_two(), GROUP)?,
             pool,
             buffers,
             free,
             len,
+            provided: depth,
+            depth,
         };
-        for (bid, buffer) in (0..).zip(selected.buffers.iter_mut()) {
-            if let Some(buffer) = buffer {
+        for (bid, slot) in (0..).zip(selected.buffers.iter_mut()) {
+            if u32::from(bid) >= depth {
+                // The slot goes back to the pool, and the identifier waits for a refill. The free
+                // list has room for each identifier.
+                drop(slot.take());
+                selected.free.push(bid);
+            } else if let Some(buffer) = slot {
                 selected.ring.add(bid, buffer.as_mut_ptr(), len);
             }
         }
+        // The lowest free identifiers come first.
+        selected.free.reverse();
         selected.ring.publish();
         Ok((selected, shelf))
     }
@@ -1526,13 +1567,17 @@ impl Selected {
     fn take(&mut self, bid: u16) -> Option<Backing> {
         let buffer = self.buffers.get_mut(usize::from(bid))?.take()?;
         self.free.push(bid);
+        self.provided -= 1;
         Some(buffer)
     }
 
-    /// Gives each slot that came back to the pool to the kernel ring again.
+    /// Gives slots that came back to the pool to the kernel ring again, up to `depth` in the ring,
+    /// the last free identifier and the last returned slot first.
     fn refill(&mut self) {
         let mut added = false;
-        while let Some(&bid) = self.free.last() {
+        while self.provided < self.depth
+            && let Some(&bid) = self.free.last()
+        {
             let Ok(mut buffer) = self.pool.acquire() else {
                 break;
             };
@@ -1541,11 +1586,19 @@ impl Selected {
             if let Some(slot) = self.buffers.get_mut(usize::from(bid)) {
                 *slot = Some(buffer);
             }
+            self.provided += 1;
             added = true;
         }
         if added {
             self.ring.publish();
         }
+    }
+
+    /// A receive found the kernel ring empty: the ring holds two times more buffers from now on,
+    /// up to the whole pool.
+    fn grow(&mut self) {
+        let identifiers = u32::try_from(self.buffers.len()).unwrap_or(u32::MAX);
+        self.depth = self.depth.saturating_mul(2).min(identifiers);
     }
 }
 
@@ -2126,7 +2179,7 @@ impl Driver {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
         let streams = u32::try_from(self.resources.slots.len()).unwrap_or(u32::MAX);
-        let (selected, shelf) = Selected::new(&mut self.queue, pool, streams)?;
+        let (selected, shelf) = Selected::new(&mut self.queue, pool, streams, self.completions_per_turn)?;
         self.resources.shelf = shelf;
         self.selected = Some(selected);
         Ok(())
@@ -2139,6 +2192,24 @@ impl Driver {
     /// A failure of the kernel entry other than an interrupt or a full completion queue, which
     /// leave work for the next turn.
     pub fn turn(&mut self) -> io::Result<Turn> {
+        self.turn_with(Enter::Now)
+    }
+
+    /// One turn of the owner of a runtime that waits next when this turn has no work
+    /// ([`Enter::AtWait`]): the turn enters no kernel, and the wait submits the pushed entries
+    /// and takes the deferred work of the kernel in its one entry.
+    ///
+    /// # Errors
+    ///
+    /// As for [`turn`](Self::turn).
+    #[cfg(all(feature = "local", target_os = "linux"))]
+    pub(crate) fn turn_before_wait(&mut self) -> io::Result<Turn> {
+        self.turn_with(Enter::AtWait)
+    }
+
+    /// One turn, which enters the kernel for its pushed entries and the deferred work of the kernel
+    /// at `enter`.
+    fn turn_with(&mut self, enter: Enter) -> io::Result<Turn> {
         #[cfg(target_os = "linux")]
         if let Some(error) = self.wake_failed.take() {
             return Err(error);
@@ -2151,7 +2222,8 @@ impl Driver {
             selected.refill();
         }
         let mut more = false;
-        if self.queue.unsubmitted() > 0 || self.queue.needs_enter() {
+        let now = enter == Enter::Now;
+        if now && (self.queue.unsubmitted() > 0 || self.queue.needs_enter()) {
             match self.queue.submit(0) {
                 Ok(_) => {}
                 Err(error) if retryable(&error) => more = true,
@@ -2192,9 +2264,10 @@ impl Driver {
             self.poll_jobs();
             self.attend();
         }
+        // At `Enter::AtWait`, the pushed entries and the deferred work of the kernel wait for the
+        // entry of the wait, which comes next.
         more |= self.queue.ready()
-            || self.queue.more()
-            || self.queue.unsubmitted() > 0
+            || now && (self.queue.more() || self.queue.unsubmitted() > 0)
             || !self.shared.requests.is_empty()
             || self.control.as_ref().is_some_and(control::Controlled::due);
         // A drop that this turn ran, for example of a buffer, can record a close. The owner turns
@@ -2774,9 +2847,19 @@ impl Driver {
         let (wakes, consumers) = (&mut self.wakes, &mut self.consumers);
         #[cfg(unix)]
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
-        for cqe in native.iter_mut().flatten().chain(kept.iter_mut().flatten()) {
+        let mut cqes = native.iter_mut().flatten().chain(kept.iter_mut().flatten()).peekable();
+        while let Some(cqe) = cqes.next() {
             completed += 1;
+            // The record of the next completion loads while this one is handled.
+            if let Some((resource, _)) = cqes.peek().and_then(|next| resources.of_record(next.user_data)) {
+                resources.prefetch(resource);
+            }
             let mut event = cqe.event();
+            if cqe.res == -tcp::ENOBUFS
+                && let Some(selected) = selected.as_mut()
+            {
+                selected.grow();
+            }
             // A completion of the multishot receive of a stream goes to the record of the stream,
             // with no operation slot: its buffer goes to the shelf, and the local receive that
             // waits wakes. The operation that waits takes it after the harvest, and a full shelf

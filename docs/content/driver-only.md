@@ -366,6 +366,13 @@ If no slot is free when the kernel tries the receive, the receive ends with the 
 (`io::Error::raw_os_error`). The data stays in the socket, so receive again after a slot comes
 back.
 
+The kernel takes the slots of its ring in order. So the driver gives the kernel at most four turns
+of completions of free slots (four times `Config::completions_per_turn`), and at least 256, and
+keeps the other free slots. Each slot then comes back to the kernel while its memory is still in
+the cache. A pool of more than 256 slots can therefore give `ENOBUFS` while it has a free slot. The
+next turn gives the kernel more slots, and each `ENOBUFS` doubles the slots that the kernel gets,
+up to the whole pool. A pool of 256 slots or fewer is always in the ring.
+
 ### One multishot receive for each stream
 
 An io_uring driver keeps one multishot receive in the read direction of each TCP stream. This is

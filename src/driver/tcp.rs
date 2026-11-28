@@ -37,9 +37,9 @@ use crate::uring::Sqe;
 /// `WSAENOBUFS` (`winerror.h`): a selecting receive found no free buffer, and the data stays in
 /// the socket.
 #[cfg(target_os = "linux")]
-const ENOBUFS: i32 = 105;
+pub(super) const ENOBUFS: i32 = 105;
 #[cfg(target_os = "macos")]
-const ENOBUFS: i32 = 55;
+pub(super) const ENOBUFS: i32 = 55;
 #[cfg(target_os = "windows")]
 pub(super) const ENOBUFS: i32 = 10055;
 /// `EAGAIN`, on Windows `WSAEWOULDBLOCK`: a receive with no wait found no datagram.

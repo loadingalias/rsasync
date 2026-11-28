@@ -53,6 +53,16 @@ mod completion;
 // The poll budget of the runtime leaves.
 mod coop;
 mod memory;
+// The cache hints of the driver and of the scheduler of a local owner.
+#[cfg(any(
+    feature = "local",
+    all(
+        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        feature = "std"
+    )
+))]
+mod prefetch;
 mod sync;
 #[cfg_attr(
     not(all(

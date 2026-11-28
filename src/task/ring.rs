@@ -23,7 +23,7 @@ use core::future::Future;
 use std::io;
 
 use super::Refused;
-use super::owner::{Enter, Local, Park};
+use super::owner::{Enter, Local, Next, Park};
 use super::slot::Home;
 use crate::capacity::Budget;
 use crate::clock::{NativeClock, Until};
@@ -274,14 +274,18 @@ impl Drive<'_> {
 impl Park for Drive<'_> {
     type Error = Failure;
 
-    fn drive(&mut self, local: &Local) -> Result<bool, Failure> {
+    fn drive(&mut self, local: &Local, next: Next) -> Result<bool, Failure> {
         self.check(local)?;
         let mut driver = local.driver.borrow_mut();
         let Some(driver) = driver.as_mut() else {
             return Ok(false);
         };
         flush(local, driver);
-        let more = driver.turn().map_err(Failure::Driver)?.more();
+        let turn = match next {
+            Next::Work => driver.turn(),
+            Next::Wait => driver.turn_before_wait(),
+        };
+        let more = turn.map_err(Failure::Driver)?.more();
         // A task that a home operation woke is in the local queue, so the owner turns again.
         let woke = driver.take_woken(|task| local.wake_local(task));
         Ok(more || woke)
