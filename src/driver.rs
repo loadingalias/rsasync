@@ -2847,13 +2847,8 @@ impl Driver {
         let (wakes, consumers) = (&mut self.wakes, &mut self.consumers);
         #[cfg(unix)]
         let (children, ring_wait) = (&mut self.children, self.report.route(Call::WaitChild) == Route::Ring);
-        let mut cqes = native.iter_mut().flatten().chain(kept.iter_mut().flatten()).peekable();
-        while let Some(cqe) = cqes.next() {
+        for cqe in native.iter_mut().flatten().chain(kept.iter_mut().flatten()) {
             completed += 1;
-            // The record of the next completion loads while this one is handled.
-            if let Some((resource, _)) = cqes.peek().and_then(|next| resources.of_record(next.user_data)) {
-                resources.prefetch(resource);
-            }
             let mut event = cqe.event();
             if cqe.res == -tcp::ENOBUFS
                 && let Some(selected) = selected.as_mut()
@@ -2864,7 +2859,13 @@ impl Driver {
             // with no operation slot: its buffer goes to the shelf, and the local receive that
             // waits wakes. The operation that waits takes it after the harvest, and a full shelf
             // ends the multishot receive there.
-            if let Some((resource, Half::Read)) = resources.of_record(cqe.user_data) {
+            let record = resources.of_record(cqe.user_data);
+            // Both lines of the record load together: the record reads the second line after the
+            // first.
+            if let Some((resource, _)) = record {
+                resources.prefetch(resource);
+            }
+            if let Some((resource, Half::Read)) = record {
                 let buffer = cqe
                     .buffer()
                     .zip(selected.as_mut())
@@ -2884,7 +2885,7 @@ impl Driver {
             // The terminal completion of the send of a record wakes the future, or the abandoned
             // rule applies to it. A part of a send of each byte goes again after the harvest.
             #[cfg(all(feature = "local", target_os = "linux"))]
-            if let Some((resource, Half::Write)) = resources.of_record(cqe.user_data) {
+            if let Some((resource, Half::Write)) = record {
                 if let Some(owned) = resources.get(resource) {
                     let (needs, waiter) = owned.directions.record_sent(cqe.res);
                     if needs {

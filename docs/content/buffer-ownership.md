@@ -239,9 +239,12 @@ receive.
 - The last backing, lease, or view of a slot returns the slot, on any thread, with no allocation
   and no lock, so the drop never blocks or fails. A slot never waits for an epoch or a reclaimer.
 - The owner of the pool is the home of its slots: only it acquires, through `&mut Pool`. A slot
-  that drops on a different thread goes into the return list of the pool. The list has at most one
-  entry for each slot, in the slot itself. The home takes the list when it has no free slot, so the
-  next acquire at the home gets the slot.
+  that drops, on any thread, goes into the return ring of the pool, which has one cell for each
+  slot. Each acquire takes the returned slots and gives the slot that came back last first, so a
+  busy pool reuses slots whose memory is still in the cache.
+- A backing from `acquire`, and a lease of it, count nothing in the slot until their first clone
+  or view. So their drop returns the slot with no read of the count, and only a lease with views
+  pays for the count.
 
 ```rust
 use core::alloc::Layout;

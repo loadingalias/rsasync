@@ -10,11 +10,12 @@ use core::ptr::NonNull;
 
 use super::{Backing, Hook, Release};
 use crate::capacity::{Budget, Exhausted, Permit};
-use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use crate::sync::{Arc, arc_size, try_arc};
 
-/// The end of a list of slots. A pool has fewer slots, so no slot has this index.
-const NONE: u32 = u32::MAX;
+/// The bit of a cell of the return ring that holds the lap of the return that wrote it. A pool has
+/// fewer slots, so no slot index has this bit.
+const LAP: u32 = 1 << 31;
 
 /// A bounded pool of slots of one size, which it charges to a budget for its whole life.
 ///
@@ -31,8 +32,9 @@ const NONE: u32 = u32::MAX;
 /// lock, and a later `acquire` can give it again. No slot waits for an epoch.
 ///
 /// The owner of the pool is the home of its slots: only it acquires, through `&mut self`. A slot
-/// that drops on a different thread goes into the return list of the pool. The list has at most one
-/// entry for each slot, in the slot itself, and the home takes the list when it has no free slot.
+/// that drops, on any thread, goes into the return ring of the pool, which has one cell for each
+/// slot. Each acquire takes the returned slots, and gives the slot that came back last first, so
+/// a busy pool reuses slots whose memory is still in the cache.
 ///
 /// ```
 /// # extern crate rstypes as rsasync;
@@ -68,8 +70,12 @@ const NONE: u32 = u32::MAX;
 /// ```
 pub struct Pool {
     shared: Arc<Shared>,
-    /// The first slot of the free list of the home, or `NONE`.
-    free: u32,
+    /// The free slots of the home: the first `top` entries, the last one first.
+    free: Box<[u32]>,
+    top: u32,
+    /// The next cell of the return ring that the home reads, and the lap bit of its next return.
+    cell: u32,
+    lap: u32,
 }
 
 /// The memory and the slots of a pool. The pool and each slot in use keep it alive.
@@ -81,7 +87,7 @@ struct Shared {
     /// The slot size that the caller asked for: the capacity of each backing.
     capacity: usize,
     slots: Box<[Slot]>,
-    returned: ReturnList,
+    returned: ReturnRing,
     /// The allocator of the arena, which gets the arena back in `Drop::drop`.
     allocator: Box<dyn Allocator + Send>,
     /// The charge of the pool. Fields drop after `Drop::drop` and in order, so the charge ends
@@ -89,46 +95,45 @@ struct Shared {
     _charge: Permit,
 }
 
-/// One slot: the count of its owners, and its entry in the free list or in the return list.
+/// One slot: the count of the owners of the slot that a clone made.
+///
+/// The first owner of a slot, the backing that `acquire` gives, counts nothing while it has no
+/// clone ([`SlotRef::alone`]), so its drop reads no count. Its first clone counts it and itself.
+/// Thus a free slot counts 0, and `acquire` writes nothing here.
 struct Slot {
     count: AtomicU64,
-    next: AtomicU32,
 }
 
-/// The slots that their owners returned on any thread, linked through the entries of the slots.
+/// The slots that their owners returned on any thread, in the order of their returns: a ring of
+/// one cell for each slot.
 ///
-/// A slot is in the list at most one time: only the drop of its last count adds it, and the home
-/// takes it out before it gives the slot again. Thus an addition needs no allocation, and the list
-/// holds at most the slot count. A driver pool that returns its slots to a home uses the same list.
-struct ReturnList {
-    head: AtomicU32,
+/// A slot is in the ring at most one time: only its last owner returns it, and the home takes it
+/// out before it gives the slot again. So the returns that the home did not take fill at most each
+/// cell, and a return needs no allocation and no lock. Each cell holds the lap of the return that
+/// wrote it (`LAP`), so the home reads a cell of the next lap as not written, and writes no cell.
+struct ReturnRing {
+    cells: Box<[AtomicU32]>,
+    /// The returns so far. Return `n` writes cell `n % cells` in lap `n / cells`. 64 bits do not
+    /// wrap.
+    tail: AtomicU64,
 }
 
-impl ReturnList {
+impl ReturnRing {
     /// Adds slot `index`, on any thread, with no lock and no allocation.
-    fn push(&self, slots: &[Slot], index: u32) {
-        let entry = &slots[index as usize].next;
-        // Ordering: `Relaxed`: the exchange below checks the value.
-        let mut head = self.head.load(Ordering::Relaxed);
-        loop {
-            entry.store(head, Ordering::Relaxed);
-            // Ordering: `Release` publishes the entry, and each use of the slot before its return,
-            // to the `Acquire` of `take`.
-            match self
-                .head
-                .compare_exchange_weak(head, index, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => return,
-                Err(now) => head = now,
-            }
-        }
-    }
-
-    /// Takes all of the returned slots, at the home. Gives the first of them, or `NONE`.
-    fn take(&self) -> u32 {
-        // Ordering: see `push`. The home takes the whole list in one exchange. Thus no slot can
-        // leave the list and come back between a read of the head and its change.
-        self.head.swap(NONE, Ordering::Acquire)
+    fn push(&self, index: u32) {
+        // Ordering: `Relaxed`: the count gives each return its own cell, and the store below
+        // publishes the slot.
+        let tail = self.tail.fetch_add(1, Ordering::Relaxed);
+        let len = self.cells.len() as u64;
+        let lap = if (tail / len) % 2 == 1 { LAP } else { 0 };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the remainder is less than the cell count, a `u32`"
+        )]
+        let cell = (tail % len) as usize;
+        // Ordering: `Release` publishes each use of the slot before its return to the `Acquire` of
+        // the home that reads the cell.
+        self.cells[cell].store(index | lap, Ordering::Release);
     }
 }
 
@@ -190,7 +195,8 @@ impl Pool {
         allocator: A,
     ) -> Result<Self, PoolRefused> {
         let count = slots.get();
-        if slot.size() == 0 || count == NONE {
+        // Each slot index is below `LAP`, the lap bit of a cell of the return ring.
+        if slot.size() == 0 || count > LAP {
             return Err(PoolRefused::Layout);
         }
         // Each slot takes its rounded size, also the last slot. `repeat` adds no padding after its
@@ -199,9 +205,19 @@ impl Pool {
             .pad_to_align()
             .repeat(count as usize)
             .map_err(|_| PoolRefused::Layout)?;
-        let charge = Layout::array::<Slot>(count as usize)
-            .ok()
-            .and_then(|entries| entries.size().checked_add(arena_layout.size()))
+        // The entries of the slots: a count, a cell of the return ring, and a place on the free
+        // list of the home, 16 bytes for each slot.
+        let entries = [
+            Layout::array::<Slot>(count as usize),
+            Layout::array::<AtomicU32>(count as usize),
+            Layout::array::<u32>(count as usize),
+        ];
+        let charge = entries
+            .iter()
+            .try_fold(0_usize, |sum, entry| {
+                entry.as_ref().ok().and_then(|entry| sum.checked_add(entry.size()))
+            })
+            .and_then(|entries| entries.checked_add(arena_layout.size()))
             .and_then(|size| size.checked_add(size_of::<A>()))
             .and_then(|size| size.checked_add(arc_size::<Shared>()))
             .and_then(|size| u64::try_from(size).ok())
@@ -209,15 +225,13 @@ impl Pool {
         let charge = budget.reserve(charge).map_err(PoolRefused::Budget)?;
 
         let allocator: Box<dyn Allocator + Send> = Box::try_new(allocator).map_err(|_| PoolRefused::Allocation)?;
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(count as usize)
-            .map_err(|_| PoolRefused::Allocation)?;
-        // At first, each slot is in the free list of the home, in order.
-        entries.extend((1..=count).map(|next| Slot {
+        let slots = filled(count, |_| Slot {
             count: AtomicU64::new(0),
-            next: AtomicU32::new(if next == count { NONE } else { next }),
-        }));
+        })?;
+        // No cell is written in the first lap.
+        let cells = filled(count, |_| AtomicU32::new(LAP))?;
+        // At first, each slot is free at the home, and the first slot comes first.
+        let free = filled(count, |place| count - 1 - place)?;
         let arena = allocator
             .allocate(arena_layout)
             .map_err(|_| PoolRefused::Allocation)?
@@ -229,15 +243,22 @@ impl Pool {
             arena_layout,
             stride,
             capacity: slot.size(),
-            slots: entries.into_boxed_slice(),
-            returned: ReturnList {
-                head: AtomicU32::new(NONE),
+            slots,
+            returned: ReturnRing {
+                cells,
+                tail: AtomicU64::new(0),
             },
             allocator,
             _charge: charge,
         })
         .map_err(|_| PoolRefused::Allocation)?;
-        Ok(Self { shared, free: 0 })
+        Ok(Self {
+            shared,
+            free,
+            top: count,
+            cell: 0,
+            lap: 0,
+        })
     }
 
     /// Gives a free slot as an exclusive backing, with no allocation, or refuses if no slot is free.
@@ -246,17 +267,10 @@ impl Pool {
     /// size. None of its bytes are initialized.
     #[expect(unsafe_code, reason = "the backing owns its slot until its last count drops")]
     pub fn acquire(&mut self) -> Result<Backing, PoolEmpty> {
-        if self.free == NONE {
-            self.free = self.shared.returned.take();
-        }
-        let index = self.free;
-        // `NONE` is not the index of a slot.
-        let Some(slot) = self.shared.slots.get(index as usize) else {
-            return Err(PoolEmpty);
-        };
-        self.free = slot.next.load(Ordering::Relaxed);
-        // Ordering: the slot is free, so only the home uses its count until the backing exists.
-        slot.count.store(1, Ordering::Relaxed);
+        self.take_returns();
+        let top = self.top.checked_sub(1).ok_or(PoolEmpty)?;
+        let index = self.free[top as usize];
+        self.top = top;
 
         // The reference of the slot to its pool, which the drop of the last count of the slot gives
         // back.
@@ -267,6 +281,7 @@ impl Pool {
             // SAFETY: `Arc::into_raw` gives a pointer that is not null.
             pool: unsafe { NonNull::new_unchecked(pool.cast_mut()) },
             index,
+            alone: AtomicBool::new(true),
         };
         let release = Release(Hook::Shared(super::Shared::Slot(count)));
         // SAFETY: the slot is `capacity` bytes in the arena, which its reference to the pool keeps
@@ -275,6 +290,39 @@ impl Pool {
         // list are atomic.
         Ok(unsafe { Backing::from_raw_parts(ptr, self.shared.capacity, 0, self.shared.stride, release) })
     }
+
+    /// Moves each returned slot onto the free list of the home, in the order of the returns, so
+    /// the slot that came back last is on top.
+    fn take_returns(&mut self) {
+        let cells = &self.shared.returned.cells;
+        // Each pass takes one return, and the ring holds at most one return for each cell.
+        for _ in 0..cells.len() {
+            // Ordering: `Acquire` reads the `Release` of the return, and each use of the slot
+            // before it.
+            let value = cells[self.cell as usize].load(Ordering::Acquire);
+            if value & LAP != self.lap {
+                return;
+            }
+            // The free list has a place for each slot, and the returned slot is not on it.
+            self.free[self.top as usize] = value & !LAP;
+            self.top += 1;
+            self.cell += 1;
+            if self.cell as usize == cells.len() {
+                self.cell = 0;
+                self.lap ^= LAP;
+            }
+        }
+    }
+}
+
+/// `count` items that `make` gives for each index, or `Allocation` when the allocator refuses.
+fn filled<T>(count: u32, make: impl FnMut(u32) -> T) -> Result<Box<[T]>, PoolRefused> {
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(count as usize)
+        .map_err(|_| PoolRefused::Allocation)?;
+    items.extend((0..count).map(make));
+    Ok(items.into_boxed_slice())
 }
 
 impl fmt::Debug for Pool {
@@ -314,6 +362,9 @@ pub(super) struct SlotRef {
     /// The pool, from `Arc::into_raw`. The slot holds one strong count of it while it is in use.
     pool: NonNull<Shared>,
     index: u32,
+    /// This is the first owner of the slot, which `acquire` gave, and no clone of it was made: it is
+    /// the only owner, and the count of the slot does not count it.
+    alone: AtomicBool,
 }
 
 impl SlotRef {
@@ -341,11 +392,15 @@ impl SlotRef {
 
 impl Clone for SlotRef {
     fn clone(&self) -> Self {
-        // Ordering: as for an `Arc`. The count of `self` keeps the slot in use, so a new count
-        // needs no order.
-        let before = self.shared().slots[self.index as usize]
-            .count
-            .fetch_add(1, Ordering::Relaxed);
+        let count = &self.shared().slots[self.index as usize].count;
+        // Ordering: as for an `Arc`. `self` keeps the slot in use, so a new count needs no order.
+        // The clone counts itself first, and then the first owner when this is its first clone. A
+        // clone that returned thus counted the first owner, so the count does not fall to 0 while
+        // an owner lives. The drop of `self` comes after each clone that borrows it.
+        let before = count.fetch_add(1, Ordering::Relaxed);
+        if self.alone.swap(false, Ordering::Relaxed) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
         // Forgotten clones can raise the count without a drop. As `Arc` does, stop far below the
         // wrap, which would return the slot while a lease uses it. Other threads can each add one
         // more before they stop, which half of the range holds.
@@ -353,6 +408,7 @@ impl Clone for SlotRef {
         Self {
             pool: self.pool,
             index: self.index,
+            alone: AtomicBool::new(false),
         }
     }
 }
@@ -364,21 +420,19 @@ impl Drop for SlotRef {
     fn drop(&mut self) {
         {
             let shared = self.shared();
-            let count = &shared.slots[self.index as usize].count;
-            // Ordering: as for an `Arc`. A count of 1 under `Acquire` is this count alone: each
-            // other count dropped with `Release` before the load, and only a holder of a count can
-            // make one more, so the last count returns the slot with no read-modify-write, which
-            // would wait for each earlier store of this thread. The acquire of the slot sets the
-            // count again. Else `Release` orders each use of the slot by this owner before the drop
-            // of its count, and the `Acquire` fence of the last owner orders all of them before
-            // the return.
-            if count.load(Ordering::Acquire) != 1 {
-                if count.fetch_sub(1, Ordering::Release) != 1 {
+            // A first owner with no clone is the only owner: it returns the slot with no access to
+            // the cold line of the count, which is 0. Each clone of it came before this drop.
+            if !self.alone.load(Ordering::Relaxed) {
+                // Ordering: as for an `Arc`. `Release` orders each use of the slot by this owner
+                // before the drop of its count, and the `Acquire` fence of the last owner orders all
+                // of them before the return. A load could not stand in for the read-modify-write: a
+                // clone on another thread adds with no order, so a load can miss it.
+                if shared.slots[self.index as usize].count.fetch_sub(1, Ordering::Release) != 1 {
                     return;
                 }
                 fence(Ordering::Acquire);
             }
-            shared.returned.push(&shared.slots, self.index);
+            shared.returned.push(self.index);
         }
         // SAFETY: `Pool::acquire` took this reference with `Arc::into_raw`, and the slot kept it
         // until its last count, which is gone now. Nothing uses `pool` after this.
@@ -387,8 +441,9 @@ impl Drop for SlotRef {
 }
 
 #[expect(unsafe_code, reason = "a count of a slot is for each thread")]
-// SAFETY: a `SlotRef` gives reads of a slot that nothing writes while it is leased, and its drop
-// uses only the atomic count and the atomic return list. The pool is `Sync`.
+// SAFETY: a `SlotRef` gives reads of a slot that nothing writes while it is leased, and its clone
+// and its drop use only the atomic count, the atomic `alone`, and the atomic return ring. The pool
+// is `Sync`.
 unsafe impl Send for SlotRef {}
 
 #[expect(unsafe_code, reason = "a count of a slot is for each thread")]

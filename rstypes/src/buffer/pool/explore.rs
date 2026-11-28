@@ -65,3 +65,24 @@ fn the_last_of_two_concurrent_views_returns_the_slot_once() {
         drop(slot);
     });
 }
+
+/// The first clones of a lease that has no clone yet, on two threads at once, each count it: its
+/// slot stays in use while the lease lives, and it returns once after the last owner drops.
+#[test]
+fn the_first_clones_of_a_lone_lease_on_two_threads_keep_its_slot_until_its_last_owner() {
+    model(|| {
+        let mut pool = pool(1);
+        let lease = loom::sync::Arc::new(Lease::from(pool.acquire().unwrap()));
+        let shared = loom::sync::Arc::clone(&lease);
+        let clones = loom::thread::spawn(move || drop(Lease::clone(&shared)));
+        drop(Lease::clone(&lease));
+        clones.join().unwrap();
+
+        // The lease lives, so its slot is not free.
+        assert_eq!(pool.acquire().unwrap_err(), PoolEmpty);
+        drop(lease);
+        let slot = pool.acquire().unwrap();
+        assert_eq!(pool.acquire().unwrap_err(), PoolEmpty);
+        drop(slot);
+    });
+}
