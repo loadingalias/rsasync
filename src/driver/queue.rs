@@ -37,6 +37,17 @@ pub(crate) enum Completions<'a> {
     Port(iocp::Completions<'a>),
 }
 
+#[cfg(target_os = "linux")]
+impl Completions<'_> {
+    /// Gives `f` the user data of each of the next `count` ready completions of a ring at most,
+    /// with no take. The other backends give none: no completion of theirs names a record.
+    pub(crate) fn ahead(&self, count: u32, f: impl FnMut(u64)) {
+        if let Self::Ring(completions) = self {
+            completions.ahead(count, f);
+        }
+    }
+}
+
 impl Iterator for Completions<'_> {
     type Item = Cqe;
 

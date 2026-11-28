@@ -1425,6 +1425,10 @@ pub const KEPT_BUFFERS: u32 = 4;
 #[cfg(target_os = "linux")]
 const WAKE: u64 = CONTROL;
 
+/// The most completions whose records a harvest asks the CPU to load before it reads the first.
+#[cfg(target_os = "linux")]
+const RECORDS_AHEAD: u32 = 16;
+
 /// The user data of a completion of the record of a stream: this tag, the half of the stream in
 /// bit 60 ([`RECORD_WRITE`]), the index of its resource slot in bits 32 to 59, and the generation
 /// of its resource ([`Resource::record`]).
@@ -2836,7 +2840,18 @@ impl Driver {
         let mut completed = 0;
         let (mut native, mut kept) = (None, None);
         match &mut self.control {
-            None => native = Some(self.queue.completions().take(limit as usize)),
+            None => {
+                let completions = self.queue.completions();
+                // The records of the first completions load together, before the harvest reads
+                // the first of them.
+                #[cfg(target_os = "linux")]
+                completions.ahead(limit.min(RECORDS_AHEAD), |user_data| {
+                    if let Some((resource, _)) = self.resources.of_record(user_data) {
+                        self.resources.prefetch(resource);
+                    }
+                });
+                native = Some(completions.take(limit as usize));
+            }
             Some(control) => kept = Some(core::iter::from_fn(|| control.give()).take(limit as usize)),
         }
         let (shared, table, pending) = (&self.shared, &mut self.table, &mut self.pending);

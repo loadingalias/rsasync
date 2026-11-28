@@ -1010,6 +1010,19 @@ pub(crate) struct Completions<'ring> {
 }
 
 #[cfg(target_os = "linux")]
+impl Completions<'_> {
+    /// Gives `f` the user data of each of the next `count` ready completions at most, with no take.
+    pub(crate) fn ahead(&self, count: u32, mut f: impl FnMut(u64)) {
+        for index in 0..self.tail.wrapping_sub(self.head).min(count) {
+            f(self
+                .ring
+                .cqe((self.head.wrapping_add(index) & self.ring.cq_mask) as usize)
+                .user_data);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Iterator for Completions<'_> {
     type Item = Cqe;
 
